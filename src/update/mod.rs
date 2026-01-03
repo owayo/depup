@@ -1,0 +1,357 @@
+//! Update judgment logic for dependencies
+//!
+//! This module provides:
+//! - Update filter configuration from CLI args
+//! - Version info from registry with release date
+//! - Update judgment engine that decides whether to update or skip
+
+mod filter;
+mod version_info;
+
+pub use filter::UpdateFilter;
+pub use version_info::VersionInfo;
+
+use crate::domain::{Dependency, Language, SkipReason, UpdateResult};
+use chrono::{DateTime, Utc};
+use std::time::Duration;
+
+/// Update judgment engine that decides whether to update a dependency
+pub struct UpdateJudge {
+    /// Filter configuration
+    filter: UpdateFilter,
+    /// Current time for age calculations
+    now: DateTime<Utc>,
+}
+
+impl UpdateJudge {
+    /// Create a new UpdateJudge with the given filter
+    pub fn new(filter: UpdateFilter) -> Self {
+        Self {
+            filter,
+            now: Utc::now(),
+        }
+    }
+
+    /// Create a new UpdateJudge with a custom current time (for testing)
+    pub fn with_time(filter: UpdateFilter, now: DateTime<Utc>) -> Self {
+        Self { filter, now }
+    }
+
+    /// Check if a dependency should be processed at all
+    /// Returns Some(SkipReason) if it should be skipped, None if it should be processed
+    pub fn should_skip(&self, dependency: &Dependency) -> Option<SkipReason> {
+        // Check language filter
+        if !self.filter.should_process_language(dependency.language) {
+            return Some(SkipReason::LanguageFiltered);
+        }
+
+        // Check package filters (exclude/only)
+        if !self.filter.should_process_package(&dependency.name) {
+            if !self.filter.only.is_empty() {
+                return Some(SkipReason::NotInOnlyList);
+            } else {
+                return Some(SkipReason::Excluded);
+            }
+        }
+
+        // Check pinned version (unless --include-pinned)
+        if dependency.is_pinned() && !self.filter.include_pinned {
+            return Some(SkipReason::Pinned);
+        }
+
+        None
+    }
+
+    /// Judge whether to update a dependency given available versions
+    pub fn judge(
+        &self,
+        dependency: &Dependency,
+        available_versions: &[VersionInfo],
+    ) -> UpdateResult {
+        // First check if we should skip this dependency
+        if let Some(reason) = self.should_skip(dependency) {
+            return UpdateResult::skip(dependency.clone(), reason);
+        }
+
+        // If no versions available, skip
+        if available_versions.is_empty() {
+            return UpdateResult::skip(
+                dependency.clone(),
+                SkipReason::FetchFailed("no versions available".to_string()),
+            );
+        }
+
+        // Filter versions by age if specified
+        let eligible_versions: Vec<&VersionInfo> = if let Some(min_age) = self.filter.min_age {
+            let min_release_time = self.now - chrono::Duration::from_std(min_age).unwrap();
+            available_versions
+                .iter()
+                .filter(|v| v.released_at <= min_release_time)
+                .collect()
+        } else {
+            available_versions.iter().collect()
+        };
+
+        if eligible_versions.is_empty() {
+            return UpdateResult::skip(dependency.clone(), SkipReason::NoSuitableVersion);
+        }
+
+        // Find the latest eligible version
+        let latest = eligible_versions
+            .iter()
+            .max_by(|a, b| a.version.cmp(&b.version))
+            .unwrap();
+
+        // Check if already at latest
+        if dependency.version() == latest.version {
+            return UpdateResult::skip_already_latest(dependency.clone());
+        }
+
+        // Return update result
+        UpdateResult::update(dependency.clone(), &latest.version)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{VersionSpec, VersionSpecKind};
+    use chrono::TimeZone;
+
+    fn make_dependency(name: &str, version: &str, language: Language, pinned: bool) -> Dependency {
+        let kind = if pinned {
+            VersionSpecKind::Exact
+        } else {
+            VersionSpecKind::Caret
+        };
+        let spec = if pinned {
+            VersionSpec::new(kind, version, version)
+        } else {
+            VersionSpec::new(kind, &format!("^{}", version), version).with_prefix("^")
+        };
+        Dependency::new(name, spec, false, language)
+    }
+
+    fn make_version_info(version: &str, days_ago: i64) -> VersionInfo {
+        let released_at = Utc::now() - chrono::Duration::days(days_ago);
+        VersionInfo::new(version, released_at)
+    }
+
+    fn fixed_time() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2024, 6, 1, 12, 0, 0).unwrap()
+    }
+
+    fn make_version_info_at(version: &str, date: DateTime<Utc>) -> VersionInfo {
+        VersionInfo::new(version, date)
+    }
+
+    #[test]
+    fn test_judge_simple_update() {
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_dependency("lodash", "1.0.0", Language::Node, false);
+        let versions = vec![
+            make_version_info("1.0.0", 100),
+            make_version_info("1.1.0", 50),
+            make_version_info("2.0.0", 10),
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_update());
+        if let UpdateResult::Update { new_version, .. } = result {
+            assert_eq!(new_version, "2.0.0");
+        }
+    }
+
+    #[test]
+    fn test_judge_already_latest() {
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_dependency("lodash", "2.0.0", Language::Node, false);
+        let versions = vec![
+            make_version_info("1.0.0", 100),
+            make_version_info("2.0.0", 10),
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_skip());
+        if let UpdateResult::Skip { reason, .. } = result {
+            assert_eq!(reason, SkipReason::AlreadyLatest);
+        }
+    }
+
+    #[test]
+    fn test_judge_skip_pinned() {
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_dependency("lodash", "1.0.0", Language::Node, true);
+        let versions = vec![make_version_info("2.0.0", 10)];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_skip());
+        if let UpdateResult::Skip { reason, .. } = result {
+            assert_eq!(reason, SkipReason::Pinned);
+        }
+    }
+
+    #[test]
+    fn test_judge_include_pinned() {
+        let filter = UpdateFilter::new().with_include_pinned(true);
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_dependency("lodash", "1.0.0", Language::Node, true);
+        let versions = vec![make_version_info("2.0.0", 10)];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_update());
+    }
+
+    #[test]
+    fn test_judge_exclude_package() {
+        let filter = UpdateFilter::new().with_exclude(vec!["lodash".to_string()]);
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_dependency("lodash", "1.0.0", Language::Node, false);
+        let versions = vec![make_version_info("2.0.0", 10)];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_skip());
+        if let UpdateResult::Skip { reason, .. } = result {
+            assert_eq!(reason, SkipReason::Excluded);
+        }
+    }
+
+    #[test]
+    fn test_judge_only_list() {
+        let filter = UpdateFilter::new().with_only(vec!["express".to_string()]);
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_dependency("lodash", "1.0.0", Language::Node, false);
+        let versions = vec![make_version_info("2.0.0", 10)];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_skip());
+        if let UpdateResult::Skip { reason, .. } = result {
+            assert_eq!(reason, SkipReason::NotInOnlyList);
+        }
+    }
+
+    #[test]
+    fn test_judge_only_list_match() {
+        let filter = UpdateFilter::new().with_only(vec!["lodash".to_string()]);
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_dependency("lodash", "1.0.0", Language::Node, false);
+        let versions = vec![make_version_info("2.0.0", 10)];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_update());
+    }
+
+    #[test]
+    fn test_judge_language_filter() {
+        let filter = UpdateFilter::new().with_languages(vec![Language::Python]);
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_dependency("lodash", "1.0.0", Language::Node, false);
+        let versions = vec![make_version_info("2.0.0", 10)];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_skip());
+        if let UpdateResult::Skip { reason, .. } = result {
+            assert_eq!(reason, SkipReason::LanguageFiltered);
+        }
+    }
+
+    #[test]
+    fn test_judge_language_filter_match() {
+        let filter = UpdateFilter::new().with_languages(vec![Language::Node]);
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_dependency("lodash", "1.0.0", Language::Node, false);
+        let versions = vec![make_version_info("2.0.0", 10)];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_update());
+    }
+
+    #[test]
+    fn test_judge_age_filter() {
+        let now = fixed_time();
+        let filter = UpdateFilter::new().with_min_age(Duration::from_secs(7 * 24 * 60 * 60)); // 7 days
+        let judge = UpdateJudge::with_time(filter, now);
+
+        let dep = make_dependency("lodash", "1.0.0", Language::Node, false);
+
+        // Version released 3 days ago (too recent)
+        let recent = make_version_info_at("2.0.0", now - chrono::Duration::days(3));
+        // Version released 10 days ago (eligible)
+        let old = make_version_info_at("1.5.0", now - chrono::Duration::days(10));
+
+        let versions = vec![old, recent];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_update());
+        if let UpdateResult::Update { new_version, .. } = result {
+            // Should update to 1.5.0 because 2.0.0 is too recent
+            assert_eq!(new_version, "1.5.0");
+        }
+    }
+
+    #[test]
+    fn test_judge_age_filter_no_suitable() {
+        let now = fixed_time();
+        let filter = UpdateFilter::new().with_min_age(Duration::from_secs(30 * 24 * 60 * 60)); // 30 days
+        let judge = UpdateJudge::with_time(filter, now);
+
+        let dep = make_dependency("lodash", "1.0.0", Language::Node, false);
+
+        // All versions too recent
+        let versions = vec![
+            make_version_info_at("2.0.0", now - chrono::Duration::days(3)),
+            make_version_info_at("1.5.0", now - chrono::Duration::days(10)),
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_skip());
+        if let UpdateResult::Skip { reason, .. } = result {
+            assert_eq!(reason, SkipReason::NoSuitableVersion);
+        }
+    }
+
+    #[test]
+    fn test_judge_no_versions() {
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_dependency("lodash", "1.0.0", Language::Node, false);
+        let versions: Vec<VersionInfo> = vec![];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_skip());
+        if let UpdateResult::Skip { reason, .. } = result {
+            assert!(matches!(reason, SkipReason::FetchFailed(_)));
+        }
+    }
+
+    #[test]
+    fn test_should_skip_returns_none_for_normal() {
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_dependency("lodash", "1.0.0", Language::Node, false);
+        assert!(judge.should_skip(&dep).is_none());
+    }
+
+    #[test]
+    fn test_should_skip_returns_reason_for_pinned() {
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_dependency("lodash", "1.0.0", Language::Node, true);
+        assert_eq!(judge.should_skip(&dep), Some(SkipReason::Pinned));
+    }
+}
