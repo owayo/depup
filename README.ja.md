@@ -29,7 +29,7 @@
       <img src="docs/images/output_python.png" width="400" alt="depup Python出力">
     </td>
     <td align="center">
-      <strong>Tauri (マルチ言語)</strong><br>
+      <strong>Tauri (Node.js + Rust)</strong><br>
       <img src="docs/images/output_tauri.png" width="400" alt="depup Tauri出力">
     </td>
   </tr>

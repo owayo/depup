@@ -29,6 +29,8 @@ impl Language {
             Language::Python => "pyproject.toml",
             Language::Rust => "Cargo.toml",
             Language::Go => "go.mod",
+            Language::Ruby => "Gemfile",
+            Language::Php => "composer.json",
         }
     }
 
@@ -39,6 +41,8 @@ impl Language {
             Language::Python => &["uv.lock", "rye.lock", "poetry.lock"],
             Language::Rust => &["Cargo.lock"],
             Language::Go => &["go.sum"],
+            Language::Ruby => &["Gemfile.lock"],
+            Language::Php => &["composer.lock"],
         }
     }
 
@@ -49,6 +53,8 @@ impl Language {
             Language::Python => "Python",
             Language::Rust => "Rust",
             Language::Go => "Go",
+            Language::Ruby => "Ruby",
+            Language::Php => "PHP",
         }
     }
 
@@ -59,6 +65,8 @@ impl Language {
             Language::Python,
             Language::Rust,
             Language::Go,
+            Language::Ruby,
+            Language::Php,
         ]
     }
 }
@@ -79,6 +87,8 @@ mod tests {
         assert_eq!(Language::Python.manifest_filename(), "pyproject.toml");
         assert_eq!(Language::Rust.manifest_filename(), "Cargo.toml");
         assert_eq!(Language::Go.manifest_filename(), "go.mod");
+        assert_eq!(Language::Ruby.manifest_filename(), "Gemfile");
+        assert_eq!(Language::Php.manifest_filename(), "composer.json");
     }
 
     #[test]
@@ -93,6 +103,8 @@ mod tests {
         );
         assert_eq!(Language::Rust.lock_filenames(), &["Cargo.lock"]);
         assert_eq!(Language::Go.lock_filenames(), &["go.sum"]);
+        assert_eq!(Language::Ruby.lock_filenames(), &["Gemfile.lock"]);
+        assert_eq!(Language::Php.lock_filenames(), &["composer.lock"]);
     }
 
     #[test]
@@ -101,6 +113,8 @@ mod tests {
         assert_eq!(Language::Python.display_name(), "Python");
         assert_eq!(Language::Rust.display_name(), "Rust");
         assert_eq!(Language::Go.display_name(), "Go");
+        assert_eq!(Language::Ruby.display_name(), "Ruby");
+        assert_eq!(Language::Php.display_name(), "PHP");
     }
 
     #[test]
@@ -109,16 +123,20 @@ mod tests {
         assert_eq!(format!("{}", Language::Python), "Python");
         assert_eq!(format!("{}", Language::Rust), "Rust");
         assert_eq!(format!("{}", Language::Go), "Go");
+        assert_eq!(format!("{}", Language::Ruby), "Ruby");
+        assert_eq!(format!("{}", Language::Php), "PHP");
     }
 
     #[test]
     fn test_all_languages() {
         let all = Language::all();
-        assert_eq!(all.len(), 4);
+        assert_eq!(all.len(), 6);
         assert!(all.contains(&Language::Node));
         assert!(all.contains(&Language::Python));
         assert!(all.contains(&Language::Rust));
         assert!(all.contains(&Language::Go));
+        assert!(all.contains(&Language::Ruby));
+        assert!(all.contains(&Language::Php));
     }
 
     #[test]
@@ -149,6 +167,14 @@ mod tests {
         let lang = Language::Python;
         let json = serde_json::to_string(&lang).unwrap();
         assert_eq!(json, "\"python\"");
+
+        let lang = Language::Ruby;
+        let json = serde_json::to_string(&lang).unwrap();
+        assert_eq!(json, "\"ruby\"");
+
+        let lang = Language::Php;
+        let json = serde_json::to_string(&lang).unwrap();
+        assert_eq!(json, "\"php\"");
     }
 
     #[test]
@@ -158,5 +184,11 @@ mod tests {
 
         let lang: Language = serde_json::from_str("\"rust\"").unwrap();
         assert_eq!(lang, Language::Rust);
+
+        let lang: Language = serde_json::from_str("\"ruby\"").unwrap();
+        assert_eq!(lang, Language::Ruby);
+
+        let lang: Language = serde_json::from_str("\"php\"").unwrap();
+        assert_eq!(lang, Language::Php);
     }
 }

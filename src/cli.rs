@@ -73,6 +73,14 @@ pub struct CliArgs {
     #[arg(long)]
     pub go: bool,
 
+    /// Update only Ruby (Gemfile) dependencies
+    #[arg(long)]
+    pub ruby: bool,
+
+    /// Update only PHP (composer.json) dependencies
+    #[arg(long)]
+    pub php: bool,
+
     // Package filters
     /// Exclude specific packages from update (can be specified multiple times)
     #[arg(long, action = ArgAction::Append)]
@@ -109,7 +117,7 @@ pub struct CliArgs {
 impl CliArgs {
     /// Check if any language filter is specified
     pub fn has_language_filter(&self) -> bool {
-        self.node || self.python || self.rust_lang || self.go
+        self.node || self.python || self.rust_lang || self.go || self.ruby || self.php
     }
 
     /// Check if a specific language should be processed
@@ -122,6 +130,8 @@ impl CliArgs {
             "python" => self.python,
             "rust" => self.rust_lang,
             "go" | "golang" => self.go,
+            "ruby" => self.ruby,
+            "php" => self.php,
             _ => false,
         }
     }

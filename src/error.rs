@@ -251,6 +251,8 @@ impl RegistryError {
             Language::Python => "PyPI",
             Language::Rust => "crates.io",
             Language::Go => "Go Proxy",
+            Language::Ruby => "RubyGems",
+            Language::Php => "Packagist",
         }
     }
 }

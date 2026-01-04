@@ -5,15 +5,21 @@
 //! - Python (pip/poetry)
 //! - Rust (cargo)
 //! - Go (go mod)
+//! - Ruby (bundler)
+//! - PHP (composer)
 
 mod go;
 mod node;
+mod php;
 mod python;
+mod ruby;
 mod rust;
 
 pub use go::GoVersionParser;
 pub use node::NodeVersionParser;
+pub use php::PhpVersionParser;
 pub use python::PythonVersionParser;
+pub use ruby::RubyVersionParser;
 pub use rust::RustVersionParser;
 
 use crate::domain::{Language, VersionSpec};
@@ -34,6 +40,8 @@ pub fn get_parser(language: Language) -> Box<dyn VersionParser> {
         Language::Python => Box::new(PythonVersionParser),
         Language::Rust => Box::new(RustVersionParser),
         Language::Go => Box::new(GoVersionParser),
+        Language::Ruby => Box::new(RubyVersionParser),
+        Language::Php => Box::new(PhpVersionParser),
     }
 }
 

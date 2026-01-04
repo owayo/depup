@@ -14,7 +14,8 @@ use crate::manifest::{
 };
 use crate::progress::Progress;
 use crate::registry::{
-    CratesIoAdapter, GoProxyAdapter, HttpClient, NpmAdapter, PyPIAdapter, RegistryAdapter,
+    CratesIoAdapter, GoProxyAdapter, HttpClient, NpmAdapter, PackagistAdapter, PyPIAdapter,
+    RegistryAdapter, RubyGemsAdapter,
 };
 use crate::update::{UpdateFilter, UpdateJudge, VersionInfo};
 use std::sync::Arc;
@@ -306,6 +307,8 @@ impl Orchestrator {
             Language::Python => self.args.python,
             Language::Rust => self.args.rust_lang,
             Language::Go => self.args.go,
+            Language::Ruby => self.args.ruby,
+            Language::Php => self.args.php,
         }
     }
 
@@ -316,6 +319,8 @@ impl Orchestrator {
             Language::Python => Box::new(PyPIAdapter::new(self.client.clone())),
             Language::Rust => Box::new(CratesIoAdapter::new(self.client.clone())),
             Language::Go => Box::new(GoProxyAdapter::new(self.client.clone())),
+            Language::Ruby => Box::new(RubyGemsAdapter::new(self.client.clone())),
+            Language::Php => Box::new(PackagistAdapter::new(self.client.clone())),
         }
     }
 

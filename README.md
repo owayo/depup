@@ -29,7 +29,7 @@
       <img src="docs/images/output_python.png" width="400" alt="depup Python output">
     </td>
     <td align="center">
-      <strong>Tauri (multi-language)</strong><br>
+      <strong>Tauri (Node.js + Rust)</strong><br>
       <img src="docs/images/output_tauri.png" width="400" alt="depup Tauri output">
     </td>
   </tr>

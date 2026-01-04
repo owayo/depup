@@ -140,6 +140,10 @@ impl SystemPackageManager {
             "cargo" => vec!["cargo", "build"],
             // Go
             "go" => vec!["go", "mod", "download"],
+            // Ruby
+            "bundle" => vec!["bundle", "install"],
+            // PHP
+            "composer" => vec!["composer", "install"],
             _ => vec![],
         }
     }
@@ -175,6 +179,20 @@ impl PackageManagerRunner for SystemPackageManager {
             Language::Go => {
                 if working_dir.join("go.mod").exists() {
                     Some("go")
+                } else {
+                    None
+                }
+            }
+            Language::Ruby => {
+                if working_dir.join("Gemfile").exists() {
+                    Some("bundle")
+                } else {
+                    None
+                }
+            }
+            Language::Php => {
+                if working_dir.join("composer.json").exists() {
+                    Some("composer")
                 } else {
                     None
                 }

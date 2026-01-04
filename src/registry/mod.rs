@@ -11,13 +11,17 @@ mod client;
 mod crates_io;
 mod go_proxy;
 mod npm;
+mod packagist;
 mod pypi;
+mod rubygems;
 
 pub use client::HttpClient;
 pub use crates_io::CratesIoAdapter;
 pub use go_proxy::GoProxyAdapter;
 pub use npm::NpmAdapter;
+pub use packagist::PackagistAdapter;
 pub use pypi::PyPIAdapter;
+pub use rubygems::RubyGemsAdapter;
 
 use crate::domain::Language;
 use crate::error::RegistryError;
@@ -44,5 +48,7 @@ pub fn create_adapter(language: Language, client: HttpClient) -> Box<dyn Registr
         Language::Python => Box::new(PyPIAdapter::new(client)),
         Language::Rust => Box::new(CratesIoAdapter::new(client)),
         Language::Go => Box::new(GoProxyAdapter::new(client)),
+        Language::Ruby => Box::new(RubyGemsAdapter::new(client)),
+        Language::Php => Box::new(PackagistAdapter::new(client)),
     }
 }
