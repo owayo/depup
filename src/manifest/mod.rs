@@ -10,6 +10,7 @@ mod cargo_toml;
 mod detector;
 mod go_mod;
 mod package_json;
+mod pnpm_settings;
 mod pyproject_toml;
 mod writer;
 
@@ -17,6 +18,7 @@ pub use cargo_toml::CargoTomlParser;
 pub use detector::{detect_manifests, ManifestFile, ManifestInfo};
 pub use go_mod::GoModParser;
 pub use package_json::PackageJsonParser;
+pub use pnpm_settings::{has_pnpm_workspace, PnpmSettings};
 pub use pyproject_toml::PyprojectTomlParser;
 pub use writer::{read_manifest, write_manifest, ManifestWriter, WriteResult};
 

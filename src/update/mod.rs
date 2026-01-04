@@ -120,8 +120,8 @@ impl UpdateJudge {
             return UpdateResult::skip_already_latest(dependency.clone());
         }
 
-        // Return update result
-        UpdateResult::update(dependency.clone(), &latest.version)
+        // Return update result with release date
+        UpdateResult::update_with_date(dependency.clone(), &latest.version, latest.released_at)
     }
 }
 

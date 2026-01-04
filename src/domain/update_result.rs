@@ -1,6 +1,7 @@
 //! Update decision result types
 
 use super::Dependency;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -51,6 +52,9 @@ pub enum UpdateResult {
         dependency: Dependency,
         /// The new version to update to
         new_version: String,
+        /// When the new version was released
+        #[serde(skip_serializing_if = "Option::is_none")]
+        released_at: Option<DateTime<Utc>>,
     },
     /// Dependency update was skipped
     Skip {
@@ -62,11 +66,25 @@ pub enum UpdateResult {
 }
 
 impl UpdateResult {
-    /// Creates an Update result
+    /// Creates an Update result without release date (for backward compatibility)
     pub fn update(dependency: Dependency, new_version: impl Into<String>) -> Self {
         UpdateResult::Update {
             dependency,
             new_version: new_version.into(),
+            released_at: None,
+        }
+    }
+
+    /// Creates an Update result with release date
+    pub fn update_with_date(
+        dependency: Dependency,
+        new_version: impl Into<String>,
+        released_at: DateTime<Utc>,
+    ) -> Self {
+        UpdateResult::Update {
+            dependency,
+            new_version: new_version.into(),
+            released_at: Some(released_at),
         }
     }
 
@@ -130,6 +148,7 @@ impl fmt::Display for UpdateResult {
             UpdateResult::Update {
                 dependency,
                 new_version,
+                released_at,
             } => {
                 write!(
                     f,
@@ -137,7 +156,11 @@ impl fmt::Display for UpdateResult {
                     dependency.name,
                     dependency.version(),
                     new_version
-                )
+                )?;
+                if let Some(date) = released_at {
+                    write!(f, " ({})", date.format("%Y/%m/%d %H:%M"))?;
+                }
+                Ok(())
             }
             UpdateResult::Skip { dependency, reason } => {
                 write!(f, "{}: skipped ({})", dependency.name, reason)
@@ -211,10 +234,35 @@ mod tests {
         if let UpdateResult::Update {
             dependency,
             new_version,
+            released_at,
         } = result
         {
             assert_eq!(dependency, dep);
             assert_eq!(new_version, "2.0.0");
+            assert!(released_at.is_none()); // No release date when using update()
+        } else {
+            panic!("Expected Update variant");
+        }
+    }
+
+    #[test]
+    fn test_update_result_update_with_date() {
+        use chrono::TimeZone;
+        let dep = sample_dependency();
+        let date = Utc.with_ymd_and_hms(2024, 6, 15, 10, 30, 0).unwrap();
+        let result = UpdateResult::update_with_date(dep.clone(), "2.0.0", date);
+
+        assert!(result.is_update());
+
+        if let UpdateResult::Update {
+            dependency,
+            new_version,
+            released_at,
+        } = result
+        {
+            assert_eq!(dependency, dep);
+            assert_eq!(new_version, "2.0.0");
+            assert_eq!(released_at, Some(date));
         } else {
             panic!("Expected Update variant");
         }
@@ -312,6 +360,18 @@ mod tests {
         let dep = sample_dependency();
         let result = UpdateResult::update(dep, "2.0.0");
         assert_eq!(format!("{}", result), "lodash: 1.2.3 → 2.0.0");
+    }
+
+    #[test]
+    fn test_update_result_display_update_with_date() {
+        use chrono::TimeZone;
+        let dep = sample_dependency();
+        let date = Utc.with_ymd_and_hms(2024, 6, 15, 10, 30, 0).unwrap();
+        let result = UpdateResult::update_with_date(dep, "2.0.0", date);
+        assert_eq!(
+            format!("{}", result),
+            "lodash: 1.2.3 → 2.0.0 (2024/06/15 10:30)"
+        );
     }
 
     #[test]

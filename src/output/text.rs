@@ -10,6 +10,7 @@
 use crate::domain::{Language, ManifestUpdateResult, SkipReason, UpdateResult, UpdateSummary};
 use crate::orchestrator::OrchestratorResult;
 use crate::output::{OutputFormatter, Verbosity};
+use chrono::{DateTime, Utc};
 use colored::Colorize;
 use std::io::Write;
 
@@ -158,11 +159,17 @@ impl TextFormatter {
         old_version: &str,
         new_version: &str,
         is_dev: bool,
+        released_at: Option<DateTime<Utc>>,
         max_name_len: usize,
         writer: &mut dyn Write,
     ) -> std::io::Result<()> {
         let change_type = VersionChangeType::from_versions(old_version, new_version);
         let dev_marker = if is_dev { " (dev)" } else { "" };
+
+        // Format release date
+        let date_display = released_at
+            .map(|d| format!(" ({})", d.format("%Y/%m/%d %H:%M")))
+            .unwrap_or_default();
 
         if self.color {
             let name_display = format!("{:width$}", name, width = max_name_len);
@@ -173,25 +180,34 @@ impl TextFormatter {
             } else {
                 String::new()
             };
+            let date_colored = released_at
+                .map(|d| {
+                    format!(" ({})", d.format("%Y/%m/%d %H:%M"))
+                        .dimmed()
+                        .to_string()
+                })
+                .unwrap_or_default();
 
             writeln!(
                 writer,
-                "  {} {} {} {} [{}]{}",
+                "  {} {} {} {} [{}]{}{}",
                 name_display,
                 old_version.dimmed(),
                 arrow,
                 new_version.bright_white().bold(),
                 change_label,
+                date_colored,
                 dev_display
             )
         } else {
             writeln!(
                 writer,
-                "  {:width$} {} -> {} [{}]{}",
+                "  {:width$} {} -> {} [{}]{}{}",
                 name,
                 old_version,
                 new_version,
                 change_type.label(),
+                date_display,
                 dev_marker,
                 width = max_name_len
             )
@@ -299,6 +315,7 @@ impl TextFormatter {
                 if let UpdateResult::Update {
                     dependency,
                     new_version,
+                    released_at,
                     ..
                 } = result
                 {
@@ -307,6 +324,7 @@ impl TextFormatter {
                         &dependency.version_spec.version,
                         new_version,
                         false,
+                        *released_at,
                         max_name_len,
                         writer,
                     )?;
@@ -320,6 +338,7 @@ impl TextFormatter {
                 if let UpdateResult::Update {
                     dependency,
                     new_version,
+                    released_at,
                     ..
                 } = result
                 {
@@ -328,6 +347,7 @@ impl TextFormatter {
                         &dependency.version_spec.version,
                         new_version,
                         true,
+                        *released_at,
                         max_name_len,
                         writer,
                     )?;

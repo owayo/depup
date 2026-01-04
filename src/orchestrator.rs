@@ -9,7 +9,9 @@
 
 use crate::cli::CliArgs;
 use crate::domain::{Language, ManifestUpdateResult, SkipReason, UpdateResult, UpdateSummary};
-use crate::manifest::{detect_manifests, get_parser, ManifestWriter, WriteResult};
+use crate::manifest::{
+    detect_manifests, get_parser, has_pnpm_workspace, ManifestWriter, PnpmSettings, WriteResult,
+};
 use crate::progress::Progress;
 use crate::registry::{
     CratesIoAdapter, GoProxyAdapter, HttpClient, NpmAdapter, PyPIAdapter, RegistryAdapter,
@@ -283,8 +285,15 @@ impl Orchestrator {
         }
 
         // Age filter
+        // Priority: CLI --age > pnpm settings (for Node.js projects)
         if let Some(age) = self.args.age {
             filter = filter.with_min_age(age);
+        } else if has_pnpm_workspace(&self.args.path) {
+            // Read pnpm settings for minimum release age
+            let pnpm_settings = PnpmSettings::from_dir(&self.args.path);
+            if let Some(age) = pnpm_settings.minimum_release_age {
+                filter = filter.with_min_age(age);
+            }
         }
 
         filter
@@ -357,9 +366,18 @@ impl Default for OrchestratorConfig {
 mod tests {
     use super::*;
     use clap::Parser;
+    use std::fs;
+    use tempfile::TempDir;
 
     fn make_args(args: &[&str]) -> CliArgs {
         CliArgs::parse_from(args)
+    }
+
+    fn make_args_with_path(path: &std::path::Path, extra_args: &[&str]) -> CliArgs {
+        let path_str = path.to_str().unwrap();
+        let mut args = vec!["depup", path_str];
+        args.extend(extra_args);
+        CliArgs::parse_from(&args)
     }
 
     #[test]
@@ -516,5 +534,87 @@ mod tests {
             message: "permission denied".to_string(),
         };
         assert!(err.to_string().contains("Failed to write"));
+    }
+
+    #[test]
+    fn test_build_filter_with_pnpm_workspace_yaml() {
+        let dir = TempDir::new().unwrap();
+
+        // Create pnpm-workspace.yaml with minimumReleaseAge in minutes (14400 = 10 days)
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages: []\nminimumReleaseAge: 14400\n",
+        )
+        .unwrap();
+
+        let args = make_args_with_path(dir.path(), &[]);
+        let orchestrator = Orchestrator::new(args).unwrap();
+        let filter = orchestrator.build_filter();
+
+        // Should have min_age from pnpm settings (14400 minutes = 864000 seconds)
+        assert!(filter.min_age.is_some());
+        assert_eq!(
+            filter.min_age.unwrap(),
+            std::time::Duration::from_secs(14400 * 60)
+        );
+    }
+
+    #[test]
+    fn test_build_filter_cli_age_overrides_pnpm() {
+        let dir = TempDir::new().unwrap();
+
+        // Create pnpm-workspace.yaml with minimumReleaseAge
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages: []\nminimumReleaseAge: 14400\n",
+        )
+        .unwrap();
+
+        // CLI --age should override pnpm settings
+        let args = make_args_with_path(dir.path(), &["--age", "2w"]);
+        let orchestrator = Orchestrator::new(args).unwrap();
+        let filter = orchestrator.build_filter();
+
+        // Should have CLI age (2 weeks), not pnpm age (10 days)
+        assert!(filter.min_age.is_some());
+        assert_eq!(
+            filter.min_age.unwrap(),
+            std::time::Duration::from_secs(14 * 24 * 60 * 60) // 2 weeks
+        );
+    }
+
+    #[test]
+    fn test_build_filter_with_npmrc() {
+        let dir = TempDir::new().unwrap();
+
+        // Create pnpm-lock.yaml to indicate pnpm project
+        fs::write(dir.path().join("pnpm-lock.yaml"), "").unwrap();
+
+        // Create .npmrc with minimum-release-age
+        fs::write(dir.path().join(".npmrc"), "minimum-release-age=10d\n").unwrap();
+
+        let args = make_args_with_path(dir.path(), &[]);
+        let orchestrator = Orchestrator::new(args).unwrap();
+        let filter = orchestrator.build_filter();
+
+        // Should have min_age from .npmrc (10 days)
+        assert!(filter.min_age.is_some());
+        assert_eq!(
+            filter.min_age.unwrap(),
+            std::time::Duration::from_secs(10 * 24 * 60 * 60)
+        );
+    }
+
+    #[test]
+    fn test_build_filter_no_pnpm_no_age() {
+        let dir = TempDir::new().unwrap();
+
+        // No pnpm files, no --age flag
+        let args = make_args_with_path(dir.path(), &[]);
+        let orchestrator = Orchestrator::new(args).unwrap();
+        let filter = orchestrator.build_filter();
+
+        // Should have no min_age
+        assert!(filter.min_age.is_none());
     }
 }
