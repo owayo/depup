@@ -146,42 +146,92 @@ impl HttpClient {
         }))
     }
 
-    /// Perform a GET request and parse JSON response
+    /// Perform a GET request and parse JSON response with retry on parse errors
     pub async fn get_json<T: serde::de::DeserializeOwned>(
         &self,
         url: &str,
         package: &str,
         registry: &str,
     ) -> Result<T, RegistryError> {
-        let response = self.get_with_context(url, package, registry).await?;
+        let mut last_error = None;
+        let mut delay = BASE_DELAY_MS;
 
-        response
-            .json::<T>()
-            .await
-            .map_err(|e| RegistryError::InvalidResponse {
-                package: package.to_string(),
-                registry: registry.to_string(),
-                message: format!("failed to parse JSON: {}", e),
-            })
+        for attempt in 0..=self.max_retries {
+            // First, get the response (this already has its own retry logic)
+            let response = match self.get_with_context(url, package, registry).await {
+                Ok(resp) => resp,
+                Err(e) => return Err(e), // Network errors are already retried in get_with_context
+            };
+
+            // Try to parse JSON
+            match response.json::<T>().await {
+                Ok(parsed) => return Ok(parsed),
+                Err(e) => {
+                    last_error = Some(RegistryError::InvalidResponse {
+                        package: package.to_string(),
+                        registry: registry.to_string(),
+                        message: format!("failed to parse JSON: {}", e),
+                    });
+
+                    if attempt < self.max_retries {
+                        // Wait before retrying with exponential backoff
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                        delay *= 2;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| RegistryError::InvalidResponse {
+            package: package.to_string(),
+            registry: registry.to_string(),
+            message: "unknown JSON parse error".to_string(),
+        }))
     }
 
-    /// Perform a GET request and get text response
+    /// Perform a GET request and get text response with retry on parse errors
     pub async fn get_text(
         &self,
         url: &str,
         package: &str,
         registry: &str,
     ) -> Result<String, RegistryError> {
-        let response = self.get_with_context(url, package, registry).await?;
+        let mut last_error = None;
+        let mut delay = BASE_DELAY_MS;
 
-        response
-            .text()
-            .await
-            .map_err(|e| RegistryError::InvalidResponse {
-                package: package.to_string(),
-                registry: registry.to_string(),
-                message: format!("failed to get text response: {}", e),
-            })
+        for attempt in 0..=self.max_retries {
+            // First, get the response (this already has its own retry logic)
+            let response = match self.get_with_context(url, package, registry).await {
+                Ok(resp) => resp,
+                Err(e) => return Err(e), // Network errors are already retried in get_with_context
+            };
+
+            // Try to get text
+            match response.text().await {
+                Ok(text) => return Ok(text),
+                Err(e) => {
+                    last_error = Some(RegistryError::InvalidResponse {
+                        package: package.to_string(),
+                        registry: registry.to_string(),
+                        message: format!("failed to get text response: {}", e),
+                    });
+
+                    if attempt < self.max_retries {
+                        // Wait before retrying with exponential backoff
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                        delay *= 2;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| RegistryError::InvalidResponse {
+            package: package.to_string(),
+            registry: registry.to_string(),
+            message: "unknown text parse error".to_string(),
+        }))
     }
 }
 
