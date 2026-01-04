@@ -23,6 +23,8 @@ pub enum VersionChangeType {
     Minor,
     /// Patch version change (fixes)
     Patch,
+    /// New version being added (no previous version)
+    New,
     /// Unknown or unparseable
     Unknown,
 }
@@ -30,6 +32,11 @@ pub enum VersionChangeType {
 impl VersionChangeType {
     /// Determine the change type between two versions
     pub fn from_versions(old: &str, new: &str) -> Self {
+        // If old version is empty or "-", this is a new version being added
+        if old.is_empty() || old == "-" {
+            return VersionChangeType::New;
+        }
+
         let parse = |v: &str| -> Option<(u64, u64, u64)> {
             let v = v.strip_prefix('v').unwrap_or(v);
             // Split by . and - to handle prerelease suffixes
@@ -69,6 +76,7 @@ impl VersionChangeType {
             VersionChangeType::Major => "major".red().bold().to_string(),
             VersionChangeType::Minor => "minor".yellow().to_string(),
             VersionChangeType::Patch => "patch".green().to_string(),
+            VersionChangeType::New => "new".cyan().to_string(),
             VersionChangeType::Unknown => "?".dimmed().to_string(),
         }
     }
@@ -79,6 +87,7 @@ impl VersionChangeType {
             VersionChangeType::Major => "major",
             VersionChangeType::Minor => "minor",
             VersionChangeType::Patch => "patch",
+            VersionChangeType::New => "new",
             VersionChangeType::Unknown => "?",
         }
     }
@@ -320,9 +329,15 @@ impl TextFormatter {
                     ..
                 } = result
                 {
+                    // Show "-" for unversioned dependencies
+                    let old_version = if dependency.version_spec.version.is_empty() {
+                        "-"
+                    } else {
+                        &dependency.version_spec.version
+                    };
                     self.format_update_line(
                         &dependency.name,
-                        &dependency.version_spec.version,
+                        old_version,
                         new_version,
                         false,
                         *released_at,
@@ -343,9 +358,15 @@ impl TextFormatter {
                     ..
                 } = result
                 {
+                    // Show "-" for unversioned dependencies
+                    let old_version = if dependency.version_spec.version.is_empty() {
+                        "-"
+                    } else {
+                        &dependency.version_spec.version
+                    };
                     self.format_update_line(
                         &dependency.name,
-                        &dependency.version_spec.version,
+                        old_version,
                         new_version,
                         true,
                         *released_at,
@@ -378,10 +399,11 @@ impl TextFormatter {
     }
 
     /// Count updates by change type
-    fn count_by_change_type(&self, summary: &UpdateSummary) -> (usize, usize, usize, usize) {
+    fn count_by_change_type(&self, summary: &UpdateSummary) -> (usize, usize, usize, usize, usize) {
         let mut major = 0;
         let mut minor = 0;
         let mut patch = 0;
+        let mut new = 0;
         let mut unknown = 0;
 
         for manifest in &summary.manifests {
@@ -399,13 +421,14 @@ impl TextFormatter {
                         VersionChangeType::Major => major += 1,
                         VersionChangeType::Minor => minor += 1,
                         VersionChangeType::Patch => patch += 1,
+                        VersionChangeType::New => new += 1,
                         VersionChangeType::Unknown => unknown += 1,
                     }
                 }
             }
         }
 
-        (major, minor, patch, unknown)
+        (major, minor, patch, new, unknown)
     }
 
     /// Count skips by reason
@@ -489,7 +512,7 @@ impl OutputFormatter for TextFormatter {
         }
 
         // Count by change type
-        let (major, minor, patch, unknown) = self.count_by_change_type(summary);
+        let (major, minor, patch, new, unknown) = self.count_by_change_type(summary);
 
         // Normal/verbose output
         if self.color {
@@ -512,6 +535,9 @@ impl OutputFormatter for TextFormatter {
                 }
                 if patch > 0 {
                     parts.push(format!("{} {}", patch.to_string().green(), "patch"));
+                }
+                if new > 0 {
+                    parts.push(format!("{} {}", new.to_string().cyan(), "new"));
                 }
                 if unknown > 0 {
                     parts.push(format!("{} {}", unknown.to_string().dimmed(), "other"));
@@ -555,6 +581,9 @@ impl OutputFormatter for TextFormatter {
                 }
                 if patch > 0 {
                     parts.push(format!("{} patch", patch));
+                }
+                if new > 0 {
+                    parts.push(format!("{} new", new));
                 }
                 if unknown > 0 {
                     parts.push(format!("{} other", unknown));
@@ -854,10 +883,11 @@ mod tests {
 
         summary.add_manifest(manifest);
 
-        let (major, minor, patch, unknown) = formatter.count_by_change_type(&summary);
+        let (major, minor, patch, new, unknown) = formatter.count_by_change_type(&summary);
         assert_eq!(major, 1);
         assert_eq!(minor, 1);
         assert_eq!(patch, 1);
+        assert_eq!(new, 0);
         assert_eq!(unknown, 0);
     }
 
@@ -873,10 +903,46 @@ mod tests {
 
         summary.add_manifest(manifest);
 
-        let (major, minor, patch, unknown) = formatter.count_by_change_type(&summary);
+        let (major, minor, patch, new, unknown) = formatter.count_by_change_type(&summary);
         assert_eq!(major, 0);
         assert_eq!(minor, 0);
         assert_eq!(patch, 0);
+        assert_eq!(new, 0);
         assert_eq!(unknown, 1);
+    }
+
+    #[test]
+    fn test_count_by_change_type_with_new() {
+        let formatter = TextFormatter::new(Verbosity::Normal, false);
+        let mut summary = UpdateSummary::new(false);
+        let mut manifest = ManifestUpdateResult::new(PathBuf::from("Gemfile"), Language::Ruby);
+
+        // New (no previous version - empty string)
+        let spec = VersionSpec::new(VersionSpecKind::Any, "", "");
+        let dep1 = Dependency::new("rmagick", spec, false, Language::Ruby);
+        manifest.add_result(UpdateResult::update(dep1, "6.1.5"));
+
+        summary.add_manifest(manifest);
+
+        let (major, minor, patch, new, unknown) = formatter.count_by_change_type(&summary);
+        assert_eq!(major, 0);
+        assert_eq!(minor, 0);
+        assert_eq!(patch, 0);
+        assert_eq!(new, 1);
+        assert_eq!(unknown, 0);
+    }
+
+    #[test]
+    fn test_version_change_type_new() {
+        // Empty old version
+        assert_eq!(
+            VersionChangeType::from_versions("", "1.0.0"),
+            VersionChangeType::New
+        );
+        // Dash representing no version
+        assert_eq!(
+            VersionChangeType::from_versions("-", "1.0.0"),
+            VersionChangeType::New
+        );
     }
 }
