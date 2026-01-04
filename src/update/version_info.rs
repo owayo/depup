@@ -47,7 +47,7 @@ impl PartialOrd for VersionInfo {
 }
 
 /// Compare two version strings using semver-like rules
-fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
     let parse_parts = |s: &str| -> Vec<u64> {
         // Remove leading 'v' if present
         let s = s.strip_prefix('v').unwrap_or(s);

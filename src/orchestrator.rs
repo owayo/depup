@@ -10,6 +10,7 @@
 use crate::cli::CliArgs;
 use crate::domain::{Language, ManifestUpdateResult, SkipReason, UpdateResult, UpdateSummary};
 use crate::manifest::{detect_manifests, get_parser, ManifestWriter, WriteResult};
+use crate::progress::Progress;
 use crate::registry::{
     CratesIoAdapter, GoProxyAdapter, HttpClient, NpmAdapter, PyPIAdapter, RegistryAdapter,
 };
@@ -108,11 +109,19 @@ impl Orchestrator {
 
     /// Run the update workflow
     pub async fn run(&self) -> OrchestratorResult {
+        self.run_with_progress(!self.args.quiet).await
+    }
+
+    /// Run the update workflow with optional progress display
+    pub async fn run_with_progress(&self, show_progress: bool) -> OrchestratorResult {
+        let mut progress = Progress::new(show_progress);
         let mut summary = UpdateSummary::new(self.args.dry_run);
         let mut errors = Vec::new();
 
         // Step 1: Detect manifest files
+        progress.spinner("Detecting manifest files...");
         let manifests = detect_manifests(&self.args.path);
+        progress.finish_and_clear();
 
         if manifests.is_empty() {
             return OrchestratorResult {
@@ -126,15 +135,15 @@ impl Orchestrator {
         let filter = self.build_filter();
         let judge = UpdateJudge::new(filter);
 
-        // Step 2: Process each manifest
+        // Step 2: Parse manifests and collect all dependencies
+        progress.spinner("Parsing manifests...");
+        let mut parsed_manifests = Vec::new();
+
         for manifest_info in &manifests {
             // Check language filter
             if !self.should_process_language(manifest_info.language) {
                 continue;
             }
-
-            let mut manifest_result =
-                ManifestUpdateResult::new(&manifest_info.path, manifest_info.language);
 
             // Parse the manifest
             let parser = get_parser(manifest_info.language);
@@ -160,13 +169,31 @@ impl Orchestrator {
                 }
             };
 
-            // Step 3: Fetch versions and judge updates for each dependency
+            parsed_manifests.push((manifest_info, dependencies));
+        }
+        progress.finish_and_clear();
+
+        // Count total dependencies for progress bar
+        let total_deps: usize = parsed_manifests
+            .iter()
+            .map(|(_, deps)| deps.len())
+            .sum();
+
+        // Step 3: Fetch versions and judge updates for each dependency
+        progress.start(total_deps as u64, "Checking dependencies");
+
+        for (manifest_info, dependencies) in parsed_manifests {
+            let mut manifest_result =
+                ManifestUpdateResult::new(&manifest_info.path, manifest_info.language);
             let adapter = self.get_adapter(manifest_info.language);
 
             for dep in dependencies {
+                progress.set_message(&format!("Checking {}", &dep.name));
+
                 // Check if we should skip this dependency early
                 if let Some(reason) = judge.should_skip(&dep) {
                     manifest_result.add_result(UpdateResult::skip(dep, reason));
+                    progress.inc();
                     continue;
                 }
 
@@ -180,6 +207,7 @@ impl Orchestrator {
                         });
                         manifest_result
                             .add_result(UpdateResult::skip(dep, SkipReason::FetchFailed(e)));
+                        progress.inc();
                         continue;
                     }
                 };
@@ -187,14 +215,20 @@ impl Orchestrator {
                 // Judge whether to update
                 let result = judge.judge(&dep, &versions);
                 manifest_result.add_result(result);
+                progress.inc();
             }
 
             summary.add_manifest(manifest_result);
         }
+        progress.finish_and_clear();
 
         // Step 4: Apply updates (unless dry-run)
+        if !self.args.dry_run {
+            progress.spinner("Writing updates...");
+        }
         let writer = ManifestWriter::new(self.args.dry_run);
         let write_results = writer.apply_all_updates(&summary.manifests, get_parser);
+        progress.finish_and_clear();
 
         // Collect write errors
         for result in &write_results {

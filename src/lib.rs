@@ -15,5 +15,6 @@ pub mod orchestrator;
 pub mod output;
 pub mod package_manager;
 pub mod parser;
+pub mod progress;
 pub mod registry;
 pub mod update;

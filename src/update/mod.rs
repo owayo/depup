@@ -9,7 +9,7 @@ mod filter;
 mod version_info;
 
 pub use filter::UpdateFilter;
-pub use version_info::VersionInfo;
+pub use version_info::{compare_versions, VersionInfo};
 
 use crate::domain::{Dependency, SkipReason, UpdateResult};
 use chrono::{DateTime, Utc};
@@ -95,14 +95,14 @@ impl UpdateJudge {
             return UpdateResult::skip(dependency.clone(), SkipReason::NoSuitableVersion);
         }
 
-        // Find the latest eligible version
-        let latest = eligible_versions
-            .iter()
-            .max_by(|a, b| a.version.cmp(&b.version))
-            .unwrap();
+        // Find the latest eligible version (uses VersionInfo's Ord which does proper semver comparison)
+        let latest = eligible_versions.iter().max().unwrap();
 
-        // Check if already at latest
-        if dependency.version() == latest.version {
+        // Check if already at latest or current version is newer (prevents downgrades)
+        // compare_versions returns Less if current < latest, so we only update in that case
+        if version_info::compare_versions(dependency.version(), &latest.version)
+            != std::cmp::Ordering::Less
+        {
             return UpdateResult::skip_already_latest(dependency.clone());
         }
 
@@ -353,5 +353,72 @@ mod tests {
 
         let dep = make_dependency("lodash", "1.0.0", Language::Node, true);
         assert_eq!(judge.should_skip(&dep), Some(SkipReason::Pinned));
+    }
+
+    #[test]
+    fn test_judge_prevents_downgrade() {
+        // Regression test: ensure 0.13 is not "downgraded" to 0.9.1
+        // This was a bug where string comparison was used instead of semver
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_dependency("mockall", "0.13.0", Language::Rust, false);
+        let versions = vec![
+            make_version_info("0.9.1", 100),
+            make_version_info("0.10.0", 80),
+            make_version_info("0.11.0", 60),
+            make_version_info("0.12.0", 40),
+            make_version_info("0.13.0", 20), // current version
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        // Should skip because already at latest (0.13.0 >= 0.13.0)
+        assert!(result.is_skip());
+        if let UpdateResult::Skip { reason, .. } = result {
+            assert_eq!(reason, SkipReason::AlreadyLatest);
+        }
+    }
+
+    #[test]
+    fn test_judge_multi_digit_version_comparison() {
+        // Ensure 1.10.0 > 1.9.0 (not string comparison where "1.9.0" > "1.10.0")
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_dependency("serde", "1.9.0", Language::Rust, false);
+        let versions = vec![
+            make_version_info("1.8.0", 100),
+            make_version_info("1.9.0", 80),
+            make_version_info("1.10.0", 60),
+            make_version_info("1.11.0", 40),
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_update());
+        if let UpdateResult::Update { new_version, .. } = result {
+            // Should update to 1.11.0, not stay at 1.9.0 or downgrade
+            assert_eq!(new_version, "1.11.0");
+        }
+    }
+
+    #[test]
+    fn test_judge_no_downgrade_when_current_is_newer() {
+        // If current version is newer than all available, skip (don't downgrade)
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_dependency("cocoa", "0.26.0", Language::Rust, false);
+        let versions = vec![
+            make_version_info("0.9.2", 200),
+            make_version_info("0.20.0", 100),
+            make_version_info("0.25.0", 50),
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        // Should skip - current 0.26.0 > latest available 0.25.0
+        assert!(result.is_skip());
+        if let UpdateResult::Skip { reason, .. } = result {
+            assert_eq!(reason, SkipReason::AlreadyLatest);
+        }
     }
 }
