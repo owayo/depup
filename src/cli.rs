@@ -11,12 +11,12 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
         return Err("empty duration string".to_string());
     }
 
-    let (num_str, unit) = if s.ends_with('d') {
-        (&s[..s.len() - 1], 'd')
-    } else if s.ends_with('w') {
-        (&s[..s.len() - 1], 'w')
-    } else if s.ends_with('m') {
-        (&s[..s.len() - 1], 'm')
+    let (num_str, unit) = if let Some(n) = s.strip_suffix('d') {
+        (n, 'd')
+    } else if let Some(n) = s.strip_suffix('w') {
+        (n, 'w')
+    } else if let Some(n) = s.strip_suffix('m') {
+        (n, 'm')
     } else {
         return Err(format!("invalid duration format: {}", s));
     };

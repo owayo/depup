@@ -207,8 +207,7 @@ impl OutputFormatter for JsonFormatter {
             errors: result.errors.iter().map(|e| e.to_string()).collect(),
         };
 
-        let json = serde_json::to_string_pretty(&output)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let json = serde_json::to_string_pretty(&output).map_err(std::io::Error::other)?;
 
         writeln!(writer, "{}", json)?;
 
@@ -229,8 +228,7 @@ impl OutputFormatter for JsonFormatter {
             by_language: Vec::new(),
         };
 
-        let json = serde_json::to_string_pretty(&output)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let json = serde_json::to_string_pretty(&output).map_err(std::io::Error::other)?;
 
         writeln!(writer, "{}", json)?;
 
@@ -244,8 +242,7 @@ impl OutputFormatter for JsonFormatter {
     ) -> std::io::Result<()> {
         let output = self.manifest_to_json(manifest);
 
-        let json = serde_json::to_string_pretty(&output)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let json = serde_json::to_string_pretty(&output).map_err(std::io::Error::other)?;
 
         writeln!(writer, "{}", json)?;
 

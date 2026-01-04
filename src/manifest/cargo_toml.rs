@@ -33,30 +33,30 @@ impl ManifestParser for CargoTomlParser {
 
         // Parse regular dependencies
         if let Some(deps) = toml.get("dependencies").and_then(|d| d.as_table()) {
-            parse_cargo_dependencies(deps, &parser, false, &mut dependencies);
+            parse_cargo_dependencies(deps, parser.as_ref(), false, &mut dependencies);
         }
 
         // Parse dev-dependencies
         if let Some(deps) = toml.get("dev-dependencies").and_then(|d| d.as_table()) {
-            parse_cargo_dependencies(deps, &parser, true, &mut dependencies);
+            parse_cargo_dependencies(deps, parser.as_ref(), true, &mut dependencies);
         }
 
         // Parse build-dependencies (treated as dev dependencies)
         if let Some(deps) = toml.get("build-dependencies").and_then(|d| d.as_table()) {
-            parse_cargo_dependencies(deps, &parser, true, &mut dependencies);
+            parse_cargo_dependencies(deps, parser.as_ref(), true, &mut dependencies);
         }
 
         // Parse target-specific dependencies
         if let Some(target) = toml.get("target").and_then(|t| t.as_table()) {
             for (_target_name, target_config) in target {
                 if let Some(deps) = target_config.get("dependencies").and_then(|d| d.as_table()) {
-                    parse_cargo_dependencies(deps, &parser, false, &mut dependencies);
+                    parse_cargo_dependencies(deps, parser.as_ref(), false, &mut dependencies);
                 }
                 if let Some(deps) = target_config
                     .get("dev-dependencies")
                     .and_then(|d| d.as_table())
                 {
-                    parse_cargo_dependencies(deps, &parser, true, &mut dependencies);
+                    parse_cargo_dependencies(deps, parser.as_ref(), true, &mut dependencies);
                 }
             }
         }
@@ -146,7 +146,7 @@ impl ManifestParser for CargoTomlParser {
 
 fn parse_cargo_dependencies(
     deps: &toml::map::Map<String, Value>,
-    parser: &Box<dyn VersionParser>,
+    parser: &dyn VersionParser,
     is_dev: bool,
     output: &mut Vec<Dependency>,
 ) {

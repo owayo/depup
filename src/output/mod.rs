@@ -18,9 +18,10 @@ use crate::orchestrator::OrchestratorResult;
 use std::io::Write;
 
 /// Output format options
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OutputFormat {
     /// Human-readable text output
+    #[default]
     Text,
     /// JSON output for machine processing
     Json,
@@ -28,27 +29,16 @@ pub enum OutputFormat {
     Diff,
 }
 
-impl Default for OutputFormat {
-    fn default() -> Self {
-        OutputFormat::Text
-    }
-}
-
 /// Output verbosity level
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Verbosity {
     /// Minimal output
     Quiet,
     /// Normal output
+    #[default]
     Normal,
     /// Detailed output with additional information
     Verbose,
-}
-
-impl Default for Verbosity {
-    fn default() -> Self {
-        Verbosity::Normal
-    }
 }
 
 /// Configuration for output formatting

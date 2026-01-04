@@ -29,22 +29,22 @@ impl ManifestParser for PackageJsonParser {
 
         // Parse regular dependencies
         if let Some(deps) = json.get("dependencies").and_then(|v| v.as_object()) {
-            parse_dependency_object(deps, &parser, false, &mut dependencies);
+            parse_dependency_object(deps, parser.as_ref(), false, &mut dependencies);
         }
 
         // Parse devDependencies
         if let Some(deps) = json.get("devDependencies").and_then(|v| v.as_object()) {
-            parse_dependency_object(deps, &parser, true, &mut dependencies);
+            parse_dependency_object(deps, parser.as_ref(), true, &mut dependencies);
         }
 
         // Parse peerDependencies (treated as regular dependencies)
         if let Some(deps) = json.get("peerDependencies").and_then(|v| v.as_object()) {
-            parse_dependency_object(deps, &parser, false, &mut dependencies);
+            parse_dependency_object(deps, parser.as_ref(), false, &mut dependencies);
         }
 
         // Parse optionalDependencies
         if let Some(deps) = json.get("optionalDependencies").and_then(|v| v.as_object()) {
-            parse_dependency_object(deps, &parser, false, &mut dependencies);
+            parse_dependency_object(deps, parser.as_ref(), false, &mut dependencies);
         }
 
         Ok(dependencies)
@@ -107,7 +107,7 @@ impl ManifestParser for PackageJsonParser {
 
 fn parse_dependency_object(
     deps: &Map<String, Value>,
-    parser: &Box<dyn VersionParser>,
+    parser: &dyn VersionParser,
     is_dev: bool,
     output: &mut Vec<Dependency>,
 ) {

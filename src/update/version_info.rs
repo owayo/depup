@@ -52,9 +52,7 @@ fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
         // Remove leading 'v' if present
         let s = s.strip_prefix('v').unwrap_or(s);
         // Split by . and - and take only the numeric parts
-        s.split(|c| c == '.' || c == '-')
-            .filter_map(|p| p.parse().ok())
-            .collect()
+        s.split(['.', '-']).filter_map(|p| p.parse().ok()).collect()
     };
 
     let parts_a = parse_parts(a);

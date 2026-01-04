@@ -59,7 +59,7 @@ pub fn parse_manifest(path: &Path) -> Result<Vec<Dependency>, ManifestError> {
     })?;
 
     let language = Language::all()
-        .into_iter()
+        .iter()
         .find(|lang| {
             path.file_name()
                 .and_then(|n| n.to_str())

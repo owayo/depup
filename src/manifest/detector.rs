@@ -187,11 +187,13 @@ fn detect_pnpm_workspace_packages(dir: &Path) -> Result<Vec<PathBuf>, std::io::E
 }
 
 /// Check if a directory is a Tauri project
+#[allow(dead_code)]
 pub fn is_tauri_project(dir: &Path) -> bool {
     dir.join("src-tauri").exists() && dir.join("src-tauri").join("Cargo.toml").exists()
 }
 
 /// Check if a directory is a pnpm workspace
+#[allow(dead_code)]
 pub fn is_pnpm_workspace(dir: &Path) -> bool {
     dir.join("pnpm-workspace.yaml").exists()
 }

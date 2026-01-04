@@ -72,7 +72,7 @@ impl ManifestParser for GoModParser {
 
             // Parse single require statement
             if let Some(caps) = SINGLE_REQUIRE_RE.captures(trimmed) {
-                if let Some(dep) = parse_go_dependency(&caps, &parser, is_pinned) {
+                if let Some(dep) = parse_go_dependency(&caps, parser.as_ref(), is_pinned) {
                     dependencies.push(dep);
                 }
                 continue;
@@ -81,7 +81,7 @@ impl ManifestParser for GoModParser {
             // Parse require block entry
             if in_require_block {
                 if let Some(caps) = BLOCK_ENTRY_RE.captures(trimmed) {
-                    if let Some(dep) = parse_go_dependency(&caps, &parser, is_pinned) {
+                    if let Some(dep) = parse_go_dependency(&caps, parser.as_ref(), is_pinned) {
                         dependencies.push(dep);
                     }
                 }
@@ -183,7 +183,7 @@ impl ManifestParser for GoModParser {
 
 fn parse_go_dependency(
     caps: &regex::Captures,
-    parser: &Box<dyn VersionParser>,
+    parser: &dyn VersionParser,
     is_pinned: bool,
 ) -> Option<Dependency> {
     let module = caps.get(1)?.as_str();
@@ -196,7 +196,7 @@ fn parse_go_dependency(
     let spec = parser.parse(version)?;
 
     // Mark as pinned if has // pinned comment
-    let mut dep = if is_indirect {
+    let dep = if is_indirect {
         // Indirect dependencies are treated as dev dependencies
         Dependency::development(module, spec, Language::Go)
     } else {
@@ -207,14 +207,11 @@ fn parse_go_dependency(
     // For Go, we'll rely on the is_pinned() method checking for Exact kind
     // But since Go versions are always "exact", we need to check the comment
     // This is handled by the update logic - pinned packages should be skipped
-    if is_pinned {
-        // We can't directly mark pinned in the current Dependency struct
-        // The updater will need to re-read the file to check for pinned comments
-        // For now, we parse it but the updater should check for // pinned
-        dep = dep; // No-op, but shows intent
-    }
+    // Note: We can't directly mark pinned in the current Dependency struct
+    // The updater will need to re-read the file to check for pinned comments
+    let _ = is_pinned; // Acknowledge the flag even though we can't act on it yet
 
-    Some(dep)
+    Some(dep.clone())
 }
 
 #[cfg(test)]

@@ -44,7 +44,7 @@ impl ManifestParser for PyprojectTomlParser {
         {
             for dep in deps {
                 if let Some(dep_str) = dep.as_str() {
-                    if let Some(parsed) = parse_pep508_dependency(dep_str, &parser, false) {
+                    if let Some(parsed) = parse_pep508_dependency(dep_str, parser.as_ref(), false) {
                         dependencies.push(parsed);
                     }
                 }
@@ -61,7 +61,9 @@ impl ManifestParser for PyprojectTomlParser {
                 if let Some(deps_array) = deps.as_array() {
                     for dep in deps_array {
                         if let Some(dep_str) = dep.as_str() {
-                            if let Some(parsed) = parse_pep508_dependency(dep_str, &parser, false) {
+                            if let Some(parsed) =
+                                parse_pep508_dependency(dep_str, parser.as_ref(), false)
+                            {
                                 dependencies.push(parsed);
                             }
                         }
@@ -82,7 +84,7 @@ impl ManifestParser for PyprojectTomlParser {
                 if name == "python" {
                     continue;
                 }
-                if let Some(parsed) = parse_poetry_dependency(name, value, &parser, false) {
+                if let Some(parsed) = parse_poetry_dependency(name, value, parser.as_ref(), false) {
                     dependencies.push(parsed);
                 }
             }
@@ -96,7 +98,7 @@ impl ManifestParser for PyprojectTomlParser {
             .and_then(|d| d.as_table())
         {
             for (name, value) in dev_deps {
-                if let Some(parsed) = parse_poetry_dependency(name, value, &parser, true) {
+                if let Some(parsed) = parse_poetry_dependency(name, value, parser.as_ref(), true) {
                     dependencies.push(parsed);
                 }
             }
@@ -113,7 +115,8 @@ impl ManifestParser for PyprojectTomlParser {
                 let is_dev = group_name == "dev" || group_name == "test";
                 if let Some(deps) = group.get("dependencies").and_then(|d| d.as_table()) {
                     for (name, value) in deps {
-                        if let Some(parsed) = parse_poetry_dependency(name, value, &parser, is_dev)
+                        if let Some(parsed) =
+                            parse_poetry_dependency(name, value, parser.as_ref(), is_dev)
                         {
                             dependencies.push(parsed);
                         }
@@ -211,7 +214,7 @@ impl ManifestParser for PyprojectTomlParser {
 
 fn parse_pep508_dependency(
     dep_str: &str,
-    parser: &Box<dyn VersionParser>,
+    parser: &dyn VersionParser,
     is_dev: bool,
 ) -> Option<Dependency> {
     let caps = PEP508_RE.captures(dep_str)?;
@@ -247,7 +250,7 @@ fn parse_pep508_dependency(
 fn parse_poetry_dependency(
     name: &str,
     value: &Value,
-    parser: &Box<dyn VersionParser>,
+    parser: &dyn VersionParser,
     is_dev: bool,
 ) -> Option<Dependency> {
     let version_str = match value {

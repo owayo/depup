@@ -11,9 +11,8 @@ mod version_info;
 pub use filter::UpdateFilter;
 pub use version_info::VersionInfo;
 
-use crate::domain::{Dependency, Language, SkipReason, UpdateResult};
+use crate::domain::{Dependency, SkipReason, UpdateResult};
 use chrono::{DateTime, Utc};
-use std::time::Duration;
 
 /// Update judgment engine that decides whether to update a dependency
 pub struct UpdateJudge {
@@ -115,8 +114,9 @@ impl UpdateJudge {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{VersionSpec, VersionSpecKind};
+    use crate::domain::{Language, VersionSpec, VersionSpecKind};
     use chrono::TimeZone;
+    use std::time::Duration;
 
     fn make_dependency(name: &str, version: &str, language: Language, pinned: bool) -> Dependency {
         let kind = if pinned {
