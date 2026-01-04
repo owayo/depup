@@ -19,6 +19,7 @@ anyhow = "1"
 regex = "1"
 async-trait = "0.1"
 indicatif = "0.18.3"
+colored = "3"
 
 [dev-dependencies]
 assert_cmd = "2"
