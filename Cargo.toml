@@ -1,6 +1,6 @@
 [package]
 name = "depup"
-version = "26.1.100"
+version = "26.1.101"
 edition = "2021"
 description = "Multi-language dependency updater CLI tool"
 license = "MIT"
