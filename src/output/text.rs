@@ -292,11 +292,10 @@ impl TextFormatter {
                 let lang_display = format!("({})", manifest.language);
                 writeln!(
                     writer,
-                    "{} {} — {} {}, {} {}",
+                    "{} {} — {} updates, {} {}",
                     path_display.bold(),
                     lang_display.dimmed(),
                     "0".dimmed(),
-                    "updates",
                     skip_count.to_string().yellow(),
                     if skip_count == 1 { "skip" } else { "skips" }
                 )?;
