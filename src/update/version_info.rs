@@ -57,7 +57,27 @@ const PRERELEASE_IDENTIFIERS: &[&str] = &[
 /// Check if a version string represents a pre-release version
 pub fn is_prerelease_version(version: &str) -> bool {
     let lower = version.to_lowercase();
-    PRERELEASE_IDENTIFIERS.iter().any(|id| lower.contains(id))
+
+    // Check for word-based identifiers (alpha, beta, canary, etc.)
+    if PRERELEASE_IDENTIFIERS.iter().any(|id| lower.contains(id)) {
+        return true;
+    }
+
+    // Check for Python/PEP 440 style short identifiers:
+    // - 26.1a1 (alpha), 21.12b0 (beta), 1.0c1 or 1.0rc1 (release candidate)
+    // Pattern: digit followed by 'a', 'b', or 'c' followed by digit
+    let chars: Vec<char> = lower.chars().collect();
+    for i in 0..chars.len().saturating_sub(2) {
+        if chars[i].is_ascii_digit() {
+            let next = chars[i + 1];
+            // 'a' for alpha, 'b' for beta, 'c' for release candidate
+            if (next == 'a' || next == 'b' || next == 'c') && chars[i + 2].is_ascii_digit() {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 impl Ord for VersionInfo {
@@ -293,6 +313,26 @@ mod tests {
         assert!(is_prerelease_version("1.0.0-pre.1"));
         assert!(is_prerelease_version("1.0.0-insiders"));
         assert!(is_prerelease_version("1.0.0-experimental"));
+    }
+
+    #[test]
+    fn test_is_prerelease_python_pep440_style() {
+        // Python/PEP 440 style: number + a/b/c + number
+        // Alpha releases
+        assert!(is_prerelease_version("26.1a1"));
+        assert!(is_prerelease_version("18.3a0"));
+        assert!(is_prerelease_version("1.0a1"));
+        // Beta releases
+        assert!(is_prerelease_version("21.12b0"));
+        assert!(is_prerelease_version("21.11b1"));
+        assert!(is_prerelease_version("1.0b2"));
+        // Release candidates (using 'c')
+        assert!(is_prerelease_version("1.0c1"));
+        assert!(is_prerelease_version("2.5c0"));
+        // Stable versions should not match
+        assert!(!is_prerelease_version("25.12.0"));
+        assert!(!is_prerelease_version("1.2.3"));
+        assert!(!is_prerelease_version("2024.1.1"));
     }
 
     #[test]
