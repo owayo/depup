@@ -9,7 +9,7 @@ mod filter;
 mod version_info;
 
 pub use filter::UpdateFilter;
-pub use version_info::{compare_versions, VersionInfo};
+pub use version_info::{compare_versions, is_prerelease_version, VersionInfo};
 
 use crate::domain::{Dependency, SkipReason, UpdateResult};
 use chrono::{DateTime, Utc};
@@ -80,15 +80,29 @@ impl UpdateJudge {
             );
         }
 
+        // Filter out pre-release versions (alpha, beta, canary, dev, etc.) by default
+        // Only consider stable releases unless the current version is already a prerelease
+        let current_is_prerelease = is_prerelease_version(dependency.version());
+        let stable_versions: Vec<&VersionInfo> = if current_is_prerelease {
+            // If current version is prerelease, allow prerelease updates
+            available_versions.iter().collect()
+        } else {
+            // Otherwise, only consider stable versions
+            available_versions
+                .iter()
+                .filter(|v| !v.is_prerelease())
+                .collect()
+        };
+
         // Filter versions by age if specified
         let eligible_versions: Vec<&VersionInfo> = if let Some(min_age) = self.filter.min_age {
             let min_release_time = self.now - chrono::Duration::from_std(min_age).unwrap();
-            available_versions
-                .iter()
+            stable_versions
+                .into_iter()
                 .filter(|v| v.released_at <= min_release_time)
                 .collect()
         } else {
-            available_versions.iter().collect()
+            stable_versions
         };
 
         if eligible_versions.is_empty() {
@@ -416,6 +430,121 @@ mod tests {
 
         let result = judge.judge(&dep, &versions);
         // Should skip - current 0.26.0 > latest available 0.25.0
+        assert!(result.is_skip());
+        if let UpdateResult::Skip { reason, .. } = result {
+            assert_eq!(reason, SkipReason::AlreadyLatest);
+        }
+    }
+
+    #[test]
+    fn test_judge_filters_prerelease_versions() {
+        // Regression test: stable versions should not update to prerelease
+        // e.g., react 19.2.1 should NOT update to 19.3.0-canary-xxx
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_dependency("react", "19.2.1", Language::Node, false);
+        let versions = vec![
+            make_version_info("19.2.0", 30),
+            make_version_info("19.2.1", 20),
+            make_version_info("19.3.0-canary-52684925-20251110", 5), // prerelease - should be ignored
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        // Should skip - already at latest STABLE version
+        assert!(result.is_skip());
+        if let UpdateResult::Skip { reason, .. } = result {
+            assert_eq!(reason, SkipReason::AlreadyLatest);
+        }
+    }
+
+    #[test]
+    fn test_judge_filters_various_prerelease_types() {
+        // Test that all prerelease types are filtered: alpha, beta, rc, dev, canary
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_dependency("typescript", "5.9.0", Language::Node, false);
+        let versions = vec![
+            make_version_info("5.8.0", 100),
+            make_version_info("5.9.0", 50),
+            make_version_info("6.0.0-dev.20260103", 10), // dev - should be ignored
+            make_version_info("6.0.0-beta.1", 8),        // beta - should be ignored
+            make_version_info("6.0.0-alpha.5", 6),       // alpha - should be ignored
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        // Should skip - already at latest STABLE version (5.9.0)
+        assert!(result.is_skip());
+        if let UpdateResult::Skip { reason, .. } = result {
+            assert_eq!(reason, SkipReason::AlreadyLatest);
+        }
+    }
+
+    #[test]
+    fn test_judge_updates_to_stable_not_prerelease() {
+        // When both stable and prerelease are newer, should update to stable
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_dependency("vite", "7.0.0", Language::Node, false);
+        let versions = vec![
+            make_version_info("7.0.0", 50),
+            make_version_info("7.1.0", 20), // stable - should be selected
+            make_version_info("8.0.0-beta.5", 10), // prerelease - should be ignored
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_update());
+        if let UpdateResult::Update { new_version, .. } = result {
+            // Should update to 7.1.0, not 8.0.0-beta.5
+            assert_eq!(new_version, "7.1.0");
+        }
+    }
+
+    #[test]
+    fn test_judge_prerelease_current_allows_prerelease_update() {
+        // If current version is prerelease, allow updating to newer prerelease
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        // User is on a canary version, so they probably want canary updates
+        let spec = VersionSpec::new(
+            VersionSpecKind::Caret,
+            "^19.3.0-canary-123",
+            "19.3.0-canary-123",
+        );
+        let dep = Dependency::new("react", spec, false, Language::Node);
+
+        let versions = vec![
+            make_version_info("19.2.1", 30),
+            make_version_info("19.3.0-canary-123", 20),
+            make_version_info("19.3.0-canary-456", 10), // newer canary
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_update());
+        if let UpdateResult::Update { new_version, .. } = result {
+            // Should update to newer canary
+            assert_eq!(new_version, "19.3.0-canary-456");
+        }
+    }
+
+    #[test]
+    fn test_judge_no_suitable_stable_version() {
+        // If all newer versions are prerelease, and current is stable, no suitable version
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_dependency("prettier", "3.7.0", Language::Node, false);
+        let versions = vec![
+            make_version_info("3.6.0", 50),
+            make_version_info("3.7.0", 30),
+            make_version_info("4.0.0-alpha.13", 10), // only newer version is alpha
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        // Should skip - already at latest STABLE version
         assert!(result.is_skip());
         if let UpdateResult::Skip { reason, .. } = result {
             assert_eq!(reason, SkipReason::AlreadyLatest);

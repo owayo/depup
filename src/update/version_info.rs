@@ -31,6 +31,33 @@ impl VersionInfo {
             released_at: Utc::now(),
         }
     }
+
+    /// Check if this version is a pre-release (alpha, beta, rc, canary, dev, etc.)
+    pub fn is_prerelease(&self) -> bool {
+        is_prerelease_version(&self.version)
+    }
+}
+
+/// Pre-release identifiers to check for
+const PRERELEASE_IDENTIFIERS: &[&str] = &[
+    "alpha",
+    "beta",
+    "rc",
+    "canary",
+    "dev",
+    "preview",
+    "next",
+    "nightly",
+    "snapshot",
+    "pre",
+    "insiders",
+    "experimental",
+];
+
+/// Check if a version string represents a pre-release version
+pub fn is_prerelease_version(version: &str) -> bool {
+    let lower = version.to_lowercase();
+    PRERELEASE_IDENTIFIERS.iter().any(|id| lower.contains(id))
 }
 
 impl Ord for VersionInfo {
@@ -224,5 +251,59 @@ mod tests {
 
         let max = versions.iter().max().unwrap();
         assert_eq!(max.version, "2.5.0");
+    }
+
+    #[test]
+    fn test_is_prerelease_stable_versions() {
+        // Stable versions should NOT be detected as prerelease
+        assert!(!is_prerelease_version("1.0.0"));
+        assert!(!is_prerelease_version("2.5.3"));
+        assert!(!is_prerelease_version("v1.0.0"));
+        assert!(!is_prerelease_version("10.20.30"));
+    }
+
+    #[test]
+    fn test_is_prerelease_alpha_beta_rc() {
+        assert!(is_prerelease_version("1.0.0-alpha"));
+        assert!(is_prerelease_version("1.0.0-alpha.1"));
+        assert!(is_prerelease_version("1.0.0-beta"));
+        assert!(is_prerelease_version("1.0.0-beta.2"));
+        assert!(is_prerelease_version("1.0.0-rc.1"));
+        assert!(is_prerelease_version("2.0.0-RC1"));
+    }
+
+    #[test]
+    fn test_is_prerelease_canary_dev() {
+        // React-style canary versions
+        assert!(is_prerelease_version("19.3.0-canary-52684925-20251110"));
+        // TypeScript-style dev versions
+        assert!(is_prerelease_version("6.0.0-dev.20260103"));
+        // Vite-style beta versions
+        assert!(is_prerelease_version("8.0.0-beta.5"));
+        // Prettier-style alpha
+        assert!(is_prerelease_version("4.0.0-alpha.13"));
+    }
+
+    #[test]
+    fn test_is_prerelease_other_identifiers() {
+        assert!(is_prerelease_version("1.0.0-preview"));
+        assert!(is_prerelease_version("1.0.0-next"));
+        assert!(is_prerelease_version("1.0.0-nightly"));
+        assert!(is_prerelease_version("1.0.0-snapshot"));
+        assert!(is_prerelease_version("1.0.0-pre.1"));
+        assert!(is_prerelease_version("1.0.0-insiders"));
+        assert!(is_prerelease_version("1.0.0-experimental"));
+    }
+
+    #[test]
+    fn test_version_info_is_prerelease() {
+        let stable = VersionInfo::now("1.0.0");
+        assert!(!stable.is_prerelease());
+
+        let canary = VersionInfo::now("19.3.0-canary-52684925-20251110");
+        assert!(canary.is_prerelease());
+
+        let beta = VersionInfo::now("8.0.0-beta.5");
+        assert!(beta.is_prerelease());
     }
 }
