@@ -164,7 +164,7 @@ impl TextFormatter {
         writer: &mut dyn Write,
     ) -> std::io::Result<()> {
         let change_type = VersionChangeType::from_versions(old_version, new_version);
-        let dev_marker = if is_dev { " (dev)" } else { "" };
+        let dev_marker = if is_dev { " 🔧" } else { "" };
 
         // Format release date
         let date_display = released_at
@@ -176,7 +176,7 @@ impl TextFormatter {
             let arrow = "→".dimmed();
             let change_label = change_type.colored_label();
             let dev_display = if is_dev {
-                " (dev)".dimmed().to_string()
+                " 🔧".dimmed().to_string()
             } else {
                 String::new()
             };
@@ -770,7 +770,7 @@ mod tests {
         assert!(output_str.contains("[minor]"));
         assert!(output_str.contains("typescript"));
         assert!(output_str.contains("[patch]"));
-        assert!(output_str.contains("(dev)"));
+        assert!(output_str.contains("🔧"));
         assert!(output_str.contains("Summary:"));
         assert!(output_str.contains("2 package(s) updated"));
     }
