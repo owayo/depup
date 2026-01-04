@@ -153,6 +153,7 @@ impl TextFormatter {
     }
 
     /// Format a single update line
+    #[allow(clippy::too_many_arguments)]
     fn format_update_line(
         &self,
         name: &str,
@@ -363,7 +364,7 @@ impl TextFormatter {
             } else {
                 writeln!(writer, "  Skipped:")?;
             }
-            let skip_results: Vec<&UpdateResult> = skips.iter().copied().collect();
+            let skip_results: Vec<&UpdateResult> = skips.to_vec();
             let skip_max_len = self.max_name_length(&skip_results).max(20);
             for result in &skips {
                 if let UpdateResult::Skip { dependency, reason } = result {
@@ -475,22 +476,14 @@ impl OutputFormatter for TextFormatter {
             // Minimal output
             if updates > 0 {
                 if self.color {
-                    writeln!(
-                        writer,
-                        "{}{} {}",
-                        prefix,
-                        updates.to_string().green(),
-                        "updated"
-                    )?;
+                    writeln!(writer, "{}{} updated", prefix, updates.to_string().green(),)?;
                 } else {
                     writeln!(writer, "{}{} updated", prefix, updates)?;
                 }
+            } else if self.color {
+                writeln!(writer, "{}{}", prefix, "No updates".dimmed())?;
             } else {
-                if self.color {
-                    writeln!(writer, "{}{}", prefix, "No updates".dimmed())?;
-                } else {
-                    writeln!(writer, "{}No updates", prefix)?;
-                }
+                writeln!(writer, "{}No updates", prefix)?;
             }
             return Ok(());
         }
