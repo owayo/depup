@@ -183,11 +183,13 @@ impl HttpClient {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| RegistryError::InvalidResponse {
-            package: package.to_string(),
-            registry: registry.to_string(),
-            message: "unknown JSON parse error".to_string(),
-        }))
+        Err(
+            last_error.unwrap_or_else(|| RegistryError::InvalidResponse {
+                package: package.to_string(),
+                registry: registry.to_string(),
+                message: "unknown JSON parse error".to_string(),
+            }),
+        )
     }
 
     /// Perform a GET request and get text response with retry on parse errors
@@ -227,11 +229,13 @@ impl HttpClient {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| RegistryError::InvalidResponse {
-            package: package.to_string(),
-            registry: registry.to_string(),
-            message: "unknown text parse error".to_string(),
-        }))
+        Err(
+            last_error.unwrap_or_else(|| RegistryError::InvalidResponse {
+                package: package.to_string(),
+                registry: registry.to_string(),
+                message: "unknown text parse error".to_string(),
+            }),
+        )
     }
 }
 
