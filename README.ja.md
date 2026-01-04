@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/owayo/depup/actions/workflows/ci.yml"><img src="https://github.com/owayo/depup/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
-  <a href="https://crates.io/crates/depup"><img src="https://img.shields.io/crates/v/depup.svg" alt="crates.io"></a>
+  <a href="https://github.com/owayo/depup/releases"><img src="https://img.shields.io/github/v/release/owayo/depup" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
 </p>
 
@@ -86,11 +86,9 @@ cd depup
 cargo install --path .
 ```
 
-### Cargoを使用
+### GitHubリリースから
 
-```bash
-cargo install depup
-```
+[GitHubリリース](https://github.com/owayo/depup/releases)から最新のバイナリをダウンロードしてください。
 
 ## クイックスタート
 
