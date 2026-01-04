@@ -276,14 +276,70 @@ impl TextFormatter {
         let updates: Vec<_> = manifest.updates().collect();
         let skips: Vec<_> = manifest.skips().collect();
 
-        // Skip empty manifests
-        if updates.is_empty() && (self.verbosity != Verbosity::Verbose || skips.is_empty()) {
+        // Skip truly empty manifests (no updates and no skips)
+        if updates.is_empty() && skips.is_empty() {
             return Ok(());
         }
 
         // Count updates and skips
         let update_count = updates.len();
         let skip_count = skips.len();
+
+        // If no updates but have skips, show skip summary (even in non-verbose mode)
+        if updates.is_empty() && !skips.is_empty() {
+            let path_display = manifest.path.display().to_string();
+            if self.color {
+                let lang_display = format!("({})", manifest.language);
+                writeln!(
+                    writer,
+                    "{} {} — {} {}, {} {}",
+                    path_display.bold(),
+                    lang_display.dimmed(),
+                    "0".dimmed(),
+                    "updates",
+                    skip_count.to_string().yellow(),
+                    if skip_count == 1 { "skip" } else { "skips" }
+                )?;
+            } else {
+                writeln!(
+                    writer,
+                    "{} ({}) — 0 updates, {} skips",
+                    path_display, manifest.language, skip_count
+                )?;
+            }
+
+            // Show skip reasons summary
+            let skip_reasons = self.summarize_skip_reasons(&skips);
+            for (reason, count, packages) in &skip_reasons {
+                if self.color {
+                    if self.verbosity == Verbosity::Verbose {
+                        // Verbose: show package names
+                        writeln!(
+                            writer,
+                            "  {} {} ({}): {}",
+                            count.to_string().yellow(),
+                            reason.dimmed(),
+                            packages.len(),
+                            packages.join(", ").dimmed()
+                        )?;
+                    } else {
+                        // Normal: just show counts
+                        writeln!(
+                            writer,
+                            "  {} {}",
+                            count.to_string().yellow(),
+                            reason.dimmed()
+                        )?;
+                    }
+                } else if self.verbosity == Verbosity::Verbose {
+                    writeln!(writer, "  {} {}: {}", count, reason, packages.join(", "))?;
+                } else {
+                    writeln!(writer, "  {} {}", count, reason)?;
+                }
+            }
+            writeln!(writer)?;
+            return Ok(());
+        }
 
         // Separate production and dev dependencies
         let (prod_updates, dev_updates): (Vec<&UpdateResult>, Vec<&UpdateResult>) =
@@ -459,6 +515,30 @@ impl TextFormatter {
         }
 
         let mut result: Vec<_> = counts.into_iter().collect();
+        result.sort_by(|a, b| b.1.cmp(&a.1)); // Sort by count descending
+        result
+    }
+
+    /// Summarize skip reasons from a list of skip results
+    /// Returns: Vec<(reason_string, count, package_names)>
+    fn summarize_skip_reasons(&self, skips: &[&UpdateResult]) -> Vec<(String, usize, Vec<String>)> {
+        use std::collections::HashMap;
+        let mut groups: HashMap<String, Vec<String>> = HashMap::new();
+
+        for result in skips {
+            if let UpdateResult::Skip { dependency, reason } = result {
+                let key = self.format_skip_reason(reason);
+                groups.entry(key).or_default().push(dependency.name.clone());
+            }
+        }
+
+        let mut result: Vec<_> = groups
+            .into_iter()
+            .map(|(reason, packages)| {
+                let count = packages.len();
+                (reason, count, packages)
+            })
+            .collect();
         result.sort_by(|a, b| b.1.cmp(&a.1)); // Sort by count descending
         result
     }
