@@ -176,10 +176,7 @@ impl Orchestrator {
         progress.finish_and_clear();
 
         // Count total dependencies for progress bar
-        let total_deps: usize = parsed_manifests
-            .iter()
-            .map(|(_, deps)| deps.len())
-            .sum();
+        let total_deps: usize = parsed_manifests.iter().map(|(_, deps)| deps.len()).sum();
 
         // Step 3: Fetch versions and judge updates for each dependency
         progress.start(total_deps as u64, "Checking dependencies");

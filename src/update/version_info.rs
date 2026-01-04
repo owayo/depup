@@ -225,7 +225,7 @@ mod tests {
 
     #[test]
     fn test_version_sorting() {
-        let mut versions = vec![
+        let mut versions = [
             VersionInfo::now("2.0.0"),
             VersionInfo::now("1.0.0"),
             VersionInfo::now("1.5.0"),
@@ -242,7 +242,7 @@ mod tests {
 
     #[test]
     fn test_find_max_version() {
-        let versions = vec![
+        let versions = [
             VersionInfo::now("1.0.0"),
             VersionInfo::now("2.5.0"),
             VersionInfo::now("2.0.0"),

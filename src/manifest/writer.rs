@@ -178,7 +178,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn sample_dependency(name: &str, version: &str, language: Language) -> Dependency {
-        let spec = VersionSpec::new(VersionSpecKind::Caret, &format!("^{}", version), version)
+        let spec = VersionSpec::new(VersionSpecKind::Caret, format!("^{}", version), version)
             .with_prefix("^");
         Dependency::new(name, spec, false, language)
     }

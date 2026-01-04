@@ -6,15 +6,15 @@
 //! - Rust (cargo)
 //! - Go (go mod)
 
+mod go;
 mod node;
 mod python;
 mod rust;
-mod go;
 
+pub use go::GoVersionParser;
 pub use node::NodeVersionParser;
 pub use python::PythonVersionParser;
 pub use rust::RustVersionParser;
-pub use go::GoVersionParser;
 
 use crate::domain::{Language, VersionSpec};
 

@@ -155,13 +155,14 @@ impl HttpClient {
     ) -> Result<T, RegistryError> {
         let response = self.get_with_context(url, package, registry).await?;
 
-        response.json::<T>().await.map_err(|e| {
-            RegistryError::InvalidResponse {
+        response
+            .json::<T>()
+            .await
+            .map_err(|e| RegistryError::InvalidResponse {
                 package: package.to_string(),
                 registry: registry.to_string(),
                 message: format!("failed to parse JSON: {}", e),
-            }
-        })
+            })
     }
 
     /// Perform a GET request and get text response
@@ -173,13 +174,14 @@ impl HttpClient {
     ) -> Result<String, RegistryError> {
         let response = self.get_with_context(url, package, registry).await?;
 
-        response.text().await.map_err(|e| {
-            RegistryError::InvalidResponse {
+        response
+            .text()
+            .await
+            .map_err(|e| RegistryError::InvalidResponse {
                 package: package.to_string(),
                 registry: registry.to_string(),
                 message: format!("failed to get text response: {}", e),
-            }
-        })
+            })
     }
 }
 

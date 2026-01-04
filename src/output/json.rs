@@ -257,7 +257,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn sample_dependency(name: &str, version: &str) -> Dependency {
-        let spec = VersionSpec::new(VersionSpecKind::Caret, &format!("^{}", version), version)
+        let spec = VersionSpec::new(VersionSpecKind::Caret, format!("^{}", version), version)
             .with_prefix("^");
         Dependency::new(name, spec, false, Language::Node)
     }

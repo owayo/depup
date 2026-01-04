@@ -111,7 +111,7 @@ mod dry_run_tests {
         let original_go_mod = fs::read_to_string(temp_dir.path().join("go.mod")).unwrap();
 
         // Run depup in dry-run mode
-        let output = Command::new(&binary)
+        let _output = Command::new(&binary)
             .args(["--dry-run", temp_dir.path().to_str().unwrap()])
             .output()
             .expect("Failed to execute command");
@@ -451,7 +451,7 @@ mod cli_options_tests {
 
         // Diff mode should produce some output if there are potential updates
         // The output format depends on whether updates are found
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let _stdout = String::from_utf8_lossy(&output.stdout);
         // Just verify it doesn't crash
         assert!(
             output.status.success() || !output.status.success(),
@@ -479,7 +479,7 @@ mod cli_options_tests {
 
             let stdout = String::from_utf8_lossy(&output.stdout);
             let json: serde_json::Value = serde_json::from_str(&stdout)
-                .expect(&format!("Output should be valid JSON for {}", lang_flag));
+                .unwrap_or_else(|_| panic!("Output should be valid JSON for {}", lang_flag));
 
             // Should have at most 1 manifest (the filtered one)
             let manifests = json["manifests"].as_array().unwrap();

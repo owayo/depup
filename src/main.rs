@@ -45,13 +45,8 @@ async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
     let result = orchestrator.run().await;
 
     // Create output formatter based on CLI options
-    let output_config = OutputConfig::from_cli(
-        args.json,
-        args.diff,
-        args.verbose,
-        args.quiet,
-        args.dry_run,
-    );
+    let output_config =
+        OutputConfig::from_cli(args.json, args.diff, args.verbose, args.quiet, args.dry_run);
     let formatter = create_formatter(output_config);
 
     // Output results

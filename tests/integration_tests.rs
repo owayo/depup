@@ -128,8 +128,7 @@ dependencies = ["flask>=2.0.0"]
 }
 
 mod manifest_update_format_preservation {
-    use super::*;
-    use depup::domain::{Dependency, Language, VersionSpec, VersionSpecKind};
+    use depup::domain::{Language, VersionSpecKind};
     use depup::manifest::get_parser;
 
     /// Test package.json format preservation with caret versions
@@ -424,7 +423,7 @@ mod registry_response_parsing {
         let v2 = VersionInfo::new("1.0.1", Utc.with_ymd_and_hms(2024, 1, 2, 0, 0, 0).unwrap());
         let v3 = VersionInfo::new("1.1.0", Utc.with_ymd_and_hms(2024, 1, 3, 0, 0, 0).unwrap());
 
-        let mut versions = vec![v3.clone(), v1.clone(), v2.clone()];
+        let mut versions = [v3.clone(), v1.clone(), v2.clone()];
         versions.sort();
 
         assert_eq!(versions[0].version, "1.0.0");

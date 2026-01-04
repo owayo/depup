@@ -141,7 +141,7 @@ mod tests {
         let spec = if pinned {
             VersionSpec::new(kind, version, version)
         } else {
-            VersionSpec::new(kind, &format!("^{}", version), version).with_prefix("^")
+            VersionSpec::new(kind, format!("^{}", version), version).with_prefix("^")
         };
         Dependency::new(name, spec, false, language)
     }
