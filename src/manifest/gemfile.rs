@@ -7,7 +7,7 @@
 //! - Multiple version constraints
 //! - Both single and double quotes
 
-use crate::domain::{Dependency, Language};
+use crate::domain::{Dependency, Language, VersionSpec, VersionSpecKind};
 use crate::error::ManifestError;
 use crate::manifest::ManifestParser;
 use crate::parser::get_parser;
@@ -99,21 +99,25 @@ impl ManifestParser for GemfileParser {
                     }
                 }
 
-                // If no version specified, skip this gem (can't update what's not pinned)
-                if version_parts.is_empty() {
-                    continue;
-                }
+                // Create dependency with version spec
+                let spec = if version_parts.is_empty() {
+                    // No version specified - use Any kind
+                    VersionSpec::new(VersionSpecKind::Any, "", "")
+                } else {
+                    // Parse the version constraint(s)
+                    let version_str = version_parts.join(", ");
+                    match parser.parse(&version_str) {
+                        Some(s) => s,
+                        None => continue, // Skip if parsing fails
+                    }
+                };
 
-                // Parse the version constraint(s)
-                let version_str = version_parts.join(", ");
-                if let Some(spec) = parser.parse(&version_str) {
-                    let dep = if in_dev_group {
-                        Dependency::development(name, spec, Language::Ruby)
-                    } else {
-                        Dependency::production(name, spec, Language::Ruby)
-                    };
-                    dependencies.push(dep);
-                }
+                let dep = if in_dev_group {
+                    Dependency::development(name, spec, Language::Ruby)
+                } else {
+                    Dependency::production(name, spec, Language::Ruby)
+                };
+                dependencies.push(dep);
             }
         }
 
@@ -131,20 +135,21 @@ impl ManifestParser for GemfileParser {
         new_version: &str,
     ) -> Result<String, ManifestError> {
         let parser = get_parser(Language::Ruby);
-
-        // Build pattern for the specific gem
-        // gem 'package' or gem "package" followed by version
         let escaped_name = regex::escape(package);
-        let pattern = format!(r#"(gem\s+['"]{escaped_name}['"]\s*,\s*['"])([^'"]+)(['"])"#);
 
-        let re = Regex::new(&pattern).map_err(|e| ManifestError::InvalidVersionSpec {
-            path: PathBuf::from("Gemfile"),
-            spec: package.to_string(),
-            message: format!("invalid regex pattern: {}", e),
-        })?;
+        // First, try to update existing version
+        // gem 'package' or gem "package" followed by version
+        let version_pattern = format!(r#"(gem\s+['"]{escaped_name}['"]\s*,\s*['"])([^'"]+)(['"])"#);
+
+        let version_re =
+            Regex::new(&version_pattern).map_err(|e| ManifestError::InvalidVersionSpec {
+                path: PathBuf::from("Gemfile"),
+                spec: package.to_string(),
+                message: format!("invalid regex pattern: {}", e),
+            })?;
 
         let mut updated = false;
-        let result = re.replace(content, |caps: &regex::Captures| {
+        let result = version_re.replace(content, |caps: &regex::Captures| {
             let prefix = &caps[1];
             let old_version = &caps[2];
             let suffix = &caps[3];
@@ -158,15 +163,93 @@ impl ManifestParser for GemfileParser {
             }
         });
 
-        if !updated {
-            return Err(ManifestError::InvalidVersionSpec {
-                path: PathBuf::from("Gemfile"),
-                spec: package.to_string(),
-                message: "gem not found or version could not be updated".to_string(),
-            });
+        if updated {
+            return Ok(result.to_string());
         }
 
-        Ok(result.to_string())
+        // If no existing version, try to add version to unversioned gem
+        // Pattern for gem without version: gem 'package' (not followed by comma and version)
+        let no_version_pattern = format!(
+            r#"(gem\s+)(['"])({escaped_name})(['"])(\s*(?:,\s*(?:require|group|git|path|branch|ref|tag|source|platforms?)\s*:|#|$))"#
+        );
+
+        let no_version_re =
+            Regex::new(&no_version_pattern).map_err(|e| ManifestError::InvalidVersionSpec {
+                path: PathBuf::from("Gemfile"),
+                spec: package.to_string(),
+                message: format!("invalid regex pattern: {}", e),
+            })?;
+
+        let result = no_version_re.replace(content, |caps: &regex::Captures| {
+            let gem_keyword = &caps[1];
+            let quote_start = &caps[2];
+            let name = &caps[3];
+            let quote_end = &caps[4];
+            let suffix = &caps[5];
+            updated = true;
+            // Add version with same quote style
+            format!(
+                "{}{}{}{}, {}{}{}{}",
+                gem_keyword,
+                quote_start,
+                name,
+                quote_end,
+                quote_start,
+                new_version,
+                quote_end,
+                suffix
+            )
+        });
+
+        if updated {
+            return Ok(result.to_string());
+        }
+
+        // Try simpler pattern for gems at end of line or followed by newline
+        let simple_pattern = format!(r#"(gem\s+)(['"])({escaped_name})(['"])(\s*)$"#);
+
+        let simple_re =
+            Regex::new(&simple_pattern).map_err(|e| ManifestError::InvalidVersionSpec {
+                path: PathBuf::from("Gemfile"),
+                spec: package.to_string(),
+                message: format!("invalid regex pattern: {}", e),
+            })?;
+
+        // Process line by line for end-of-line matching
+        let mut lines: Vec<String> = Vec::new();
+        for line in content.lines() {
+            if let Some(caps) = simple_re.captures(line) {
+                let gem_keyword = &caps[1];
+                let quote_start = &caps[2];
+                let name = &caps[3];
+                let quote_end = &caps[4];
+                let trailing = &caps[5];
+                updated = true;
+                lines.push(format!(
+                    "{}{}{}{}, {}{}{}{}",
+                    gem_keyword,
+                    quote_start,
+                    name,
+                    quote_end,
+                    quote_start,
+                    new_version,
+                    quote_end,
+                    trailing
+                ));
+            } else {
+                lines.push(line.to_string());
+            }
+        }
+
+        if updated {
+            return Ok(lines.join("\n"));
+        }
+
+        Err(ManifestError::InvalidVersionSpec {
+            path: PathBuf::from("Gemfile"),
+            spec: package.to_string(),
+            message: "gem not found or version could not be updated".to_string(),
+        })
     }
 }
 
@@ -226,8 +309,42 @@ gem 'rails', '~> 7.0'
     fn test_parse_no_version() {
         let content = r#"gem 'some_gem'"#;
         let deps = parse(content).unwrap();
-        // Gems without version should be skipped
-        assert!(deps.is_empty());
+        // Gems without version should be included with Any kind
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "some_gem");
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Any);
+        assert!(!deps[0].is_dev);
+    }
+
+    #[test]
+    fn test_parse_multiple_no_version() {
+        let content = r#"
+gem 'rmagick'
+gem 'nokogiri'
+gem 'playwright-ruby-client', '1.57.1'
+gem 'websocket-driver'
+gem 'rtesseract'
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 5);
+
+        // Check unversioned gems
+        assert_eq!(deps[0].name, "rmagick");
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Any);
+
+        assert_eq!(deps[1].name, "nokogiri");
+        assert_eq!(deps[1].version_spec.kind, VersionSpecKind::Any);
+
+        // Check versioned gem
+        assert_eq!(deps[2].name, "playwright-ruby-client");
+        assert_eq!(deps[2].version_spec.kind, VersionSpecKind::Exact);
+        assert_eq!(deps[2].version_spec.version, "1.57.1");
+
+        assert_eq!(deps[3].name, "websocket-driver");
+        assert_eq!(deps[3].version_spec.kind, VersionSpecKind::Any);
+
+        assert_eq!(deps[4].name, "rtesseract");
+        assert_eq!(deps[4].version_spec.kind, VersionSpecKind::Any);
     }
 
     #[test]
@@ -402,5 +519,68 @@ gem 'pg', '~> 1.1'
             .update_version(content, "rails", "7.1")
             .unwrap();
         assert!(result.contains("'~> 7.1'"));
+    }
+
+    #[test]
+    fn test_update_version_add_to_unversioned_gem() {
+        let content = r#"gem 'rmagick'"#;
+        let result = GemfileParser
+            .update_version(content, "rmagick", "5.3.0")
+            .unwrap();
+        assert!(result.contains("gem 'rmagick', '5.3.0'"));
+    }
+
+    #[test]
+    fn test_update_version_add_to_unversioned_gem_double_quotes() {
+        let content = r#"gem "nokogiri""#;
+        let result = GemfileParser
+            .update_version(content, "nokogiri", "1.16.0")
+            .unwrap();
+        assert!(result.contains("gem \"nokogiri\", \"1.16.0\""));
+    }
+
+    #[test]
+    fn test_update_version_add_to_unversioned_gem_with_options() {
+        let content = r#"gem 'my_gem', require: false"#;
+        let result = GemfileParser
+            .update_version(content, "my_gem", "1.0.0")
+            .unwrap();
+        assert!(result.contains("gem 'my_gem', '1.0.0', require: false"));
+    }
+
+    #[test]
+    fn test_update_version_add_to_unversioned_gem_in_multiline() {
+        let content = r#"
+gem 'rmagick'
+gem 'nokogiri'
+gem 'playwright-ruby-client', '1.57.1'
+"#;
+        let result = GemfileParser
+            .update_version(content, "rmagick", "5.3.0")
+            .unwrap();
+        assert!(result.contains("gem 'rmagick', '5.3.0'"));
+        // Other gems should be unchanged
+        assert!(result.contains("gem 'nokogiri'"));
+        assert!(result.contains("gem 'playwright-ruby-client', '1.57.1'"));
+    }
+
+    #[test]
+    fn test_update_version_mixed_versioned_and_unversioned() {
+        let content = r#"
+gem 'rmagick'
+gem 'rails', '~> 7.0'
+gem 'nokogiri'
+"#;
+        // Update versioned gem
+        let result = GemfileParser
+            .update_version(content, "rails", "7.1.0")
+            .unwrap();
+        assert!(result.contains("'~> 7.1.0'"));
+
+        // Update unversioned gem
+        let result2 = GemfileParser
+            .update_version(content, "rmagick", "5.3.0")
+            .unwrap();
+        assert!(result2.contains("gem 'rmagick', '5.3.0'"));
     }
 }

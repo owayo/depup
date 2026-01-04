@@ -33,6 +33,8 @@ pub enum VersionSpecKind {
     Range,
     /// Go module version with pinned comment
     GoPinned,
+    /// Any version (no constraint specified, e.g., `gem 'rails'` without version)
+    Any,
 }
 
 impl VersionSpecKind {
@@ -122,6 +124,16 @@ mod tests {
         assert!(!VersionSpecKind::Tilde.is_pinned());
         assert!(!VersionSpecKind::GreaterOrEqual.is_pinned());
         assert!(!VersionSpecKind::Range.is_pinned());
+        assert!(!VersionSpecKind::Any.is_pinned());
+    }
+
+    #[test]
+    fn test_version_spec_kind_any() {
+        let spec = VersionSpec::new(VersionSpecKind::Any, "", "");
+        assert_eq!(spec.kind, VersionSpecKind::Any);
+        assert!(!spec.is_pinned());
+        // Format updated should just return the new version for Any kind
+        assert_eq!(spec.format_updated("1.2.3"), "1.2.3");
     }
 
     #[test]
