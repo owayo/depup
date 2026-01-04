@@ -85,6 +85,104 @@ require github.com/gin-gonic/gin v1.9.0
         );
     }
 
+    /// Test detection of Ruby and PHP manifests
+    #[test]
+    fn test_detect_ruby_php_manifests() {
+        let temp_dir = create_test_dir();
+
+        // Create Gemfile (Ruby)
+        let gemfile = r#"source 'https://rubygems.org'
+
+gem 'rails', '~> 7.0'
+gem 'pg', '~> 1.5'
+"#;
+        fs::write(temp_dir.path().join("Gemfile"), gemfile).unwrap();
+
+        // Create composer.json (PHP)
+        let composer_json = r#"{
+    "require": {
+        "laravel/framework": "^10.0",
+        "monolog/monolog": "^3.0"
+    }
+}"#;
+        fs::write(temp_dir.path().join("composer.json"), composer_json).unwrap();
+
+        let manifests = depup::manifest::detect_manifests(temp_dir.path());
+
+        assert_eq!(manifests.len(), 2, "Should detect 2 manifest files");
+
+        let languages: Vec<_> = manifests.iter().map(|m| m.language).collect();
+        assert!(
+            languages.contains(&depup::domain::Language::Ruby),
+            "Should detect Ruby manifest"
+        );
+        assert!(
+            languages.contains(&depup::domain::Language::Php),
+            "Should detect PHP manifest"
+        );
+    }
+
+    /// Test detection of all 6 languages together
+    #[test]
+    fn test_detect_all_six_languages() {
+        let temp_dir = create_test_dir();
+
+        // Node.js
+        fs::write(
+            temp_dir.path().join("package.json"),
+            r#"{"dependencies": {"lodash": "^4.17.21"}}"#,
+        )
+        .unwrap();
+
+        // Python
+        fs::write(
+            temp_dir.path().join("pyproject.toml"),
+            r#"[project]
+dependencies = ["requests>=2.28.0"]
+"#,
+        )
+        .unwrap();
+
+        // Rust
+        fs::write(
+            temp_dir.path().join("Cargo.toml"),
+            r#"[package]
+name = "test"
+version = "0.1.0"
+
+[dependencies]
+serde = "1.0"
+"#,
+        )
+        .unwrap();
+
+        // Go
+        fs::write(
+            temp_dir.path().join("go.mod"),
+            r#"module example.com/test
+
+go 1.21
+
+require github.com/gin-gonic/gin v1.9.0
+"#,
+        )
+        .unwrap();
+
+        // Ruby
+        fs::write(temp_dir.path().join("Gemfile"), r#"gem 'rails', '~> 7.0'"#).unwrap();
+
+        // PHP
+        fs::write(
+            temp_dir.path().join("composer.json"),
+            r#"{"require": {"laravel/framework": "^10.0"}}"#,
+        )
+        .unwrap();
+
+        let manifests = depup::manifest::detect_manifests(temp_dir.path());
+
+        assert_eq!(manifests.len(), 6, "Should detect all 6 manifest files");
+    }
+
     /// Test detection with partial manifests (some languages only)
     #[test]
     fn test_detect_partial_manifests() {
@@ -313,6 +411,149 @@ require (
             updated
         );
     }
+
+    /// Test Gemfile pessimistic constraint (~>) preservation
+    #[test]
+    fn test_gemfile_pessimistic_preservation() {
+        let content = r#"source 'https://rubygems.org'
+
+gem 'rails', '~> 7.0'
+gem 'pg', '~> 1.5'
+"#;
+
+        let parser = get_parser(Language::Ruby);
+        let deps = parser.parse(content).unwrap();
+
+        assert_eq!(deps.len(), 2);
+
+        let rails = deps.iter().find(|d| d.name == "rails").unwrap();
+        assert_eq!(rails.version_spec.kind, VersionSpecKind::Tilde);
+
+        let updated = parser.update_version(content, "rails", "7.1.0").unwrap();
+        assert!(
+            updated.contains("'~> 7.1.0'"),
+            "Should preserve pessimistic operator: {}",
+            updated
+        );
+    }
+
+    /// Test Gemfile exact version preservation
+    #[test]
+    fn test_gemfile_exact_version_preservation() {
+        let content = r#"gem 'bcrypt', '3.1.18'"#;
+
+        let parser = get_parser(Language::Ruby);
+        let updated = parser.update_version(content, "bcrypt", "3.1.20").unwrap();
+        assert!(
+            updated.contains("'3.1.20'"),
+            "Should preserve exact version format: {}",
+            updated
+        );
+    }
+
+    /// Test Gemfile double quotes preservation
+    #[test]
+    fn test_gemfile_double_quotes_preservation() {
+        let content = r#"gem "rails", "~> 7.0""#;
+
+        let parser = get_parser(Language::Ruby);
+        let updated = parser.update_version(content, "rails", "7.1.0").unwrap();
+        assert!(
+            updated.contains("\"~> 7.1.0\""),
+            "Should preserve double quotes: {}",
+            updated
+        );
+    }
+
+    /// Test composer.json caret preservation
+    #[test]
+    fn test_composer_json_caret_preservation() {
+        let content = r#"{
+  "require": {
+    "laravel/framework": "^10.0"
+  }
+}"#;
+
+        let parser = get_parser(Language::Php);
+        let deps = parser.parse(content).unwrap();
+
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "laravel/framework");
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Caret);
+
+        let updated = parser
+            .update_version(content, "laravel/framework", "10.5.0")
+            .unwrap();
+        assert!(
+            updated.contains("\"^10.5.0\""),
+            "Should preserve caret prefix: {}",
+            updated
+        );
+    }
+
+    /// Test composer.json tilde preservation
+    #[test]
+    fn test_composer_json_tilde_preservation() {
+        let content = r#"{
+  "require": {
+    "symfony/console": "~6.0"
+  }
+}"#;
+
+        let parser = get_parser(Language::Php);
+        let updated = parser
+            .update_version(content, "symfony/console", "6.4.0")
+            .unwrap();
+        assert!(
+            updated.contains("\"~6.4.0\""),
+            "Should preserve tilde prefix: {}",
+            updated
+        );
+    }
+
+    /// Test composer.json wildcard preservation
+    #[test]
+    fn test_composer_json_wildcard_preservation() {
+        let content = r#"{
+  "require": {
+    "vendor/package": "1.2.*"
+  }
+}"#;
+
+        let parser = get_parser(Language::Php);
+        let updated = parser
+            .update_version(content, "vendor/package", "1.3")
+            .unwrap();
+        assert!(
+            updated.contains("\"1.3.*\""),
+            "Should preserve wildcard format: {}",
+            updated
+        );
+    }
+
+    /// Test composer.json require-dev parsing
+    #[test]
+    fn test_composer_json_require_dev() {
+        let content = r#"{
+  "require": {
+    "laravel/framework": "^10.0"
+  },
+  "require-dev": {
+    "phpunit/phpunit": "^10.0"
+  }
+}"#;
+
+        let parser = get_parser(Language::Php);
+        let deps = parser.parse(content).unwrap();
+
+        assert_eq!(deps.len(), 2);
+
+        let phpunit = deps.iter().find(|d| d.name == "phpunit/phpunit").unwrap();
+        assert!(phpunit.is_dev, "Should mark require-dev as dev dependency");
+
+        let laravel = deps.iter().find(|d| d.name == "laravel/framework").unwrap();
+        assert!(!laravel.is_dev, "Should mark require as non-dev dependency");
+    }
 }
 
 mod registry_response_parsing {
@@ -448,5 +689,119 @@ mod registry_response_parsing {
         assert!(stable < patch);
         // Pre-release also comes before next patch
         assert!(prerelease < patch);
+    }
+
+    /// Test RubyGems response JSON parsing
+    #[test]
+    fn test_rubygems_response_structure() {
+        // Simulate RubyGems API response structure
+        let rubygems_response = r#"[
+            {"number": "7.1.0", "created_at": "2023-10-05T12:00:00Z", "platform": "ruby", "yanked": false},
+            {"number": "7.0.8", "created_at": "2023-09-01T12:00:00Z", "platform": "ruby", "yanked": false},
+            {"number": "7.0.7", "created_at": "2023-08-15T12:00:00Z", "platform": "ruby", "yanked": true}
+        ]"#;
+
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(rubygems_response).unwrap();
+
+        assert_eq!(parsed.len(), 3);
+
+        let v710 = &parsed[0];
+        assert_eq!(v710.get("number").unwrap().as_str().unwrap(), "7.1.0");
+        assert_eq!(v710.get("yanked").unwrap().as_bool().unwrap(), false);
+        assert!(v710.get("created_at").is_some());
+
+        // Third version is yanked
+        let v707 = &parsed[2];
+        assert_eq!(v707.get("yanked").unwrap().as_bool().unwrap(), true);
+    }
+
+    /// Test Packagist response JSON parsing
+    #[test]
+    fn test_packagist_response_structure() {
+        // Simulate Packagist p2 API response structure
+        let packagist_response = r#"{
+            "packages": {
+                "laravel/framework": [
+                    {"version": "v10.0.0", "version_normalized": "10.0.0.0", "time": "2023-02-14T15:00:00+00:00"},
+                    {"version": "v9.0.0", "version_normalized": "9.0.0.0", "time": "2022-02-08T15:00:00+00:00"},
+                    {"version": "dev-master", "version_normalized": "dev-master", "time": "2024-01-01T00:00:00+00:00"}
+                ]
+            }
+        }"#;
+
+        let parsed: serde_json::Value = serde_json::from_str(packagist_response).unwrap();
+
+        let packages = parsed.get("packages").unwrap().as_object().unwrap();
+        assert!(packages.contains_key("laravel/framework"));
+
+        let versions = packages
+            .get("laravel/framework")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(versions.len(), 3);
+
+        let v10 = &versions[0];
+        assert_eq!(v10.get("version").unwrap().as_str().unwrap(), "v10.0.0");
+        assert!(v10.get("time").is_some());
+
+        // Dev version should be filtered in actual implementation
+        let dev = &versions[2];
+        assert!(dev
+            .get("version")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .contains("dev"));
+    }
+
+    /// Test RubyGems version filtering (yanked)
+    #[test]
+    fn test_rubygems_yanked_filtering_logic() {
+        let versions = vec![
+            ("7.1.0", false), // not yanked
+            ("7.0.8", false), // not yanked
+            ("7.0.7", true),  // yanked - should be excluded
+        ];
+
+        let active_versions: Vec<_> = versions
+            .into_iter()
+            .filter(|(_, yanked)| !yanked)
+            .map(|(v, _)| v)
+            .collect();
+
+        assert_eq!(active_versions.len(), 2);
+        assert!(active_versions.contains(&"7.1.0"));
+        assert!(active_versions.contains(&"7.0.8"));
+        assert!(!active_versions.contains(&"7.0.7"));
+    }
+
+    /// Test Packagist dev version filtering logic
+    #[test]
+    fn test_packagist_dev_version_filtering_logic() {
+        let versions = vec!["v10.0.0", "v9.0.0", "dev-master", "dev-main", "1.0.x-dev"];
+
+        let stable_versions: Vec<_> = versions
+            .into_iter()
+            .filter(|v| {
+                let lower = v.to_lowercase();
+                !lower.contains("dev") && !lower.contains("-dev")
+            })
+            .collect();
+
+        assert_eq!(stable_versions.len(), 2);
+        assert!(stable_versions.contains(&"v10.0.0"));
+        assert!(stable_versions.contains(&"v9.0.0"));
+    }
+
+    /// Test Packagist version normalization (v prefix removal)
+    #[test]
+    fn test_packagist_version_normalization() {
+        let normalize =
+            |version: &str| -> String { version.strip_prefix('v').unwrap_or(version).to_string() };
+
+        assert_eq!(normalize("v10.0.0"), "10.0.0");
+        assert_eq!(normalize("v1.2.3"), "1.2.3");
+        assert_eq!(normalize("1.0.0"), "1.0.0"); // no v prefix
     }
 }
