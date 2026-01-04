@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/images/app.png" width="128" alt="depup">
+</p>
+
 <h1 align="center">depup</h1>
 
 <p align="center">
