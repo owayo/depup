@@ -14,8 +14,8 @@ use crate::manifest::{
 };
 use crate::progress::Progress;
 use crate::registry::{
-    CratesIoAdapter, GoProxyAdapter, HttpClient, NpmAdapter, PackagistAdapter, PyPIAdapter,
-    RegistryAdapter, RubyGemsAdapter,
+    CratesIoAdapter, GoProxyAdapter, HttpClient, MavenCentralAdapter, NpmAdapter, PackagistAdapter,
+    PyPIAdapter, RegistryAdapter, RubyGemsAdapter,
 };
 use crate::update::{UpdateFilter, UpdateJudge, VersionInfo};
 use std::sync::Arc;
@@ -309,6 +309,7 @@ impl Orchestrator {
             Language::Go => self.args.go,
             Language::Ruby => self.args.ruby,
             Language::Php => self.args.php,
+            Language::Java => self.args.java,
         }
     }
 
@@ -321,6 +322,7 @@ impl Orchestrator {
             Language::Go => Box::new(GoProxyAdapter::new(self.client.clone())),
             Language::Ruby => Box::new(RubyGemsAdapter::new(self.client.clone())),
             Language::Php => Box::new(PackagistAdapter::new(self.client.clone())),
+            Language::Java => Box::new(MavenCentralAdapter::new(self.client.clone())),
         }
     }
 
@@ -466,6 +468,7 @@ mod tests {
         assert!(orchestrator.should_process_language(Language::Python));
         assert!(orchestrator.should_process_language(Language::Rust));
         assert!(orchestrator.should_process_language(Language::Go));
+        assert!(orchestrator.should_process_language(Language::Java));
     }
 
     #[test]
@@ -477,6 +480,15 @@ mod tests {
         assert!(!orchestrator.should_process_language(Language::Python));
         assert!(!orchestrator.should_process_language(Language::Rust));
         assert!(!orchestrator.should_process_language(Language::Go));
+        assert!(!orchestrator.should_process_language(Language::Java));
+
+        // Test Java-only filter
+        let args = make_args(&["depup", "--java"]);
+        let orchestrator = Orchestrator::new(args).unwrap();
+
+        assert!(orchestrator.should_process_language(Language::Java));
+        assert!(!orchestrator.should_process_language(Language::Node));
+        assert!(!orchestrator.should_process_language(Language::Python));
     }
 
     #[test]
@@ -509,6 +521,14 @@ mod tests {
         let orchestrator = Orchestrator::new(args).unwrap();
         let adapter = orchestrator.get_adapter(Language::Go);
         assert_eq!(adapter.language(), Language::Go);
+    }
+
+    #[test]
+    fn test_get_adapter_java() {
+        let args = make_args(&["depup"]);
+        let orchestrator = Orchestrator::new(args).unwrap();
+        let adapter = orchestrator.get_adapter(Language::Java);
+        assert_eq!(adapter.language(), Language::Java);
     }
 
     #[test]

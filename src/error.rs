@@ -113,6 +113,14 @@ pub enum RegistryError {
     /// Authentication error
     #[error("authentication failed for {registry}: {message}")]
     AuthenticationError { registry: String, message: String },
+
+    /// Invalid package name format
+    #[error("invalid package name '{name}' for {registry}: {reason}")]
+    InvalidPackageName {
+        name: String,
+        registry: String,
+        reason: String,
+    },
 }
 
 /// Errors related to configuration
@@ -253,6 +261,7 @@ impl RegistryError {
             Language::Go => "Go Proxy",
             Language::Ruby => "RubyGems",
             Language::Php => "Packagist",
+            Language::Java => "Maven Central",
         }
     }
 }

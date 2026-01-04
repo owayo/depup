@@ -59,9 +59,10 @@ pub struct ManifestFile {
 /// Detect all manifest files in the given directory
 ///
 /// This function:
-/// 1. Looks for standard manifest files (package.json, pyproject.toml, Cargo.toml, go.mod)
+/// 1. Looks for standard manifest files (package.json, pyproject.toml, Cargo.toml, go.mod, build.gradle)
 /// 2. Checks for pnpm-workspace.yaml to detect monorepo
 /// 3. Checks for src-tauri/Cargo.toml for Tauri projects
+/// 4. Checks for build.gradle.kts (Kotlin DSL) for Gradle projects
 pub fn detect_manifests(dir: &Path) -> Vec<ManifestInfo> {
     let mut manifests = Vec::new();
 
@@ -82,6 +83,15 @@ pub fn detect_manifests(dir: &Path) -> Vec<ManifestInfo> {
             }
 
             manifests.push(info);
+        }
+
+        // Check for Kotlin DSL variant for Java (build.gradle.kts)
+        if *language == Language::Java {
+            let kts_path = dir.join("build.gradle.kts");
+            if kts_path.exists() && !manifest_path.exists() {
+                // Only add .kts if no build.gradle exists (prefer Groovy over Kotlin DSL)
+                manifests.push(ManifestInfo::new(&kts_path, Language::Java));
+            }
         }
     }
 
@@ -389,5 +399,44 @@ mod tests {
             .find(|m| m.path == dir.path().join("package.json"))
             .unwrap();
         assert!(root.is_workspace_root);
+    }
+
+    #[test]
+    fn test_detect_build_gradle() {
+        let dir = create_temp_dir();
+        fs::write(dir.path().join("build.gradle"), "").unwrap();
+
+        let manifests = detect_manifests(dir.path());
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(manifests[0].language, Language::Java);
+        assert!(manifests[0].path.ends_with("build.gradle"));
+    }
+
+    #[test]
+    fn test_detect_build_gradle_kts() {
+        let dir = create_temp_dir();
+        fs::write(dir.path().join("build.gradle.kts"), "").unwrap();
+
+        let manifests = detect_manifests(dir.path());
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(manifests[0].language, Language::Java);
+        assert!(manifests[0].path.ends_with("build.gradle.kts"));
+    }
+
+    #[test]
+    fn test_detect_build_gradle_prefers_groovy_over_kts() {
+        let dir = create_temp_dir();
+        // Both Groovy and Kotlin DSL exist - prefer Groovy
+        fs::write(dir.path().join("build.gradle"), "").unwrap();
+        fs::write(dir.path().join("build.gradle.kts"), "").unwrap();
+
+        let manifests = detect_manifests(dir.path());
+        let java_manifests: Vec<_> = manifests
+            .iter()
+            .filter(|m| m.language == Language::Java)
+            .collect();
+        // Should only detect one (Groovy)
+        assert_eq!(java_manifests.len(), 1);
+        assert!(java_manifests[0].path.ends_with("build.gradle"));
     }
 }

@@ -15,6 +15,9 @@ pub struct Dependency {
     pub is_dev: bool,
     /// The language/ecosystem this dependency belongs to
     pub language: Language,
+    /// Optional variable name if version is defined via variable (e.g., Gradle def/val)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variable_name: Option<String>,
 }
 
 impl Dependency {
@@ -30,7 +33,14 @@ impl Dependency {
             version_spec,
             is_dev,
             language,
+            variable_name: None,
         }
+    }
+
+    /// Sets the variable name for this dependency (builder pattern)
+    pub fn with_variable(mut self, var_name: impl Into<String>) -> Self {
+        self.variable_name = Some(var_name.into());
+        self
     }
 
     /// Creates a new production dependency

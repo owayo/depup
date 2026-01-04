@@ -144,6 +144,9 @@ impl SystemPackageManager {
             "bundle" => vec!["bundle", "install"],
             // PHP
             "composer" => vec!["composer", "install"],
+            // Java/Gradle
+            "gradle" => vec!["gradle", "dependencies"],
+            "./gradlew" => vec!["./gradlew", "dependencies"],
             _ => vec![],
         }
     }
@@ -193,6 +196,18 @@ impl PackageManagerRunner for SystemPackageManager {
             Language::Php => {
                 if working_dir.join("composer.json").exists() {
                     Some("composer")
+                } else {
+                    None
+                }
+            }
+            Language::Java => {
+                // Prefer gradlew if available, fallback to gradle
+                if working_dir.join("gradlew").exists() {
+                    Some("./gradlew")
+                } else if working_dir.join("build.gradle").exists()
+                    || working_dir.join("build.gradle.kts").exists()
+                {
+                    Some("gradle")
                 } else {
                     None
                 }
@@ -388,6 +403,20 @@ mod tests {
         let pm = SystemPackageManager::new();
         let cmd = pm.get_install_command("poetry");
         assert_eq!(cmd, vec!["poetry", "install"]);
+    }
+
+    #[test]
+    fn test_get_install_command_gradle() {
+        let pm = SystemPackageManager::new();
+        let cmd = pm.get_install_command("gradle");
+        assert_eq!(cmd, vec!["gradle", "dependencies"]);
+    }
+
+    #[test]
+    fn test_get_install_command_gradlew() {
+        let pm = SystemPackageManager::new();
+        let cmd = pm.get_install_command("./gradlew");
+        assert_eq!(cmd, vec!["./gradlew", "dependencies"]);
     }
 
     #[test]

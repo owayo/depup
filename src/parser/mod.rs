@@ -7,8 +7,10 @@
 //! - Go (go mod)
 //! - Ruby (bundler)
 //! - PHP (composer)
+//! - Java (gradle)
 
 mod go;
+mod java;
 mod node;
 mod php;
 mod python;
@@ -16,6 +18,7 @@ mod ruby;
 mod rust;
 
 pub use go::GoVersionParser;
+pub use java::JavaVersionParser;
 pub use node::NodeVersionParser;
 pub use php::PhpVersionParser;
 pub use python::PythonVersionParser;
@@ -42,6 +45,7 @@ pub fn get_parser(language: Language) -> Box<dyn VersionParser> {
         Language::Go => Box::new(GoVersionParser),
         Language::Ruby => Box::new(RubyVersionParser),
         Language::Php => Box::new(PhpVersionParser),
+        Language::Java => Box::new(JavaVersionParser),
     }
 }
 

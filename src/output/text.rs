@@ -170,6 +170,7 @@ impl TextFormatter {
         new_version: &str,
         is_dev: bool,
         released_at: Option<DateTime<Utc>>,
+        variable_name: Option<&str>,
         max_name_len: usize,
         writer: &mut dyn Write,
     ) -> std::io::Result<()> {
@@ -179,6 +180,11 @@ impl TextFormatter {
         // Format release date
         let date_display = released_at
             .map(|d| format!(" ({})", d.format("%Y/%m/%d %H:%M")))
+            .unwrap_or_default();
+
+        // Format variable indicator
+        let var_display = variable_name
+            .map(|v| format!(" via ${}", v))
             .unwrap_or_default();
 
         if self.color {
@@ -197,27 +203,32 @@ impl TextFormatter {
                         .to_string()
                 })
                 .unwrap_or_default();
+            let var_colored = variable_name
+                .map(|v| format!(" via ${}", v).cyan().to_string())
+                .unwrap_or_default();
 
             writeln!(
                 writer,
-                "  {} {} {} {} [{}]{}{}",
+                "  {} {} {} {} [{}]{}{}{}",
                 name_display,
                 old_version.dimmed(),
                 arrow,
                 new_version.bright_white().bold(),
                 change_label,
                 date_colored,
+                var_colored,
                 dev_display
             )
         } else {
             writeln!(
                 writer,
-                "  {:width$} {} -> {} [{}]{}{}",
+                "  {:width$} {} -> {} [{}]{}{}{}",
                 name,
                 old_version,
                 new_version,
                 change_type.label(),
                 date_display,
+                var_display,
                 dev_marker,
                 width = max_name_len
             )
@@ -341,6 +352,7 @@ impl TextFormatter {
                         new_version,
                         false,
                         *released_at,
+                        dependency.variable_name.as_deref(),
                         max_name_len,
                         writer,
                     )?;
@@ -370,6 +382,7 @@ impl TextFormatter {
                         new_version,
                         true,
                         *released_at,
+                        dependency.variable_name.as_deref(),
                         max_name_len,
                         writer,
                     )?;

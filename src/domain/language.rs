@@ -19,6 +19,8 @@ pub enum Language {
     Ruby,
     /// PHP ecosystem (composer.json)
     Php,
+    /// Java ecosystem (build.gradle, build.gradle.kts)
+    Java,
 }
 
 impl Language {
@@ -31,6 +33,7 @@ impl Language {
             Language::Go => "go.mod",
             Language::Ruby => "Gemfile",
             Language::Php => "composer.json",
+            Language::Java => "build.gradle",
         }
     }
 
@@ -43,6 +46,7 @@ impl Language {
             Language::Go => &["go.sum"],
             Language::Ruby => &["Gemfile.lock"],
             Language::Php => &["composer.lock"],
+            Language::Java => &["gradle.lockfile"],
         }
     }
 
@@ -55,6 +59,7 @@ impl Language {
             Language::Go => "Go",
             Language::Ruby => "Ruby",
             Language::Php => "PHP",
+            Language::Java => "Java",
         }
     }
 
@@ -67,6 +72,7 @@ impl Language {
             Language::Go,
             Language::Ruby,
             Language::Php,
+            Language::Java,
         ]
     }
 }
@@ -89,6 +95,7 @@ mod tests {
         assert_eq!(Language::Go.manifest_filename(), "go.mod");
         assert_eq!(Language::Ruby.manifest_filename(), "Gemfile");
         assert_eq!(Language::Php.manifest_filename(), "composer.json");
+        assert_eq!(Language::Java.manifest_filename(), "build.gradle");
     }
 
     #[test]
@@ -105,6 +112,7 @@ mod tests {
         assert_eq!(Language::Go.lock_filenames(), &["go.sum"]);
         assert_eq!(Language::Ruby.lock_filenames(), &["Gemfile.lock"]);
         assert_eq!(Language::Php.lock_filenames(), &["composer.lock"]);
+        assert_eq!(Language::Java.lock_filenames(), &["gradle.lockfile"]);
     }
 
     #[test]
@@ -115,6 +123,7 @@ mod tests {
         assert_eq!(Language::Go.display_name(), "Go");
         assert_eq!(Language::Ruby.display_name(), "Ruby");
         assert_eq!(Language::Php.display_name(), "PHP");
+        assert_eq!(Language::Java.display_name(), "Java");
     }
 
     #[test]
@@ -125,18 +134,20 @@ mod tests {
         assert_eq!(format!("{}", Language::Go), "Go");
         assert_eq!(format!("{}", Language::Ruby), "Ruby");
         assert_eq!(format!("{}", Language::Php), "PHP");
+        assert_eq!(format!("{}", Language::Java), "Java");
     }
 
     #[test]
     fn test_all_languages() {
         let all = Language::all();
-        assert_eq!(all.len(), 6);
+        assert_eq!(all.len(), 7);
         assert!(all.contains(&Language::Node));
         assert!(all.contains(&Language::Python));
         assert!(all.contains(&Language::Rust));
         assert!(all.contains(&Language::Go));
         assert!(all.contains(&Language::Ruby));
         assert!(all.contains(&Language::Php));
+        assert!(all.contains(&Language::Java));
     }
 
     #[test]
@@ -175,6 +186,10 @@ mod tests {
         let lang = Language::Php;
         let json = serde_json::to_string(&lang).unwrap();
         assert_eq!(json, "\"php\"");
+
+        let lang = Language::Java;
+        let json = serde_json::to_string(&lang).unwrap();
+        assert_eq!(json, "\"java\"");
     }
 
     #[test]
@@ -190,5 +205,8 @@ mod tests {
 
         let lang: Language = serde_json::from_str("\"php\"").unwrap();
         assert_eq!(lang, Language::Php);
+
+        let lang: Language = serde_json::from_str("\"java\"").unwrap();
+        assert_eq!(lang, Language::Java);
     }
 }

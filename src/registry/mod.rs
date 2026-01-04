@@ -6,10 +6,12 @@
 //! - PyPI JSON API adapter
 //! - crates.io API adapter
 //! - Go Module Proxy adapter
+//! - Maven Central adapter
 
 mod client;
 mod crates_io;
 mod go_proxy;
+mod maven_central;
 mod npm;
 mod packagist;
 mod pypi;
@@ -18,6 +20,7 @@ mod rubygems;
 pub use client::HttpClient;
 pub use crates_io::CratesIoAdapter;
 pub use go_proxy::GoProxyAdapter;
+pub use maven_central::MavenCentralAdapter;
 pub use npm::NpmAdapter;
 pub use packagist::PackagistAdapter;
 pub use pypi::PyPIAdapter;
@@ -50,5 +53,6 @@ pub fn create_adapter(language: Language, client: HttpClient) -> Box<dyn Registr
         Language::Go => Box::new(GoProxyAdapter::new(client)),
         Language::Ruby => Box::new(RubyGemsAdapter::new(client)),
         Language::Php => Box::new(PackagistAdapter::new(client)),
+        Language::Java => Box::new(MavenCentralAdapter::new(client)),
     }
 }

@@ -81,6 +81,10 @@ pub struct CliArgs {
     #[arg(long)]
     pub php: bool,
 
+    /// Update only Java (build.gradle) dependencies
+    #[arg(long)]
+    pub java: bool,
+
     // Package filters
     /// Exclude specific packages from update (can be specified multiple times)
     #[arg(long, action = ArgAction::Append)]
@@ -117,7 +121,7 @@ pub struct CliArgs {
 impl CliArgs {
     /// Check if any language filter is specified
     pub fn has_language_filter(&self) -> bool {
-        self.node || self.python || self.rust_lang || self.go || self.ruby || self.php
+        self.node || self.python || self.rust_lang || self.go || self.ruby || self.php || self.java
     }
 
     /// Check if a specific language should be processed
@@ -132,6 +136,7 @@ impl CliArgs {
             "go" | "golang" => self.go,
             "ruby" => self.ruby,
             "php" => self.php,
+            "java" => self.java,
             _ => false,
         }
     }
@@ -222,6 +227,10 @@ mod tests {
 
         let args = CliArgs::parse_from(["depup", "--go"]);
         assert!(args.go);
+
+        let args = CliArgs::parse_from(["depup", "--java"]);
+        assert!(args.java);
+        assert!(!args.node);
     }
 
     #[test]
@@ -231,6 +240,14 @@ mod tests {
         assert!(args.python);
         assert!(!args.rust_lang);
         assert!(!args.go);
+        assert!(!args.java);
+
+        // Test Java with other languages
+        let args = CliArgs::parse_from(["depup", "--java", "--node"]);
+        assert!(args.java);
+        assert!(args.node);
+        assert!(!args.python);
+        assert!(!args.rust_lang);
     }
 
     #[test]
@@ -294,6 +311,9 @@ mod tests {
 
         let args = CliArgs::parse_from(["depup", "--node"]);
         assert!(args.has_language_filter());
+
+        let args = CliArgs::parse_from(["depup", "--java"]);
+        assert!(args.has_language_filter());
     }
 
     #[test]
@@ -303,12 +323,20 @@ mod tests {
         assert!(args.should_process_language("python"));
         assert!(args.should_process_language("rust"));
         assert!(args.should_process_language("go"));
+        assert!(args.should_process_language("java"));
 
         let args = CliArgs::parse_from(["depup", "--node", "--python"]);
         assert!(args.should_process_language("node"));
         assert!(args.should_process_language("python"));
         assert!(!args.should_process_language("rust"));
         assert!(!args.should_process_language("go"));
+        assert!(!args.should_process_language("java"));
+
+        // Test Java-only filter
+        let args = CliArgs::parse_from(["depup", "--java"]);
+        assert!(args.should_process_language("java"));
+        assert!(!args.should_process_language("node"));
+        assert!(!args.should_process_language("python"));
     }
 
     #[test]
