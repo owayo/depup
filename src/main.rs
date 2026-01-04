@@ -19,6 +19,12 @@ use std::process::ExitCode;
 async fn main() -> ExitCode {
     let args = CliArgs::parse();
 
+    // Handle version flag
+    if args.print_version {
+        println!("depup {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
+
     // Run the main logic and handle errors
     match run(args).await {
         Ok(exit_code) => exit_code,

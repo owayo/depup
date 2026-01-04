@@ -37,8 +37,16 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
 
 /// Multi-language dependency updater
 #[derive(Parser, Debug, Clone)]
-#[command(name = "depup", version, about = "Multi-language dependency updater")]
+#[command(
+    name = "depup",
+    about = "Multi-language dependency updater",
+    disable_version_flag = true
+)]
 pub struct CliArgs {
+    /// Print version
+    #[arg(short = 'v', long = "version")]
+    pub print_version: bool,
+
     /// Target directory (default: current directory)
     #[arg(default_value = ".")]
     pub path: PathBuf,
