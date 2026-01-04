@@ -10,6 +10,7 @@ use crate::domain::{Dependency, Language};
 use crate::error::ManifestError;
 use crate::manifest::ManifestParser;
 use crate::parser::{get_parser, VersionParser};
+use regex::Regex;
 use serde_json::{Map, Value};
 use std::path::PathBuf;
 
@@ -60,34 +61,34 @@ impl ManifestParser for PackageJsonParser {
         package: &str,
         new_version: &str,
     ) -> Result<String, ManifestError> {
-        let mut json: Value =
-            serde_json::from_str(content).map_err(|e| ManifestError::JsonParseError {
-                path: PathBuf::from("package.json"),
-                message: e.to_string(),
-            })?;
+        let parser = get_parser(Language::Node);
+
+        // Use regex-based text replacement to preserve original formatting and key order
+        // Pattern matches: "package-name": "version" with flexible whitespace
+        // Escape special characters in package name (e.g., @scope/package)
+        let escaped_package = regex::escape(package);
+        let pattern = format!(r#"("{}"\s*:\s*)"([^"]+)""#, escaped_package);
+
+        let re = Regex::new(&pattern).map_err(|e| ManifestError::InvalidVersionSpec {
+            path: PathBuf::from("package.json"),
+            spec: package.to_string(),
+            message: format!("invalid regex pattern: {}", e),
+        })?;
 
         let mut updated = false;
+        let result = re.replace(content, |caps: &regex::Captures| {
+            let prefix = &caps[1]; // "package": or "package" :
+            let old_version = &caps[2];
 
-        // Update in all dependency sections
-        for section in &[
-            "dependencies",
-            "devDependencies",
-            "peerDependencies",
-            "optionalDependencies",
-        ] {
-            if let Some(deps) = json.get_mut(section).and_then(|v| v.as_object_mut()) {
-                if let Some(version_value) = deps.get_mut(package) {
-                    if let Some(old_version_str) = version_value.as_str() {
-                        let parser = get_parser(Language::Node);
-                        if let Some(spec) = parser.parse(old_version_str) {
-                            let updated_version = spec.format_updated(new_version);
-                            *version_value = Value::String(updated_version);
-                            updated = true;
-                        }
-                    }
-                }
+            if let Some(spec) = parser.parse(old_version) {
+                updated = true;
+                let new_ver = spec.format_updated(new_version);
+                format!(r#"{}"{}""#, prefix, new_ver)
+            } else {
+                // If we can't parse the version, keep the original
+                caps[0].to_string()
             }
-        }
+        });
 
         if !updated {
             return Err(ManifestError::InvalidVersionSpec {
@@ -97,11 +98,7 @@ impl ManifestParser for PackageJsonParser {
             });
         }
 
-        // Serialize with pretty printing to maintain formatting
-        serde_json::to_string_pretty(&json).map_err(|e| ManifestError::JsonParseError {
-            path: PathBuf::from("package.json"),
-            message: e.to_string(),
-        })
+        Ok(result.to_string())
     }
 }
 
@@ -298,5 +295,67 @@ mod tests {
         let deps = parse(content).unwrap();
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Wildcard);
+    }
+
+    #[test]
+    fn test_update_version_preserves_key_order() {
+        // Keys are intentionally NOT in alphabetical order
+        let content = r#"{
+  "name": "test-package",
+  "version": "1.0.0",
+  "dependencies": {
+    "zod": "^3.0.0",
+    "axios": "^1.0.0",
+    "lodash": "^4.17.21"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}"#;
+
+        let result = PackageJsonParser
+            .update_version(content, "axios", "1.5.0")
+            .unwrap();
+
+        // Verify the original key order is preserved
+        assert_eq!(result, content.replace("^1.0.0", "^1.5.0"));
+
+        // Double-check by finding positions - zod should come before axios
+        let zod_pos = result.find("\"zod\"").unwrap();
+        let axios_pos = result.find("\"axios\"").unwrap();
+        let lodash_pos = result.find("\"lodash\"").unwrap();
+        assert!(zod_pos < axios_pos, "zod should come before axios");
+        assert!(axios_pos < lodash_pos, "axios should come before lodash");
+    }
+
+    #[test]
+    fn test_update_version_scoped_package() {
+        let content = r#"{
+  "dependencies": {
+    "@types/node": "^20.0.0",
+    "@scope/package": "^1.0.0"
+  }
+}"#;
+
+        let result = PackageJsonParser
+            .update_version(content, "@types/node", "20.10.0")
+            .unwrap();
+        assert!(result.contains("\"@types/node\": \"^20.10.0\""));
+
+        let result2 = PackageJsonParser
+            .update_version(content, "@scope/package", "2.0.0")
+            .unwrap();
+        assert!(result2.contains("\"@scope/package\": \"^2.0.0\""));
+    }
+
+    #[test]
+    fn test_update_version_preserves_formatting() {
+        // Test various formatting styles
+        let content_with_spaces = r#"{"dependencies": { "lodash" : "^4.17.21" }}"#;
+        let result = PackageJsonParser
+            .update_version(content_with_spaces, "lodash", "4.18.0")
+            .unwrap();
+        // Should preserve the original spacing around the colon
+        assert!(result.contains("\"lodash\" : \"^4.18.0\""));
     }
 }
