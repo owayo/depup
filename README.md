@@ -14,6 +14,18 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
 </p>
 
+<h3 align="center">Supported Languages</h3>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Node.js-339933?logo=nodedotjs&logoColor=white" alt="Node.js">
+  <img src="https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=white" alt="Python">
+  <img src="https://img.shields.io/badge/Rust-000000?logo=rust&logoColor=white" alt="Rust">
+  <img src="https://img.shields.io/badge/Go-00ADD8?logo=go&logoColor=white" alt="Go">
+  <img src="https://img.shields.io/badge/Ruby-CC342D?logo=ruby&logoColor=white" alt="Ruby">
+  <img src="https://img.shields.io/badge/PHP-777BB4?logo=php&logoColor=white" alt="PHP">
+  <img src="https://img.shields.io/badge/Java-ED8B00?logo=openjdk&logoColor=white" alt="Java">
+</p>
+
 <p align="center">
   <a href="README.ja.md">日本語</a>
 </p>
@@ -37,7 +49,7 @@
 
 ## Features
 
-- **Multi-Language Support**: Node.js, Python, Rust, Go
+- **Multi-Language Support**: Node.js, Python, Rust, Go, Ruby, PHP, Java
 - **Manifest Updates**: Directly updates version specifications in manifest files
 - **Smart Version Handling**: Preserves version range formats (^, ~, >=)
 - **Pinned Version Detection**: Skips intentionally pinned versions by default
@@ -49,12 +61,15 @@
 
 ## Supported Languages
 
-| Language | Manifest | Lock Files |
-|----------|----------|------------|
-| Node.js | package.json | package-lock.json, pnpm-lock.yaml, yarn.lock |
-| Python | pyproject.toml | uv.lock, poetry.lock |
-| Rust | Cargo.toml | Cargo.lock |
-| Go | go.mod | go.sum |
+| Language | Manifest | Registry | Lock Files |
+|----------|----------|----------|------------|
+| <img src="https://img.shields.io/badge/-339933?logo=nodedotjs&logoColor=white" height="16"> Node.js | package.json | npm | package-lock.json, pnpm-lock.yaml, yarn.lock |
+| <img src="https://img.shields.io/badge/-3776AB?logo=python&logoColor=white" height="16"> Python | pyproject.toml | PyPI | uv.lock, poetry.lock |
+| <img src="https://img.shields.io/badge/-000000?logo=rust&logoColor=white" height="16"> Rust | Cargo.toml | crates.io | Cargo.lock |
+| <img src="https://img.shields.io/badge/-00ADD8?logo=go&logoColor=white" height="16"> Go | go.mod | Go Proxy | go.sum |
+| <img src="https://img.shields.io/badge/-CC342D?logo=ruby&logoColor=white" height="16"> Ruby | Gemfile | RubyGems | Gemfile.lock |
+| <img src="https://img.shields.io/badge/-777BB4?logo=php&logoColor=white" height="16"> PHP | composer.json | Packagist | composer.lock |
+| <img src="https://img.shields.io/badge/-ED8B00?logo=openjdk&logoColor=white" height="16"> Java | build.gradle | Maven Central | - |
 
 ## Requirements
 
@@ -112,6 +127,9 @@ depup [OPTIONS] [PATH]
 | `--python` | | Update only Python dependencies |
 | `--rust` | | Update only Rust dependencies |
 | `--go` | | Update only Go dependencies |
+| `--ruby` | | Update only Ruby dependencies |
+| `--php` | | Update only PHP dependencies |
+| `--java` | | Update only Java dependencies |
 | `--exclude <PKG>` | | Exclude specific packages (repeatable) |
 | `--only <PKG>` | | Update only specific packages (repeatable) |
 | `--include-pinned` | | Include pinned versions in update |
@@ -140,6 +158,9 @@ depup --age 2w
 # Update Python and Rust only
 depup --python --rust
 
+# Update Java (Gradle) dependencies
+depup --java
+
 # JSON output for CI/CD
 depup --json
 
@@ -162,6 +183,11 @@ Pinned versions are intentionally fixed and excluded from updates by default:
 | Rust | `"=1.2.3"` | ❌ |
 | Rust | `"1.2.3"`, `"^1.2.3"` | ✅ |
 | Go | `// pinned` comment | ❌ |
+| Ruby | `'= 1.2.3'` | ❌ |
+| Ruby | `'~> 1.2.3'`, `'>= 1.2.3'` | ✅ |
+| PHP | `"1.2.3"` | ❌ |
+| PHP | `"^1.2.3"`, `"~1.2.3"` | ✅ |
+| Java | Fixed version in Gradle | ✅ |
 
 Use `--include-pinned` to update pinned versions.
 
