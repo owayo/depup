@@ -9,6 +9,12 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/owayo/depup/actions/workflows/ci.yml"><img src="https://github.com/owayo/depup/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://crates.io/crates/depup"><img src="https://img.shields.io/crates/v/depup.svg" alt="crates.io"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+</p>
+
+<p align="center">
   <a href="README.ja.md">日本語</a>
 </p>
 
@@ -38,6 +44,11 @@
 | Python | pyproject.toml | uv.lock, poetry.lock |
 | Rust | Cargo.toml | Cargo.lock |
 | Go | go.mod | go.sum |
+
+## Requirements
+
+- **OS**: macOS, Linux, Windows
+- **Rust**: 1.70+ (for building from source)
 
 ## Installation
 
