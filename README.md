@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="docs/images/app.png" width="128" alt="depup">
-</p>
-
 <h1 align="center">depup</h1>
 
 <p align="center">
@@ -13,6 +9,10 @@
 </p>
 
 ---
+
+<p align="center">
+  <img src="docs/images/output.png" width="600" alt="depup output">
+</p>
 
 ## Features
 
@@ -176,19 +176,17 @@ depup automatically reads `minimumReleaseAge` from pnpm configuration:
 
 ## Output
 
+### Progress Display
+
+<p align="center">
+  <img src="docs/images/scanning.png" alt="depup scanning">
+</p>
+
 ### Text Output (Default)
-
-```
-📦 package.json
-
-  lodash      4.17.20 -> 4.17.21 [patch] (2024/12/15 10:30)
-  typescript  5.3.0   -> 5.4.0   [minor] (2024/12/20 14:00) 🔧
-
-Summary: 2 package(s) updated
-```
 
 - `🔧` indicates devDependencies
 - Release date shown in `(yyyy/mm/dd HH:MM)` format
+- Change type: `[major]`, `[minor]`, `[patch]`
 
 ### JSON Output
 
