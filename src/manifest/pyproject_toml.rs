@@ -6,6 +6,7 @@
 //! - dependency-groups (PEP 735)
 //! - tool.poetry.dependencies (Poetry)
 //! - tool.poetry.dev-dependencies (Poetry)
+//! - tool.rye.dev-dependencies (Rye)
 
 use crate::domain::{Dependency, Language};
 use crate::error::ManifestError;
@@ -139,6 +140,22 @@ impl ManifestParser for PyprojectTomlParser {
                         {
                             dependencies.push(parsed);
                         }
+                    }
+                }
+            }
+        }
+
+        // Parse Rye dev-dependencies
+        if let Some(deps) = toml
+            .get("tool")
+            .and_then(|t| t.get("rye"))
+            .and_then(|r| r.get("dev-dependencies"))
+            .and_then(|d| d.as_array())
+        {
+            for dep in deps {
+                if let Some(dep_str) = dep.as_str() {
+                    if let Some(parsed) = parse_pep508_dependency(dep_str, parser.as_ref(), true) {
+                        dependencies.push(parsed);
                     }
                 }
             }
@@ -502,6 +519,37 @@ requests = { version = "^2.28.0", extras = ["security"] }
             .update_version(content, "requests", "2.31.0")
             .unwrap();
         assert!(result.contains("^2.31.0"));
+    }
+
+    #[test]
+    fn test_parse_rye_dev_dependencies() {
+        let content = r#"
+[project]
+name = "ci-watcher"
+dependencies = [
+    "requests>=2.32.5",
+]
+
+[tool.rye]
+managed = true
+dev-dependencies = [
+    "ruff>=0.11.3",
+    "pytest>=7.0.0",
+]
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 3);
+
+        let requests = deps.iter().find(|d| d.name == "requests").unwrap();
+        assert!(!requests.is_dev);
+
+        let ruff = deps.iter().find(|d| d.name == "ruff").unwrap();
+        assert!(ruff.is_dev); // Rye dev-dependencies should be marked as dev
+        assert_eq!(ruff.version_spec.kind, VersionSpecKind::GreaterOrEqual);
+
+        let pytest = deps.iter().find(|d| d.name == "pytest").unwrap();
+        assert!(pytest.is_dev);
     }
 
     #[test]

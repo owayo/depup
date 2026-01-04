@@ -20,9 +20,20 @@
 
 ---
 
-<p align="center">
-  <img src="docs/images/output.png" width="600" alt="depup output">
-</p>
+### Output Examples
+
+<table>
+  <tr>
+    <td align="center">
+      <strong>Python (pyproject.toml)</strong><br>
+      <img src="docs/images/output_python.png" width="400" alt="depup Python output">
+    </td>
+    <td align="center">
+      <strong>Tauri (multi-language)</strong><br>
+      <img src="docs/images/output_tauri.png" width="400" alt="depup Tauri output">
+    </td>
+  </tr>
+</table>
 
 ## Features
 

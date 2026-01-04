@@ -15,6 +15,10 @@ pub enum Language {
     Rust,
     /// Go ecosystem (go.mod)
     Go,
+    /// Ruby ecosystem (Gemfile)
+    Ruby,
+    /// PHP ecosystem (composer.json)
+    Php,
 }
 
 impl Language {
