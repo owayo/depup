@@ -3,6 +3,7 @@
 //! Handles:
 //! - project.dependencies (PEP 621)
 //! - project.optional-dependencies (PEP 621)
+//! - dependency-groups (PEP 735)
 //! - tool.poetry.dependencies (Poetry)
 //! - tool.poetry.dev-dependencies (Poetry)
 
@@ -63,6 +64,24 @@ impl ManifestParser for PyprojectTomlParser {
                         if let Some(dep_str) = dep.as_str() {
                             if let Some(parsed) =
                                 parse_pep508_dependency(dep_str, parser.as_ref(), false)
+                            {
+                                dependencies.push(parsed);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Parse PEP 735 dependency-groups
+        if let Some(groups) = toml.get("dependency-groups").and_then(|d| d.as_table()) {
+            for (group_name, deps) in groups {
+                let is_dev = group_name == "dev" || group_name == "test" || group_name == "lint";
+                if let Some(deps_array) = deps.as_array() {
+                    for dep in deps_array {
+                        if let Some(dep_str) = dep.as_str() {
+                            if let Some(parsed) =
+                                parse_pep508_dependency(dep_str, parser.as_ref(), is_dev)
                             {
                                 dependencies.push(parsed);
                             }
@@ -359,6 +378,42 @@ sphinx = "^6.0.0"
 
         let pytest = deps.iter().find(|d| d.name == "pytest").unwrap();
         assert!(pytest.is_dev);
+
+        let sphinx = deps.iter().find(|d| d.name == "sphinx").unwrap();
+        assert!(!sphinx.is_dev); // docs group is not dev
+    }
+
+    #[test]
+    fn test_parse_pep735_dependency_groups() {
+        let content = r#"
+[project]
+name = "test"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.11.8",
+    "pytest>=7.0.0",
+]
+lint = [
+    "mypy>=1.0.0",
+]
+docs = [
+    "sphinx>=6.0.0",
+]
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 4);
+
+        let ruff = deps.iter().find(|d| d.name == "ruff").unwrap();
+        assert!(ruff.is_dev); // dev group is dev
+        assert_eq!(ruff.version_spec.kind, VersionSpecKind::GreaterOrEqual);
+
+        let pytest = deps.iter().find(|d| d.name == "pytest").unwrap();
+        assert!(pytest.is_dev); // dev group is dev
+
+        let mypy = deps.iter().find(|d| d.name == "mypy").unwrap();
+        assert!(mypy.is_dev); // lint group is dev
 
         let sphinx = deps.iter().find(|d| d.name == "sphinx").unwrap();
         assert!(!sphinx.is_dev); // docs group is not dev
