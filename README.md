@@ -1,1 +1,267 @@
-# depup
+<p align="center">
+  <img src="docs/images/app.png" width="128" alt="depup">
+</p>
+
+<h1 align="center">depup</h1>
+
+<p align="center">
+  Multi-language dependency updater CLI tool
+</p>
+
+<p align="center">
+  <a href="README.ja.md">日本語</a>
+</p>
+
+---
+
+## Features
+
+- **Multi-Language Support**: Node.js, Python, Rust, Go
+- **Manifest Updates**: Directly updates version specifications in manifest files
+- **Smart Version Handling**: Preserves version range formats (^, ~, >=)
+- **Pinned Version Detection**: Skips intentionally pinned versions by default
+- **Age Filter**: Only update to versions released N days/weeks ago
+- **pnpm Integration**: Respects `minimumReleaseAge` from pnpm settings
+- **Monorepo Support**: pnpm workspaces and Tauri projects
+- **Release Date Display**: Shows when each new version was released
+- **Multiple Output Formats**: Text (colored), JSON, diff
+
+## Supported Languages
+
+| Language | Manifest | Lock Files |
+|----------|----------|------------|
+| Node.js | package.json | package-lock.json, pnpm-lock.yaml, yarn.lock |
+| Python | pyproject.toml | uv.lock, poetry.lock |
+| Rust | Cargo.toml | Cargo.lock |
+| Go | go.mod | go.sum |
+
+## Installation
+
+### From Source
+
+```bash
+git clone https://github.com/owayo/depup.git
+cd depup
+cargo install --path .
+```
+
+### Using Cargo
+
+```bash
+cargo install depup
+```
+
+## Quickstart
+
+```bash
+# Update all dependencies (dry run)
+depup -n
+
+# Update Node.js dependencies only
+depup --node
+
+# Update with age filter (2 weeks minimum)
+depup --age 2w
+
+# Update and show diff
+depup --diff
+```
+
+## Usage
+
+### Basic Syntax
+
+```bash
+depup [OPTIONS] [PATH]
+```
+
+### Options
+
+| Option | Short | Description |
+|--------|-------|-------------|
+| `--dry-run` | `-n` | Show what would be updated without making changes |
+| `--verbose` | | Enable verbose output |
+| `--quiet` | `-q` | Minimal output |
+| `--node` | | Update only Node.js dependencies |
+| `--python` | | Update only Python dependencies |
+| `--rust` | | Update only Rust dependencies |
+| `--go` | | Update only Go dependencies |
+| `--exclude <PKG>` | | Exclude specific packages (repeatable) |
+| `--only <PKG>` | | Update only specific packages (repeatable) |
+| `--include-pinned` | | Include pinned versions in update |
+| `--age <DURATION>` | | Minimum release age (e.g., 2w, 10d, 1m) |
+| `--json` | | Output results in JSON format |
+| `--diff` | | Show changes in diff format |
+| `--install` | | Run package manager install after update |
+| `--version` | `-v` | Show version |
+| `--help` | `-h` | Show help |
+
+### Examples
+
+```bash
+# Preview all updates
+depup -n
+
+# Update only lodash and typescript
+depup --only lodash --only typescript
+
+# Exclude react from updates
+depup --exclude react
+
+# Update packages at least 2 weeks old
+depup --age 2w
+
+# Update Python and Rust only
+depup --python --rust
+
+# JSON output for CI/CD
+depup --json
+
+# Update and run npm install
+depup --node --install
+```
+
+## Version Handling
+
+### Pinned Versions (Excluded by Default)
+
+Pinned versions are intentionally fixed and excluded from updates by default:
+
+| Language | Pinned Example | Updated |
+|----------|----------------|---------|
+| Node.js | `"1.2.3"` | ❌ |
+| Node.js | `"^1.2.3"`, `"~1.2.3"` | ✅ |
+| Python | `"==1.2.3"` | ❌ |
+| Python | `">=1.2.3"`, `"^1.2.3"` | ✅ |
+| Rust | `"=1.2.3"` | ❌ |
+| Rust | `"1.2.3"`, `"^1.2.3"` | ✅ |
+| Go | `// pinned` comment | ❌ |
+
+Use `--include-pinned` to update pinned versions.
+
+### Range Preservation
+
+depup preserves the original version range format:
+
+```
+"^1.2.3" → "^2.0.0"  (caret preserved)
+"~1.2.3" → "~1.3.0"  (tilde preserved)
+">=1.0.0" → ">=2.0.0" (range preserved)
+```
+
+## Age Filter
+
+The `--age` option ensures stability by only updating to versions that have been released for a certain period:
+
+```bash
+# Only update to versions at least 2 weeks old
+depup --age 2w
+
+# Only update to versions at least 10 days old
+depup --age 10d
+
+# Only update to versions at least 1 month old
+depup --age 1m
+```
+
+### pnpm Integration
+
+depup automatically reads `minimumReleaseAge` from pnpm configuration:
+
+**Priority order:**
+1. CLI `--age` flag (highest)
+2. `.npmrc` (`minimum-release-age=10d`)
+3. `pnpm-workspace.yaml` (`minimumReleaseAge: 14400` in minutes)
+4. `package.json` (`pnpm.settings.minimumReleaseAge`)
+
+## Output
+
+### Text Output (Default)
+
+```
+📦 package.json
+
+  lodash      4.17.20 -> 4.17.21 [patch] (2024/12/15 10:30)
+  typescript  5.3.0   -> 5.4.0   [minor] (2024/12/20 14:00) 🔧
+
+Summary: 2 package(s) updated
+```
+
+- `🔧` indicates devDependencies
+- Release date shown in `(yyyy/mm/dd HH:MM)` format
+
+### JSON Output
+
+```bash
+depup --json
+```
+
+```json
+{
+  "manifests": [
+    {
+      "path": "package.json",
+      "language": "node",
+      "updates": [
+        {
+          "type": "update",
+          "dependency": {
+            "name": "lodash",
+            "version_spec": "^4.17.20"
+          },
+          "new_version": "4.17.21",
+          "released_at": "2024-12-15T10:30:00Z"
+        }
+      ]
+    }
+  ]
+}
+```
+
+### Diff Output
+
+```bash
+depup --diff
+```
+
+```diff
+--- package.json
++++ package.json
+@@ dependencies @@
+-  "lodash": "^4.17.20"
++  "lodash": "^4.17.21"
+```
+
+## Monorepo Support
+
+### pnpm Workspaces
+
+depup detects `pnpm-workspace.yaml` and processes all workspace packages.
+
+### Tauri Projects
+
+depup automatically detects `src-tauri/Cargo.toml` in Tauri projects.
+
+## Build
+
+```bash
+# Debug build
+cargo build
+
+# Release build
+cargo build --release
+
+# Run tests
+cargo test
+
+# Install locally
+cargo install --path .
+```
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
+
+## License
+
+[MIT](LICENSE)
