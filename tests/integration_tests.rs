@@ -707,12 +707,12 @@ mod registry_response_parsing {
 
         let v710 = &parsed[0];
         assert_eq!(v710.get("number").unwrap().as_str().unwrap(), "7.1.0");
-        assert_eq!(v710.get("yanked").unwrap().as_bool().unwrap(), false);
+        assert!(!v710.get("yanked").unwrap().as_bool().unwrap());
         assert!(v710.get("created_at").is_some());
 
         // Third version is yanked
         let v707 = &parsed[2];
-        assert_eq!(v707.get("yanked").unwrap().as_bool().unwrap(), true);
+        assert!(v707.get("yanked").unwrap().as_bool().unwrap());
     }
 
     /// Test Packagist response JSON parsing
