@@ -27,13 +27,12 @@ static PEP508_RE: LazyLock<Regex> =
 
 impl ManifestParser for PyprojectTomlParser {
     fn parse(&self, content: &str) -> Result<Vec<Dependency>, ManifestError> {
-        let toml: Value =
-            content
-                .parse()
-                .map_err(|e: toml::de::Error| ManifestError::TomlParseError {
-                    path: PathBuf::from("pyproject.toml"),
-                    message: e.to_string(),
-                })?;
+        let toml: Value = toml::from_str(content).map_err(|e: toml::de::Error| {
+            ManifestError::TomlParseError {
+                path: PathBuf::from("pyproject.toml"),
+                message: e.to_string(),
+            }
+        })?;
 
         let mut dependencies = Vec::new();
         let parser = get_parser(Language::Python);
