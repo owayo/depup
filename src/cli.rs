@@ -44,7 +44,7 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
 )]
 pub struct CliArgs {
     /// Print version
-    #[arg(short = 'v', long = "version")]
+    #[arg(short = 'V', long = "version")]
     pub print_version: bool,
 
     /// Target directory (default: current directory)
