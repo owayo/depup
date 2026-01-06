@@ -485,4 +485,86 @@ features = ["derive"]
         assert!(result.contains("version = \"1.1.0\""));
         assert!(result.contains("features = [\"derive\"]"));
     }
+
+    #[test]
+    fn test_update_mixed_dependency_formats() {
+        // Real-world Cargo.toml with mixed formats:
+        // - Simple format: pkg = "version"
+        // - Inline table: pkg = { version = "...", features = [...] }
+        // - Multiline table: [dependencies.pkg]
+        let content = r#"[package]
+name = "example-hooks"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+dirs = "5"
+regex = "1"
+thiserror = "1"
+anyhow = "1"
+
+[dependencies.ts-parser]
+version = "0.22"
+optional = true
+
+[dependencies.ts-bash]
+version = "0.21"
+optional = true
+
+[features]
+default = ["ast-parser"]
+ast-parser = ["ts-parser", "ts-bash"]
+"#;
+
+        // Test simple format update
+        let result = CargoTomlParser
+            .update_version(content, "serde_json", "1.0.140")
+            .unwrap();
+        assert!(result.contains("serde_json = \"1.0.140\""));
+
+        // Test inline table format update
+        let result = CargoTomlParser
+            .update_version(&result, "clap", "4.5.0")
+            .unwrap();
+        assert!(result.contains("version = \"4.5.0\""));
+        assert!(result.contains("features = [\"derive\"]"));
+
+        // Test another inline table
+        let result = CargoTomlParser
+            .update_version(&result, "tracing-subscriber", "0.3.20")
+            .unwrap();
+        assert!(result.contains("version = \"0.3.20\""));
+        assert!(result.contains("features = [\"env-filter\"]"));
+
+        // Test multiline table format - must have proper closing quotes
+        let result = CargoTomlParser
+            .update_version(&result, "ts-parser", "0.26.3")
+            .unwrap();
+        assert!(result.contains("version = \"0.26.3\""));
+        // Verify closing quote exists (not broken)
+        assert!(!result.contains("\"0.26.3\n["));
+
+        let result = CargoTomlParser
+            .update_version(&result, "ts-bash", "0.25.1")
+            .unwrap();
+        assert!(result.contains("version = \"0.25.1\""));
+        assert!(!result.contains("\"0.25.1\n["));
+
+        // Verify all updates are preserved
+        assert!(result.contains("serde_json = \"1.0.140\""));
+        assert!(result.contains("clap = { version = \"4.5.0\""));
+        assert!(result.contains("version = \"0.26.3\""));
+        assert!(result.contains("version = \"0.25.1\""));
+
+        // Verify unrelated content is preserved
+        assert!(result.contains("[features]"));
+        assert!(result.contains("ast-parser = [\"ts-parser\", \"ts-bash\"]"));
+    }
 }
