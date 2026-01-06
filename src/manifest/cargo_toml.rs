@@ -124,7 +124,7 @@ impl ManifestParser for CargoTomlParser {
                 let old_version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
                 if let Some(spec) = parser.parse(old_version) {
                     let new_ver = spec.format_updated(new_version);
-                    let replacement = format!(r#"{}"{}"#, &caps[1], new_ver);
+                    let replacement = format!(r#"{}"{}""#, &caps[1], new_ver);
                     result = re.replace(&result, replacement.as_str()).to_string();
                     updated = true;
                 }
@@ -442,5 +442,47 @@ pkg4 = "<2.0.0"
 
         let pkg4 = deps.iter().find(|d| d.name == "pkg4").unwrap();
         assert_eq!(pkg4.version_spec.kind, VersionSpecKind::Less);
+    }
+
+    #[test]
+    fn test_update_multiline_table() {
+        let content = r#"[dependencies.tree-sitter]
+version = "0.22"
+
+[dependencies.tree-sitter-bash]
+version = "0.21"
+"#;
+
+        let result = CargoTomlParser
+            .update_version(content, "tree-sitter", "0.26.3")
+            .unwrap();
+
+        // Check that version is properly quoted
+        assert!(result.contains("version = \"0.26.3\""));
+        // Ensure closing quote exists
+        assert!(!result.contains("\"0.26.3\n"));
+
+        // Update second package
+        let result2 = CargoTomlParser
+            .update_version(&result, "tree-sitter-bash", "0.25.1")
+            .unwrap();
+
+        assert!(result2.contains("version = \"0.25.1\""));
+        assert!(result2.contains("version = \"0.26.3\""));
+    }
+
+    #[test]
+    fn test_update_multiline_table_with_features() {
+        let content = r#"[dependencies.serde]
+version = "1.0.0"
+features = ["derive"]
+"#;
+
+        let result = CargoTomlParser
+            .update_version(content, "serde", "1.1.0")
+            .unwrap();
+
+        assert!(result.contains("version = \"1.1.0\""));
+        assert!(result.contains("features = [\"derive\"]"));
     }
 }
