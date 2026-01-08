@@ -190,6 +190,8 @@ Pinned versions are intentionally fixed and excluded from updates by default:
 
 Use `--include-pinned` to update pinned versions.
 
+> **Note**: Go dependencies are always included in updates regardless of the `--include-pinned` flag, because `go.mod` only supports exact versions (no range specifiers like `^` or `~`). All Go versions are effectively "pinned" by nature.
+
 ### Range Preservation
 
 depup preserves the original version range format:
