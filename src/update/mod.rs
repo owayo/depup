@@ -53,8 +53,13 @@ impl UpdateJudge {
             }
         }
 
-        // Check pinned version (unless --include-pinned)
-        if dependency.is_pinned() && !self.filter.include_pinned {
+        // Check pinned version (unless --include-pinned or language always uses pinned versions)
+        // Languages like Go and Java don't have range specifiers, so all versions are pinned.
+        // For these languages, we should always include them even without --include-pinned.
+        if dependency.is_pinned()
+            && !self.filter.include_pinned
+            && !dependency.language.always_pinned()
+        {
             return Some(SkipReason::Pinned);
         }
 
@@ -367,6 +372,78 @@ mod tests {
 
         let dep = make_dependency("lodash", "1.0.0", Language::Node, true);
         assert_eq!(judge.should_skip(&dep), Some(SkipReason::Pinned));
+    }
+
+    #[test]
+    fn test_should_skip_go_always_pinned_language() {
+        // Go only supports exact versions, so pinned deps should NOT be skipped
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        // Go dependency is always pinned (VersionSpecKind::Exact)
+        let dep = make_dependency("github.com/gin-gonic/gin", "1.9.0", Language::Go, true);
+
+        // Should NOT skip - Go is an always_pinned language
+        assert!(judge.should_skip(&dep).is_none());
+    }
+
+    #[test]
+    fn test_should_skip_java_pinned_dependency() {
+        // Java/Gradle supports version ranges (Maven-style, prefix versions, etc.)
+        // so pinned dependencies SHOULD be skipped without --include-pinned
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        // Java dependency with exact version (pinned)
+        let dep = make_dependency(
+            "org.springframework:spring-core",
+            "6.0.0",
+            Language::Java,
+            true,
+        );
+
+        // Should skip - Java is NOT an always_pinned language
+        assert_eq!(judge.should_skip(&dep), Some(SkipReason::Pinned));
+    }
+
+    #[test]
+    fn test_judge_go_pinned_without_include_pinned_flag() {
+        // Go dependencies should be updated even without --include-pinned
+        let filter = UpdateFilter::new(); // include_pinned = false
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_dependency("github.com/gin-gonic/gin", "1.9.0", Language::Go, true);
+        let versions = vec![make_version_info("1.10.0", 10)];
+
+        let result = judge.judge(&dep, &versions);
+        // Should update because Go is always_pinned language
+        assert!(result.is_update());
+        if let UpdateResult::Update { new_version, .. } = result {
+            assert_eq!(new_version, "1.10.0");
+        }
+    }
+
+    #[test]
+    fn test_judge_java_pinned_without_include_pinned_flag() {
+        // Java/Gradle supports version ranges, so pinned deps should be skipped
+        // without --include-pinned flag
+        let filter = UpdateFilter::new(); // include_pinned = false
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_dependency(
+            "org.springframework:spring-core",
+            "6.0.0",
+            Language::Java,
+            true,
+        );
+        let versions = vec![make_version_info("6.1.0", 10)];
+
+        let result = judge.judge(&dep, &versions);
+        // Should skip because Java is NOT always_pinned and include_pinned = false
+        assert!(result.is_skip());
+        if let UpdateResult::Skip { reason, .. } = result {
+            assert_eq!(reason, SkipReason::Pinned);
+        }
     }
 
     #[test]

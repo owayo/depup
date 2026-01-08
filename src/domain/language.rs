@@ -75,6 +75,19 @@ impl Language {
             Language::Java,
         ]
     }
+
+    /// Returns true if this language only supports pinned/exact versions
+    ///
+    /// Go doesn't have range specifiers in go.mod - all versions are
+    /// effectively pinned. For this language, `--include-pinned` should
+    /// be implicitly enabled.
+    ///
+    /// Note: Java/Gradle does support version ranges (Maven-style ranges,
+    /// prefix versions like `1.+`, dynamic versions like `latest.release`),
+    /// so it is NOT included here.
+    pub fn always_pinned(&self) -> bool {
+        matches!(self, Language::Go)
+    }
 }
 
 impl fmt::Display for Language {
@@ -208,5 +221,21 @@ mod tests {
 
         let lang: Language = serde_json::from_str("\"java\"").unwrap();
         assert_eq!(lang, Language::Java);
+    }
+
+    #[test]
+    fn test_always_pinned() {
+        // Go only supports exact/pinned versions (no range syntax in go.mod)
+        assert!(Language::Go.always_pinned());
+
+        // Java/Gradle supports version ranges (Maven-style, prefix versions, dynamic versions)
+        assert!(!Language::Java.always_pinned());
+
+        // Other languages also support range specifiers
+        assert!(!Language::Node.always_pinned());
+        assert!(!Language::Python.always_pinned());
+        assert!(!Language::Rust.always_pinned());
+        assert!(!Language::Ruby.always_pinned());
+        assert!(!Language::Php.always_pinned());
     }
 }
