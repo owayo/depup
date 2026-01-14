@@ -286,4 +286,26 @@ mod tests {
     fn test_language() {
         assert_eq!(PythonVersionParser.language(), Language::Python);
     }
+
+    #[test]
+    fn test_parse_range_extracts_first_version() {
+        let spec = parse(">=3.5.0,<4.0.0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.raw, ">=3.5.0,<4.0.0");
+        assert_eq!(spec.version, "3.5.0"); // 最初のバージョンが抽出される
+    }
+
+    #[test]
+    fn test_format_updated_range_has_no_prefix_suffix() {
+        // Range型はprefix/suffixが設定されていないため、
+        // format_updatedは新バージョンのみを返す（これは期待される動作）
+        // 呼び出し側でRange型を特別に処理する必要がある
+        let spec = parse(">=3.5.0,<4.0.0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert!(spec.prefix.is_none());
+        assert!(spec.suffix.is_none());
+        // 注意: Range型のformat_updatedは不完全な結果を返すため、
+        // 呼び出し側（pyproject_toml.rs）でRange型を特別に処理している
+        assert_eq!(spec.format_updated("4.0.0"), "4.0.0");
+    }
 }

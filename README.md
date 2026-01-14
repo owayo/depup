@@ -202,6 +202,19 @@ depup preserves the original version range format:
 ">=1.0.0" → ">=2.0.0" (range preserved)
 ```
 
+### Range Constraints (Python)
+
+depup respects compound version constraints with upper bounds:
+
+```
+">=3.5.0,<4.0.0"  → preserved as-is, only updates within bounds
+```
+
+When a dependency has an upper bound constraint (e.g., `<4.0.0`), depup will:
+- **Not propose** versions that exceed the upper bound (4.0.0 won't be suggested)
+- **Preserve** the original constraint format in the manifest file
+- **Only update** within the specified range if a newer compatible version exists
+
 ## Age Filter
 
 The `--age` option ensures stability by only updating to versions that have been released for a certain period:

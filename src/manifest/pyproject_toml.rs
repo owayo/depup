@@ -8,7 +8,7 @@
 //! - tool.poetry.dev-dependencies (Poetry)
 //! - tool.rye.dev-dependencies (Rye)
 
-use crate::domain::{Dependency, Language};
+use crate::domain::{Dependency, Language, VersionSpecKind};
 use crate::error::ManifestError;
 use crate::manifest::ManifestParser;
 use crate::parser::{get_parser, VersionParser};
@@ -224,7 +224,12 @@ impl ManifestParser for PyprojectTomlParser {
 
                     if pkg_name == package && !version_part.is_empty() {
                         if let Some(spec) = parser.parse(version_part) {
-                            let new_ver = spec.format_updated(new_version);
+                            // Range型（>=X,<Y）は複合制約のため元の指定子をそのまま保持
+                            let new_ver = if spec.kind == VersionSpecKind::Range {
+                                version_part.to_string()
+                            } else {
+                                spec.format_updated(new_version)
+                            };
                             let new_dep = format!("{}{}", package, new_ver);
                             result = result
                                 .replace(&format!(r#""{full_dep}""#), &format!(r#""{new_dep}""#));
@@ -554,5 +559,90 @@ dev-dependencies = [
     #[test]
     fn test_language() {
         assert_eq!(PyprojectTomlParser.language(), Language::Python);
+    }
+
+    #[test]
+    fn test_parse_pep508_range_version() {
+        let content = r#"
+[project]
+dependencies = [
+    "paramiko>=3.5.0,<4.0.0",
+]
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "paramiko");
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Range);
+        assert_eq!(deps[0].version_spec.raw, ">=3.5.0,<4.0.0");
+    }
+
+    #[test]
+    fn test_update_pep508_range_preserves_constraint() {
+        // Range型（>=X,<Y）は複合制約のため更新時に元の指定子を保持すべき
+        let content = r#"
+[project]
+dependencies = [
+    "paramiko>=3.5.0,<4.0.0",
+]
+"#;
+
+        let result = PyprojectTomlParser
+            .update_version(content, "paramiko", "4.0.0")
+            .unwrap();
+
+        // Range型は元の指定子が保持されるべき
+        assert!(
+            result.contains("paramiko>=3.5.0,<4.0.0"),
+            "Range constraint should be preserved, got: {}",
+            result
+        );
+        // バグの症状: パッケージ名とバージョンがくっついてしまう
+        assert!(
+            !result.contains("paramiko4.0.0"),
+            "Version should not be concatenated with package name"
+        );
+    }
+
+    #[test]
+    fn test_update_pep508_range_with_space() {
+        let content = r#"
+[project]
+dependencies = [
+    "requests>=2.0, <3.0",
+]
+"#;
+
+        let result = PyprojectTomlParser
+            .update_version(content, "requests", "2.31.0")
+            .unwrap();
+
+        // Range型は元の指定子が保持されるべき
+        assert!(
+            result.contains("requests>=2.0, <3.0"),
+            "Range constraint with space should be preserved, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_update_pep508_simple_gte_still_works() {
+        // 単純な>=指定子は通常通り更新されるべき
+        let content = r#"
+[project]
+dependencies = [
+    "requests>=2.28.0",
+]
+"#;
+
+        let result = PyprojectTomlParser
+            .update_version(content, "requests", "2.31.0")
+            .unwrap();
+
+        assert!(
+            result.contains("requests>=2.31.0"),
+            "Simple >= constraint should be updated, got: {}",
+            result
+        );
     }
 }

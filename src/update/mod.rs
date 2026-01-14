@@ -11,8 +11,22 @@ mod version_info;
 pub use filter::UpdateFilter;
 pub use version_info::{compare_versions, is_prerelease_version, VersionInfo};
 
-use crate::domain::{Dependency, SkipReason, UpdateResult};
+use crate::domain::{Dependency, SkipReason, UpdateResult, VersionSpecKind};
 use chrono::{DateTime, Utc};
+use regex::Regex;
+use std::sync::LazyLock;
+
+/// Regex to extract upper bound from Range constraint (e.g., ">=3.5.0,<4.0.0" -> "4.0.0")
+static UPPER_BOUND_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<(\d+(?:\.\d+)*)").unwrap());
+
+/// Extract upper bound version from a Range constraint string
+/// e.g., ">=3.5.0,<4.0.0" -> Some("4.0.0")
+fn extract_upper_bound(raw: &str) -> Option<String> {
+    UPPER_BOUND_RE
+        .captures(raw)
+        .and_then(|caps| caps.get(1))
+        .map(|m| m.as_str().to_string())
+}
 
 /// Update judgment engine that decides whether to update a dependency
 pub struct UpdateJudge {
@@ -100,7 +114,7 @@ impl UpdateJudge {
         };
 
         // Filter versions by age if specified
-        let eligible_versions: Vec<&VersionInfo> = if let Some(min_age) = self.filter.min_age {
+        let age_filtered: Vec<&VersionInfo> = if let Some(min_age) = self.filter.min_age {
             let min_release_time = self.now - chrono::Duration::from_std(min_age).unwrap();
             stable_versions
                 .into_iter()
@@ -109,6 +123,25 @@ impl UpdateJudge {
         } else {
             stable_versions
         };
+
+        // Filter versions by Range constraint upper bound if applicable
+        // e.g., for ">=3.5.0,<4.0.0", exclude versions >= 4.0.0
+        let eligible_versions: Vec<&VersionInfo> =
+            if dependency.version_spec.kind == VersionSpecKind::Range {
+                if let Some(upper_bound) = extract_upper_bound(&dependency.version_spec.raw) {
+                    age_filtered
+                        .into_iter()
+                        .filter(|v| {
+                            version_info::compare_versions(&v.version, &upper_bound)
+                                == std::cmp::Ordering::Less
+                        })
+                        .collect()
+                } else {
+                    age_filtered
+                }
+            } else {
+                age_filtered
+            };
 
         if eligible_versions.is_empty() {
             return UpdateResult::skip(dependency.clone(), SkipReason::NoSuitableVersion);
@@ -625,6 +658,128 @@ mod tests {
         assert!(result.is_skip());
         if let UpdateResult::Skip { reason, .. } = result {
             assert_eq!(reason, SkipReason::AlreadyLatest);
+        }
+    }
+
+    #[test]
+    fn test_extract_upper_bound() {
+        // Test the helper function for extracting upper bound from Range constraint
+        assert_eq!(
+            super::extract_upper_bound(">=3.5.0,<4.0.0"),
+            Some("4.0.0".to_string())
+        );
+        assert_eq!(
+            super::extract_upper_bound(">=1.0,<2.0"),
+            Some("2.0".to_string())
+        );
+        assert_eq!(
+            super::extract_upper_bound(">=1.0, <2.0"),
+            Some("2.0".to_string())
+        );
+        // No upper bound
+        assert_eq!(super::extract_upper_bound(">=1.0"), None);
+        // Only lower bound with >
+        assert_eq!(super::extract_upper_bound(">1.0"), None);
+    }
+
+    fn make_range_dependency(
+        name: &str,
+        raw: &str,
+        version: &str,
+        language: Language,
+    ) -> Dependency {
+        let spec = VersionSpec::new(VersionSpecKind::Range, raw, version);
+        Dependency::new(name, spec, false, language)
+    }
+
+    #[test]
+    fn test_judge_range_respects_upper_bound() {
+        // Regression test: paramiko>=3.5.0,<4.0.0 should NOT update to 4.0.0
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_range_dependency("paramiko", ">=3.5.0,<4.0.0", "3.5.0", Language::Python);
+        let versions = vec![
+            make_version_info("3.5.0", 100),
+            make_version_info("3.6.0", 50),
+            make_version_info("3.9.0", 20),
+            make_version_info("4.0.0", 10), // Should be excluded by upper bound
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_update());
+        if let UpdateResult::Update { new_version, .. } = result {
+            // Should update to 3.9.0, NOT 4.0.0
+            assert_eq!(new_version, "3.9.0");
+        }
+    }
+
+    #[test]
+    fn test_judge_range_already_at_max_within_bound() {
+        // If already at latest version within bound, should skip
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_range_dependency("paramiko", ">=3.5.0,<4.0.0", "3.9.0", Language::Python);
+        let versions = vec![
+            make_version_info("3.5.0", 100),
+            make_version_info("3.9.0", 20), // current version
+            make_version_info("4.0.0", 10), // excluded by upper bound
+            make_version_info("4.1.0", 5),  // excluded by upper bound
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        // Should skip because 3.9.0 is the latest within the bound
+        assert!(result.is_skip());
+        if let UpdateResult::Skip { reason, .. } = result {
+            assert_eq!(reason, SkipReason::AlreadyLatest);
+        }
+    }
+
+    #[test]
+    fn test_judge_range_no_suitable_version_all_above_bound() {
+        // If all newer versions are above the upper bound, no suitable version
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_range_dependency("package", ">=1.0,<2.0", "1.0", Language::Python);
+        let versions = vec![
+            make_version_info("1.0", 100), // current version
+            make_version_info("2.0", 50),  // excluded by upper bound
+            make_version_info("3.0", 20),  // excluded by upper bound
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        // Should skip - no version available within bounds that's newer
+        assert!(result.is_skip());
+        if let UpdateResult::Skip { reason, .. } = result {
+            assert_eq!(reason, SkipReason::AlreadyLatest);
+        }
+    }
+
+    #[test]
+    fn test_judge_range_without_upper_bound_updates_normally() {
+        // Range without upper bound (just >=) should update to latest
+        // Note: This is technically not a proper Range in our parser,
+        // but testing defensive behavior
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        // Create a Range spec without upper bound (edge case)
+        let spec = VersionSpec::new(VersionSpecKind::Range, ">=1.0", "1.0");
+        let dep = Dependency::new("package", spec, false, Language::Python);
+
+        let versions = vec![
+            make_version_info("1.0", 100),
+            make_version_info("2.0", 50),
+            make_version_info("3.0", 20),
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_update());
+        if let UpdateResult::Update { new_version, .. } = result {
+            // Should update to latest since no upper bound
+            assert_eq!(new_version, "3.0");
         }
     }
 }
