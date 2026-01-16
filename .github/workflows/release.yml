@@ -85,74 +85,9 @@ jobs:
           echo "🧪 Dry run mode - skipping commit and tag"
           echo "Would release: ${{ steps.bump.outputs.tag }}"
 
-  create-release:
-    name: Create Release
+  build:
+    name: Build
     needs: prepare-release
-    if: ${{ !inputs.dry_run }}
-    runs-on: ubuntu-latest
-    outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.prepare-release.outputs.tag }}
-
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ needs.prepare-release.outputs.tag }}
-          release_name: ${{ needs.prepare-release.outputs.tag }}
-          body: |
-            ## depup ${{ needs.prepare-release.outputs.version }}
-
-            Multi-language dependency updater CLI tool.
-
-            ### Supported Languages
-            - Node.js (package.json)
-            - Python (pyproject.toml)
-            - Rust (Cargo.toml)
-            - Go (go.mod)
-
-            ### Installation
-
-            Download the appropriate binary for your platform and add it to your PATH.
-
-            #### macOS (Apple Silicon)
-            ```bash
-            curl -L https://github.com/${{ github.repository }}/releases/download/${{ needs.prepare-release.outputs.tag }}/depup-aarch64-apple-darwin.tar.gz | tar xz
-            sudo mv depup /usr/local/bin/
-            ```
-
-            #### macOS (Intel)
-            ```bash
-            curl -L https://github.com/${{ github.repository }}/releases/download/${{ needs.prepare-release.outputs.tag }}/depup-x86_64-apple-darwin.tar.gz | tar xz
-            sudo mv depup /usr/local/bin/
-            ```
-
-            #### Linux (x86_64)
-            ```bash
-            curl -L https://github.com/${{ github.repository }}/releases/download/${{ needs.prepare-release.outputs.tag }}/depup-x86_64-unknown-linux-gnu.tar.gz | tar xz
-            sudo mv depup /usr/local/bin/
-            ```
-
-            #### Linux (ARM64)
-            ```bash
-            curl -L https://github.com/${{ github.repository }}/releases/download/${{ needs.prepare-release.outputs.tag }}/depup-aarch64-unknown-linux-gnu.tar.gz | tar xz
-            sudo mv depup /usr/local/bin/
-            ```
-
-            #### Windows
-            Download `depup-x86_64-pc-windows-msvc.zip`, extract, and add to PATH.
-
-          draft: false
-          prerelease: false
-
-  build-and-upload:
-    name: Build and Upload
-    needs: [prepare-release, create-release]
     if: ${{ !inputs.dry_run }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -229,19 +164,93 @@ jobs:
           7z a ../../../${{ matrix.asset_name }} ${{ matrix.artifact_name }}
           cd ../../..
 
-      - name: Upload Release Asset
-        uses: actions/upload-release-asset@v1
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}
+          retention-days: 1
+
+  release:
+    name: Create Release
+    needs: [prepare-release, build]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec mv {} release-assets/ \;
+          ls -la release-assets/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare-release.outputs.tag }}
+          name: ${{ needs.prepare-release.outputs.tag }}
+          body: |
+            ## depup ${{ needs.prepare-release.outputs.version }}
+
+            Multi-language dependency updater CLI tool.
+
+            ### Supported Languages
+            - Node.js (package.json)
+            - Python (pyproject.toml)
+            - Rust (Cargo.toml)
+            - Go (go.mod)
+
+            ### Installation
+
+            #### Homebrew (macOS/Linux)
+            ```bash
+            brew install owayo/depup/depup
+            ```
+
+            #### Manual Download
+
+            Download the appropriate binary for your platform and add it to your PATH.
+
+            **macOS (Apple Silicon)**
+            ```bash
+            curl -L https://github.com/${{ github.repository }}/releases/download/${{ needs.prepare-release.outputs.tag }}/depup-aarch64-apple-darwin.tar.gz | tar xz
+            sudo mv depup /usr/local/bin/
+            ```
+
+            **macOS (Intel)**
+            ```bash
+            curl -L https://github.com/${{ github.repository }}/releases/download/${{ needs.prepare-release.outputs.tag }}/depup-x86_64-apple-darwin.tar.gz | tar xz
+            sudo mv depup /usr/local/bin/
+            ```
+
+            **Linux (x86_64)**
+            ```bash
+            curl -L https://github.com/${{ github.repository }}/releases/download/${{ needs.prepare-release.outputs.tag }}/depup-x86_64-unknown-linux-gnu.tar.gz | tar xz
+            sudo mv depup /usr/local/bin/
+            ```
+
+            **Linux (ARM64)**
+            ```bash
+            curl -L https://github.com/${{ github.repository }}/releases/download/${{ needs.prepare-release.outputs.tag }}/depup-aarch64-unknown-linux-gnu.tar.gz | tar xz
+            sudo mv depup /usr/local/bin/
+            ```
+
+            **Windows**
+            Download `depup-x86_64-pc-windows-msvc.zip`, extract, and add to PATH.
+
+          draft: false
+          prerelease: false
+          files: release-assets/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./${{ matrix.asset_name }}
-          asset_name: ${{ matrix.asset_name }}
-          asset_content_type: application/octet-stream
 
   update-homebrew:
     name: Update Homebrew Tap
-    needs: [prepare-release, build-and-upload]
+    needs: [prepare-release, release]
     if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     steps:
@@ -331,7 +340,7 @@ jobs:
 
   release-summary:
     name: Release Summary
-    needs: [prepare-release, build-and-upload, update-homebrew]
+    needs: [prepare-release, release, update-homebrew]
     if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     steps:
