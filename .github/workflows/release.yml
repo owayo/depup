@@ -60,7 +60,8 @@ jobs:
           NEW_VERSION="${YEAR}.${MONTH}.${NEW_COUNTER}"
           echo "New version: ${NEW_VERSION}"
 
-          sed -i "s/^version = \"[^\"]*\"/version = \"${NEW_VERSION}\"/" Cargo.toml
+          # Only replace the first occurrence (package version, not dependency versions)
+          sed -i "0,/^version = \"[^\"]*\"/s//version = \"${NEW_VERSION}\"/" Cargo.toml
 
           if [ -f "Cargo.lock" ]; then
             cargo generate-lockfile 2>/dev/null || true
@@ -86,7 +87,7 @@ jobs:
           echo "Would release: ${{ steps.bump.outputs.tag }}"
 
   build:
-    name: Build
+    name: Build (${{ matrix.target }})
     needs: prepare-release
     if: ${{ !inputs.dry_run }}
     runs-on: ${{ matrix.os }}
@@ -169,7 +170,6 @@ jobs:
         with:
           name: ${{ matrix.asset_name }}
           path: ${{ matrix.asset_name }}
-          retention-days: 1
 
   release:
     name: Create Release
@@ -182,11 +182,11 @@ jobs:
         with:
           path: artifacts
 
-      - name: Prepare release assets
+      - name: Prepare release files
         run: |
-          mkdir -p release-assets
-          find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec mv {} release-assets/ \;
-          ls -la release-assets/
+          mkdir -p release
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec mv {} release/ \;
+          ls -la release/
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -198,12 +198,6 @@ jobs:
 
             Multi-language dependency updater CLI tool.
 
-            ### Supported Languages
-            - Node.js (package.json)
-            - Python (pyproject.toml)
-            - Rust (Cargo.toml)
-            - Go (go.mod)
-
             ### Installation
 
             #### Homebrew (macOS/Linux)
@@ -212,39 +206,38 @@ jobs:
             ```
 
             #### Manual Download
-
             Download the appropriate binary for your platform and add it to your PATH.
 
-            **macOS (Apple Silicon)**
+            #### macOS (Apple Silicon)
             ```bash
             curl -L https://github.com/${{ github.repository }}/releases/download/${{ needs.prepare-release.outputs.tag }}/depup-aarch64-apple-darwin.tar.gz | tar xz
             sudo mv depup /usr/local/bin/
             ```
 
-            **macOS (Intel)**
+            #### macOS (Intel)
             ```bash
             curl -L https://github.com/${{ github.repository }}/releases/download/${{ needs.prepare-release.outputs.tag }}/depup-x86_64-apple-darwin.tar.gz | tar xz
             sudo mv depup /usr/local/bin/
             ```
 
-            **Linux (x86_64)**
+            #### Linux (x86_64)
             ```bash
             curl -L https://github.com/${{ github.repository }}/releases/download/${{ needs.prepare-release.outputs.tag }}/depup-x86_64-unknown-linux-gnu.tar.gz | tar xz
             sudo mv depup /usr/local/bin/
             ```
 
-            **Linux (ARM64)**
+            #### Linux (ARM64)
             ```bash
             curl -L https://github.com/${{ github.repository }}/releases/download/${{ needs.prepare-release.outputs.tag }}/depup-aarch64-unknown-linux-gnu.tar.gz | tar xz
             sudo mv depup /usr/local/bin/
             ```
 
-            **Windows**
+            #### Windows
             Download `depup-x86_64-pc-windows-msvc.zip`, extract, and add to PATH.
 
+          files: release/*
           draft: false
           prerelease: false
-          files: release-assets/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -264,58 +257,69 @@ jobs:
 
       - name: Download and Calculate SHA256
         id: sha256
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG="${{ needs.prepare-release.outputs.tag }}"
-          REPO="${{ github.repository }}"
-
-          # Download each asset and calculate SHA256
-          for asset in "depup-aarch64-apple-darwin.tar.gz" "depup-x86_64-apple-darwin.tar.gz" "depup-aarch64-unknown-linux-gnu.tar.gz" "depup-x86_64-unknown-linux-gnu.tar.gz"; do
-            echo "Downloading ${asset}..."
-            curl -sL "https://github.com/${REPO}/releases/download/${TAG}/${asset}" -o "${asset}"
-            sha=$(sha256sum "${asset}" | cut -d' ' -f1)
-            name=$(echo "${asset}" | sed 's/depup-//' | sed 's/.tar.gz//' | tr '-' '_')
-            echo "sha256_${name}=${sha}" >> $GITHUB_OUTPUT
-            echo "${asset}: ${sha}"
-          done
-
-      - name: Checkout Homebrew Tap
-        uses: actions/checkout@v4
-        with:
-          repository: owayo/homebrew-depup
-          token: ${{ steps.app-token.outputs.token }}
-          path: homebrew-tap
-
-      - name: Update Formula
         run: |
           VERSION="${{ needs.prepare-release.outputs.version }}"
           TAG="${{ needs.prepare-release.outputs.tag }}"
 
-          cat > homebrew-tap/Formula/depup.rb << 'EOF'
+          # Download tarballs and calculate SHA256
+          curl -sL "https://github.com/${{ github.repository }}/releases/download/${TAG}/depup-aarch64-apple-darwin.tar.gz" -o arm64.tar.gz
+          curl -sL "https://github.com/${{ github.repository }}/releases/download/${TAG}/depup-x86_64-apple-darwin.tar.gz" -o x86_64.tar.gz
+          curl -sL "https://github.com/${{ github.repository }}/releases/download/${TAG}/depup-x86_64-unknown-linux-gnu.tar.gz" -o linux_x86_64.tar.gz
+          curl -sL "https://github.com/${{ github.repository }}/releases/download/${TAG}/depup-aarch64-unknown-linux-gnu.tar.gz" -o linux_arm64.tar.gz
+
+          SHA256_ARM64=$(sha256sum arm64.tar.gz | cut -d' ' -f1)
+          SHA256_X86_64=$(sha256sum x86_64.tar.gz | cut -d' ' -f1)
+          SHA256_LINUX_X86_64=$(sha256sum linux_x86_64.tar.gz | cut -d' ' -f1)
+          SHA256_LINUX_ARM64=$(sha256sum linux_arm64.tar.gz | cut -d' ' -f1)
+
+          echo "sha256_arm64=${SHA256_ARM64}" >> $GITHUB_OUTPUT
+          echo "sha256_x86_64=${SHA256_X86_64}" >> $GITHUB_OUTPUT
+          echo "sha256_linux_x86_64=${SHA256_LINUX_X86_64}" >> $GITHUB_OUTPUT
+          echo "sha256_linux_arm64=${SHA256_LINUX_ARM64}" >> $GITHUB_OUTPUT
+
+      - name: Update Homebrew Formula
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          VERSION="${{ needs.prepare-release.outputs.version }}"
+          TAG="${{ needs.prepare-release.outputs.tag }}"
+          SHA256_ARM64="${{ steps.sha256.outputs.sha256_arm64 }}"
+          SHA256_X86_64="${{ steps.sha256.outputs.sha256_x86_64 }}"
+          SHA256_LINUX_X86_64="${{ steps.sha256.outputs.sha256_linux_x86_64 }}"
+          SHA256_LINUX_ARM64="${{ steps.sha256.outputs.sha256_linux_arm64 }}"
+
+          # Clone homebrew tap
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/owayo/homebrew-depup.git"
+          cd homebrew-depup
+
+          # Create Formula directory if not exists
+          mkdir -p Formula
+
+          # Create/update formula
+          cat > Formula/depup.rb << 'FORMULA'
           class Depup < Formula
             desc "Multi-language dependency updater CLI tool"
             homepage "https://github.com/owayo/depup"
-            version "${{ needs.prepare-release.outputs.version }}"
+            version "VERSION_PLACEHOLDER"
             license "MIT"
 
             on_macos do
               if Hardware::CPU.arm?
-                url "https://github.com/owayo/depup/releases/download/${{ needs.prepare-release.outputs.tag }}/depup-aarch64-apple-darwin.tar.gz"
-                sha256 "${{ steps.sha256.outputs.sha256_aarch64_apple_darwin }}"
+                url "URL_ARM64_PLACEHOLDER"
+                sha256 "SHA256_ARM64_PLACEHOLDER"
               else
-                url "https://github.com/owayo/depup/releases/download/${{ needs.prepare-release.outputs.tag }}/depup-x86_64-apple-darwin.tar.gz"
-                sha256 "${{ steps.sha256.outputs.sha256_x86_64_apple_darwin }}"
+                url "URL_X86_64_PLACEHOLDER"
+                sha256 "SHA256_X86_64_PLACEHOLDER"
               end
             end
 
             on_linux do
               if Hardware::CPU.arm?
-                url "https://github.com/owayo/depup/releases/download/${{ needs.prepare-release.outputs.tag }}/depup-aarch64-unknown-linux-gnu.tar.gz"
-                sha256 "${{ steps.sha256.outputs.sha256_aarch64_unknown_linux_gnu }}"
+                url "URL_LINUX_ARM64_PLACEHOLDER"
+                sha256 "SHA256_LINUX_ARM64_PLACEHOLDER"
               else
-                url "https://github.com/owayo/depup/releases/download/${{ needs.prepare-release.outputs.tag }}/depup-x86_64-unknown-linux-gnu.tar.gz"
-                sha256 "${{ steps.sha256.outputs.sha256_x86_64_unknown_linux_gnu }}"
+                url "URL_LINUX_X86_64_PLACEHOLDER"
+                sha256 "SHA256_LINUX_X86_64_PLACEHOLDER"
               end
             end
 
@@ -327,15 +331,27 @@ jobs:
               system "#{bin}/depup", "--version"
             end
           end
-          EOF
+          FORMULA
 
-      - name: Commit and Push Formula
-        run: |
-          cd homebrew-tap
+          # Replace placeholders with actual values
+          sed -i "s|VERSION_PLACEHOLDER|${VERSION}|g" Formula/depup.rb
+          sed -i "s|URL_ARM64_PLACEHOLDER|https://github.com/owayo/depup/releases/download/${TAG}/depup-aarch64-apple-darwin.tar.gz|g" Formula/depup.rb
+          sed -i "s|SHA256_ARM64_PLACEHOLDER|${SHA256_ARM64}|g" Formula/depup.rb
+          sed -i "s|URL_X86_64_PLACEHOLDER|https://github.com/owayo/depup/releases/download/${TAG}/depup-x86_64-apple-darwin.tar.gz|g" Formula/depup.rb
+          sed -i "s|SHA256_X86_64_PLACEHOLDER|${SHA256_X86_64}|g" Formula/depup.rb
+          sed -i "s|URL_LINUX_ARM64_PLACEHOLDER|https://github.com/owayo/depup/releases/download/${TAG}/depup-aarch64-unknown-linux-gnu.tar.gz|g" Formula/depup.rb
+          sed -i "s|SHA256_LINUX_ARM64_PLACEHOLDER|${SHA256_LINUX_ARM64}|g" Formula/depup.rb
+          sed -i "s|URL_LINUX_X86_64_PLACEHOLDER|https://github.com/owayo/depup/releases/download/${TAG}/depup-x86_64-unknown-linux-gnu.tar.gz|g" Formula/depup.rb
+          sed -i "s|SHA256_LINUX_X86_64_PLACEHOLDER|${SHA256_LINUX_X86_64}|g" Formula/depup.rb
+
+          # Remove leading spaces from heredoc
+          sed -i 's/^          //' Formula/depup.rb
+
+          # Commit and push
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/depup.rb
-          git commit -m "Update depup to ${{ needs.prepare-release.outputs.version }}"
+          git commit -m "Update depup to ${TAG}"
           git push
 
   release-summary:
