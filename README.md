@@ -79,6 +79,12 @@
 
 ## Installation
 
+### Homebrew (macOS/Linux)
+
+```bash
+brew install owayo/depup/depup
+```
+
 ### From Source
 
 ```bash
