@@ -125,6 +125,7 @@ depup [OPTIONS] [PATH]
 
 | オプション | 短縮形 | 説明 |
 |-----------|-------|------|
+| `--cd <DIR>` | `-C` | 指定ディレクトリに移動してから実行 |
 | `--dry-run` | `-n` | 変更せずに更新内容を表示 |
 | `--verbose` | | 詳細出力を有効化 |
 | `--quiet` | `-q` | 最小限の出力 |
@@ -171,6 +172,9 @@ depup --json
 
 # 更新後にnpm installを実行
 depup --node --install
+
+# 別のディレクトリで実行
+depup --cd ./projects/myapp -n
 ```
 
 ## バージョン処理

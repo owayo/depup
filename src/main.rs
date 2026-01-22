@@ -25,6 +25,18 @@ async fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // Change directory if --cd is specified
+    if let Some(ref dir) = args.directory {
+        if let Err(e) = std::env::set_current_dir(dir) {
+            eprintln!(
+                "Error: cannot change to directory '{}': {}",
+                dir.display(),
+                e
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+
     // Run the main logic and handle errors
     match run(args).await {
         Ok(exit_code) => exit_code,

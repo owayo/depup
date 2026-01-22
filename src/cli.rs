@@ -51,6 +51,10 @@ pub struct CliArgs {
     #[arg(default_value = ".")]
     pub path: PathBuf,
 
+    /// Change to directory before running
+    #[arg(short = 'C', long = "cd", value_name = "DIR")]
+    pub directory: Option<PathBuf>,
+
     // General options
     /// Dry run mode - show what would be updated without making changes
     #[arg(short = 'n', long)]
@@ -172,6 +176,7 @@ mod tests {
     fn test_default_args() {
         let args = CliArgs::parse_from(["depup"]);
         assert_eq!(args.path, PathBuf::from("."));
+        assert!(args.directory.is_none());
         assert!(!args.dry_run);
         assert!(!args.verbose);
         assert!(!args.quiet);
@@ -186,6 +191,27 @@ mod tests {
         assert!(!args.json);
         assert!(!args.diff);
         assert!(!args.install);
+    }
+
+    #[test]
+    fn test_cd_short_flag() {
+        let args = CliArgs::parse_from(["depup", "-C", "/some/path"]);
+        assert_eq!(args.directory, Some(PathBuf::from("/some/path")));
+        assert_eq!(args.path, PathBuf::from("."));
+    }
+
+    #[test]
+    fn test_cd_long_flag() {
+        let args = CliArgs::parse_from(["depup", "--cd", "./hoge/fuga"]);
+        assert_eq!(args.directory, Some(PathBuf::from("./hoge/fuga")));
+        assert_eq!(args.path, PathBuf::from("."));
+    }
+
+    #[test]
+    fn test_cd_with_path() {
+        let args = CliArgs::parse_from(["depup", "--cd", "/work", "./subdir"]);
+        assert_eq!(args.directory, Some(PathBuf::from("/work")));
+        assert_eq!(args.path, PathBuf::from("./subdir"));
     }
 
     #[test]

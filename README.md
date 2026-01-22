@@ -125,6 +125,7 @@ depup [OPTIONS] [PATH]
 
 | Option | Short | Description |
 |--------|-------|-------------|
+| `--cd <DIR>` | `-C` | Change to directory before running |
 | `--dry-run` | `-n` | Show what would be updated without making changes |
 | `--verbose` | | Enable verbose output |
 | `--quiet` | `-q` | Minimal output |
@@ -171,6 +172,9 @@ depup --json
 
 # Update and run npm install
 depup --node --install
+
+# Run in a different directory
+depup --cd ./projects/myapp -n
 ```
 
 ## Version Handling
