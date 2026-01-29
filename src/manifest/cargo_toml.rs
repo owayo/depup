@@ -4,6 +4,7 @@
 //! - dependencies
 //! - dev-dependencies
 //! - build-dependencies
+//! - workspace.dependencies (for Cargo workspace root)
 //! - Inline table format: { version = "1.0" }
 //! - Workspace dependencies
 
@@ -57,6 +58,13 @@ impl ManifestParser for CargoTomlParser {
                 {
                     parse_cargo_dependencies(deps, parser.as_ref(), true, &mut dependencies);
                 }
+            }
+        }
+
+        // Parse workspace.dependencies (for Cargo workspace root Cargo.toml)
+        if let Some(workspace) = toml.get("workspace").and_then(|w| w.as_table()) {
+            if let Some(deps) = workspace.get("dependencies").and_then(|d| d.as_table()) {
+                parse_cargo_dependencies(deps, parser.as_ref(), false, &mut dependencies);
             }
         }
 
@@ -115,8 +123,9 @@ impl ManifestParser for CargoTomlParser {
         // Pattern for multi-line table format:
         // [dependencies.package]
         // version = "1.0.0"
+        // Also handles [workspace.dependencies.package]
         let multiline_pattern = format!(
-            r#"(?m)(\[(?:dependencies|dev-dependencies|build-dependencies)\.{}[^\]]*\][^\[]*version\s*=\s*)"([^"]+)""#,
+            r#"(?m)(\[(?:dependencies|dev-dependencies|build-dependencies|workspace\.dependencies)\.{}[^\]]*\][^\[]*version\s*=\s*)"([^"]+)""#,
             regex::escape(package)
         );
         if let Ok(re) = Regex::new(&multiline_pattern) {
@@ -566,5 +575,236 @@ ast-parser = ["ts-parser", "ts-bash"]
         // Verify unrelated content is preserved
         assert!(result.contains("[features]"));
         assert!(result.contains("ast-parser = [\"ts-parser\", \"ts-bash\"]"));
+    }
+
+    #[test]
+    fn test_parse_workspace_dependencies() {
+        let content = r#"
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 5);
+
+        let tokio = deps.iter().find(|d| d.name == "tokio").unwrap();
+        assert_eq!(tokio.version_spec.kind, VersionSpecKind::Caret);
+        assert!(!tokio.is_dev);
+
+        let serde = deps.iter().find(|d| d.name == "serde").unwrap();
+        assert_eq!(serde.version_spec.kind, VersionSpecKind::Caret);
+
+        let serde_json = deps.iter().find(|d| d.name == "serde_json").unwrap();
+        assert_eq!(serde_json.version_spec.kind, VersionSpecKind::Caret);
+
+        let thiserror = deps.iter().find(|d| d.name == "thiserror").unwrap();
+        assert_eq!(thiserror.version_spec.kind, VersionSpecKind::Caret);
+
+        let clap = deps.iter().find(|d| d.name == "clap").unwrap();
+        assert_eq!(clap.version_spec.kind, VersionSpecKind::Caret);
+    }
+
+    #[test]
+    fn test_update_workspace_dependencies_simple() {
+        let content = r#"
+[workspace.dependencies]
+serde_json = "1"
+thiserror = "2"
+"#;
+
+        let result = CargoTomlParser
+            .update_version(content, "serde_json", "1.0.140")
+            .unwrap();
+        assert!(result.contains("serde_json = \"1.0.140\""));
+        // Ensure other dependencies are preserved
+        assert!(result.contains("thiserror = \"2\""));
+    }
+
+    #[test]
+    fn test_update_workspace_dependencies_inline_table() {
+        let content = r#"
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+"#;
+
+        let result = CargoTomlParser
+            .update_version(content, "tokio", "1.45.0")
+            .unwrap();
+        assert!(result.contains("version = \"1.45.0\""));
+        assert!(result.contains("features = [\"full\"]"));
+
+        let result = CargoTomlParser
+            .update_version(&result, "serde", "1.0.220")
+            .unwrap();
+        assert!(result.contains("serde = { version = \"1.0.220\""));
+    }
+
+    #[test]
+    fn test_update_workspace_dependencies_multiline_table() {
+        let content = r#"[workspace.dependencies.tokio]
+version = "1"
+features = ["full"]
+
+[workspace.dependencies.serde]
+version = "1"
+features = ["derive"]
+"#;
+
+        let result = CargoTomlParser
+            .update_version(content, "tokio", "1.45.0")
+            .unwrap();
+        assert!(result.contains("version = \"1.45.0\""));
+        assert!(result.contains("features = [\"full\"]"));
+
+        let result = CargoTomlParser
+            .update_version(&result, "serde", "1.0.220")
+            .unwrap();
+        assert!(result.contains("version = \"1.0.220\""));
+    }
+
+    #[test]
+    fn test_parse_full_workspace_cargo_toml() {
+        // Real-world example from the user
+        let content = r#"
+[workspace]
+resolver = "2"
+members = [
+    "crates/omni-pty-core",
+    "crates/term-ipc",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["omni-pty contributors"]
+repository = "https://github.com/omni-pty/omni-pty"
+
+[workspace.dependencies]
+# Core dependencies
+portable-pty = "0.9"
+vte = "0.15"
+tokio = { version = "1", features = ["full"] }
+kdl = "4"
+
+# Utilities
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+parking_lot = "0.12"
+log = "0.4"
+libc = "0.2"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Testing
+tokio-test = "0.4"
+
+# Swift FFI
+swift-bridge = "0.1"
+swift-bridge-build = "0.1"
+"#;
+
+        let deps = parse(content).unwrap();
+        // Should parse all workspace.dependencies (16 total)
+        assert_eq!(deps.len(), 16);
+
+        // Verify some specific dependencies
+        let portable_pty = deps.iter().find(|d| d.name == "portable-pty").unwrap();
+        assert_eq!(portable_pty.version_spec.version, "0.9");
+
+        let tokio = deps.iter().find(|d| d.name == "tokio").unwrap();
+        assert_eq!(tokio.version_spec.version, "1");
+
+        let uuid = deps.iter().find(|d| d.name == "uuid").unwrap();
+        assert_eq!(uuid.version_spec.version, "1");
+
+        let swift_bridge = deps.iter().find(|d| d.name == "swift-bridge").unwrap();
+        assert_eq!(swift_bridge.version_spec.version, "0.1");
+    }
+
+    #[test]
+    fn test_update_full_workspace_cargo_toml() {
+        let content = r#"
+[workspace]
+resolver = "2"
+members = ["crates/core"]
+
+[workspace.dependencies]
+portable-pty = "0.9"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+"#;
+
+        // Update simple format
+        let result = CargoTomlParser
+            .update_version(content, "portable-pty", "0.10.0")
+            .unwrap();
+        assert!(result.contains("portable-pty = \"0.10.0\""));
+
+        // Update inline table format
+        let result = CargoTomlParser
+            .update_version(&result, "tokio", "1.45.0")
+            .unwrap();
+        assert!(result.contains("version = \"1.45.0\""));
+        assert!(result.contains("features = [\"full\"]"));
+
+        // Verify workspace metadata is preserved
+        assert!(result.contains("resolver = \"2\""));
+        assert!(result.contains("members = [\"crates/core\"]"));
+    }
+
+    #[test]
+    fn test_parse_workspace_with_regular_dependencies() {
+        // Workspace root with both workspace.dependencies and regular dependencies
+        let content = r#"
+[workspace]
+resolver = "2"
+members = ["crates/cli"]
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = "1"
+
+[dependencies]
+clap = "4"
+
+[dev-dependencies]
+criterion = "0.5"
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 4);
+
+        // Workspace dependencies
+        let tokio = deps.iter().find(|d| d.name == "tokio").unwrap();
+        assert!(!tokio.is_dev);
+
+        let serde = deps.iter().find(|d| d.name == "serde").unwrap();
+        assert!(!serde.is_dev);
+
+        // Regular dependencies
+        let clap = deps.iter().find(|d| d.name == "clap").unwrap();
+        assert!(!clap.is_dev);
+
+        // Dev dependencies
+        let criterion = deps.iter().find(|d| d.name == "criterion").unwrap();
+        assert!(criterion.is_dev);
     }
 }
