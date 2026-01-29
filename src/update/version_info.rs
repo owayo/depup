@@ -94,6 +94,7 @@ impl PartialOrd for VersionInfo {
 }
 
 /// Compare two version strings using semver-like rules
+/// Missing parts are treated as 0 (e.g., "1.0" == "1.0.0")
 pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
     let parse_parts = |s: &str| -> Vec<u64> {
         // Remove leading 'v' if present
@@ -105,16 +106,19 @@ pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
     let parts_a = parse_parts(a);
     let parts_b = parse_parts(b);
 
-    // Compare each part
-    for (pa, pb) in parts_a.iter().zip(parts_b.iter()) {
-        match pa.cmp(pb) {
+    let max_len = parts_a.len().max(parts_b.len());
+
+    // Compare each part, treating missing parts as 0
+    for i in 0..max_len {
+        let pa = parts_a.get(i).copied().unwrap_or(0);
+        let pb = parts_b.get(i).copied().unwrap_or(0);
+        match pa.cmp(&pb) {
             std::cmp::Ordering::Equal => continue,
             other => return other,
         }
     }
 
-    // If all common parts are equal, the longer version is greater
-    parts_a.len().cmp(&parts_b.len())
+    std::cmp::Ordering::Equal
 }
 
 #[cfg(test)]
@@ -188,8 +192,32 @@ mod tests {
     fn test_version_comparison_different_lengths() {
         let v1 = VersionInfo::now("1.0");
         let v2 = VersionInfo::now("1.0.0");
-        // 1.0 is considered less than 1.0.0 (fewer parts)
-        assert!(v1 < v2);
+        // 1.0 is equivalent to 1.0.0 (missing parts are treated as 0)
+        assert_eq!(v1.cmp(&v2), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn test_version_comparison_semver_equivalence() {
+        // Test various semver-equivalent versions
+        assert_eq!(
+            compare_versions("0.15", "0.15.0"),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(compare_versions("1", "1.0"), std::cmp::Ordering::Equal);
+        assert_eq!(compare_versions("1", "1.0.0"), std::cmp::Ordering::Equal);
+        assert_eq!(
+            compare_versions("2.0", "2.0.0.0"),
+            std::cmp::Ordering::Equal
+        );
+
+        // But different versions should still be different
+        assert_eq!(compare_versions("0.15", "0.15.1"), std::cmp::Ordering::Less);
+        assert_eq!(
+            compare_versions("0.16", "0.15.1"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(compare_versions("1", "1.0.1"), std::cmp::Ordering::Less);
+        assert_eq!(compare_versions("2", "1.9.9"), std::cmp::Ordering::Greater);
     }
 
     #[test]

@@ -782,4 +782,47 @@ mod tests {
             assert_eq!(new_version, "3.0");
         }
     }
+
+    #[test]
+    fn test_judge_short_version_equivalent_to_full() {
+        // Regression test: "0.15" should be considered equal to "0.15.0"
+        // So if current version is "0.15" and latest is "0.15.0", it's AlreadyLatest
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        // Simulate vte = "0.15" where latest is 0.15.0
+        let dep = make_dependency("vte", "0.15", Language::Rust, false);
+        let versions = vec![
+            make_version_info("0.14.0", 100),
+            make_version_info("0.15.0", 50), // latest, but equivalent to current "0.15"
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        // Should skip because 0.15 == 0.15.0
+        assert!(result.is_skip());
+        if let UpdateResult::Skip { reason, .. } = result {
+            assert_eq!(reason, SkipReason::AlreadyLatest);
+        }
+    }
+
+    #[test]
+    fn test_judge_short_version_can_still_update() {
+        // But if there's a newer version, short versions should still update
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        // Simulate tokio = "1" where latest is 1.49.0
+        let dep = make_dependency("tokio", "1", Language::Rust, false);
+        let versions = vec![
+            make_version_info("1.0.0", 200),
+            make_version_info("1.48.0", 50),
+            make_version_info("1.49.0", 20),
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_update());
+        if let UpdateResult::Update { new_version, .. } = result {
+            assert_eq!(new_version, "1.49.0");
+        }
+    }
 }
