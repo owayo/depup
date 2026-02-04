@@ -17,6 +17,7 @@ use crate::registry::{
     CratesIoAdapter, GoProxyAdapter, HttpClient, MavenCentralAdapter, NpmAdapter, PackagistAdapter,
     PyPIAdapter, RegistryAdapter, RubyGemsAdapter,
 };
+use crate::tauri_sync::{TauriVersionSync, TAURI_CRATE, TAURI_NPM_PACKAGES};
 use crate::update::{UpdateFilter, UpdateJudge, VersionInfo};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -222,6 +223,15 @@ impl Orchestrator {
         }
         progress.finish_and_clear();
 
+        // Step 3.5: Synchronize Tauri versions if this is a Tauri project
+        let is_tauri = manifests.iter().any(|m| m.is_tauri_rust);
+        if is_tauri {
+            progress.spinner("Synchronizing Tauri versions...");
+            self.synchronize_tauri_versions(&mut summary, &mut errors)
+                .await;
+            progress.finish_and_clear();
+        }
+
         // Step 4: Apply updates (unless dry-run)
         if !self.args.dry_run {
             progress.spinner("Writing updates...");
@@ -345,6 +355,170 @@ impl Orchestrator {
             .fetch_versions(package)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    /// Synchronize Tauri package versions (@tauri-apps/api, @tauri-apps/cli, and tauri crate)
+    ///
+    /// Ensures all packages have matching major.minor versions to prevent
+    /// Tauri build errors.
+    async fn synchronize_tauri_versions(
+        &self,
+        summary: &mut UpdateSummary,
+        errors: &mut Vec<OrchestratorError>,
+    ) {
+        use crate::tauri_sync::extract_major_minor;
+
+        // Find all Tauri npm packages in Node manifests
+        // Returns: Vec<(manifest_idx, result_idx, result, current_version)>
+        let npm_packages: Vec<(usize, usize, UpdateResult, String)> = summary
+            .manifests
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.language == Language::Node)
+            .flat_map(|(mi, m)| {
+                m.results
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| TAURI_NPM_PACKAGES.contains(&r.package_name()))
+                    .map(move |(ri, r)| {
+                        let current = r.dependency().version().to_string();
+                        (mi, ri, r.clone(), current)
+                    })
+            })
+            .collect();
+
+        // Find tauri crate in Rust manifests
+        let crate_info: Option<(usize, usize, UpdateResult, String)> = summary
+            .manifests
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.language == Language::Rust)
+            .flat_map(|(mi, m)| {
+                m.results
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| r.package_name() == TAURI_CRATE)
+                    .map(move |(ri, r)| {
+                        let current = r.dependency().version().to_string();
+                        (mi, ri, r.clone(), current)
+                    })
+            })
+            .next();
+
+        // If no tauri packages found at all, nothing to sync
+        if npm_packages.is_empty() && crate_info.is_none() {
+            return;
+        }
+
+        // Get the crate's target version (either from update or current)
+        let _crate_target = crate_info.as_ref().map(|(_, _, r, current)| match r {
+            UpdateResult::Update { new_version, .. } => new_version.clone(),
+            _ => current.clone(),
+        });
+
+        // Get first npm package's current version for reference
+        let npm_current = npm_packages.first().map(|(_, _, _, v)| v.as_str());
+
+        // Determine effective versions (after any pending updates)
+        let npm_effective = npm_packages.first().map(|(_, _, r, current)| match r {
+            UpdateResult::Update { new_version, .. } => new_version.as_str(),
+            _ => current.as_str(),
+        });
+
+        let crate_effective = crate_info.as_ref().map(|(_, _, r, current)| match r {
+            UpdateResult::Update { new_version, .. } => new_version.as_str(),
+            _ => current.as_str(),
+        });
+
+        // Check if versions already match - if so, no sync needed
+        if let (Some(npm_v), Some(crate_v)) = (npm_effective, crate_effective) {
+            if let (Some(npm_mm), Some(crate_mm)) =
+                (extract_major_minor(npm_v), extract_major_minor(crate_v))
+            {
+                if npm_mm == crate_mm {
+                    return;
+                }
+            }
+        }
+
+        // Versions don't match - need to sync
+
+        // Fetch versions from both registries
+        let npm_adapter = self.get_adapter(Language::Node);
+        let crate_adapter = self.get_adapter(Language::Rust);
+
+        // Use first npm package name for version fetch (they all share versions)
+        let npm_pkg_name = TAURI_NPM_PACKAGES[0];
+        let npm_versions = match self.fetch_versions(&*npm_adapter, npm_pkg_name).await {
+            Ok(v) => v,
+            Err(e) => {
+                errors.push(OrchestratorError::RegistryError {
+                    package: npm_pkg_name.to_string(),
+                    message: format!("Failed to fetch for Tauri sync: {}", e),
+                });
+                return;
+            }
+        };
+
+        let crate_versions = match self.fetch_versions(&*crate_adapter, TAURI_CRATE).await {
+            Ok(v) => v,
+            Err(e) => {
+                errors.push(OrchestratorError::RegistryError {
+                    package: TAURI_CRATE.to_string(),
+                    message: format!("Failed to fetch for Tauri sync: {}", e),
+                });
+                return;
+            }
+        };
+
+        // Create sync helper and get synchronized versions
+        let sync = TauriVersionSync::new(npm_versions, crate_versions);
+
+        let npm_update_result = npm_packages.first().map(|(_, _, r, _)| r);
+        let crate_update_result = crate_info.as_ref().map(|(_, _, r, _)| r);
+
+        let (npm_target_version, crate_target_version) = sync.synchronize_with_current(
+            npm_current,
+            npm_update_result,
+            crate_info.as_ref().map(|(_, _, _, v)| v.as_str()),
+            crate_update_result,
+        );
+
+        // Apply npm version adjustments to all Tauri npm packages
+        if let Some(ref target) = npm_target_version {
+            for (manifest_idx, result_idx, original, _current) in &npm_packages {
+                match original {
+                    UpdateResult::Update { dependency, .. } => {
+                        // Adjust existing update
+                        let adjusted = UpdateResult::update(dependency.clone(), target);
+                        summary.manifests[*manifest_idx].results[*result_idx] = adjusted;
+                    }
+                    UpdateResult::Skip { dependency, .. } => {
+                        // Create new update from skip
+                        let adjusted = UpdateResult::update(dependency.clone(), target);
+                        summary.manifests[*manifest_idx].results[*result_idx] = adjusted;
+                        summary.manifests[*manifest_idx].modified = true;
+                    }
+                }
+            }
+        }
+
+        // Apply crate version adjustment
+        if let Some(ref target) = crate_target_version {
+            if let Some((manifest_idx, result_idx, original, _)) = crate_info {
+                match original {
+                    UpdateResult::Update { dependency, .. } => {
+                        let adjusted = UpdateResult::update(dependency, target);
+                        summary.manifests[manifest_idx].results[result_idx] = adjusted;
+                    }
+                    UpdateResult::Skip { dependency, .. } => {
+                        let adjusted = UpdateResult::update(dependency, target);
+                        summary.manifests[manifest_idx].results[result_idx] = adjusted;
+                        summary.manifests[manifest_idx].modified = true;
+                    }
+                }
+            }
+        }
     }
 }
 

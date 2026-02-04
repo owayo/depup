@@ -2,8 +2,8 @@
 //!
 //! Handles version formats:
 //! - Exact: `1.2.3`
-//! - Caret: `^1.2.3`
-//! - Tilde: `~1.2.3`
+//! - Caret: `^1.2.3`, `^1.2`, `^1`
+//! - Tilde: `~1.2.3`, `~1.2`, `~1`
 //! - Comparison: `>=1.2.3`, `>1.2.3`, `<=1.2.3`, `<1.2.3`
 //! - Wildcard: `*`, `1.x`, `1.2.*`
 //! - Range: `>=1.0.0 <2.0.0`, `1.0.0 - 2.0.0`
@@ -16,19 +16,42 @@ use std::sync::LazyLock;
 /// Node.js version specification parser
 pub struct NodeVersionParser;
 
+/// Normalize partial version to full semver (e.g., "2" -> "2.0.0", "2.1" -> "2.1.0")
+fn normalize_version(version: &str) -> String {
+    // Handle prerelease suffix
+    let (base, prerelease) = if let Some(idx) = version.find('-') {
+        (&version[..idx], Some(&version[idx..]))
+    } else {
+        (version, None)
+    };
+
+    let parts: Vec<&str> = base.split('.').collect();
+    let normalized = match parts.len() {
+        1 => format!("{}.0.0", parts[0]),
+        2 => format!("{}.{}.0", parts[0], parts[1]),
+        _ => base.to_string(),
+    };
+
+    match prerelease {
+        Some(pre) => format!("{}{}", normalized, pre),
+        None => normalized,
+    }
+}
+
 // Regex patterns for Node.js version specifications
+// These patterns accept partial versions (e.g., ^2, ~2.1)
 static CARET_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\^(\d+\.\d+\.\d+(?:-[\w.]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^\^(\d+(?:\.\d+)?(?:\.\d+)?(?:-[\w.]+)?)$").unwrap());
 static TILDE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^~(\d+\.\d+\.\d+(?:-[\w.]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^~(\d+(?:\.\d+)?(?:\.\d+)?(?:-[\w.]+)?)$").unwrap());
 static GTE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^>=(\d+\.\d+\.\d+(?:-[\w.]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^>=(\d+(?:\.\d+)?(?:\.\d+)?(?:-[\w.]+)?)$").unwrap());
 static GT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^>(\d+\.\d+\.\d+(?:-[\w.]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^>(\d+(?:\.\d+)?(?:\.\d+)?(?:-[\w.]+)?)$").unwrap());
 static LTE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^<=(\d+\.\d+\.\d+(?:-[\w.]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^<=(\d+(?:\.\d+)?(?:\.\d+)?(?:-[\w.]+)?)$").unwrap());
 static LT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^<(\d+\.\d+\.\d+(?:-[\w.]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^<(\d+(?:\.\d+)?(?:\.\d+)?(?:-[\w.]+)?)$").unwrap());
 static EXACT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(\d+\.\d+\.\d+(?:-[\w.]+)?)$").unwrap());
 static WILDCARD_RE: LazyLock<Regex> =
@@ -46,50 +69,50 @@ impl VersionParser for NodeVersionParser {
             return None;
         }
 
-        // Check for caret range (^1.2.3)
+        // Check for caret range (^1.2.3, ^1.2, ^1)
         if let Some(caps) = CARET_RE.captures(trimmed) {
-            let version = caps.get(1)?.as_str();
+            let version = normalize_version(caps.get(1)?.as_str());
             return Some(
                 VersionSpec::new(VersionSpecKind::Caret, trimmed, version).with_prefix("^"),
             );
         }
 
-        // Check for tilde range (~1.2.3)
+        // Check for tilde range (~1.2.3, ~1.2, ~1)
         if let Some(caps) = TILDE_RE.captures(trimmed) {
-            let version = caps.get(1)?.as_str();
+            let version = normalize_version(caps.get(1)?.as_str());
             return Some(
                 VersionSpec::new(VersionSpecKind::Tilde, trimmed, version).with_prefix("~"),
             );
         }
 
-        // Check for greater than or equal (>=1.2.3)
+        // Check for greater than or equal (>=1.2.3, >=1.2, >=1)
         if let Some(caps) = GTE_RE.captures(trimmed) {
-            let version = caps.get(1)?.as_str();
+            let version = normalize_version(caps.get(1)?.as_str());
             return Some(
                 VersionSpec::new(VersionSpecKind::GreaterOrEqual, trimmed, version)
                     .with_prefix(">="),
             );
         }
 
-        // Check for greater than (>1.2.3)
+        // Check for greater than (>1.2.3, >1.2, >1)
         if let Some(caps) = GT_RE.captures(trimmed) {
-            let version = caps.get(1)?.as_str();
+            let version = normalize_version(caps.get(1)?.as_str());
             return Some(
                 VersionSpec::new(VersionSpecKind::Greater, trimmed, version).with_prefix(">"),
             );
         }
 
-        // Check for less than or equal (<=1.2.3)
+        // Check for less than or equal (<=1.2.3, <=1.2, <=1)
         if let Some(caps) = LTE_RE.captures(trimmed) {
-            let version = caps.get(1)?.as_str();
+            let version = normalize_version(caps.get(1)?.as_str());
             return Some(
                 VersionSpec::new(VersionSpecKind::LessOrEqual, trimmed, version).with_prefix("<="),
             );
         }
 
-        // Check for less than (<1.2.3)
+        // Check for less than (<1.2.3, <1.2, <1)
         if let Some(caps) = LT_RE.captures(trimmed) {
-            let version = caps.get(1)?.as_str();
+            let version = normalize_version(caps.get(1)?.as_str());
             return Some(
                 VersionSpec::new(VersionSpecKind::Less, trimmed, version).with_prefix("<"),
             );
@@ -180,12 +203,47 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_caret_major_only() {
+        let spec = parse("^2").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Caret);
+        assert_eq!(spec.version, "2.0.0");
+        assert_eq!(spec.raw, "^2");
+        assert_eq!(spec.prefix, Some("^".to_string()));
+        assert!(!spec.is_pinned());
+    }
+
+    #[test]
+    fn test_parse_caret_major_minor() {
+        let spec = parse("^2.1").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Caret);
+        assert_eq!(spec.version, "2.1.0");
+        assert_eq!(spec.raw, "^2.1");
+        assert_eq!(spec.prefix, Some("^".to_string()));
+    }
+
+    #[test]
     fn test_parse_tilde() {
         let spec = parse("~1.2.3").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Tilde);
         assert_eq!(spec.version, "1.2.3");
         assert_eq!(spec.prefix, Some("~".to_string()));
         assert!(!spec.is_pinned());
+    }
+
+    #[test]
+    fn test_parse_tilde_major_only() {
+        let spec = parse("~2").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Tilde);
+        assert_eq!(spec.version, "2.0.0");
+        assert_eq!(spec.raw, "~2");
+    }
+
+    #[test]
+    fn test_parse_tilde_major_minor() {
+        let spec = parse("~2.1").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Tilde);
+        assert_eq!(spec.version, "2.1.0");
+        assert_eq!(spec.raw, "~2.1");
     }
 
     #[test]
@@ -292,6 +350,18 @@ mod tests {
     fn test_format_updated_exact() {
         let spec = parse("1.2.3").unwrap();
         assert_eq!(spec.format_updated("2.0.0"), "2.0.0");
+    }
+
+    #[test]
+    fn test_format_updated_caret_partial() {
+        let spec = parse("^2").unwrap();
+        assert_eq!(spec.format_updated("2.10.0"), "^2.10.0");
+    }
+
+    #[test]
+    fn test_format_updated_tilde_partial() {
+        let spec = parse("~2.1").unwrap();
+        assert_eq!(spec.format_updated("2.2.0"), "~2.2.0");
     }
 
     #[test]

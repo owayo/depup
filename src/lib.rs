@@ -17,4 +17,5 @@ pub mod package_manager;
 pub mod parser;
 pub mod progress;
 pub mod registry;
+pub mod tauri_sync;
 pub mod update;

@@ -316,6 +316,22 @@ depup detects `pnpm-workspace.yaml` and processes all workspace packages.
 
 depup automatically detects `src-tauri/Cargo.toml` in Tauri projects.
 
+#### Tauri Version Synchronization
+
+Tauri projects require the npm `@tauri-apps/api` package and the Rust `tauri` crate to have matching major/minor versions. depup automatically synchronizes these versions to prevent build errors.
+
+```
+# Error example (version mismatch)
+Found version mismatched Tauri packages:
+  tauri (v2.10.1) : @tauri-apps/api (v2.9.1)
+
+# depup automatically synchronizes versions
+@tauri-apps/api: 2.9.1 → 2.10.0
+tauri: 2.9.0 → 2.10.1
+```
+
+Both packages are automatically adjusted to the same major.minor version (e.g., 2.10.x).
+
 ## Build
 
 ```bash
