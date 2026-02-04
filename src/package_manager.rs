@@ -122,6 +122,11 @@ impl SystemPackageManager {
         None
     }
 
+    /// Detect if this is a Tauri project (has src-tauri/Cargo.toml)
+    fn detect_tauri_project(&self, working_dir: &Path) -> bool {
+        working_dir.join("src-tauri/Cargo.toml").exists()
+    }
+
     /// Get the install command for a package manager
     fn get_install_command(&self, pm: &str) -> Vec<&'static str> {
         match pm {
@@ -137,7 +142,7 @@ impl SystemPackageManager {
             "rye" => vec!["rye", "sync"],
             "pipenv" => vec!["pipenv", "install"],
             // Rust
-            "cargo" => vec!["cargo", "build"],
+            "cargo" => vec!["cargo", "update"],
             // Go
             "go" => vec!["go", "mod", "download"],
             // Ruby
@@ -169,40 +174,50 @@ impl SystemPackageManager {
 
 impl PackageManagerRunner for SystemPackageManager {
     fn run_install(&self, language: Language, working_dir: &Path) -> InstallResult {
-        let pm = match language {
-            Language::Node => self.detect_node_pm(working_dir),
-            Language::Python => self.detect_python_pm(working_dir),
+        // For Rust in Tauri projects, use src-tauri directory
+        let (effective_dir, pm) = match language {
+            Language::Node => (working_dir.to_path_buf(), self.detect_node_pm(working_dir)),
+            Language::Python => (
+                working_dir.to_path_buf(),
+                self.detect_python_pm(working_dir),
+            ),
             Language::Rust => {
-                if working_dir.join("Cargo.toml").exists() {
-                    Some("cargo")
+                // Check for Tauri project first
+                if self.detect_tauri_project(working_dir) {
+                    (working_dir.join("src-tauri"), Some("cargo"))
+                } else if working_dir.join("Cargo.toml").exists() {
+                    (working_dir.to_path_buf(), Some("cargo"))
                 } else {
-                    None
+                    (working_dir.to_path_buf(), None)
                 }
             }
             Language::Go => {
-                if working_dir.join("go.mod").exists() {
+                let pm = if working_dir.join("go.mod").exists() {
                     Some("go")
                 } else {
                     None
-                }
+                };
+                (working_dir.to_path_buf(), pm)
             }
             Language::Ruby => {
-                if working_dir.join("Gemfile").exists() {
+                let pm = if working_dir.join("Gemfile").exists() {
                     Some("bundle")
                 } else {
                     None
-                }
+                };
+                (working_dir.to_path_buf(), pm)
             }
             Language::Php => {
-                if working_dir.join("composer.json").exists() {
+                let pm = if working_dir.join("composer.json").exists() {
                     Some("composer")
                 } else {
                     None
-                }
+                };
+                (working_dir.to_path_buf(), pm)
             }
             Language::Java => {
                 // Prefer gradlew if available, fallback to gradle
-                if working_dir.join("gradlew").exists() {
+                let pm = if working_dir.join("gradlew").exists() {
                     Some("./gradlew")
                 } else if working_dir.join("build.gradle").exists()
                     || working_dir.join("build.gradle.kts").exists()
@@ -210,7 +225,8 @@ impl PackageManagerRunner for SystemPackageManager {
                     Some("gradle")
                 } else {
                     None
-                }
+                };
+                (working_dir.to_path_buf(), pm)
             }
         };
 
@@ -225,7 +241,7 @@ impl PackageManagerRunner for SystemPackageManager {
 
         let command_str = command_parts.join(" ");
 
-        match self.run_command(&command_parts, working_dir) {
+        match self.run_command(&command_parts, &effective_dir) {
             Ok(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout).to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -381,7 +397,7 @@ mod tests {
     fn test_get_install_command_cargo() {
         let pm = SystemPackageManager::new();
         let cmd = pm.get_install_command("cargo");
-        assert_eq!(cmd, vec!["cargo", "build"]);
+        assert_eq!(cmd, vec!["cargo", "update"]);
     }
 
     #[test]
@@ -514,5 +530,32 @@ mod tests {
         let result = pm.run_install(Language::Node, temp_dir.path());
         assert!(result.success);
         assert!(result.command.is_empty());
+    }
+
+    #[test]
+    fn test_detect_tauri_project_true() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp_dir.path().join("src-tauri")).unwrap();
+        std::fs::write(temp_dir.path().join("src-tauri/Cargo.toml"), "[package]").unwrap();
+
+        let pm = SystemPackageManager::new();
+        assert!(pm.detect_tauri_project(temp_dir.path()));
+    }
+
+    #[test]
+    fn test_detect_tauri_project_false() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let pm = SystemPackageManager::new();
+        assert!(!pm.detect_tauri_project(temp_dir.path()));
+    }
+
+    #[test]
+    fn test_detect_tauri_project_no_cargo_toml() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp_dir.path().join("src-tauri")).unwrap();
+
+        let pm = SystemPackageManager::new();
+        assert!(!pm.detect_tauri_project(temp_dir.path()));
     }
 }
