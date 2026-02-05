@@ -473,4 +473,97 @@ require github.com/gin-gonic/gin v1.9.1
     fn test_language() {
         assert_eq!(GoModParser.language(), Language::Go);
     }
+
+    #[test]
+    fn test_parse_ignores_exclude() {
+        // exclude directives should not be parsed as dependencies
+        let content = r#"
+module example.com/myproject
+
+go 1.21
+
+require github.com/gin-gonic/gin v1.9.1
+
+exclude github.com/bad/pkg v1.2.3
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "github.com/gin-gonic/gin");
+    }
+
+    #[test]
+    fn test_parse_ignores_exclude_block() {
+        // exclude blocks should not be parsed as dependencies
+        let content = r#"
+module example.com/myproject
+
+go 1.21
+
+require github.com/gin-gonic/gin v1.9.1
+
+exclude (
+	github.com/bad/pkg v1.2.3
+	github.com/old/module v0.1.0
+)
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "github.com/gin-gonic/gin");
+    }
+
+    #[test]
+    fn test_parse_ignores_retract() {
+        // retract directives should not be parsed as dependencies
+        let content = r#"
+module example.com/myproject
+
+go 1.21
+
+require github.com/gin-gonic/gin v1.9.1
+
+retract v1.0.0
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "github.com/gin-gonic/gin");
+    }
+
+    #[test]
+    fn test_parse_mixed_directives() {
+        // All non-require directives should be ignored
+        let content = r#"
+module example.com/myproject
+
+go 1.21
+
+require (
+	github.com/gin-gonic/gin v1.9.1
+	github.com/stretchr/testify v1.8.4
+)
+
+replace github.com/foo/bar => ../bar
+
+exclude github.com/bad/pkg v1.2.3
+
+retract (
+	v1.0.0
+	[v1.1.0, v1.2.0]
+)
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_require_with_tabs_and_spaces() {
+        // Mixed whitespace should be handled
+        let content = "module example.com/myproject\n\ngo 1.21\n\nrequire (\n\tgithub.com/gin-gonic/gin v1.9.1\n    github.com/pkg/errors v0.9.1\n)";
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 2);
+    }
 }

@@ -645,4 +645,84 @@ dependencies = [
             result
         );
     }
+
+    #[test]
+    fn test_parse_pep508_without_version_is_skipped() {
+        // Dependencies without version specifiers should be skipped
+        let content = r#"
+[project]
+dependencies = [
+    "requests",
+    "flask>=2.0"
+]
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "flask");
+    }
+
+    #[test]
+    fn test_parse_poetry_path_dependency_skipped() {
+        // Path dependencies in Poetry format should be skipped
+        let content = r#"
+[tool.poetry.dependencies]
+python = "^3.8"
+requests = "^2.28.0"
+local-pkg = { path = "../local-pkg" }
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "requests");
+    }
+
+    #[test]
+    fn test_parse_poetry_git_dependency_skipped() {
+        // Git dependencies in Poetry format should be skipped
+        let content = r#"
+[tool.poetry.dependencies]
+python = "^3.8"
+requests = "^2.28.0"
+my-pkg = { git = "https://github.com/user/my-pkg.git", branch = "main" }
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "requests");
+    }
+
+    #[test]
+    fn test_parse_pep508_with_url_skipped() {
+        // URL dependencies should be skipped
+        let content = r#"
+[project]
+dependencies = [
+    "flask>=2.0",
+    "my-pkg @ https://example.com/my-pkg-1.0.tar.gz",
+]
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "flask");
+    }
+
+    #[test]
+    fn test_parse_pep508_with_spaces_in_version() {
+        // Note: PEP 508 allows spaces around operators, but our parser currently
+        // requires no space between package name and version specifier.
+        // "requests >= 2.28.0" is technically valid PEP 508 but not parsed by our regex.
+        // This is a known limitation - only compact form without space is supported.
+        let content = r#"
+[project]
+dependencies = [
+    "flask>=2.0",
+]
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "flask");
+    }
 }

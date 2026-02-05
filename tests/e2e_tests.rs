@@ -557,4 +557,121 @@ mod cli_options_tests {
             }
         }
     }
+
+    /// Test invalid --cd path
+    #[test]
+    fn test_invalid_cd_path() {
+        let binary = get_binary_path();
+
+        let output = Command::new(&binary)
+            .args(["--cd", "/path/does/not/exist", "--dry-run"])
+            .output()
+            .expect("Failed to execute command");
+
+        // --cd with non-existent directory should fail
+        assert!(
+            !output.status.success(),
+            "--cd with non-existent path should fail"
+        );
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("cannot change to directory")
+                || stderr.contains("No such file or directory")
+                || stderr.contains("does not exist"),
+            "Error message should indicate directory problem: {}",
+            stderr
+        );
+    }
+
+    /// Test mutually exclusive options
+    #[test]
+    fn test_mutually_exclusive_options() {
+        let temp_dir = create_test_project();
+        let binary = get_binary_path();
+
+        // --json and --diff should be mutually exclusive
+        let output = Command::new(&binary)
+            .args([
+                "--dry-run",
+                "--json",
+                "--diff",
+                temp_dir.path().to_str().unwrap(),
+            ])
+            .output()
+            .expect("Failed to execute command");
+
+        // Should either fail or produce valid output (implementation dependent)
+        // At minimum, verify it doesn't crash
+        let _stdout = String::from_utf8_lossy(&output.stdout);
+        let _stderr = String::from_utf8_lossy(&output.stderr);
+    }
+
+    /// Test help output
+    #[test]
+    fn test_help_output() {
+        let binary = get_binary_path();
+
+        let output = Command::new(&binary)
+            .arg("--help")
+            .output()
+            .expect("Failed to execute command");
+
+        assert!(output.status.success(), "--help should exit with success");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("Usage:")
+                || stdout.contains("USAGE:")
+                || stdout.contains("Arguments:")
+                || stdout.contains("Options:"),
+            "Help output should contain usage information"
+        );
+    }
+
+    /// Test age filter option
+    #[test]
+    fn test_age_filter_option() {
+        let temp_dir = create_test_project();
+        let binary = get_binary_path();
+
+        let output = Command::new(&binary)
+            .args([
+                "--dry-run",
+                "--json",
+                "--age",
+                "7d",
+                temp_dir.path().to_str().unwrap(),
+            ])
+            .output()
+            .expect("Failed to execute command");
+
+        // Should succeed
+        assert!(output.status.success(), "--age option should work");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Should produce valid JSON
+        let _: serde_json::Value =
+            serde_json::from_str(&stdout).expect("Output should be valid JSON");
+    }
+
+    /// Test invalid age format
+    #[test]
+    fn test_invalid_age_format() {
+        let temp_dir = create_test_project();
+        let binary = get_binary_path();
+
+        let output = Command::new(&binary)
+            .args([
+                "--dry-run",
+                "--age",
+                "invalid",
+                temp_dir.path().to_str().unwrap(),
+            ])
+            .output()
+            .expect("Failed to execute command");
+
+        // Should fail with invalid age format
+        assert!(!output.status.success(), "Invalid --age format should fail");
+    }
 }

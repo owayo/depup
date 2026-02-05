@@ -412,4 +412,83 @@ mod tests {
         let result = fs::read_to_string(&path).unwrap();
         assert_eq!(result, content);
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_apply_updates_write_permission_denied() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = TempDir::new().unwrap();
+        let original_content = r#"{
+  "dependencies": {
+    "lodash": "^4.17.21"
+  }
+}"#;
+        let path = create_temp_package_json(&temp_dir, original_content);
+
+        // Make file read-only
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o444);
+        fs::set_permissions(&path, perms).unwrap();
+
+        let mut manifest_result = ManifestUpdateResult::new(&path, Language::Node);
+        let dep = sample_dependency("lodash", "4.17.21", Language::Node);
+        manifest_result.add_result(UpdateResult::update(dep, "4.18.0"));
+
+        let writer = ManifestWriter::new(false);
+        let parser = crate::manifest::PackageJsonParser;
+        let result = writer.apply_updates(&manifest_result, &parser);
+
+        // Restore permissions for cleanup
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&path, perms).unwrap();
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ManifestError::WriteError { .. } => {}
+            e => panic!("Expected WriteError, got: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_apply_all_updates_empty() {
+        let writer = ManifestWriter::new(false);
+        let results =
+            writer.apply_all_updates(&[], |_| Box::new(crate::manifest::PackageJsonParser));
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_apply_all_updates_skips_no_updates() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = create_temp_package_json(&temp_dir, r#"{"dependencies": {}}"#);
+
+        // ManifestUpdateResult with no updates
+        let manifest_result = ManifestUpdateResult::new(&path, Language::Node);
+
+        let writer = ManifestWriter::new(false);
+        let results = writer.apply_all_updates(&[manifest_result], |_| {
+            Box::new(crate::manifest::PackageJsonParser)
+        });
+
+        // Should skip manifests with no updates
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_apply_all_updates_handles_missing_file() {
+        let mut manifest_result =
+            ManifestUpdateResult::new("/nonexistent/path/package.json", Language::Node);
+        let dep = sample_dependency("lodash", "4.17.21", Language::Node);
+        manifest_result.add_result(UpdateResult::update(dep, "4.18.0"));
+
+        let writer = ManifestWriter::new(false);
+        let results = writer.apply_all_updates(&[manifest_result], |_| {
+            Box::new(crate::manifest::PackageJsonParser)
+        });
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].has_errors());
+    }
 }

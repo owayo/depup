@@ -805,3 +805,189 @@ mod registry_response_parsing {
         assert_eq!(normalize("1.0.0"), "1.0.0"); // no v prefix
     }
 }
+
+mod pipeline_tests {
+    use super::*;
+    use chrono::Utc;
+    use depup::domain::ManifestUpdateResult;
+    use depup::manifest::{detect_manifests, get_parser, ManifestWriter};
+    use depup::update::{UpdateFilter, UpdateJudge, VersionInfo};
+
+    /// Test full pipeline: detect -> parse -> judge -> write (without network)
+    #[test]
+    fn test_pipeline_updates_manifest_file() {
+        let dir = create_test_dir();
+        let path = dir.path().join("package.json");
+        fs::write(
+            &path,
+            r#"{
+  "dependencies": {
+    "lodash": "^4.17.21"
+  }
+}"#,
+        )
+        .unwrap();
+
+        // Step 1: Detect manifests
+        let manifests = detect_manifests(dir.path());
+        assert_eq!(manifests.len(), 1);
+
+        // Step 2: Parse dependencies
+        let parser = get_parser(manifests[0].language);
+        let content = fs::read_to_string(&path).unwrap();
+        let deps = parser.parse(&content).unwrap();
+        assert_eq!(deps.len(), 1);
+
+        // Step 3: Simulate version info (without network)
+        let versions = vec![
+            VersionInfo::new("4.17.21", Utc::now() - chrono::Duration::days(100)),
+            VersionInfo::new("4.18.0", Utc::now() - chrono::Duration::days(10)),
+        ];
+
+        // Step 4: Judge update
+        let judge = UpdateJudge::new(UpdateFilter::new());
+        let result = judge.judge(&deps[0], &versions);
+
+        // Step 5: Apply update
+        let mut manifest_result = ManifestUpdateResult::new(&path, manifests[0].language);
+        manifest_result.add_result(result);
+
+        let writer = ManifestWriter::new(false);
+        let write_result = writer
+            .apply_updates(&manifest_result, parser.as_ref())
+            .unwrap();
+
+        assert_eq!(write_result.updates_applied, 1);
+        assert!(write_result.file_modified);
+
+        // Verify file content changed
+        let updated = fs::read_to_string(&path).unwrap();
+        assert!(updated.contains("^4.18.0"));
+    }
+
+    /// Test pipeline with multiple languages
+    #[test]
+    fn test_pipeline_multi_language() {
+        let dir = create_test_dir();
+
+        // Create package.json
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies": {"lodash": "^4.17.21"}}"#,
+        )
+        .unwrap();
+
+        // Create Cargo.toml
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            r#"[package]
+name = "test"
+version = "0.1.0"
+
+[dependencies]
+serde = "1.0.0"
+"#,
+        )
+        .unwrap();
+
+        // Detect all manifests
+        let manifests = detect_manifests(dir.path());
+        assert_eq!(manifests.len(), 2);
+
+        // Verify both languages detected
+        let languages: Vec<_> = manifests.iter().map(|m| m.language).collect();
+        assert!(languages.contains(&depup::domain::Language::Node));
+        assert!(languages.contains(&depup::domain::Language::Rust));
+    }
+
+    /// Test pipeline preserves file format
+    #[test]
+    fn test_pipeline_preserves_formatting() {
+        let dir = create_test_dir();
+        let path = dir.path().join("package.json");
+
+        // Original content with specific formatting
+        let original_content = r#"{
+  "name": "test-package",
+  "version": "1.0.0",
+  "dependencies": {
+    "zod": "^3.0.0",
+    "axios": "^1.0.0",
+    "lodash": "^4.17.21"
+  }
+}"#;
+        fs::write(&path, original_content).unwrap();
+
+        let manifests = detect_manifests(dir.path());
+        let parser = get_parser(manifests[0].language);
+        let content = fs::read_to_string(&path).unwrap();
+        let deps = parser.parse(&content).unwrap();
+
+        // Find lodash dependency
+        let lodash = deps.iter().find(|d| d.name == "lodash").unwrap();
+
+        let versions = vec![
+            VersionInfo::new("4.17.21", Utc::now() - chrono::Duration::days(100)),
+            VersionInfo::new("4.18.0", Utc::now() - chrono::Duration::days(10)),
+        ];
+
+        let judge = UpdateJudge::new(UpdateFilter::new());
+        let result = judge.judge(lodash, &versions);
+
+        let mut manifest_result = ManifestUpdateResult::new(&path, manifests[0].language);
+        manifest_result.add_result(result);
+
+        let writer = ManifestWriter::new(false);
+        writer
+            .apply_updates(&manifest_result, parser.as_ref())
+            .unwrap();
+
+        let updated = fs::read_to_string(&path).unwrap();
+
+        // Verify key order preserved (zod before axios before lodash)
+        let zod_pos = updated.find("\"zod\"").unwrap();
+        let axios_pos = updated.find("\"axios\"").unwrap();
+        let lodash_pos = updated.find("\"lodash\"").unwrap();
+        assert!(zod_pos < axios_pos, "zod should come before axios");
+        assert!(axios_pos < lodash_pos, "axios should come before lodash");
+    }
+
+    /// Test pipeline dry-run doesn't modify files
+    #[test]
+    fn test_pipeline_dry_run_no_modification() {
+        let dir = create_test_dir();
+        let path = dir.path().join("package.json");
+        let original_content = r#"{"dependencies": {"lodash": "^4.17.21"}}"#;
+        fs::write(&path, original_content).unwrap();
+
+        let manifests = detect_manifests(dir.path());
+        let parser = get_parser(manifests[0].language);
+        let content = fs::read_to_string(&path).unwrap();
+        let deps = parser.parse(&content).unwrap();
+
+        let versions = vec![
+            VersionInfo::new("4.17.21", Utc::now() - chrono::Duration::days(100)),
+            VersionInfo::new("4.18.0", Utc::now() - chrono::Duration::days(10)),
+        ];
+
+        let judge = UpdateJudge::new(UpdateFilter::new());
+        let result = judge.judge(&deps[0], &versions);
+
+        let mut manifest_result = ManifestUpdateResult::new(&path, manifests[0].language);
+        manifest_result.add_result(result);
+
+        // Use dry-run mode
+        let writer = ManifestWriter::dry_run();
+        let write_result = writer
+            .apply_updates(&manifest_result, parser.as_ref())
+            .unwrap();
+
+        // Update should be counted but file not modified
+        assert_eq!(write_result.updates_applied, 1);
+        assert!(!write_result.file_modified);
+
+        // Verify file unchanged
+        let after = fs::read_to_string(&path).unwrap();
+        assert_eq!(after, original_content);
+    }
+}

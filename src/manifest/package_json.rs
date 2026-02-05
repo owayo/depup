@@ -358,4 +358,99 @@ mod tests {
         // Should preserve the original spacing around the colon
         assert!(result.contains("\"lodash\" : \"^4.18.0\""));
     }
+
+    #[test]
+    fn test_parse_ignores_non_string_versions() {
+        // Non-string version values (objects, numbers, booleans, null) should be ignored
+        let content = r#"{
+            "dependencies": {
+                "lodash": "^4.17.21",
+                "local": { "path": "../local" },
+                "num": 1,
+                "flag": true,
+                "nil": null
+            }
+        }"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "lodash");
+    }
+
+    #[test]
+    fn test_parse_ignores_link_protocol() {
+        // link: protocol dependencies should be ignored
+        let content = r#"{
+            "dependencies": {
+                "lodash": "^4.17.21",
+                "local-pkg": "link:../packages/local"
+            }
+        }"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "lodash");
+    }
+
+    #[test]
+    fn test_parse_ignores_file_protocol() {
+        // file: protocol dependencies should be ignored
+        let content = r#"{
+            "dependencies": {
+                "express": "^4.18.0",
+                "my-local": "file:../my-local"
+            }
+        }"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "express");
+    }
+
+    #[test]
+    fn test_parse_ignores_git_url() {
+        // git:// and github: URLs should be ignored
+        let content = r#"{
+            "dependencies": {
+                "axios": "^1.0.0",
+                "git-dep": "git://github.com/user/repo.git",
+                "github-dep": "github:user/repo"
+            }
+        }"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "axios");
+    }
+
+    #[test]
+    fn test_parse_workspace_protocol() {
+        // workspace: protocol (pnpm/yarn workspaces) should be handled
+        let content = r#"{
+            "dependencies": {
+                "lodash": "^4.17.21",
+                "shared": "workspace:*"
+            }
+        }"#;
+
+        let deps = parse(content).unwrap();
+        // workspace: dependencies should be ignored (no version to update)
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "lodash");
+    }
+
+    #[test]
+    fn test_parse_empty_version_string() {
+        // Empty string version should be ignored
+        let content = r#"{
+            "dependencies": {
+                "valid": "^1.0.0",
+                "empty": ""
+            }
+        }"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "valid");
+    }
 }
