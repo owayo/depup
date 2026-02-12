@@ -95,10 +95,13 @@ impl PartialOrd for VersionInfo {
 
 /// Compare two version strings using semver-like rules
 /// Missing parts are treated as 0 (e.g., "1.0" == "1.0.0")
+/// Build metadata after '+' is ignored per semver spec
 pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
     let parse_parts = |s: &str| -> Vec<u64> {
         // Remove leading 'v' if present
         let s = s.strip_prefix('v').unwrap_or(s);
+        // Strip build metadata (+...) per semver spec
+        let s = s.split('+').next().unwrap_or(s);
         // Split by . and - and take only the numeric parts
         s.split(['.', '-']).filter_map(|p| p.parse().ok()).collect()
     };
@@ -373,5 +376,27 @@ mod tests {
 
         let beta = VersionInfo::now("8.0.0-beta.5");
         assert!(beta.is_prerelease());
+    }
+
+    #[test]
+    fn test_compare_versions_ignores_build_metadata() {
+        // semver build metadata (+...) should not affect version precedence
+        assert_eq!(
+            compare_versions("1.0.0", "1.0.0+spec-1.1.0"),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            compare_versions("1.0.0+spec-1.1.0", "1.0.0"),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            compare_versions("1.0.0+build.1", "1.0.0+build.2"),
+            std::cmp::Ordering::Equal
+        );
+        // But actual version differences should still work
+        assert_eq!(
+            compare_versions("1.0.0+build", "1.0.1"),
+            std::cmp::Ordering::Less
+        );
     }
 }
