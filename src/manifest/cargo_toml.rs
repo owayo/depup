@@ -81,6 +81,9 @@ impl ManifestParser for CargoTomlParser {
         package: &str,
         new_version: &str,
     ) -> Result<String, ManifestError> {
+        // Strip semver build metadata (+...) to avoid Cargo warnings
+        let new_version = new_version.split('+').next().unwrap_or(new_version);
+
         let parser = get_parser(Language::Rust);
         let mut result = content.to_string();
         let mut updated = false;
@@ -806,5 +809,36 @@ criterion = "0.5"
         // Dev dependencies
         let criterion = deps.iter().find(|d| d.name == "criterion").unwrap();
         assert!(criterion.is_dev);
+    }
+
+    #[test]
+    fn test_update_version_strips_build_metadata() {
+        let content = r#"
+[dependencies]
+toml = "0.8.0"
+"#;
+
+        // crates.io returns versions like "1.0.0+spec-1.1.0"
+        let result = CargoTomlParser
+            .update_version(content, "toml", "1.0.0+spec-1.1.0")
+            .unwrap();
+        // Build metadata should be stripped
+        assert!(result.contains("\"1.0.0\""));
+        assert!(!result.contains("+spec-1.1.0"));
+    }
+
+    #[test]
+    fn test_update_version_strips_build_metadata_inline_table() {
+        let content = r#"
+[dependencies]
+toml = { version = "0.8.0", features = ["derive"] }
+"#;
+
+        let result = CargoTomlParser
+            .update_version(content, "toml", "1.0.0+spec-1.1.0")
+            .unwrap();
+        assert!(result.contains("version = \"1.0.0\""));
+        assert!(!result.contains("+spec-1.1.0"));
+        assert!(result.contains("features"));
     }
 }

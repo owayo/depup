@@ -195,4 +195,40 @@ mod tests {
         let parsed: Dependency = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, dep);
     }
+
+    #[test]
+    fn test_dependency_with_variable() {
+        let dep = Dependency::new("guava", sample_version_spec(), false, Language::Java)
+            .with_variable("guavaVersion");
+        assert_eq!(dep.variable_name, Some("guavaVersion".to_string()));
+        assert_eq!(dep.name, "guava");
+    }
+
+    #[test]
+    fn test_dependency_with_variable_serde_skip() {
+        // variable_name is None -> should not appear in JSON
+        let dep = Dependency::new("lodash", sample_version_spec(), false, Language::Node);
+        let json = serde_json::to_string(&dep).unwrap();
+        assert!(!json.contains("variable_name"));
+
+        // variable_name is Some -> should appear in JSON
+        let dep_with_var = dep.with_variable("ver");
+        let json_with_var = serde_json::to_string(&dep_with_var).unwrap();
+        assert!(json_with_var.contains("variable_name"));
+        assert!(json_with_var.contains("ver"));
+    }
+
+    #[test]
+    fn test_dependency_display_all_languages() {
+        let spec = sample_version_spec();
+
+        let ruby_dep = Dependency::new("rails", spec.clone(), false, Language::Ruby);
+        assert!(format!("{}", ruby_dep).contains("[Ruby]"));
+
+        let php_dep = Dependency::new("laravel", spec.clone(), false, Language::Php);
+        assert!(format!("{}", php_dep).contains("[PHP]"));
+
+        let java_dep = Dependency::new("guava", spec, false, Language::Java);
+        assert!(format!("{}", java_dep).contains("[Java]"));
+    }
 }

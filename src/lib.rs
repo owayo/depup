@@ -6,6 +6,9 @@
 //! - Python (pyproject.toml)
 //! - Rust (Cargo.toml)
 //! - Go (go.mod)
+//! - Ruby (Gemfile)
+//! - PHP (composer.json)
+//! - Java (build.gradle / build.gradle.kts)
 
 pub mod cli;
 pub mod domain;

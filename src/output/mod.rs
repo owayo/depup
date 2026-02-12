@@ -193,4 +193,46 @@ mod tests {
         let config = OutputConfig::from_cli(false, false, false, false, true);
         assert!(config.dry_run);
     }
+
+    #[test]
+    fn test_create_formatter_text() {
+        let config = OutputConfig::new(OutputFormat::Text, Verbosity::Normal, false);
+        let _formatter = create_formatter(config);
+    }
+
+    #[test]
+    fn test_create_formatter_json() {
+        let config = OutputConfig::new(OutputFormat::Json, Verbosity::Normal, false);
+        let _formatter = create_formatter(config);
+    }
+
+    #[test]
+    fn test_create_formatter_diff() {
+        let config = OutputConfig::new(OutputFormat::Diff, Verbosity::Normal, false);
+        let _formatter = create_formatter(config);
+    }
+
+    #[test]
+    fn test_output_format_debug() {
+        let text = format!("{:?}", OutputFormat::Text);
+        assert_eq!(text, "Text");
+        let json = format!("{:?}", OutputFormat::Json);
+        assert_eq!(json, "Json");
+        let diff = format!("{:?}", OutputFormat::Diff);
+        assert_eq!(diff, "Diff");
+    }
+
+    #[test]
+    fn test_verbosity_debug() {
+        assert_eq!(format!("{:?}", Verbosity::Quiet), "Quiet");
+        assert_eq!(format!("{:?}", Verbosity::Normal), "Normal");
+        assert_eq!(format!("{:?}", Verbosity::Verbose), "Verbose");
+    }
+
+    #[test]
+    fn test_output_config_debug() {
+        let config = OutputConfig::default();
+        let debug = format!("{:?}", config);
+        assert!(debug.contains("OutputConfig"));
+    }
 }

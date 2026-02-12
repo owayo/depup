@@ -439,4 +439,107 @@ mod tests {
         let debug = format!("{:?}", err);
         assert!(debug.contains("NotFound"));
     }
+
+    #[test]
+    fn test_registry_name_all_languages() {
+        assert_eq!(RegistryError::registry_name(Language::Ruby), "RubyGems");
+        assert_eq!(RegistryError::registry_name(Language::Php), "Packagist");
+        assert_eq!(
+            RegistryError::registry_name(Language::Java),
+            "Maven Central"
+        );
+    }
+
+    #[test]
+    fn test_manifest_error_write_error() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied");
+        let err = ManifestError::write_error("/path/to/Cargo.toml", io_err);
+        let msg = format!("{}", err);
+        assert!(msg.contains("failed to write manifest file"));
+        assert!(msg.contains("Cargo.toml"));
+    }
+
+    #[test]
+    fn test_manifest_error_read_error() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
+        let err = ManifestError::read_error("/path/to/go.mod", io_err);
+        let msg = format!("{}", err);
+        assert!(msg.contains("failed to read manifest file"));
+        assert!(msg.contains("go.mod"));
+    }
+
+    #[test]
+    fn test_manifest_error_unsupported_format() {
+        let err = ManifestError::UnsupportedFormat {
+            path: PathBuf::from("/path/to/unknown.xyz"),
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("unsupported manifest format"));
+        assert!(msg.contains("unknown.xyz"));
+    }
+
+    #[test]
+    fn test_registry_error_invalid_response() {
+        let err = RegistryError::InvalidResponse {
+            package: "serde".to_string(),
+            registry: "crates.io".to_string(),
+            message: "malformed JSON".to_string(),
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("invalid response"));
+        assert!(msg.contains("serde"));
+        assert!(msg.contains("malformed JSON"));
+    }
+
+    #[test]
+    fn test_registry_error_authentication() {
+        let err = RegistryError::AuthenticationError {
+            registry: "npm".to_string(),
+            message: "token expired".to_string(),
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("authentication failed"));
+        assert!(msg.contains("token expired"));
+    }
+
+    #[test]
+    fn test_registry_error_invalid_package_name() {
+        let err = RegistryError::InvalidPackageName {
+            name: "@invalid//pkg".to_string(),
+            registry: "npm".to_string(),
+            reason: "double slash not allowed".to_string(),
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("invalid package name"));
+        assert!(msg.contains("@invalid//pkg"));
+    }
+
+    #[test]
+    fn test_config_error_invalid_path() {
+        let err = ConfigError::InvalidPath {
+            path: PathBuf::from("/null\0byte"),
+            message: "contains null byte".to_string(),
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("invalid path"));
+    }
+
+    #[test]
+    fn test_config_error_invalid_language_filter() {
+        let err = ConfigError::InvalidLanguageFilter {
+            value: "kotlin".to_string(),
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("invalid language filter"));
+        assert!(msg.contains("kotlin"));
+    }
+
+    #[test]
+    fn test_io_error_generic() {
+        let io_err = std::io::Error::other("disk full");
+        let err = IoError::generic("/path/to/file", io_err);
+        let msg = format!("{}", err);
+        assert!(msg.contains("IO error"));
+        assert!(msg.contains("disk full"));
+    }
 }

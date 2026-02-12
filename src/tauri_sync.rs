@@ -460,6 +460,40 @@ mod tests {
     }
 
     #[test]
+    fn test_find_matching_version_no_match() {
+        let versions = vec![make_version_info("2.9.0"), make_version_info("2.9.1")];
+        // No 2.10.x versions available
+        let result = find_matching_version((2, 10), &versions);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_find_matching_version_skips_prerelease() {
+        let versions = vec![
+            make_version_info("2.10.0-beta.1"),
+            make_version_info("2.10.0-alpha.2"),
+        ];
+        // Only prerelease versions - should not match
+        let result = find_matching_version((2, 10), &versions);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_major_minor_single_part() {
+        // Only one part - not enough
+        assert_eq!(extract_major_minor("1"), None);
+        assert_eq!(extract_major_minor(""), None);
+    }
+
+    #[test]
+    fn test_find_common_major_minor_empty_lists() {
+        let npm_versions: Vec<VersionInfo> = vec![];
+        let crate_versions: Vec<VersionInfo> = vec![];
+        let common = find_common_major_minor(&npm_versions, &crate_versions);
+        assert_eq!(common, None);
+    }
+
+    #[test]
     fn test_get_synchronized_versions() {
         let npm_versions = vec![
             make_version_info("2.9.1"),

@@ -5,6 +5,9 @@
 //! - Python (pyproject.toml)
 //! - Rust (Cargo.toml)
 //! - Go (go.mod)
+//! - Ruby (Gemfile)
+//! - PHP (composer.json)
+//! - Java (build.gradle / build.gradle.kts)
 
 use clap::Parser;
 use depup::cli::CliArgs;

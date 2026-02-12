@@ -480,6 +480,15 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_node_pm_bun() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(temp_dir.path().join("bun.lockb"), "").unwrap();
+
+        let pm = SystemPackageManager::new();
+        assert_eq!(pm.detect_node_pm(temp_dir.path()), Some("bun"));
+    }
+
+    #[test]
     fn test_detect_node_pm_none() {
         let temp_dir = tempfile::tempdir().unwrap();
 
@@ -557,5 +566,114 @@ mod tests {
 
         let pm = SystemPackageManager::new();
         assert!(!pm.detect_tauri_project(temp_dir.path()));
+    }
+
+    #[test]
+    fn test_get_install_command_bun() {
+        let pm = SystemPackageManager::new();
+        let cmd = pm.get_install_command("bun");
+        assert_eq!(cmd, vec!["bun", "install"]);
+    }
+
+    #[test]
+    fn test_get_install_command_bundle() {
+        let pm = SystemPackageManager::new();
+        let cmd = pm.get_install_command("bundle");
+        assert_eq!(cmd, vec!["bundle", "install"]);
+    }
+
+    #[test]
+    fn test_get_install_command_composer() {
+        let pm = SystemPackageManager::new();
+        let cmd = pm.get_install_command("composer");
+        assert_eq!(cmd, vec!["composer", "install"]);
+    }
+
+    #[test]
+    fn test_get_install_command_rye() {
+        let pm = SystemPackageManager::new();
+        let cmd = pm.get_install_command("rye");
+        assert_eq!(cmd, vec!["rye", "sync"]);
+    }
+
+    #[test]
+    fn test_get_install_command_pipenv() {
+        let pm = SystemPackageManager::new();
+        let cmd = pm.get_install_command("pipenv");
+        assert_eq!(cmd, vec!["pipenv", "install"]);
+    }
+
+    #[test]
+    fn test_get_install_command_pip() {
+        let pm = SystemPackageManager::new();
+        let cmd = pm.get_install_command("pip");
+        assert_eq!(cmd, vec!["pip", "install", "-e", "."]);
+    }
+
+    #[test]
+    fn test_detect_python_pm_rye() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(temp_dir.path().join("rye.lock"), "").unwrap();
+
+        let pm = SystemPackageManager::new();
+        assert_eq!(pm.detect_python_pm(temp_dir.path()), Some("rye"));
+    }
+
+    #[test]
+    fn test_detect_python_pm_pipenv() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(temp_dir.path().join("Pipfile.lock"), "{}").unwrap();
+
+        let pm = SystemPackageManager::new();
+        assert_eq!(pm.detect_python_pm(temp_dir.path()), Some("pipenv"));
+    }
+
+    #[test]
+    fn test_detect_python_pm_requirements_txt() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(temp_dir.path().join("requirements.txt"), "requests>=2.0").unwrap();
+
+        let pm = SystemPackageManager::new();
+        assert_eq!(pm.detect_python_pm(temp_dir.path()), Some("pip"));
+    }
+
+    #[test]
+    fn test_run_install_ruby_skipped_no_gemfile() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let pm = SystemPackageManager::new();
+
+        let result = pm.run_install(Language::Ruby, temp_dir.path());
+        assert!(result.success);
+        assert!(result.command.is_empty()); // skipped
+    }
+
+    #[test]
+    fn test_run_install_php_skipped_no_composer() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let pm = SystemPackageManager::new();
+
+        let result = pm.run_install(Language::Php, temp_dir.path());
+        assert!(result.success);
+        assert!(result.command.is_empty()); // skipped
+    }
+
+    #[test]
+    fn test_run_install_java_skipped_no_gradle() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let pm = SystemPackageManager::new();
+
+        let result = pm.run_install(Language::Java, temp_dir.path());
+        assert!(result.success);
+        assert!(result.command.is_empty()); // skipped
+    }
+
+    #[test]
+    fn test_run_install_go_skipped_no_gomod() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let pm = SystemPackageManager::new();
+
+        let result = pm.run_install(Language::Go, temp_dir.path());
+        assert!(result.success);
+        assert!(result.command.is_empty()); // skipped
     }
 }

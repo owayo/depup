@@ -223,6 +223,120 @@ dependencies = ["flask>=2.0.0"]
             "Should return empty for non-existent directory"
         );
     }
+
+    /// Test detection of Java/Gradle manifests (build.gradle and build.gradle.kts)
+    #[test]
+    fn test_detect_gradle_manifests() {
+        let temp_dir = create_test_dir();
+
+        // Create build.gradle (Groovy DSL)
+        let build_gradle = r#"plugins {
+    id 'java'
+}
+
+dependencies {
+    implementation 'com.google.guava:guava:33.0.0-jre'
+    testImplementation 'junit:junit:4.13.2'
+}
+"#;
+        fs::write(temp_dir.path().join("build.gradle"), build_gradle).unwrap();
+
+        let manifests = depup::manifest::detect_manifests(temp_dir.path());
+
+        assert_eq!(manifests.len(), 1, "Should detect build.gradle");
+        assert_eq!(
+            manifests[0].language,
+            depup::domain::Language::Java,
+            "Should detect Java language"
+        );
+    }
+
+    /// Test detection of build.gradle.kts (Kotlin DSL)
+    #[test]
+    fn test_detect_gradle_kts_manifest() {
+        let temp_dir = create_test_dir();
+
+        let build_gradle_kts = r#"plugins {
+    java
+}
+
+dependencies {
+    implementation("com.google.guava:guava:33.0.0-jre")
+    testImplementation("junit:junit:4.13.2")
+}
+"#;
+        fs::write(temp_dir.path().join("build.gradle.kts"), build_gradle_kts).unwrap();
+
+        let manifests = depup::manifest::detect_manifests(temp_dir.path());
+
+        assert_eq!(manifests.len(), 1, "Should detect build.gradle.kts");
+        assert_eq!(
+            manifests[0].language,
+            depup::domain::Language::Java,
+            "Should detect Java language from .kts"
+        );
+    }
+
+    /// Test detection of all 7 languages including Java
+    #[test]
+    fn test_detect_all_seven_languages() {
+        let temp_dir = create_test_dir();
+
+        // Node.js
+        fs::write(
+            temp_dir.path().join("package.json"),
+            r#"{"dependencies": {"lodash": "^4.17.21"}}"#,
+        )
+        .unwrap();
+
+        // Python
+        fs::write(
+            temp_dir.path().join("pyproject.toml"),
+            "[project]\ndependencies = [\"requests>=2.28.0\"]\n",
+        )
+        .unwrap();
+
+        // Rust
+        fs::write(
+            temp_dir.path().join("Cargo.toml"),
+            "[package]\nname = \"test\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1.0\"\n",
+        )
+        .unwrap();
+
+        // Go
+        fs::write(
+            temp_dir.path().join("go.mod"),
+            "module example.com/test\n\ngo 1.21\n\nrequire github.com/gin-gonic/gin v1.9.0\n",
+        )
+        .unwrap();
+
+        // Ruby
+        fs::write(temp_dir.path().join("Gemfile"), "gem 'rails', '~> 7.0'\n").unwrap();
+
+        // PHP
+        fs::write(
+            temp_dir.path().join("composer.json"),
+            r#"{"require": {"laravel/framework": "^10.0"}}"#,
+        )
+        .unwrap();
+
+        // Java
+        fs::write(
+            temp_dir.path().join("build.gradle"),
+            "dependencies {\n    implementation 'com.google.guava:guava:33.0.0-jre'\n}\n",
+        )
+        .unwrap();
+
+        let manifests = depup::manifest::detect_manifests(temp_dir.path());
+
+        assert_eq!(manifests.len(), 7, "Should detect all 7 manifest files");
+
+        let languages: Vec<_> = manifests.iter().map(|m| m.language).collect();
+        assert!(
+            languages.contains(&depup::domain::Language::Java),
+            "Should detect Java manifest"
+        );
+    }
 }
 
 mod manifest_update_format_preservation {
@@ -529,6 +643,103 @@ gem 'pg', '~> 1.5'
             "Should preserve wildcard format: {}",
             updated
         );
+    }
+
+    /// Test Gradle string notation parsing and update
+    #[test]
+    fn test_gradle_string_notation_preservation() {
+        let content = r#"plugins {
+    id 'java'
+}
+
+dependencies {
+    implementation 'com.google.guava:guava:33.0.0-jre'
+    testImplementation 'junit:junit:4.13.2'
+}
+"#;
+
+        let parser = get_parser(Language::Java);
+        let deps = parser.parse(content).unwrap();
+
+        assert!(
+            deps.iter().any(|d| d.name == "com.google.guava:guava"),
+            "Should parse Gradle string notation dependency"
+        );
+
+        let updated = parser
+            .update_version(content, "com.google.guava:guava", "33.1.0-jre")
+            .unwrap();
+        assert!(
+            updated.contains("33.1.0-jre"),
+            "Should update Gradle version: {}",
+            updated
+        );
+    }
+
+    /// Test Gradle Kotlin DSL string notation
+    #[test]
+    fn test_gradle_kts_string_notation_preservation() {
+        let content = r#"plugins {
+    java
+}
+
+dependencies {
+    implementation("com.google.guava:guava:33.0.0-jre")
+    testImplementation("junit:junit:4.13.2")
+}
+"#;
+
+        let parser = get_parser(Language::Java);
+        let deps = parser.parse(content).unwrap();
+
+        assert!(
+            deps.iter().any(|d| d.name == "com.google.guava:guava"),
+            "Should parse Kotlin DSL string notation"
+        );
+    }
+
+    /// Test Gradle variable-based version definition
+    #[test]
+    fn test_gradle_variable_version() {
+        let content = r#"
+def guavaVersion = '33.0.0-jre'
+
+dependencies {
+    implementation "com.google.guava:guava:$guavaVersion"
+}
+"#;
+
+        let parser = get_parser(Language::Java);
+        let deps = parser.parse(content).unwrap();
+
+        let guava = deps.iter().find(|d| d.name == "com.google.guava:guava");
+        assert!(guava.is_some(), "Should parse variable-based version");
+
+        if let Some(dep) = guava {
+            assert_eq!(dep.version_spec.version, "33.0.0-jre");
+        }
+    }
+
+    /// Test Gradle dev dependency detection
+    #[test]
+    fn test_gradle_dev_dependency_detection() {
+        let content = r#"dependencies {
+    implementation 'com.google.guava:guava:33.0.0-jre'
+    testImplementation 'junit:junit:4.13.2'
+}
+"#;
+
+        let parser = get_parser(Language::Java);
+        let deps = parser.parse(content).unwrap();
+
+        let guava = deps
+            .iter()
+            .find(|d| d.name == "com.google.guava:guava")
+            .unwrap();
+        assert!(!guava.is_dev, "implementation should not be dev dependency");
+
+        let junit = deps.iter().find(|d| d.name == "junit:junit").unwrap();
+        assert!(junit.is_dev, "testImplementation should be dev dependency");
     }
 
     /// Test composer.json require-dev parsing
