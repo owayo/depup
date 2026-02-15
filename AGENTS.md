@@ -29,7 +29,7 @@ src/
   package_manager.rs - パッケージマネージャinstall連携
   tauri_sync.rs    - Tauriバージョン同期
   domain/
-    language.rs      - 対応言語enum (Node/Python/Rust/Go/Ruby/PHP/Java)
+    language.rs      - 対応言語enum (Node/Python/Rust/Go/Ruby/PHP/Java/Swift)
     dependency.rs    - 依存関係構造体
     version_spec.rs  - バージョン指定種別 (Caret/Tilde/Range等)
     update_result.rs - 更新判定結果
@@ -44,6 +44,7 @@ src/
     gemfile.rs       - Ruby パーサ
     composer_json.rs - PHP パーサ
     gradle.rs        - Java パーサ
+    package_swift.rs - Swift パーサ
     pnpm_settings.rs - pnpm設定読み取り
   parser/           - 言語別パース処理
   registry/
@@ -55,6 +56,7 @@ src/
     rubygems.rs      - RubyGems
     packagist.rs     - Packagist
     maven_central.rs - Maven Central
+    github_tags.rs   - GitHub Tags (Swift)
   update/
     filter.rs        - フィルタ設定
     version_info.rs  - バージョン情報・比較
@@ -85,6 +87,7 @@ tests/
 | Ruby | Gemfile | RubyGems |
 | PHP | composer.json | Packagist |
 | Java | build.gradle / build.gradle.kts | Maven Central |
+| Swift | Package.swift | GitHub Tags |
 
 ## Development Commands
 
@@ -113,3 +116,6 @@ make help                # Makefileヘルプ
 - Go は常に pinned 扱い (`--include-pinned` 不要)
 - Range制約 (`>=X,<Y`) では上限を超えるバージョンは除外
 - Tauriプロジェクトでは npm/crate のバージョンを自動同期
+- Swift は GitHub Tags API を使用 (`GITHUB_TOKEN`/`GH_TOKEN` で認証可能)
+- Swift の非 GitHub URL はスキップされる (警告なし)
+- Swift の `branch:` / `revision:` 依存はバージョンなしとしてスキップ

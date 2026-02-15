@@ -262,6 +262,7 @@ impl RegistryError {
             Language::Ruby => "RubyGems",
             Language::Php => "Packagist",
             Language::Java => "Maven Central",
+            Language::Swift => "GitHub Tags",
         }
     }
 }

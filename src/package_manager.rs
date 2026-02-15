@@ -152,6 +152,8 @@ impl SystemPackageManager {
             // Java/Gradle
             "gradle" => vec!["gradle", "dependencies"],
             "./gradlew" => vec!["./gradlew", "dependencies"],
+            // Swift
+            "swift" => vec!["swift", "package", "resolve"],
             _ => vec![],
         }
     }
@@ -223,6 +225,14 @@ impl PackageManagerRunner for SystemPackageManager {
                     || working_dir.join("build.gradle.kts").exists()
                 {
                     Some("gradle")
+                } else {
+                    None
+                };
+                (working_dir.to_path_buf(), pm)
+            }
+            Language::Swift => {
+                let pm = if working_dir.join("Package.swift").exists() {
+                    Some("swift")
                 } else {
                     None
                 };

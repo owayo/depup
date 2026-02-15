@@ -13,6 +13,7 @@ mod gemfile;
 mod go_mod;
 mod gradle;
 mod package_json;
+mod package_swift;
 mod pnpm_settings;
 mod pyproject_toml;
 mod writer;
@@ -24,6 +25,7 @@ pub use gemfile::GemfileParser;
 pub use go_mod::GoModParser;
 pub use gradle::GradleParser;
 pub use package_json::PackageJsonParser;
+pub use package_swift::PackageSwiftParser;
 pub use pnpm_settings::{has_pnpm_workspace, PnpmSettings};
 pub use pyproject_toml::PyprojectTomlParser;
 pub use writer::{read_manifest, write_manifest, ManifestWriter, WriteResult};
@@ -59,6 +61,7 @@ pub fn get_parser(language: Language) -> Box<dyn ManifestParser> {
         Language::Ruby => Box::new(GemfileParser),
         Language::Php => Box::new(ComposerJsonParser),
         Language::Java => Box::new(GradleParser),
+        Language::Swift => Box::new(PackageSwiftParser),
     }
 }
 

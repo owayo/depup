@@ -10,6 +10,7 @@
 
 mod client;
 mod crates_io;
+mod github_tags;
 mod go_proxy;
 mod maven_central;
 mod npm;
@@ -19,6 +20,7 @@ mod rubygems;
 
 pub use client::HttpClient;
 pub use crates_io::CratesIoAdapter;
+pub use github_tags::GitHubTagsAdapter;
 pub use go_proxy::GoProxyAdapter;
 pub use maven_central::MavenCentralAdapter;
 pub use npm::NpmAdapter;
@@ -54,5 +56,6 @@ pub fn create_adapter(language: Language, client: HttpClient) -> Box<dyn Registr
         Language::Ruby => Box::new(RubyGemsAdapter::new(client)),
         Language::Php => Box::new(PackagistAdapter::new(client)),
         Language::Java => Box::new(MavenCentralAdapter::new(client)),
+        Language::Swift => Box::new(GitHubTagsAdapter::new(client)),
     }
 }

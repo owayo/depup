@@ -24,6 +24,7 @@
   <img src="https://img.shields.io/badge/Ruby-CC342D?logo=ruby&logoColor=white" alt="Ruby">
   <img src="https://img.shields.io/badge/PHP-777BB4?logo=php&logoColor=white" alt="PHP">
   <img src="https://img.shields.io/badge/Java-ED8B00?logo=openjdk&logoColor=white" alt="Java">
+  <img src="https://img.shields.io/badge/Swift-F05138?logo=swift&logoColor=white" alt="Swift">
 </p>
 
 <p align="center">
@@ -50,7 +51,7 @@
 
 ## Features
 
-- **Multi-Language Support**: Node.js, Python, Rust, Go, Ruby, PHP, Java
+- **Multi-Language Support**: Node.js, Python, Rust, Go, Ruby, PHP, Java, Swift
 - **Manifest Updates**: Directly updates version specifications in manifest files
 - **Smart Version Handling**: Preserves version range formats (^, ~, >=)
 - **Pinned Version Detection**: Skips intentionally pinned versions by default
@@ -71,6 +72,7 @@
 | <img src="https://img.shields.io/badge/-CC342D?logo=ruby&logoColor=white" height="16"> Ruby | Gemfile | RubyGems | Gemfile.lock |
 | <img src="https://img.shields.io/badge/-777BB4?logo=php&logoColor=white" height="16"> PHP | composer.json | Packagist | composer.lock |
 | <img src="https://img.shields.io/badge/-ED8B00?logo=openjdk&logoColor=white" height="16"> Java | build.gradle, build.gradle.kts | Maven Central | gradle.lockfile |
+| <img src="https://img.shields.io/badge/-F05138?logo=swift&logoColor=white" height="16"> Swift | Package.swift | GitHub Tags | Package.resolved |
 
 ## Requirements
 
@@ -136,6 +138,7 @@ depup [OPTIONS] [PATH]
 | `--ruby` | | Update only Ruby dependencies |
 | `--php` | | Update only PHP dependencies |
 | `--java` | | Update only Java dependencies |
+| `--swift` | | Update only Swift dependencies |
 | `--exclude <PKG>` | | Exclude specific packages (repeatable) |
 | `--only <PKG>` | | Update only specific packages (repeatable) |
 | `--include-pinned` | | Include pinned versions in update |
@@ -167,6 +170,9 @@ depup --python --rust
 # Update Java (Gradle) dependencies
 depup --java
 
+# Update Swift (Package.swift) dependencies
+depup --swift
+
 # JSON output for CI/CD
 depup --json
 
@@ -197,6 +203,8 @@ Pinned versions are intentionally fixed and excluded from updates by default:
 | PHP | `"1.2.3"` | ❌ |
 | PHP | `"^1.2.3"`, `"~1.2.3"` | ✅ |
 | Java | Fixed version in Gradle | ✅ |
+| Swift | `exact: "1.2.3"` | ❌ |
+| Swift | `from: "1.2.3"`, `.upToNextMinor` | ✅ |
 
 Use `--include-pinned` to update pinned versions.
 

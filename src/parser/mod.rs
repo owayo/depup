@@ -16,6 +16,7 @@ mod php;
 mod python;
 mod ruby;
 mod rust;
+mod swift;
 
 pub use go::GoVersionParser;
 pub use java::JavaVersionParser;
@@ -24,6 +25,7 @@ pub use php::PhpVersionParser;
 pub use python::PythonVersionParser;
 pub use ruby::RubyVersionParser;
 pub use rust::RustVersionParser;
+pub use swift::SwiftVersionParser;
 
 use crate::domain::{Language, VersionSpec};
 
@@ -46,6 +48,7 @@ pub fn get_parser(language: Language) -> Box<dyn VersionParser> {
         Language::Ruby => Box::new(RubyVersionParser),
         Language::Php => Box::new(PhpVersionParser),
         Language::Java => Box::new(JavaVersionParser),
+        Language::Swift => Box::new(SwiftVersionParser),
     }
 }
 

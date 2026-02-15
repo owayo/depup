@@ -14,8 +14,8 @@ use crate::manifest::{
 };
 use crate::progress::Progress;
 use crate::registry::{
-    CratesIoAdapter, GoProxyAdapter, HttpClient, MavenCentralAdapter, NpmAdapter, PackagistAdapter,
-    PyPIAdapter, RegistryAdapter, RubyGemsAdapter,
+    CratesIoAdapter, GitHubTagsAdapter, GoProxyAdapter, HttpClient, MavenCentralAdapter,
+    NpmAdapter, PackagistAdapter, PyPIAdapter, RegistryAdapter, RubyGemsAdapter,
 };
 use crate::tauri_sync::{TauriVersionSync, TAURI_CRATE, TAURI_NPM_PACKAGES};
 use crate::update::{UpdateFilter, UpdateJudge, VersionInfo};
@@ -276,6 +276,18 @@ impl Orchestrator {
             if self.args.go {
                 languages.push(Language::Go);
             }
+            if self.args.ruby {
+                languages.push(Language::Ruby);
+            }
+            if self.args.php {
+                languages.push(Language::Php);
+            }
+            if self.args.java {
+                languages.push(Language::Java);
+            }
+            if self.args.swift {
+                languages.push(Language::Swift);
+            }
             filter = filter.with_languages(languages);
         }
 
@@ -320,6 +332,7 @@ impl Orchestrator {
             Language::Ruby => self.args.ruby,
             Language::Php => self.args.php,
             Language::Java => self.args.java,
+            Language::Swift => self.args.swift,
         }
     }
 
@@ -333,6 +346,7 @@ impl Orchestrator {
             Language::Ruby => Box::new(RubyGemsAdapter::new(self.client.clone())),
             Language::Php => Box::new(PackagistAdapter::new(self.client.clone())),
             Language::Java => Box::new(MavenCentralAdapter::new(self.client.clone())),
+            Language::Swift => Box::new(GitHubTagsAdapter::new(self.client.clone())),
         }
     }
 

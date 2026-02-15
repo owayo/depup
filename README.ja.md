@@ -24,6 +24,7 @@
   <img src="https://img.shields.io/badge/Ruby-CC342D?logo=ruby&logoColor=white" alt="Ruby">
   <img src="https://img.shields.io/badge/PHP-777BB4?logo=php&logoColor=white" alt="PHP">
   <img src="https://img.shields.io/badge/Java-ED8B00?logo=openjdk&logoColor=white" alt="Java">
+  <img src="https://img.shields.io/badge/Swift-F05138?logo=swift&logoColor=white" alt="Swift">
 </p>
 
 <p align="center">
@@ -50,7 +51,7 @@
 
 ## 特徴
 
-- **マルチ言語対応**: Node.js, Python, Rust, Go, Ruby, PHP, Java
+- **マルチ言語対応**: Node.js, Python, Rust, Go, Ruby, PHP, Java, Swift
 - **マニフェスト更新**: マニフェストファイル内のバージョン指定を直接更新
 - **スマートバージョン処理**: バージョン範囲形式（^, ~, >=）を維持
 - **固定バージョン検出**: 意図的に固定されたバージョンはデフォルトでスキップ
@@ -71,6 +72,7 @@
 | <img src="https://img.shields.io/badge/-CC342D?logo=ruby&logoColor=white" height="16"> Ruby | Gemfile | RubyGems | Gemfile.lock |
 | <img src="https://img.shields.io/badge/-777BB4?logo=php&logoColor=white" height="16"> PHP | composer.json | Packagist | composer.lock |
 | <img src="https://img.shields.io/badge/-ED8B00?logo=openjdk&logoColor=white" height="16"> Java | build.gradle, build.gradle.kts | Maven Central | gradle.lockfile |
+| <img src="https://img.shields.io/badge/-F05138?logo=swift&logoColor=white" height="16"> Swift | Package.swift | GitHub Tags | Package.resolved |
 
 ## 動作要件
 
@@ -136,6 +138,7 @@ depup [OPTIONS] [PATH]
 | `--ruby` | | Rubyの依存関係のみ更新 |
 | `--php` | | PHPの依存関係のみ更新 |
 | `--java` | | Javaの依存関係のみ更新 |
+| `--swift` | | Swiftの依存関係のみ更新 |
 | `--exclude <PKG>` | | 特定パッケージを除外（複数指定可） |
 | `--only <PKG>` | | 特定パッケージのみ更新（複数指定可） |
 | `--include-pinned` | | 固定バージョンも更新対象に含める |
@@ -167,6 +170,9 @@ depup --python --rust
 # Java（Gradle）の依存関係のみ更新
 depup --java
 
+# Swift（Package.swift）の依存関係のみ更新
+depup --swift
+
 # CI/CD用にJSON出力
 depup --json
 
@@ -197,6 +203,8 @@ depup --cd ./projects/myapp -n
 | PHP | `"1.2.3"` | ❌ |
 | PHP | `"^1.2.3"`, `"~1.2.3"` | ✅ |
 | Java | Gradleの固定バージョン | ✅ |
+| Swift | `exact: "1.2.3"` | ❌ |
+| Swift | `from: "1.2.3"`, `.upToNextMinor` | ✅ |
 
 `--include-pinned` で固定バージョンも更新対象にできます。
 

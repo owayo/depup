@@ -97,6 +97,10 @@ pub struct CliArgs {
     #[arg(long)]
     pub java: bool,
 
+    /// Update only Swift (Package.swift) dependencies
+    #[arg(long)]
+    pub swift: bool,
+
     // Package filters
     /// Exclude specific packages from update (can be specified multiple times)
     #[arg(long, action = ArgAction::Append)]
@@ -133,7 +137,14 @@ pub struct CliArgs {
 impl CliArgs {
     /// Check if any language filter is specified
     pub fn has_language_filter(&self) -> bool {
-        self.node || self.python || self.rust_lang || self.go || self.ruby || self.php || self.java
+        self.node
+            || self.python
+            || self.rust_lang
+            || self.go
+            || self.ruby
+            || self.php
+            || self.java
+            || self.swift
     }
 
     /// Check if a specific language should be processed
@@ -149,6 +160,7 @@ impl CliArgs {
             "ruby" => self.ruby,
             "php" => self.php,
             "java" => self.java,
+            "swift" => self.swift,
             _ => false,
         }
     }
