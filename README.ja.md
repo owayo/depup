@@ -146,7 +146,7 @@ depup [OPTIONS] [PATH]
 | `--json` | | JSON形式で出力 |
 | `--diff` | | diff形式で変更を表示 |
 | `--install` | | 更新後にパッケージマネージャのinstallを実行 |
-| `--version` | `-v` | バージョンを表示 |
+| `--version` | `-V` | バージョンを表示 |
 | `--help` | `-h` | ヘルプを表示 |
 
 ### 使用例

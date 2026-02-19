@@ -59,3 +59,29 @@ pub fn create_adapter(language: Language, client: HttpClient) -> Box<dyn Registr
         Language::Swift => Box::new(GitHubTagsAdapter::new(client)),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_create_adapter_returns_correct_language() {
+        let languages = vec![
+            (Language::Node, "npm"),
+            (Language::Python, "PyPI"),
+            (Language::Rust, "crates.io"),
+            (Language::Go, "Go Proxy"),
+            (Language::Ruby, "rubygems"),
+            (Language::Php, "packagist"),
+            (Language::Java, "Maven Central"),
+            (Language::Swift, "GitHub Tags"),
+        ];
+
+        for (lang, expected_registry) in languages {
+            let client = HttpClient::new().unwrap();
+            let adapter = create_adapter(lang, client);
+            assert_eq!(adapter.language(), lang);
+            assert_eq!(adapter.registry_name(), expected_registry);
+        }
+    }
+}

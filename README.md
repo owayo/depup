@@ -146,7 +146,7 @@ depup [OPTIONS] [PATH]
 | `--json` | | Output results in JSON format |
 | `--diff` | | Show changes in diff format |
 | `--install` | | Run package manager install after update |
-| `--version` | `-v` | Show version |
+| `--version` | `-V` | Show version |
 | `--help` | `-h` | Show help |
 
 ### Examples

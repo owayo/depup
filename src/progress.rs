@@ -120,4 +120,36 @@ mod tests {
         progress.inc();
         progress.finish_and_clear();
     }
+
+    #[test]
+    fn test_progress_default_is_enabled() {
+        let mut progress = Progress::default();
+        // Default should be enabled; spinner should create a bar
+        progress.spinner("loading");
+        progress.finish("done");
+    }
+
+    #[test]
+    fn test_progress_spinner_then_finish_and_clear() {
+        let mut progress = Progress::new(true);
+        progress.spinner("scanning");
+        progress.set_message("updated message");
+        progress.finish_and_clear();
+        // After finish_and_clear, inc/set_message should be no-ops
+        progress.inc();
+        progress.set_message("no-op");
+    }
+
+    #[test]
+    fn test_progress_disabled_operations_are_noop() {
+        let mut progress = Progress::disabled();
+        // All operations should be safe no-ops when disabled
+        progress.spinner("test");
+        progress.inc();
+        progress.set_message("msg");
+        progress.finish_and_clear();
+        progress.start(5, "test");
+        progress.inc();
+        progress.finish("done");
+    }
 }
