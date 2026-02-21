@@ -802,4 +802,60 @@ dependencies = [
             result
         );
     }
+
+    #[test]
+    fn test_parse_dependency_group_with_extras_and_bare() {
+        // extras付き・バージョンなし・通常のパッケージが混在するグループ
+        let content = r#"
+[project]
+name = "test"
+
+[project.optional-dependencies]
+dev = [
+    "coverage[toml]>=6.5",
+    "pytest",
+    "scipy",
+    "ruff",
+]
+"#;
+
+        let deps = parse(content).unwrap();
+        // pytest, scipy, ruff はバージョン指定なしなのでスキップされる
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "coverage");
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::GreaterOrEqual);
+        assert_eq!(deps[0].version_spec.version, "6.5");
+    }
+
+    #[test]
+    fn test_update_dependency_group_with_extras_and_bare() {
+        // extras付きパッケージがバージョンなしパッケージと共存する場合の更新
+        let content = r#"
+[project]
+name = "test"
+
+[project.optional-dependencies]
+dev = [
+    "coverage[toml]>=6.5",
+    "pytest",
+    "scipy",
+    "ruff",
+]
+"#;
+
+        let result = PyprojectTomlParser
+            .update_version(content, "coverage", "7.6.0")
+            .unwrap();
+
+        // extras が保持され、バージョンが更新される
+        assert!(
+            result.contains(r#""coverage[toml]>=7.6.0""#),
+            "Extras should be preserved and version updated, got: {}",
+            result
+        );
+        // 他のパッケージは変更されない
+        assert!(result.contains(r#""pytest""#));
+        assert!(result.contains(r#""scipy""#));
+        assert!(result.contains(r#""ruff""#));
+    }
 }
