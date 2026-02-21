@@ -978,4 +978,113 @@ dev = [
             .unwrap();
         assert!(result3.contains(r#""numpy>=2.4.2""#));
     }
+
+    #[test]
+    fn test_parse_full_optional_dependencies_groups() {
+        // optional-dependencies の全グループがパースされるか検証
+        let content = r#"
+[project]
+name = "style-bert-vits2"
+dependencies = [
+    "numba>=0.64.0",
+    "numpy>=2.4.2",
+    "pydantic>=2.12.5",
+]
+
+[project.optional-dependencies]
+torch = [
+    "accelerate",
+    "torch>=2.10.0",
+    "torchaudio>=2.10.0",
+]
+train = [
+    "style-bert-vits2[torch]",
+    "faster-whisper>=1.2.1",
+    "GPUtil",
+    "gradio>=6.6.0",
+    "librosa>=0.11.0",
+    "onnx>=1.20.1",
+    "protobuf>=6.33.5",
+    "pyannote.audio>=4.0.4",
+]
+infer = [
+    "style-bert-vits2[torch]",
+    "GPUtil",
+    "gradio>=6.6.0",
+    "onnx>=1.20.1",
+    "pyannote.audio>=4.0.4",
+]
+colab = [
+    "style-bert-vits2[train]",
+    "onnxruntime-gpu",
+    "torchvision",
+]
+
+[dependency-groups]
+dev = [
+    "coverage[toml]>=7.13.4",
+    "pytest",
+    "scipy",
+    "ruff",
+]
+"#;
+
+        let deps = parse(content).unwrap();
+        let names: Vec<&str> = deps.iter().map(|d| d.name.as_str()).collect();
+        println!("Parsed deps: {:?}", names);
+
+        // project.dependencies (3)
+        assert!(deps.iter().any(|d| d.name == "numba"), "numba missing");
+        assert!(deps.iter().any(|d| d.name == "numpy"), "numpy missing");
+        assert!(
+            deps.iter().any(|d| d.name == "pydantic"),
+            "pydantic missing"
+        );
+
+        // torch group (2 with versions)
+        assert!(deps.iter().any(|d| d.name == "torch"), "torch missing");
+        assert!(
+            deps.iter().any(|d| d.name == "torchaudio"),
+            "torchaudio missing"
+        );
+
+        // train group
+        assert!(
+            deps.iter().any(|d| d.name == "faster-whisper"),
+            "faster-whisper missing"
+        );
+        assert!(
+            deps.iter().any(|d| d.name == "gradio"),
+            "gradio missing from train"
+        );
+        assert!(deps.iter().any(|d| d.name == "librosa"), "librosa missing");
+        assert!(deps.iter().any(|d| d.name == "onnx"), "onnx missing");
+        assert!(
+            deps.iter().any(|d| d.name == "protobuf"),
+            "protobuf missing"
+        );
+
+        // infer group (gradio, onnx は train にも出現するので重複あり)
+        assert!(
+            deps.iter().filter(|d| d.name == "gradio").count() >= 2,
+            "gradio should appear in both train and infer"
+        );
+        assert!(
+            deps.iter().filter(|d| d.name == "onnx").count() >= 2,
+            "onnx should appear in both train and infer"
+        );
+
+        // dependency-groups: coverage[toml] のみ
+        assert!(
+            deps.iter().any(|d| d.name == "coverage"),
+            "coverage missing"
+        );
+
+        // self-reference (style-bert-vits2[torch]) やバージョンなしはスキップ
+        assert!(!deps.iter().any(|d| d.name == "style-bert-vits2"));
+        assert!(!deps.iter().any(|d| d.name == "accelerate"));
+        assert!(!deps
+            .iter()
+            .any(|d| d.name == "GPUtil" || d.name == "gputil"));
+    }
 }
