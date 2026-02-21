@@ -212,15 +212,29 @@ impl ManifestParser for PyprojectTomlParser {
             }
         }
 
-        // Pattern for PEP 508 in array: "package>=1.0,<2.0"
-        let pep508_pattern = format!(r#""({}(?:\s*[<>=!~^]+[^"]+)?)""#, regex::escape(package));
+        // Pattern for PEP 508 in array: "package>=1.0,<2.0" or "package[extras]>=1.0"
+        let pep508_pattern = format!(
+            r#""({}(?:\[[^\]]*\])?(?:\s*[<>=!~^]+[^"]+)?)""#,
+            regex::escape(package)
+        );
         if let Ok(re) = Regex::new(&pep508_pattern) {
             let result_clone = result.clone();
             for caps in re.captures_iter(&result_clone) {
                 let full_dep = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                 if let Some(pep_caps) = PEP508_RE.captures(full_dep) {
                     let pkg_name = pep_caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                    let version_part = pep_caps.get(2).map(|m| m.as_str()).unwrap_or("").trim();
+                    let raw_version = pep_caps.get(2).map(|m| m.as_str()).unwrap_or("").trim();
+
+                    // Strip extras [extra] from version part, preserving for replacement
+                    let (extras_str, version_part) = if raw_version.starts_with('[') {
+                        if let Some(idx) = raw_version.find(']') {
+                            (&raw_version[..=idx], raw_version[idx + 1..].trim())
+                        } else {
+                            ("", raw_version)
+                        }
+                    } else {
+                        ("", raw_version)
+                    };
 
                     if pkg_name == package && !version_part.is_empty() {
                         if let Some(spec) = parser.parse(version_part) {
@@ -230,7 +244,7 @@ impl ManifestParser for PyprojectTomlParser {
                             } else {
                                 spec.format_updated(new_version)
                             };
-                            let new_dep = format!("{}{}", package, new_ver);
+                            let new_dep = format!("{}{}{}", package, extras_str, new_ver);
                             result = result
                                 .replace(&format!(r#""{full_dep}""#), &format!(r#""{new_dep}""#));
                             updated = true;
@@ -724,5 +738,68 @@ dependencies = [
         let deps = parse(content).unwrap();
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].name, "flask");
+    }
+
+    #[test]
+    fn test_update_pep508_with_extras() {
+        // PEP 508 extras like coverage[toml]>=6.5 should be updated correctly
+        let content = r#"
+[project]
+dependencies = [
+    "coverage[toml]>=6.5",
+]
+"#;
+
+        let result = PyprojectTomlParser
+            .update_version(content, "coverage", "7.6.0")
+            .unwrap();
+
+        assert!(
+            result.contains("coverage[toml]>=7.6.0"),
+            "Extras should be preserved during update, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_update_pep508_with_multiple_extras() {
+        let content = r#"
+[project]
+dependencies = [
+    "httpx[http2,brotli]>=0.24.0",
+]
+"#;
+
+        let result = PyprojectTomlParser
+            .update_version(content, "httpx", "0.28.0")
+            .unwrap();
+
+        assert!(
+            result.contains("httpx[http2,brotli]>=0.28.0"),
+            "Multiple extras should be preserved, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_update_pep508_extras_with_range() {
+        // Range型 + extras の組み合わせ
+        let content = r#"
+[project]
+dependencies = [
+    "coverage[toml]>=6.5,<8.0",
+]
+"#;
+
+        let result = PyprojectTomlParser
+            .update_version(content, "coverage", "7.6.0")
+            .unwrap();
+
+        // Range型は元の制約を保持すべき
+        assert!(
+            result.contains("coverage[toml]>=6.5,<8.0"),
+            "Range constraint with extras should be preserved, got: {}",
+            result
+        );
     }
 }
