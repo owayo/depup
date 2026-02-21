@@ -858,4 +858,124 @@ dev = [
         assert!(result.contains(r#""scipy""#));
         assert!(result.contains(r#""ruff""#));
     }
+
+    #[test]
+    fn test_parse_real_world_pyproject_with_extras() {
+        // 実際の pyproject.toml に近い構造: self-reference extras, extras付き依存, バージョンなし依存が混在
+        let content = r#"
+[project]
+name = "style-bert-vits2"
+dependencies = [
+    "numba>=0.64.0",
+    "numpy>=2.4.2",
+    "pydantic>=2.12.5",
+]
+
+[project.optional-dependencies]
+train = [
+    "style-bert-vits2[torch]",
+    "faster-whisper>=1.2.1",
+    "onnx>=1.20.1",
+    "protobuf>=6.33.5",
+    "pyannote.audio>=4.0.4",
+]
+infer = [
+    "style-bert-vits2[torch]",
+    "onnx>=1.20.1",
+    "pyannote.audio>=4.0.4",
+]
+
+[dependency-groups]
+dev = [
+    "coverage[toml]>=6.5",
+    "pytest",
+    "scipy",
+    "ruff",
+]
+"#;
+
+        let deps = parse(content).unwrap();
+
+        // dependencies: numba, numpy, pydantic
+        assert!(deps.iter().any(|d| d.name == "numba"));
+        assert!(deps.iter().any(|d| d.name == "numpy"));
+        assert!(deps.iter().any(|d| d.name == "pydantic"));
+
+        // optional-dependencies: self-reference はバージョンなしなのでスキップ
+        assert!(!deps.iter().any(|d| d.name == "style-bert-vits2"));
+
+        // onnx は train と infer 両方に出現するので2つ
+        assert_eq!(deps.iter().filter(|d| d.name == "onnx").count(), 2);
+
+        // dependency-groups: coverage のみ (pytest, scipy, ruff はバージョンなし)
+        let coverage = deps.iter().find(|d| d.name == "coverage").unwrap();
+        assert!(coverage.is_dev);
+        assert_eq!(coverage.version_spec.kind, VersionSpecKind::GreaterOrEqual);
+        assert_eq!(coverage.version_spec.version, "6.5");
+
+        // pytest, scipy, ruff はバージョン指定なしなのでスキップ
+        assert!(!deps.iter().any(|d| d.name == "pytest"));
+        assert!(!deps.iter().any(|d| d.name == "scipy"));
+        assert!(!deps.iter().any(|d| d.name == "ruff"));
+    }
+
+    #[test]
+    fn test_update_real_world_pyproject_coverage_with_extras() {
+        // 修正前のバグ再現: coverage[toml]>=6.5 の更新で
+        // "package not found or version could not be updated" エラーが発生していた
+        let content = r#"
+[project]
+name = "style-bert-vits2"
+dependencies = [
+    "numba>=0.64.0",
+    "numpy>=2.4.2",
+    "pydantic>=2.12.5",
+]
+
+[project.optional-dependencies]
+train = [
+    "style-bert-vits2[torch]",
+    "onnx>=1.20.1",
+]
+infer = [
+    "style-bert-vits2[torch]",
+    "onnx>=1.20.1",
+]
+
+[dependency-groups]
+dev = [
+    "coverage[toml]>=6.5",
+    "pytest",
+    "scipy",
+    "ruff",
+]
+"#;
+
+        // coverage の更新
+        let result = PyprojectTomlParser
+            .update_version(content, "coverage", "7.13.4")
+            .unwrap();
+        assert!(
+            result.contains(r#""coverage[toml]>=7.13.4""#),
+            "coverage[toml] extras should be preserved, got: {}",
+            result
+        );
+        // 他のエントリは変更されない
+        assert!(result.contains(r#""numba>=0.64.0""#));
+        assert!(result.contains(r#""numpy>=2.4.2""#));
+        assert!(result.contains(r#""onnx>=1.20.1""#));
+        assert!(result.contains(r#""pytest""#));
+
+        // onnx の更新（optional-dependencies 内の2箇所が同時に更新される）
+        let result2 = PyprojectTomlParser
+            .update_version(content, "onnx", "1.20.1")
+            .unwrap();
+        assert!(result2.contains(r#""onnx>=1.20.1""#));
+
+        // numpy の更新
+        let result3 = PyprojectTomlParser
+            .update_version(content, "numpy", "2.4.2")
+            .unwrap();
+        assert!(result3.contains(r#""numpy>=2.4.2""#));
+    }
 }
