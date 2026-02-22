@@ -23,6 +23,7 @@ src/
   main.rs          - CLI エントリポイント
   lib.rs           - ライブラリエクスポート
   cli.rs           - CLI引数定義 (clap derive)
+  config.rs        - .depup 設定ファイルパーサ (モノレポ対応)
   orchestrator.rs  - ワークフロー制御 (detect → parse → fetch → judge → write)
   error.rs         - エラー型定義 (thiserror)
   progress.rs      - プログレスバー表示
@@ -75,6 +76,8 @@ tests/
 - **RegistryAdapter trait**: 各レジストリアダプタが実装 (`fetch_versions`)
 - **UpdateJudge**: フィルタ条件に基づく更新判定エンジン
 - **VersionSpec**: バージョン制約の種類保持とフォーマット保存
+- **DepupConfig**: `.depup` ファイルによるモノレポ対応 (複数ディレクトリ一括処理)
+- **VersionCache**: レジストリ応答のキャッシュ (同一パッケージの重複フェッチ防止)
 
 ## Supported Languages
 

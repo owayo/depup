@@ -11,11 +11,14 @@
 
 use clap::Parser;
 use depup::cli::CliArgs;
+use depup::config::DepupConfig;
 use depup::domain::Language;
-use depup::orchestrator::Orchestrator;
+use depup::orchestrator::{Orchestrator, OrchestratorResult};
 use depup::output::{create_formatter, OutputConfig};
 use depup::package_manager::{run_installs, SystemPackageManager};
+use std::collections::HashMap;
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 #[tokio::main]
@@ -61,9 +64,26 @@ async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
         }
     }
 
+    // Check for .depup monorepo config
+    let monorepo_config = DepupConfig::from_dir(&args.path);
+
     // Create and run the orchestrator
     let orchestrator = Orchestrator::new(args.clone())?;
-    let result = orchestrator.run().await;
+
+    let (result, monorepo_dirs) = if let Some(config) = monorepo_config {
+        if args.verbose {
+            eprintln!("Monorepo mode: {} directories", config.directories.len());
+            for dir in &config.directories {
+                eprintln!("  - {}", dir.display());
+            }
+        }
+        let dirs = config.directories.clone();
+        let r = orchestrator.run_directories(&dirs).await;
+        (r, Some(dirs))
+    } else {
+        let r = orchestrator.run().await;
+        (r, None)
+    };
 
     // Create output formatter based on CLI options
     let output_config =
@@ -84,57 +104,9 @@ async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
         }
     }
 
-    // Determine which languages had updates
-    let mut updated_languages: Vec<Language> = Vec::new();
-    for manifest in &result.summary.manifests {
-        if manifest.has_updates() && !updated_languages.contains(&manifest.language) {
-            updated_languages.push(manifest.language);
-        }
-    }
-
     // Run package manager install if requested and not dry-run
-    if args.install && !args.dry_run && !updated_languages.is_empty() {
-        if args.verbose {
-            eprintln!();
-            eprintln!("Running package manager install...");
-        }
-
-        let pm_runner = SystemPackageManager::new();
-        let install_results = run_installs(&pm_runner, &updated_languages, &args.path);
-
-        for install_result in &install_results {
-            if install_result.command.is_empty() {
-                // Skipped - no package manager found
-                continue;
-            }
-
-            if install_result.success {
-                if args.verbose {
-                    eprintln!(
-                        "  {} install completed: {}",
-                        install_result.language.display_name(),
-                        install_result.command
-                    );
-                }
-            } else {
-                eprintln!(
-                    "  {} install failed: {}",
-                    install_result.language.display_name(),
-                    install_result.command
-                );
-                if !install_result.stderr.is_empty() {
-                    eprintln!("    {}", install_result.stderr);
-                }
-            }
-        }
-
-        // Check if any install failed
-        let any_install_failed = install_results
-            .iter()
-            .any(|r| !r.command.is_empty() && !r.success);
-        if any_install_failed {
-            return Ok(ExitCode::FAILURE);
-        }
+    if args.install && !args.dry_run {
+        run_package_installs(&args, &result, &monorepo_dirs)?;
     }
 
     // Return appropriate exit code
@@ -151,4 +123,97 @@ async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
         // No updates needed
         Ok(ExitCode::SUCCESS)
     }
+}
+
+/// Run package manager installs, handling both single-dir and monorepo modes
+fn run_package_installs(
+    args: &CliArgs,
+    result: &OrchestratorResult,
+    monorepo_dirs: &Option<Vec<PathBuf>>,
+) -> anyhow::Result<()> {
+    // Build a map of directory -> languages that need install
+    let install_map = build_install_map(result, monorepo_dirs, &args.path);
+
+    if install_map.is_empty() {
+        return Ok(());
+    }
+
+    if args.verbose {
+        eprintln!();
+        eprintln!("Running package manager install...");
+    }
+
+    let pm_runner = SystemPackageManager::new();
+    let mut any_install_failed = false;
+
+    for (dir, languages) in &install_map {
+        let install_results = run_installs(&pm_runner, languages, dir);
+
+        for install_result in &install_results {
+            if install_result.command.is_empty() {
+                continue;
+            }
+
+            if install_result.success {
+                if args.verbose {
+                    eprintln!(
+                        "  {} install completed: {} ({})",
+                        install_result.language.display_name(),
+                        install_result.command,
+                        dir.display()
+                    );
+                }
+            } else {
+                eprintln!(
+                    "  {} install failed: {} ({})",
+                    install_result.language.display_name(),
+                    install_result.command,
+                    dir.display()
+                );
+                if !install_result.stderr.is_empty() {
+                    eprintln!("    {}", install_result.stderr);
+                }
+                any_install_failed = true;
+            }
+        }
+    }
+
+    if any_install_failed {
+        anyhow::bail!("Some package manager installs failed");
+    }
+
+    Ok(())
+}
+
+/// Build a map of directory -> languages needing install from the result
+fn build_install_map(
+    result: &OrchestratorResult,
+    monorepo_dirs: &Option<Vec<PathBuf>>,
+    default_path: &Path,
+) -> Vec<(PathBuf, Vec<Language>)> {
+    let mut dir_langs: HashMap<PathBuf, Vec<Language>> = HashMap::new();
+
+    for manifest in &result.summary.manifests {
+        if !manifest.has_updates() {
+            continue;
+        }
+
+        // Determine which directory this manifest belongs to
+        let working_dir = if let Some(dirs) = monorepo_dirs {
+            let manifest_path = &manifest.path;
+            dirs.iter()
+                .find(|d| manifest_path.starts_with(d))
+                .cloned()
+                .unwrap_or_else(|| default_path.to_path_buf())
+        } else {
+            default_path.to_path_buf()
+        };
+
+        let entry = dir_langs.entry(working_dir).or_default();
+        if !entry.contains(&manifest.language) {
+            entry.push(manifest.language);
+        }
+    }
+
+    dir_langs.into_iter().collect()
 }

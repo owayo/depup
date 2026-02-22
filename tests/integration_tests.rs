@@ -1017,6 +1017,112 @@ mod registry_response_parsing {
     }
 }
 
+mod monorepo_config {
+    use super::*;
+    use depup::config::DepupConfig;
+
+    /// Test parsing a .depup config file with valid directories
+    #[test]
+    fn test_parse_config_with_valid_dirs() {
+        let dir = create_test_dir();
+        fs::create_dir(dir.path().join("gui")).unwrap();
+        fs::create_dir(dir.path().join("web")).unwrap();
+        fs::create_dir(dir.path().join("cli")).unwrap();
+
+        let content = "gui\nweb\ncli\n";
+        let config = DepupConfig::parse(content, dir.path()).unwrap();
+        assert_eq!(config.directories.len(), 3);
+    }
+
+    /// Test that manifest detection works across monorepo directories
+    #[test]
+    fn test_monorepo_manifest_detection() {
+        let dir = create_test_dir();
+
+        // Create subdirectories with manifests
+        let gui_dir = dir.path().join("gui");
+        let web_dir = dir.path().join("web");
+        fs::create_dir(&gui_dir).unwrap();
+        fs::create_dir(&web_dir).unwrap();
+
+        // gui has package.json
+        fs::write(
+            gui_dir.join("package.json"),
+            r#"{"dependencies": {"react": "^18.0.0"}}"#,
+        )
+        .unwrap();
+
+        // web has package.json and pyproject.toml
+        fs::write(
+            web_dir.join("package.json"),
+            r#"{"dependencies": {"express": "^4.18.0"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            web_dir.join("pyproject.toml"),
+            "[project]\ndependencies = [\"flask>=2.0.0\"]\n",
+        )
+        .unwrap();
+
+        // Detect manifests per directory
+        let gui_manifests = depup::manifest::detect_manifests(&gui_dir);
+        let web_manifests = depup::manifest::detect_manifests(&web_dir);
+
+        assert_eq!(gui_manifests.len(), 1);
+        assert_eq!(web_manifests.len(), 2);
+
+        // Combined
+        let total = gui_manifests.len() + web_manifests.len();
+        assert_eq!(total, 3);
+    }
+
+    /// Test .depup file with comments and inline comments
+    #[test]
+    fn test_config_with_comments() {
+        let dir = create_test_dir();
+        fs::create_dir(dir.path().join("app")).unwrap();
+        fs::create_dir(dir.path().join("lib")).unwrap();
+
+        let content = "\
+# Main application
+app  # frontend
+
+# Shared libraries
+lib
+# skipped: tests
+";
+        let config = DepupConfig::parse(content, dir.path()).unwrap();
+        assert_eq!(config.directories.len(), 2);
+    }
+
+    /// Test .depup with nonexistent directories skipped
+    #[test]
+    fn test_config_skips_nonexistent() {
+        let dir = create_test_dir();
+        fs::create_dir(dir.path().join("exists")).unwrap();
+
+        let content = "exists\nmissing\n";
+        let config = DepupConfig::parse(content, dir.path()).unwrap();
+        assert_eq!(config.directories.len(), 1);
+    }
+
+    /// Test from_dir with and without .depup file
+    #[test]
+    fn test_from_dir_presence() {
+        let dir = create_test_dir();
+
+        // No .depup file
+        assert!(DepupConfig::from_dir(dir.path()).is_none());
+
+        // Create .depup with a valid directory
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join(".depup"), "sub\n").unwrap();
+
+        let config = DepupConfig::from_dir(dir.path()).unwrap();
+        assert_eq!(config.directories.len(), 1);
+    }
+}
+
 mod pipeline_tests {
     use super::*;
     use chrono::Utc;

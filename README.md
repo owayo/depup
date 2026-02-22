@@ -316,6 +316,24 @@ depup --diff
 
 ## Monorepo Support
 
+### `.depup` Configuration File
+
+For monorepo projects with multiple subdirectories, create a `.depup` file at the project root to list directories to process:
+
+```
+# .depup
+gui       # Frontend app
+api       # Backend API
+shared    # Shared libraries
+```
+
+Run `depup` from the root directory to update dependencies across all listed directories at once. Version lookups are cached, so shared packages are only fetched once.
+
+- `#` starts a comment (line or inline)
+- Empty lines are ignored
+- Paths are relative to the `.depup` file location
+- Non-existent directories are warned and skipped
+
 ### pnpm Workspaces
 
 depup detects `pnpm-workspace.yaml` and processes all workspace packages.

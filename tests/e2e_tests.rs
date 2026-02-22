@@ -415,6 +415,158 @@ mod exit_code_tests {
     }
 }
 
+mod monorepo_tests {
+    use super::*;
+
+    /// Create a monorepo test project with .depup config
+    fn create_monorepo_project() -> TempDir {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp directory");
+
+        // Create subdirectories
+        let gui_dir = temp_dir.path().join("gui");
+        let api_dir = temp_dir.path().join("api");
+        fs::create_dir(&gui_dir).unwrap();
+        fs::create_dir(&api_dir).unwrap();
+
+        // gui/package.json
+        fs::write(
+            gui_dir.join("package.json"),
+            r#"{
+  "name": "gui",
+  "dependencies": {
+    "react": "^18.2.0"
+  }
+}"#,
+        )
+        .unwrap();
+
+        // api/pyproject.toml
+        fs::write(
+            api_dir.join("pyproject.toml"),
+            r#"[project]
+name = "api"
+dependencies = [
+    "fastapi>=0.100.0",
+]
+"#,
+        )
+        .unwrap();
+
+        // .depup config
+        fs::write(temp_dir.path().join(".depup"), "gui\napi\n").unwrap();
+
+        temp_dir
+    }
+
+    /// Test monorepo dry-run with JSON output processes all subdirectories
+    #[test]
+    fn test_monorepo_dry_run_json() {
+        let temp_dir = create_monorepo_project();
+        let binary = get_binary_path();
+
+        let output = Command::new(&binary)
+            .args(["--dry-run", "--json", temp_dir.path().to_str().unwrap()])
+            .output()
+            .expect("Failed to execute command");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json: serde_json::Value =
+            serde_json::from_str(&stdout).expect("Output should be valid JSON");
+
+        // Should have manifests from both subdirectories
+        let manifests = json["manifests"].as_array().unwrap();
+        assert!(
+            manifests.len() >= 2,
+            "Should detect manifests from both gui and api, got {}",
+            manifests.len()
+        );
+
+        // Verify both languages are represented
+        let languages: Vec<&str> = manifests
+            .iter()
+            .filter_map(|m| m["language"].as_str())
+            .collect();
+        assert!(
+            languages.contains(&"Node.js"),
+            "Should detect Node.js manifest from gui/"
+        );
+        assert!(
+            languages.contains(&"Python"),
+            "Should detect Python manifest from api/"
+        );
+    }
+
+    /// Test monorepo dry-run leaves all files unchanged
+    #[test]
+    fn test_monorepo_dry_run_no_modification() {
+        let temp_dir = create_monorepo_project();
+        let binary = get_binary_path();
+
+        let original_pkg = fs::read_to_string(temp_dir.path().join("gui/package.json")).unwrap();
+        let original_py = fs::read_to_string(temp_dir.path().join("api/pyproject.toml")).unwrap();
+
+        Command::new(&binary)
+            .args(["--dry-run", temp_dir.path().to_str().unwrap()])
+            .output()
+            .expect("Failed to execute command");
+
+        let new_pkg = fs::read_to_string(temp_dir.path().join("gui/package.json")).unwrap();
+        let new_py = fs::read_to_string(temp_dir.path().join("api/pyproject.toml")).unwrap();
+
+        assert_eq!(
+            original_pkg, new_pkg,
+            "gui/package.json should not change in dry-run"
+        );
+        assert_eq!(
+            original_py, new_py,
+            "api/pyproject.toml should not change in dry-run"
+        );
+    }
+
+    /// Test that without .depup, existing single-dir behavior is preserved
+    #[test]
+    fn test_no_depup_file_preserves_existing_behavior() {
+        let temp_dir = create_test_project();
+        let binary = get_binary_path();
+
+        // No .depup file - should work as before
+        let output = Command::new(&binary)
+            .args(["--dry-run", "--json", temp_dir.path().to_str().unwrap()])
+            .output()
+            .expect("Failed to execute command");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json: serde_json::Value =
+            serde_json::from_str(&stdout).expect("Output should be valid JSON");
+
+        // Should detect manifests in the root directory
+        let manifests = json["manifests"].as_array().unwrap();
+        assert!(
+            !manifests.is_empty(),
+            "Should detect manifests without .depup file"
+        );
+    }
+
+    /// Test monorepo with verbose flag shows directory info
+    #[test]
+    fn test_monorepo_verbose() {
+        let temp_dir = create_monorepo_project();
+        let binary = get_binary_path();
+
+        let output = Command::new(&binary)
+            .args(["--dry-run", "--verbose", temp_dir.path().to_str().unwrap()])
+            .output()
+            .expect("Failed to execute command");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("Monorepo mode"),
+            "Verbose output should mention monorepo mode: {}",
+            stderr
+        );
+    }
+}
+
 mod cli_options_tests {
     use super::*;
 

@@ -19,14 +19,19 @@ use crate::registry::{
 };
 use crate::tauri_sync::{TauriVersionSync, TAURI_CRATE, TAURI_NPM_PACKAGES};
 use crate::update::{UpdateFilter, UpdateJudge, VersionInfo};
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 
 /// Default concurrency limit for registry requests
 const DEFAULT_CONCURRENCY: usize = 10;
 
 /// Concurrency limit for crates.io (rate limited)
 const CRATES_IO_CONCURRENCY: usize = 1;
+
+/// Cache for version information keyed by (language, package_name)
+pub type VersionCache = Arc<Mutex<HashMap<(Language, String), Vec<VersionInfo>>>>;
 
 /// Orchestrator for coordinating the update workflow
 pub struct Orchestrator {
@@ -38,6 +43,8 @@ pub struct Orchestrator {
     general_semaphore: Arc<Semaphore>,
     /// Semaphore for crates.io specific rate limiting
     crates_io_semaphore: Arc<Semaphore>,
+    /// Version cache shared across directories
+    version_cache: VersionCache,
 }
 
 /// Result of running the orchestrator
@@ -98,6 +105,7 @@ impl Orchestrator {
             client,
             general_semaphore: Arc::new(Semaphore::new(DEFAULT_CONCURRENCY)),
             crates_io_semaphore: Arc::new(Semaphore::new(CRATES_IO_CONCURRENCY)),
+            version_cache: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -108,7 +116,14 @@ impl Orchestrator {
             client,
             general_semaphore: Arc::new(Semaphore::new(DEFAULT_CONCURRENCY)),
             crates_io_semaphore: Arc::new(Semaphore::new(CRATES_IO_CONCURRENCY)),
+            version_cache: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Set a shared version cache (for monorepo multi-directory runs)
+    pub fn with_cache(mut self, cache: VersionCache) -> Self {
+        self.version_cache = cache;
+        self
     }
 
     /// Run the update workflow
@@ -257,6 +272,149 @@ impl Orchestrator {
         }
     }
 
+    /// Run the update workflow across multiple directories (monorepo mode)
+    ///
+    /// Detects manifests in each directory, shares the version cache,
+    /// and produces a combined result.
+    pub async fn run_directories(&self, directories: &[PathBuf]) -> OrchestratorResult {
+        let show_progress = !self.args.quiet;
+        let mut progress = Progress::new(show_progress);
+        let mut summary = UpdateSummary::new(self.args.dry_run);
+        let mut errors = Vec::new();
+
+        // Step 1: Detect manifest files across all directories
+        progress.spinner("Detecting manifest files...");
+        let mut all_manifests = Vec::new();
+        for dir in directories {
+            let manifests = detect_manifests(dir);
+            all_manifests.extend(manifests);
+        }
+        progress.finish_and_clear();
+
+        if all_manifests.is_empty() {
+            return OrchestratorResult {
+                summary,
+                write_results: Vec::new(),
+                errors,
+            };
+        }
+
+        // Build update filter from CLI args
+        let filter = self.build_filter();
+        let judge = UpdateJudge::new(filter);
+
+        // Step 2: Parse manifests and collect all dependencies
+        progress.spinner("Parsing manifests...");
+        let mut parsed_manifests = Vec::new();
+
+        for manifest_info in &all_manifests {
+            if !self.should_process_language(manifest_info.language) {
+                continue;
+            }
+
+            let parser = get_parser(manifest_info.language);
+            let content = match std::fs::read_to_string(&manifest_info.path) {
+                Ok(c) => c,
+                Err(e) => {
+                    errors.push(OrchestratorError::ManifestParseError {
+                        path: manifest_info.path.display().to_string(),
+                        message: e.to_string(),
+                    });
+                    continue;
+                }
+            };
+
+            let dependencies = match parser.parse(&content) {
+                Ok(deps) => deps,
+                Err(e) => {
+                    errors.push(OrchestratorError::ManifestParseError {
+                        path: manifest_info.path.display().to_string(),
+                        message: e.to_string(),
+                    });
+                    continue;
+                }
+            };
+
+            parsed_manifests.push((manifest_info, dependencies));
+        }
+        progress.finish_and_clear();
+
+        // Count total dependencies for progress bar
+        let total_deps: usize = parsed_manifests.iter().map(|(_, deps)| deps.len()).sum();
+
+        // Step 3: Fetch versions and judge updates (cache shared across dirs)
+        progress.start(total_deps as u64, "Checking dependencies");
+
+        for (manifest_info, dependencies) in parsed_manifests {
+            let mut manifest_result =
+                ManifestUpdateResult::new(&manifest_info.path, manifest_info.language);
+            let adapter = self.get_adapter(manifest_info.language);
+
+            for dep in dependencies {
+                progress.set_message(&format!("Checking {}", &dep.name));
+
+                if let Some(reason) = judge.should_skip(&dep) {
+                    manifest_result.add_result(UpdateResult::skip(dep, reason));
+                    progress.inc();
+                    continue;
+                }
+
+                let versions = match self.fetch_versions(&*adapter, &dep.name).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        errors.push(OrchestratorError::RegistryError {
+                            package: dep.name.clone(),
+                            message: e.to_string(),
+                        });
+                        manifest_result
+                            .add_result(UpdateResult::skip(dep, SkipReason::FetchFailed(e)));
+                        progress.inc();
+                        continue;
+                    }
+                };
+
+                let result = judge.judge(&dep, &versions);
+                manifest_result.add_result(result);
+                progress.inc();
+            }
+
+            summary.add_manifest(manifest_result);
+        }
+        progress.finish_and_clear();
+
+        // Step 3.5: Synchronize Tauri versions per directory group
+        let is_tauri = all_manifests.iter().any(|m| m.is_tauri_rust);
+        if is_tauri {
+            progress.spinner("Synchronizing Tauri versions...");
+            self.synchronize_tauri_versions(&mut summary, &mut errors)
+                .await;
+            progress.finish_and_clear();
+        }
+
+        // Step 4: Apply updates (unless dry-run)
+        if !self.args.dry_run {
+            progress.spinner("Writing updates...");
+        }
+        let writer = ManifestWriter::new(self.args.dry_run);
+        let write_results = writer.apply_all_updates(&summary.manifests, get_parser);
+        progress.finish_and_clear();
+
+        for result in &write_results {
+            for error in &result.errors {
+                errors.push(OrchestratorError::WriteError {
+                    path: result.path.display().to_string(),
+                    message: error.clone(),
+                });
+            }
+        }
+
+        OrchestratorResult {
+            summary,
+            write_results,
+            errors,
+        }
+    }
+
     /// Build an UpdateFilter from CLI arguments
     fn build_filter(&self) -> UpdateFilter {
         let mut filter = UpdateFilter::new();
@@ -350,12 +508,22 @@ impl Orchestrator {
         }
     }
 
-    /// Fetch versions from registry with concurrency control
+    /// Fetch versions from registry with concurrency control and caching
     async fn fetch_versions(
         &self,
         adapter: &(dyn RegistryAdapter + Send + Sync),
         package: &str,
     ) -> Result<Vec<VersionInfo>, String> {
+        let cache_key = (adapter.language(), package.to_string());
+
+        // Check cache first
+        {
+            let cache = self.version_cache.lock().await;
+            if let Some(cached) = cache.get(&cache_key) {
+                return Ok(cached.clone());
+            }
+        }
+
         // Use appropriate semaphore based on registry
         let semaphore = if adapter.language() == Language::Rust {
             &self.crates_io_semaphore
@@ -365,10 +533,18 @@ impl Orchestrator {
 
         let _permit = semaphore.acquire().await.unwrap();
 
-        adapter
+        let result = adapter
             .fetch_versions(package)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+
+        // Store in cache
+        {
+            let mut cache = self.version_cache.lock().await;
+            cache.insert(cache_key, result.clone());
+        }
+
+        Ok(result)
     }
 
     /// Synchronize Tauri package versions (@tauri-apps/api, @tauri-apps/cli, and tauri crate)
