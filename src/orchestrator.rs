@@ -1003,4 +1003,69 @@ mod tests {
         // Should have no min_age
         assert!(filter.min_age.is_none());
     }
+
+    #[tokio::test]
+    async fn test_version_cache_prevents_duplicate_fetches() {
+        let args = make_args(&["depup"]);
+        let orchestrator = Orchestrator::new(args).unwrap();
+
+        // Pre-populate cache with a known package
+        let cache_key = (Language::Node, "lodash".to_string());
+        {
+            let mut cache = orchestrator.version_cache.lock().await;
+            cache.insert(
+                cache_key,
+                vec![VersionInfo {
+                    version: "4.17.21".to_string(),
+                    released_at: chrono::Utc::now(),
+                }],
+            );
+        }
+
+        // Fetch the same package — should return cached result without network access
+        let adapter = orchestrator.get_adapter(Language::Node);
+        let result = orchestrator.fetch_versions(&*adapter, "lodash").await;
+
+        assert!(result.is_ok());
+        let versions = result.unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version, "4.17.21");
+    }
+
+    #[tokio::test]
+    async fn test_run_directories_with_root_included() {
+        let dir = TempDir::new().unwrap();
+
+        // Create root manifest
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"root\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        // Create subdirectory with manifest
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        fs::write(
+            dir.path().join("sub").join("Cargo.toml"),
+            "[package]\nname = \"sub\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        // Build directories list using DepupConfig::directories_with_root
+        let config = crate::config::DepupConfig {
+            directories: vec![dir.path().join("sub")],
+        };
+        let dirs = config.directories_with_root(dir.path());
+
+        assert_eq!(dirs.len(), 2);
+
+        // Run orchestrator with these directories (dry-run, no network)
+        let args = make_args_with_path(dir.path(), &["--dry-run"]);
+        let orchestrator = Orchestrator::new(args).unwrap();
+        let result = orchestrator.run_directories(&dirs).await;
+
+        // Both directories' manifests should be detected
+        // (they have no dependencies so 0 updates, but no errors either)
+        assert!(result.errors.is_empty());
+    }
 }

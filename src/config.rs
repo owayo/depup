@@ -31,6 +31,20 @@ impl DepupConfig {
         }
     }
 
+    /// Build the list of directories to scan, always including the root directory.
+    ///
+    /// The root directory is placed first, followed by any `.depup`-listed directories
+    /// that are not the root itself (to avoid duplicates).
+    pub fn directories_with_root(&self, root: &Path) -> Vec<PathBuf> {
+        let mut dirs = vec![root.to_path_buf()];
+        for dir in &self.directories {
+            if *dir != root {
+                dirs.push(dir.clone());
+            }
+        }
+        dirs
+    }
+
     /// Parse the content of a `.depup` file
     ///
     /// Each line is treated as a relative path. `#` starts a comment (line or inline).
@@ -196,5 +210,47 @@ missing
 
         let config = DepupConfig::from_dir(dir.path()).unwrap();
         assert!(config.directories.is_empty());
+    }
+
+    #[test]
+    fn test_directories_with_root_always_includes_root() {
+        let dir = create_test_dir();
+        fs::create_dir(dir.path().join("gui")).unwrap();
+        fs::create_dir(dir.path().join("api")).unwrap();
+
+        let config = DepupConfig::parse("gui\napi\n", dir.path()).unwrap();
+        let dirs = config.directories_with_root(dir.path());
+
+        assert_eq!(dirs.len(), 3);
+        assert_eq!(dirs[0], dir.path().to_path_buf(), "root should be first");
+        assert_eq!(dirs[1], dir.path().join("gui"));
+        assert_eq!(dirs[2], dir.path().join("api"));
+    }
+
+    #[test]
+    fn test_directories_with_root_no_duplicate_when_root_in_depup() {
+        let dir = create_test_dir();
+        fs::create_dir(dir.path().join("gui")).unwrap();
+
+        // .depup にルート自身のパスが含まれていても重複しない
+        let directories = vec![dir.path().to_path_buf(), dir.path().join("gui")];
+        let config = DepupConfig { directories };
+        let dirs = config.directories_with_root(dir.path());
+
+        assert_eq!(dirs.len(), 2);
+        assert_eq!(dirs[0], dir.path().to_path_buf());
+        assert_eq!(dirs[1], dir.path().join("gui"));
+    }
+
+    #[test]
+    fn test_directories_with_root_empty_depup() {
+        let dir = create_test_dir();
+        fs::write(dir.path().join(".depup"), "").unwrap();
+
+        let config = DepupConfig::from_dir(dir.path()).unwrap();
+        let dirs = config.directories_with_root(dir.path());
+
+        assert_eq!(dirs.len(), 1);
+        assert_eq!(dirs[0], dir.path().to_path_buf(), "root only");
     }
 }
