@@ -71,13 +71,19 @@ async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
     let orchestrator = Orchestrator::new(args.clone())?;
 
     let (result, monorepo_dirs) = if let Some(config) = monorepo_config {
+        // Always include root directory, then add .depup directories
+        let mut dirs = vec![args.path.clone()];
+        for dir in &config.directories {
+            if *dir != args.path {
+                dirs.push(dir.clone());
+            }
+        }
         if args.verbose {
-            eprintln!("Monorepo mode: {} directories", config.directories.len());
-            for dir in &config.directories {
+            eprintln!("Monorepo mode: {} directories", dirs.len());
+            for dir in &dirs {
                 eprintln!("  - {}", dir.display());
             }
         }
-        let dirs = config.directories.clone();
         let r = orchestrator.run_directories(&dirs).await;
         (r, Some(dirs))
     } else {
