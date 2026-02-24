@@ -4,6 +4,7 @@
 //! - Semantic version: `v1.2.3`
 //! - Prerelease: `v1.2.3-beta.1`
 //! - Pseudo-version: `v0.0.0-20210101120000-abcdef123456`
+//! - Extended pseudo-version: `v1.2.4-0.20240101010101-abcdef123456`
 //!
 //! Note: Go modules use `// pinned` comment to indicate pinned versions,
 //! which is handled at the manifest parsing level, not here.
@@ -17,17 +18,19 @@ use std::sync::LazyLock;
 pub struct GoVersionParser;
 
 // Regex patterns for Go version specifications
-// Standard semver: v1.2.3, v1.2.3-beta.1
-static SEMVER_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^v(\d+\.\d+\.\d+(?:-[\w.]+)?)$").unwrap());
+// Standard semver: v1.2.3, v1.2.3-beta.1, v1.2.3+meta
+static SEMVER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^v(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)(\+[0-9A-Za-z.-]+)?$").unwrap()
+});
 
-// Pseudo-version: v0.0.0-20210101120000-abcdef123456
-static PSEUDO_VERSION_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^v(\d+\.\d+\.\d+-\d{14}-[a-f0-9]{12})$").unwrap());
-
-// Incompatible module versions: v2.0.0+incompatible
-static INCOMPATIBLE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^v(\d+\.\d+\.\d+(?:-[\w.]+)?)\+incompatible$").unwrap());
+// Pseudo-version:
+// - v0.0.0-20210101120000-abcdef123456
+// - v1.2.3-0.20210101120000-abcdef123456
+// - v1.2.4-beta.0.20210101120000-abcdef123456
+static PSEUDO_VERSION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^v(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+\.)?\d{14}-[a-f0-9]{12})(\+incompatible)?$")
+        .unwrap()
+});
 
 impl VersionParser for GoVersionParser {
     fn parse(&self, version_str: &str) -> Option<VersionSpec> {
@@ -41,19 +44,12 @@ impl VersionParser for GoVersionParser {
         // These are treated as exact/pinned since they reference a specific commit
         if let Some(caps) = PSEUDO_VERSION_RE.captures(trimmed) {
             let version = caps.get(1)?.as_str();
-            return Some(
-                VersionSpec::new(VersionSpecKind::Exact, trimmed, version).with_prefix("v"),
-            );
-        }
-
-        // Check for +incompatible suffix
-        if let Some(caps) = INCOMPATIBLE_RE.captures(trimmed) {
-            let version = caps.get(1)?.as_str();
-            return Some(
-                VersionSpec::new(VersionSpecKind::Exact, trimmed, version)
-                    .with_prefix("v")
-                    .with_suffix("+incompatible"),
-            );
+            let mut spec =
+                VersionSpec::new(VersionSpecKind::Exact, trimmed, version).with_prefix("v");
+            if caps.get(2).is_some() {
+                spec = spec.with_suffix("+incompatible");
+            }
+            return Some(spec);
         }
 
         // Check for standard semver (v1.2.3)
@@ -61,9 +57,12 @@ impl VersionParser for GoVersionParser {
         // The concept of ranges doesn't exist in go.mod
         if let Some(caps) = SEMVER_RE.captures(trimmed) {
             let version = caps.get(1)?.as_str();
-            return Some(
-                VersionSpec::new(VersionSpecKind::Exact, trimmed, version).with_prefix("v"),
-            );
+            let mut spec =
+                VersionSpec::new(VersionSpecKind::Exact, trimmed, version).with_prefix("v");
+            if let Some(sfx) = caps.get(2) {
+                spec = spec.with_suffix(sfx.as_str());
+            }
+            return Some(spec);
         }
 
         None
@@ -123,6 +122,20 @@ mod tests {
         assert_eq!(spec.version, "2.0.0");
         assert_eq!(spec.prefix, Some("v".to_string()));
         assert_eq!(spec.suffix, Some("+incompatible".to_string()));
+    }
+
+    #[test]
+    fn test_parse_extended_pseudo_version() {
+        let spec = parse("v1.2.4-0.20210101120000-abcdef123456").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "1.2.4-0.20210101120000-abcdef123456");
+    }
+
+    #[test]
+    fn test_parse_extended_pseudo_with_prerelease() {
+        let spec = parse("v1.2.4-beta.0.20210101120000-abcdef123456").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "1.2.4-beta.0.20210101120000-abcdef123456");
     }
 
     #[test]

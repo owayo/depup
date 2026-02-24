@@ -16,16 +16,87 @@ use chrono::{DateTime, Utc};
 use regex::Regex;
 use std::sync::LazyLock;
 
-/// Regex to extract upper bound from Range constraint (e.g., ">=3.5.0,<4.0.0" -> "4.0.0")
-static UPPER_BOUND_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<(\d+(?:\.\d+)*)").unwrap());
+/// Common version token used in range upper-bound extraction.
+const VERSION_TOKEN: &str = r"[vV]?\d+(?:\.\d+)*(?:[-+][0-9A-Za-z.-]+)?";
 
-/// Extract upper bound version from a Range constraint string
-/// e.g., ">=3.5.0,<4.0.0" -> Some("4.0.0")
-fn extract_upper_bound(raw: &str) -> Option<String> {
-    UPPER_BOUND_RE
-        .captures(raw)
-        .and_then(|caps| caps.get(1))
-        .map(|m| m.as_str().to_string())
+/// Regex to extract inclusive upper bound (`<=X`) from Range constraints.
+static UPPER_BOUND_LTE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!(r"<=\s*({VERSION_TOKEN})")).unwrap());
+/// Regex to extract exclusive upper bound (`<X`) from Range constraints.
+static UPPER_BOUND_LT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!(r"<\s*({VERSION_TOKEN})")).unwrap());
+/// Regex to extract Swift closed-range upper bound (`A...B`) from Range constraints.
+static UPPER_BOUND_SWIFT_CLOSED_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!(r"\.\.\.\s*({VERSION_TOKEN})")).unwrap());
+/// Regex to extract Swift half-open upper bound (`A..<B`) from Range constraints.
+static UPPER_BOUND_SWIFT_HALF_OPEN_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!(r"\.\.<\s*({VERSION_TOKEN})")).unwrap());
+/// Regex to extract hyphen range upper bound (`A - B`) from Range constraints.
+static UPPER_BOUND_HYPHEN_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!(r"{VERSION_TOKEN}\s*-\s*({VERSION_TOKEN})")).unwrap());
+/// Regex to extract Maven-style ranges (`[1.0,2.0)`, `(,2.0]`) from Range constraints.
+static MAVEN_RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r"^([\[\(])\s*({VERSION_TOKEN})?\s*,\s*({VERSION_TOKEN})?\s*([\]\)])$"
+    ))
+    .unwrap()
+});
+
+fn normalize_bound_version(version: &str) -> String {
+    version
+        .strip_prefix('v')
+        .or_else(|| version.strip_prefix('V'))
+        .unwrap_or(version)
+        .to_string()
+}
+
+/// Extract upper bound version and inclusiveness from a Range constraint string.
+///
+/// Returns `(upper_bound, inclusive)` where:
+/// - `<X` and `A..<B` return `(X, false)`
+/// - `<=X` and `A...B` return `(X, true)`
+fn extract_upper_bound(raw: &str) -> Option<(String, bool)> {
+    let trimmed = raw.trim();
+
+    if let Some(caps) = UPPER_BOUND_SWIFT_HALF_OPEN_RE.captures(trimmed) {
+        if let Some(m) = caps.get(1) {
+            return Some((normalize_bound_version(m.as_str()), false));
+        }
+    }
+
+    if let Some(caps) = UPPER_BOUND_LTE_RE.captures(raw) {
+        if let Some(m) = caps.get(1) {
+            return Some((normalize_bound_version(m.as_str()), true));
+        }
+    }
+
+    if let Some(caps) = UPPER_BOUND_LT_RE.captures(raw) {
+        if let Some(m) = caps.get(1) {
+            return Some((normalize_bound_version(m.as_str()), false));
+        }
+    }
+
+    if let Some(caps) = UPPER_BOUND_SWIFT_CLOSED_RE.captures(trimmed) {
+        if let Some(m) = caps.get(1) {
+            return Some((normalize_bound_version(m.as_str()), true));
+        }
+    }
+
+    if let Some(caps) = UPPER_BOUND_HYPHEN_RE.captures(trimmed) {
+        if let Some(m) = caps.get(1) {
+            return Some((normalize_bound_version(m.as_str()), true));
+        }
+    }
+
+    if let Some(caps) = MAVEN_RANGE_RE.captures(trimmed) {
+        let upper = caps.get(3).map(|m| m.as_str()).unwrap_or("").trim();
+        if !upper.is_empty() {
+            let inclusive = caps.get(4).map(|m| m.as_str()) == Some("]");
+            return Some((normalize_bound_version(upper), inclusive));
+        }
+    }
+
+    None
 }
 
 /// Update judgment engine that decides whether to update a dependency
@@ -128,12 +199,17 @@ impl UpdateJudge {
         // e.g., for ">=3.5.0,<4.0.0", exclude versions >= 4.0.0
         let eligible_versions: Vec<&VersionInfo> =
             if dependency.version_spec.kind == VersionSpecKind::Range {
-                if let Some(upper_bound) = extract_upper_bound(&dependency.version_spec.raw) {
+                if let Some((upper_bound, inclusive)) =
+                    extract_upper_bound(&dependency.version_spec.raw)
+                {
                     age_filtered
                         .into_iter()
                         .filter(|v| {
-                            version_info::compare_versions(&v.version, &upper_bound)
-                                == std::cmp::Ordering::Less
+                            match version_info::compare_versions(&v.version, &upper_bound) {
+                                std::cmp::Ordering::Less => true,
+                                std::cmp::Ordering::Equal => inclusive,
+                                std::cmp::Ordering::Greater => false,
+                            }
                         })
                         .collect()
                 } else {
@@ -666,15 +742,43 @@ mod tests {
         // Test the helper function for extracting upper bound from Range constraint
         assert_eq!(
             super::extract_upper_bound(">=3.5.0,<4.0.0"),
-            Some("4.0.0".to_string())
+            Some(("4.0.0".to_string(), false))
         );
         assert_eq!(
             super::extract_upper_bound(">=1.0,<2.0"),
-            Some("2.0".to_string())
+            Some(("2.0".to_string(), false))
         );
         assert_eq!(
             super::extract_upper_bound(">=1.0, <2.0"),
-            Some("2.0".to_string())
+            Some(("2.0".to_string(), false))
+        );
+        assert_eq!(
+            super::extract_upper_bound(">=1.0,<=2.0"),
+            Some(("2.0".to_string(), true))
+        );
+        assert_eq!(
+            super::extract_upper_bound("4.0.0...4.9.9"),
+            Some(("4.9.9".to_string(), true))
+        );
+        assert_eq!(
+            super::extract_upper_bound("4.0.0..<5.0.0"),
+            Some(("5.0.0".to_string(), false))
+        );
+        assert_eq!(
+            super::extract_upper_bound("1.2.0 - 2.0.0"),
+            Some(("2.0.0".to_string(), true))
+        );
+        assert_eq!(
+            super::extract_upper_bound("[1.0,2.0)"),
+            Some(("2.0".to_string(), false))
+        );
+        assert_eq!(
+            super::extract_upper_bound("(,2.0]"),
+            Some(("2.0".to_string(), true))
+        );
+        assert_eq!(
+            super::extract_upper_bound(">=1.0.0,<v2.0.0"),
+            Some(("2.0.0".to_string(), false))
         );
         // No upper bound
         assert_eq!(super::extract_upper_bound(">=1.0"), None);
@@ -733,6 +837,46 @@ mod tests {
         assert!(result.is_skip());
         if let UpdateResult::Skip { reason, .. } = result {
             assert_eq!(reason, SkipReason::AlreadyLatest);
+        }
+    }
+
+    #[test]
+    fn test_judge_range_respects_inclusive_upper_bound() {
+        // Inclusive upper bound should allow the boundary version (<=2.0)
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_range_dependency("package", ">=1.0,<=2.0", "1.0", Language::Python);
+        let versions = vec![
+            make_version_info("1.0", 100),
+            make_version_info("2.0", 50), // included by upper bound
+            make_version_info("2.1", 20), // excluded by upper bound
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_update());
+        if let UpdateResult::Update { new_version, .. } = result {
+            assert_eq!(new_version, "2.0");
+        }
+    }
+
+    #[test]
+    fn test_judge_swift_closed_range_respects_upper_bound() {
+        // Swift closed range (`...`) has an inclusive upper bound.
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_range_dependency("vapor/vapor", "4.0.0...4.9.9", "4.0.0", Language::Swift);
+        let versions = vec![
+            make_version_info("4.0.0", 100),
+            make_version_info("4.9.9", 50), // included by upper bound
+            make_version_info("5.0.0", 20), // excluded by upper bound
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_update());
+        if let UpdateResult::Update { new_version, .. } = result {
+            assert_eq!(new_version, "4.9.9");
         }
     }
 

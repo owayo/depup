@@ -5,8 +5,8 @@
 //! - Caret ranges: `^1.2.3`
 //! - Tilde ranges: `~1.2.3`
 //! - Comparison operators: `>=`, `<`, `>`, `<=`
-//! - Compound constraints: `>=1.0 <2.0`
-//! - Wildcards: `1.2.*`
+//! - Compound constraints: `>=1.0 <2.0`, `^1 || ^2`, `1.0 - 2.0`
+//! - Wildcards: `1.2.*`, `1.x`, `*`
 
 use crate::domain::{Language, VersionSpec, VersionSpecKind};
 use crate::parser::VersionParser;
@@ -20,33 +20,42 @@ pub struct PhpVersionParser;
 // PHP/Composer uses standard semver-like patterns
 
 // Caret range: ^1.2.3
-static CARET_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\^(\d+(?:\.\d+)*)$").unwrap());
+static CARET_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\^\s*(v?\d+(?:\.\d+){0,2}(?:[-+][\w.-]+)?)$").unwrap());
 
 // Tilde range: ~1.2.3
-static TILDE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^~(\d+(?:\.\d+)*)$").unwrap());
+static TILDE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^~\s*(v?\d+(?:\.\d+){0,2}(?:[-+][\w.-]+)?)$").unwrap());
 
 // Greater than or equal: >=1.2.3
-static GTE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^>=\s*(\d+(?:\.\d+)*)$").unwrap());
+static GTE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^>=\s*(v?\d+(?:\.\d+){0,2}(?:[-+][\w.-]+)?)$").unwrap());
 
 // Greater than: >1.2.3
-static GT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^>\s*(\d+(?:\.\d+)*)$").unwrap());
+static GT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^>\s*(v?\d+(?:\.\d+){0,2}(?:[-+][\w.-]+)?)$").unwrap());
 
 // Less than or equal: <=1.2.3
-static LTE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^<=\s*(\d+(?:\.\d+)*)$").unwrap());
+static LTE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^<=\s*(v?\d+(?:\.\d+){0,2}(?:[-+][\w.-]+)?)$").unwrap());
 
 // Less than: <1.2.3
-static LT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^<\s*(\d+(?:\.\d+)*)$").unwrap());
+static LT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^<\s*(v?\d+(?:\.\d+){0,2}(?:[-+][\w.-]+)?)$").unwrap());
+static NOT_EQUAL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^!=\s*(v?\d+(?:\.\d+){0,2}(?:[-+][\w.-]+)?)$").unwrap());
 
-// Wildcard: 1.2.*
+// Wildcard: 1.2.*, 1.x, *
 static WILDCARD_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(\d+(?:\.\d+)*)\.\*$").unwrap());
+    LazyLock::new(|| Regex::new(r"^(?:v?(?:\d+|[xX*])(?:\.(?:\d+|[xX*])){0,2}|\*)$").unwrap());
 
 // Bare version (exact): 1.2.3
 static BARE_VERSION_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(\d+(?:\.\d+)*)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^(v?\d+(?:\.\d+){0,2}(?:[-+][\w.-]+)?)$").unwrap());
 
 // Compound constraint pattern - OR separator
-static COMPOUND_OR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\|\|").unwrap());
+static COMPOUND_OR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\|\|?").unwrap());
+static HYPHEN_RANGE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s-\s").unwrap());
 
 // Space-separated compound: requires two operator-prefixed constraints
 // e.g., ">=1.0 <2.0" or "^1.0 !=1.5"
@@ -56,11 +65,25 @@ static COMPOUND_SPACE_RE: LazyLock<Regex> = LazyLock::new(|| {
     // First constraint, then space, then another constraint starting with operator
     Regex::new(r"^[<>=^~!].*\s+[<>=^~!]").unwrap()
 });
+static COMPOUND_COMMA_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r",").unwrap());
+static VERSION_TOKEN_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"v?\d+(?:\.\d+){0,2}(?:[-+][\w.-]+)?").unwrap());
+
+fn normalize_version(version: &str) -> String {
+    version.strip_prefix('v').unwrap_or(version).to_string()
+}
+
+fn extract_first_version(raw: &str) -> String {
+    VERSION_TOKEN_RE
+        .find(raw)
+        .map(|m| normalize_version(m.as_str()))
+        .unwrap_or_default()
+}
 
 impl PhpVersionParser {
     /// Parse a single version constraint (not compound)
     fn parse_single(&self, version_str: &str) -> Option<VersionSpec> {
-        let trimmed = version_str.trim();
+        let trimmed = version_str.trim().split('@').next().unwrap_or("").trim();
 
         if trimmed.is_empty() {
             return None;
@@ -68,7 +91,7 @@ impl PhpVersionParser {
 
         // Check for caret range (^1.2.3)
         if let Some(caps) = CARET_RE.captures(trimmed) {
-            let version = caps.get(1)?.as_str();
+            let version = normalize_version(caps.get(1)?.as_str());
             return Some(
                 VersionSpec::new(VersionSpecKind::Caret, trimmed, version).with_prefix("^"),
             );
@@ -76,7 +99,7 @@ impl PhpVersionParser {
 
         // Check for tilde range (~1.2.3)
         if let Some(caps) = TILDE_RE.captures(trimmed) {
-            let version = caps.get(1)?.as_str();
+            let version = normalize_version(caps.get(1)?.as_str());
             return Some(
                 VersionSpec::new(VersionSpecKind::Tilde, trimmed, version).with_prefix("~"),
             );
@@ -84,7 +107,7 @@ impl PhpVersionParser {
 
         // Check for greater than or equal (>=1.2.3)
         if let Some(caps) = GTE_RE.captures(trimmed) {
-            let version = caps.get(1)?.as_str();
+            let version = normalize_version(caps.get(1)?.as_str());
             return Some(
                 VersionSpec::new(VersionSpecKind::GreaterOrEqual, trimmed, version)
                     .with_prefix(">="),
@@ -93,7 +116,7 @@ impl PhpVersionParser {
 
         // Check for greater than (>1.2.3)
         if let Some(caps) = GT_RE.captures(trimmed) {
-            let version = caps.get(1)?.as_str();
+            let version = normalize_version(caps.get(1)?.as_str());
             return Some(
                 VersionSpec::new(VersionSpecKind::Greater, trimmed, version).with_prefix(">"),
             );
@@ -101,7 +124,7 @@ impl PhpVersionParser {
 
         // Check for less than or equal (<=1.2.3)
         if let Some(caps) = LTE_RE.captures(trimmed) {
-            let version = caps.get(1)?.as_str();
+            let version = normalize_version(caps.get(1)?.as_str());
             return Some(
                 VersionSpec::new(VersionSpecKind::LessOrEqual, trimmed, version).with_prefix("<="),
             );
@@ -109,23 +132,32 @@ impl PhpVersionParser {
 
         // Check for less than (<1.2.3)
         if let Some(caps) = LT_RE.captures(trimmed) {
-            let version = caps.get(1)?.as_str();
+            let version = normalize_version(caps.get(1)?.as_str());
             return Some(
                 VersionSpec::new(VersionSpecKind::Less, trimmed, version).with_prefix("<"),
             );
         }
 
-        // Check for wildcard (1.2.*)
-        if let Some(caps) = WILDCARD_RE.captures(trimmed) {
-            let version = caps.get(1)?.as_str();
-            return Some(
-                VersionSpec::new(VersionSpecKind::Wildcard, trimmed, version).with_suffix(".*"),
-            );
+        if let Some(caps) = NOT_EQUAL_RE.captures(trimmed) {
+            let version = normalize_version(caps.get(1)?.as_str());
+            return Some(VersionSpec::new(VersionSpecKind::Range, trimmed, version));
+        }
+
+        // Check for wildcard (*, 1.2.*, 1.x)
+        if WILDCARD_RE.is_match(trimmed)
+            && (trimmed.contains('x') || trimmed.contains('X') || trimmed.contains('*'))
+        {
+            let version = extract_first_version(trimmed);
+            let mut spec = VersionSpec::new(VersionSpecKind::Wildcard, trimmed, version);
+            if trimmed.ends_with(".*") {
+                spec = spec.with_suffix(".*");
+            }
+            return Some(spec);
         }
 
         // Check for bare version (1.2.3) - treated as exact
         if let Some(caps) = BARE_VERSION_RE.captures(trimmed) {
-            let version = caps.get(1)?.as_str();
+            let version = normalize_version(caps.get(1)?.as_str());
             return Some(VersionSpec::new(VersionSpecKind::Exact, trimmed, version));
         }
 
@@ -141,36 +173,25 @@ impl VersionParser for PhpVersionParser {
             return None;
         }
 
-        // Check for OR compound constraints (||)
-        if COMPOUND_OR_RE.is_match(trimmed) {
-            // For OR constraints, extract the first version for reference
-            let parts: Vec<&str> = trimmed.split("||").collect();
-            if let Some(first_part) = parts.first() {
-                if let Some(first_spec) = self.parse_single(first_part.trim()) {
-                    return Some(VersionSpec::new(
-                        VersionSpecKind::Range,
-                        trimmed,
-                        first_spec.version,
-                    ));
-                }
-            }
-            return None;
+        // Check for OR compound constraints (||, |)
+        if COMPOUND_OR_RE.is_match(trimmed)
+            || HYPHEN_RANGE_RE.is_match(trimmed)
+            || COMPOUND_COMMA_RE.is_match(trimmed)
+        {
+            return Some(VersionSpec::new(
+                VersionSpecKind::Range,
+                trimmed,
+                extract_first_version(trimmed),
+            ));
         }
 
         // Check for space-separated compound constraints (>=1.0 <2.0)
         if COMPOUND_SPACE_RE.is_match(trimmed) {
-            // For space-separated constraints, extract the first version for reference
-            let parts: Vec<&str> = trimmed.split_whitespace().collect();
-            if let Some(first_part) = parts.first() {
-                if let Some(first_spec) = self.parse_single(first_part) {
-                    return Some(VersionSpec::new(
-                        VersionSpecKind::Range,
-                        trimmed,
-                        first_spec.version,
-                    ));
-                }
-            }
-            return None;
+            return Some(VersionSpec::new(
+                VersionSpecKind::Range,
+                trimmed,
+                extract_first_version(trimmed),
+            ));
         }
 
         // Parse single constraint
@@ -289,6 +310,12 @@ mod tests {
         assert_eq!(spec.version, "1");
     }
 
+    #[test]
+    fn test_parse_wildcard_x() {
+        let spec = parse("1.x").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Wildcard);
+    }
+
     // Exact version tests
     #[test]
     fn test_parse_exact() {
@@ -329,6 +356,27 @@ mod tests {
         assert_eq!(spec.kind, VersionSpecKind::Range);
         assert_eq!(spec.version, "1.0");
         assert_eq!(spec.raw, "^1.0 || ^2.0");
+    }
+
+    #[test]
+    fn test_parse_compound_pipe() {
+        let spec = parse("^1.0 | ^2.0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1.0");
+    }
+
+    #[test]
+    fn test_parse_hyphen_range() {
+        let spec = parse("1.0 - 2.0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1.0");
+    }
+
+    #[test]
+    fn test_parse_not_equal() {
+        let spec = parse("!=1.5.0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1.5.0");
     }
 
     // Edge case tests

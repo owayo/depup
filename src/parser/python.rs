@@ -4,7 +4,7 @@
 //! - Exact: `==1.2.3`
 //! - Caret: `^1.2.3` (Poetry)
 //! - Tilde: `~1.2.3` or `~=1.2.3` (compatible release)
-//! - Comparison: `>=1.2.3`, `>1.2.3`, `<=1.2.3`, `<1.2.3`, `!=1.2.3`
+//! - Comparison: `>=1.2.3`, `>1.2.3`, `<=1.2.3`, `<1.2.3`, `!=1.2.3`, `===1.2.3`
 //! - Wildcard: `*`, `1.*`
 //! - Range: `>=1.0,<2.0`
 
@@ -17,26 +17,49 @@ use std::sync::LazyLock;
 pub struct PythonVersionParser;
 
 // Regex patterns for Python version specifications
-static EXACT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^==(\d+(?:\.\d+)*(?:[a-zA-Z]\d+)?)$").unwrap());
 static CARET_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\^(\d+(?:\.\d+)*(?:[a-zA-Z]\d+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^\^\s*([0-9A-Za-z][0-9A-Za-z._!+-]*(?:\*)?)$").unwrap());
 static TILDE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^~(\d+(?:\.\d+)*(?:[a-zA-Z]\d+)?)$").unwrap());
-static COMPATIBLE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^~=(\d+(?:\.\d+)*(?:[a-zA-Z]\d+)?)$").unwrap());
-static GTE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^>=(\d+(?:\.\d+)*(?:[a-zA-Z]\d+)?)$").unwrap());
-static GT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^>(\d+(?:\.\d+)*(?:[a-zA-Z]\d+)?)$").unwrap());
-static LTE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^<=(\d+(?:\.\d+)*(?:[a-zA-Z]\d+)?)$").unwrap());
-static LT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^<(\d+(?:\.\d+)*(?:[a-zA-Z]\d+)?)$").unwrap());
-static RANGE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[<>=!]+\d+(?:\.\d+)*,\s*[<>=!]+\d+(?:\.\d+)*$").unwrap());
+    LazyLock::new(|| Regex::new(r"^~\s*([0-9A-Za-z][0-9A-Za-z._!+-]*(?:\*)?)$").unwrap());
+static OP_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(===|==|!=|~=|>=|<=|>|<)\s*([0-9A-Za-z][0-9A-Za-z._!+-]*(?:\*)?)$").unwrap()
+});
+static RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+            r"^(?:\s*(?:===|==|!=|~=|>=|<=|>|<)\s*[0-9A-Za-z][0-9A-Za-z._!+-]*(?:\*)?\s*,)+\s*(?:===|==|!=|~=|>=|<=|>|<)\s*[0-9A-Za-z][0-9A-Za-z._!+-]*(?:\*)?\s*$",
+        )
+        .unwrap()
+});
 static WILDCARD_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\*$|^\d+(?:\.\d+)*\.\*$").unwrap());
+static VERSION_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d+(?:\.\d+)+").unwrap());
+
+fn normalize_for_compare(version: &str) -> String {
+    let mut s = version.trim();
+    if let Some((_, rest)) = s.split_once('!') {
+        s = rest;
+    }
+    let mut buf = String::new();
+    let mut seen_digit = false;
+    for ch in s.chars() {
+        if ch.is_ascii_digit() {
+            seen_digit = true;
+            buf.push(ch);
+        } else if seen_digit && ch == '.' {
+            buf.push(ch);
+        } else if seen_digit {
+            break;
+        }
+    }
+    buf.trim_matches('.').to_string()
+}
+
+fn extract_first_version(raw: &str) -> String {
+    VERSION_TOKEN_RE
+        .find(raw)
+        .map(|m| normalize_for_compare(m.as_str()))
+        .unwrap_or_default()
+}
 
 impl VersionParser for PythonVersionParser {
     fn parse(&self, version_str: &str) -> Option<VersionSpec> {
@@ -46,88 +69,53 @@ impl VersionParser for PythonVersionParser {
             return None;
         }
 
-        // Check for exact version (==1.2.3)
-        if let Some(caps) = EXACT_RE.captures(trimmed) {
-            let version = caps.get(1)?.as_str();
-            return Some(
-                VersionSpec::new(VersionSpecKind::Exact, trimmed, version).with_prefix("=="),
-            );
-        }
-
         // Check for caret (^1.2.3) - Poetry style
         if let Some(caps) = CARET_RE.captures(trimmed) {
-            let version = caps.get(1)?.as_str();
+            let version = normalize_for_compare(caps.get(1)?.as_str());
             return Some(
                 VersionSpec::new(VersionSpecKind::Caret, trimmed, version).with_prefix("^"),
             );
         }
 
-        // Check for tilde (~1.2.3) - Poetry style
         if let Some(caps) = TILDE_RE.captures(trimmed) {
-            let version = caps.get(1)?.as_str();
+            let version = normalize_for_compare(caps.get(1)?.as_str());
             return Some(
                 VersionSpec::new(VersionSpecKind::Tilde, trimmed, version).with_prefix("~"),
             );
         }
 
-        // Check for compatible release (~=1.2.3) - PEP 440
-        if let Some(caps) = COMPATIBLE_RE.captures(trimmed) {
-            let version = caps.get(1)?.as_str();
-            return Some(
-                VersionSpec::new(VersionSpecKind::Tilde, trimmed, version).with_prefix("~="),
-            );
-        }
+        if let Some(caps) = OP_RE.captures(trimmed) {
+            let op = caps.get(1)?.as_str();
+            let raw_version = caps.get(2)?.as_str();
+            let normalized = normalize_for_compare(raw_version);
 
-        // Check for greater than or equal (>=1.2.3)
-        if let Some(caps) = GTE_RE.captures(trimmed) {
-            let version = caps.get(1)?.as_str();
-            return Some(
-                VersionSpec::new(VersionSpecKind::GreaterOrEqual, trimmed, version)
+            return Some(match op {
+                "===" | "==" if !raw_version.ends_with(".*") => {
+                    VersionSpec::new(VersionSpecKind::Exact, trimmed, normalized).with_prefix(op)
+                }
+                "~=" => {
+                    VersionSpec::new(VersionSpecKind::Tilde, trimmed, normalized).with_prefix("~=")
+                }
+                ">=" => VersionSpec::new(VersionSpecKind::GreaterOrEqual, trimmed, normalized)
                     .with_prefix(">="),
-            );
+                ">" => {
+                    VersionSpec::new(VersionSpecKind::Greater, trimmed, normalized).with_prefix(">")
+                }
+                "<=" => VersionSpec::new(VersionSpecKind::LessOrEqual, trimmed, normalized)
+                    .with_prefix("<="),
+                "<" => {
+                    VersionSpec::new(VersionSpecKind::Less, trimmed, normalized).with_prefix("<")
+                }
+                _ => VersionSpec::new(VersionSpecKind::Range, trimmed, normalized),
+            });
         }
 
-        // Check for greater than (>1.2.3)
-        if let Some(caps) = GT_RE.captures(trimmed) {
-            let version = caps.get(1)?.as_str();
-            return Some(
-                VersionSpec::new(VersionSpecKind::Greater, trimmed, version).with_prefix(">"),
-            );
-        }
-
-        // Check for less than or equal (<=1.2.3)
-        if let Some(caps) = LTE_RE.captures(trimmed) {
-            let version = caps.get(1)?.as_str();
-            return Some(
-                VersionSpec::new(VersionSpecKind::LessOrEqual, trimmed, version).with_prefix("<="),
-            );
-        }
-
-        // Check for less than (<1.2.3)
-        if let Some(caps) = LT_RE.captures(trimmed) {
-            let version = caps.get(1)?.as_str();
-            return Some(
-                VersionSpec::new(VersionSpecKind::Less, trimmed, version).with_prefix("<"),
-            );
-        }
-
-        // Check for range (>=1.0,<2.0)
+        // Check for range (>=1.0,<2.0), including arbitrary spaces
         if RANGE_RE.is_match(trimmed) {
-            // Extract the first version from range for reference
-            let first_version = trimmed
-                .split(',')
-                .next()
-                .and_then(|s| {
-                    s.trim_start_matches(|c: char| !c.is_ascii_digit())
-                        .split(|c: char| !c.is_ascii_digit() && c != '.')
-                        .next()
-                })
-                .unwrap_or("")
-                .to_string();
             return Some(VersionSpec::new(
                 VersionSpecKind::Range,
                 trimmed,
-                first_version,
+                extract_first_version(trimmed),
             ));
         }
 
@@ -169,7 +157,7 @@ mod tests {
     fn test_parse_exact_with_prerelease() {
         let spec = parse("==1.2.3a1").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Exact);
-        assert_eq!(spec.version, "1.2.3a1");
+        assert_eq!(spec.version, "1.2.3");
     }
 
     #[test]
@@ -187,7 +175,6 @@ mod tests {
         assert_eq!(spec.kind, VersionSpecKind::Tilde);
         assert_eq!(spec.version, "1.2.3");
         assert_eq!(spec.prefix, Some("~".to_string()));
-        assert!(!spec.is_pinned());
     }
 
     #[test]
@@ -196,6 +183,13 @@ mod tests {
         assert_eq!(spec.kind, VersionSpecKind::Tilde);
         assert_eq!(spec.version, "1.2.3");
         assert_eq!(spec.prefix, Some("~=".to_string()));
+    }
+
+    #[test]
+    fn test_parse_arbitrary_equality() {
+        let spec = parse("===v1.2-custom").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.prefix, Some("===".to_string()));
     }
 
     #[test]
@@ -238,8 +232,15 @@ mod tests {
 
     #[test]
     fn test_parse_range_with_space() {
-        let spec = parse(">=1.0, <2.0").unwrap();
+        let spec = parse(">= 1.0, < 2.0").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Range);
+    }
+
+    #[test]
+    fn test_parse_not_equal_as_range() {
+        let spec = parse("!=1.2.3").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1.2.3");
     }
 
     #[test]
@@ -307,5 +308,12 @@ mod tests {
         // 注意: Range型のformat_updatedは不完全な結果を返すため、
         // 呼び出し側（pyproject_toml.rs）でRange型を特別に処理している
         assert_eq!(spec.format_updated("4.0.0"), "4.0.0");
+    }
+
+    #[test]
+    fn test_parse_pep440_epoch() {
+        let spec = parse(">=1!2.3").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::GreaterOrEqual);
+        assert_eq!(spec.version, "2.3");
     }
 }

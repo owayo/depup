@@ -80,10 +80,18 @@ impl ManifestParser for PackageJsonParser {
             let prefix = &caps[1]; // "package": or "package" :
             let old_version = &caps[2];
 
-            if let Some(spec) = parser.parse(old_version) {
-                updated = true;
-                let new_ver = spec.format_updated(new_version);
-                format!(r#"{}"{}""#, prefix, new_ver)
+            if let Some((parse_target, alias_prefix)) = normalize_node_constraint(old_version) {
+                if let Some(spec) = parser.parse(parse_target) {
+                    updated = true;
+                    let new_ver = spec.format_updated(new_version);
+                    let rendered = if let Some(alias) = alias_prefix {
+                        format!("{}{}", alias, new_ver)
+                    } else {
+                        new_ver
+                    };
+                    return format!(r#"{}"{}""#, prefix, rendered);
+                }
+                caps[0].to_string()
             } else {
                 // If we can't parse the version, keep the original
                 caps[0].to_string()
@@ -102,6 +110,49 @@ impl ManifestParser for PackageJsonParser {
     }
 }
 
+/// Returns `(parse_target, alias_prefix_if_any)` for npm aliases, or None for non-updatable protocols.
+fn normalize_node_constraint(version: &str) -> Option<(&str, Option<String>)> {
+    let trimmed = version.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // npm alias: npm:real-package@^1.2.3
+    if let Some(rest) = trimmed.strip_prefix("npm:") {
+        if let Some(at_pos) = rest.rfind('@') {
+            if at_pos > 0 && at_pos + 1 < rest.len() {
+                let prefix = format!("npm:{}@", &rest[..at_pos]);
+                return Some((&rest[at_pos + 1..], Some(prefix)));
+            }
+        }
+        return None;
+    }
+
+    // Protocol references that are not registry semver constraints
+    const NON_UPDATABLE_PREFIXES: &[&str] = &[
+        "workspace:",
+        "file:",
+        "link:",
+        "git+",
+        "git://",
+        "github:",
+        "http://",
+        "https://",
+        "ssh://",
+        "portal:",
+        "patch:",
+        "catalog:",
+    ];
+    if NON_UPDATABLE_PREFIXES
+        .iter()
+        .any(|p| trimmed.starts_with(p))
+    {
+        return None;
+    }
+
+    Some((trimmed, None))
+}
+
 fn parse_dependency_object(
     deps: &Map<String, Value>,
     parser: &dyn VersionParser,
@@ -110,13 +161,15 @@ fn parse_dependency_object(
 ) {
     for (name, version_value) in deps {
         if let Some(version_str) = version_value.as_str() {
-            if let Some(spec) = parser.parse(version_str) {
-                let dep = if is_dev {
-                    Dependency::development(name.clone(), spec, Language::Node)
-                } else {
-                    Dependency::production(name.clone(), spec, Language::Node)
-                };
-                output.push(dep);
+            if let Some((parse_target, _alias_prefix)) = normalize_node_constraint(version_str) {
+                if let Some(spec) = parser.parse(parse_target) {
+                    let dep = if is_dev {
+                        Dependency::development(name.clone(), spec, Language::Node)
+                    } else {
+                        Dependency::production(name.clone(), spec, Language::Node)
+                    };
+                    output.push(dep);
+                }
             }
         }
     }
@@ -452,5 +505,34 @@ mod tests {
         let deps = parse(content).unwrap();
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].name, "valid");
+    }
+
+    #[test]
+    fn test_parse_npm_alias_dependency() {
+        let content = r#"{
+            "dependencies": {
+                "ui": "npm:@mui/lab@^7.0.0"
+            }
+        }"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "ui");
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Caret);
+        assert_eq!(deps[0].version_spec.version, "7.0.0");
+    }
+
+    #[test]
+    fn test_update_npm_alias_dependency() {
+        let content = r#"{
+  "dependencies": {
+    "ui": "npm:@mui/lab@^7.0.0"
+  }
+}"#;
+
+        let result = PackageJsonParser
+            .update_version(content, "ui", "7.1.0")
+            .unwrap();
+        assert!(result.contains(r#""ui": "npm:@mui/lab@^7.1.0""#));
     }
 }

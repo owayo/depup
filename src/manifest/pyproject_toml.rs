@@ -724,20 +724,19 @@ dependencies = [
 
     #[test]
     fn test_parse_pep508_with_spaces_in_version() {
-        // Note: PEP 508 allows spaces around operators, but our parser currently
-        // requires no space between package name and version specifier.
-        // "requests >= 2.28.0" is technically valid PEP 508 but not parsed by our regex.
-        // This is a known limitation - only compact form without space is supported.
+        // PEP 508 allows spaces around operators; both spaced and compact forms should parse.
         let content = r#"
 [project]
 dependencies = [
     "flask>=2.0",
+    "requests >= 2.28.0",
 ]
 "#;
 
         let deps = parse(content).unwrap();
-        assert_eq!(deps.len(), 1);
-        assert_eq!(deps[0].name, "flask");
+        assert_eq!(deps.len(), 2);
+        assert!(deps.iter().any(|d| d.name == "flask"));
+        assert!(deps.iter().any(|d| d.name == "requests"));
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! - Fixed versions: `= 1.2.3`, `1.2.3`
 //! - Pessimistic constraints: `~> 1.2`, `~> 1.2.3`
 //! - Comparison operators: `>=`, `<`, `>`, `<=`
-//! - Compound constraints: `>= 1.0, < 2.0`
+//! - Compound constraints: `>= 1.0, < 2.0`, `>= 1.0 < 2.0`
 
 use crate::domain::{Language, VersionSpec, VersionSpecKind};
 use crate::parser::VersionParser;
@@ -19,30 +19,47 @@ pub struct RubyVersionParser;
 
 // Pessimistic constraint: ~> 1.2 or ~> 1.2.3
 static PESSIMISTIC_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^~>\s*(\d+(?:\.\d+)*)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^~>\s*(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)?)$").unwrap());
 
 // Exact with = prefix: = 1.2.3
 static EXACT_EQ_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^=\s*(\d+(?:\.\d+)*)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^=\s*(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)?)$").unwrap());
 
 // Greater than or equal: >= 1.2.3
-static GTE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^>=\s*(\d+(?:\.\d+)*)$").unwrap());
+static GTE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^>=\s*(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)?)$").unwrap());
 
 // Greater than: > 1.2.3
-static GT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^>\s*(\d+(?:\.\d+)*)$").unwrap());
+static GT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^>\s*(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)?)$").unwrap());
 
 // Less than or equal: <= 1.2.3
-static LTE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^<=\s*(\d+(?:\.\d+)*)$").unwrap());
+static LTE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^<=\s*(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)?)$").unwrap());
 
 // Less than: < 1.2.3
-static LT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^<\s*(\d+(?:\.\d+)*)$").unwrap());
+static LT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^<\s*(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)?)$").unwrap());
+static NOT_EQUAL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^!=\s*(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)?)$").unwrap());
 
 // Bare version (exact): 1.2.3
 static BARE_VERSION_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(\d+(?:\.\d+)*)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)?)$").unwrap());
 
 // Compound constraint pattern (to detect before individual parsing)
 static COMPOUND_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r",").unwrap());
+static COMPOUND_SPACE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[<>=~!].*\s+[<>=~!]").unwrap());
+static VERSION_TOKEN_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)?").unwrap());
+
+fn extract_first_version(raw: &str) -> String {
+    VERSION_TOKEN_RE
+        .find(raw)
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_default()
+}
 
 impl RubyVersionParser {
     /// Parse a single version constraint (not compound)
@@ -102,6 +119,11 @@ impl RubyVersionParser {
             );
         }
 
+        if let Some(caps) = NOT_EQUAL_RE.captures(trimmed) {
+            let version = caps.get(1)?.as_str();
+            return Some(VersionSpec::new(VersionSpecKind::Range, trimmed, version));
+        }
+
         // Check for bare version (1.2.3) - treated as exact
         if let Some(caps) = BARE_VERSION_RE.captures(trimmed) {
             let version = caps.get(1)?.as_str();
@@ -122,19 +144,19 @@ impl VersionParser for RubyVersionParser {
 
         // Check for compound constraints (>= 1.0, < 2.0)
         if COMPOUND_RE.is_match(trimmed) {
-            // For compound constraints, extract the first version for reference
-            let parts: Vec<&str> = trimmed.split(',').collect();
-            if let Some(first_part) = parts.first() {
-                if let Some(first_spec) = self.parse_single(first_part) {
-                    // Return as Range type with the first version as reference
-                    return Some(VersionSpec::new(
-                        VersionSpecKind::Range,
-                        trimmed,
-                        first_spec.version,
-                    ));
-                }
-            }
-            return None;
+            return Some(VersionSpec::new(
+                VersionSpecKind::Range,
+                trimmed,
+                extract_first_version(trimmed),
+            ));
+        }
+
+        if COMPOUND_SPACE_RE.is_match(trimmed) {
+            return Some(VersionSpec::new(
+                VersionSpecKind::Range,
+                trimmed,
+                extract_first_version(trimmed),
+            ));
         }
 
         // Parse single constraint
@@ -261,6 +283,20 @@ mod tests {
         let spec = parse(">= 1.0, < 2.0, != 1.5.0").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Range);
         assert_eq!(spec.version, "1.0");
+    }
+
+    #[test]
+    fn test_parse_compound_space_without_comma() {
+        let spec = parse(">= 1.0 < 2.0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1.0");
+    }
+
+    #[test]
+    fn test_parse_not_equal() {
+        let spec = parse("!= 1.5.0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1.5.0");
     }
 
     // Edge case tests
