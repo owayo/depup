@@ -399,4 +399,86 @@ mod tests {
             std::cmp::Ordering::Less
         );
     }
+
+    #[test]
+    fn test_compare_versions_four_part_versions() {
+        // Some ecosystems use 4-part versions (e.g., Java SNAPSHOT, .NET)
+        assert_eq!(
+            compare_versions("1.0.0.0", "1.0.0.1"),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_versions("1.0.0.1", "1.0.0.0"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_versions("1.0.0.0", "1.0.0.0"),
+            std::cmp::Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn test_compare_versions_large_numbers() {
+        // CalVer-style large version numbers
+        assert_eq!(
+            compare_versions("2024.1.1", "2025.1.1"),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_versions("2025.12.31", "2025.12.31"),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            compare_versions("20260226", "20260227"),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn test_is_prerelease_false_positives_avoided() {
+        // Versions that contain prerelease-like substrings but are NOT prerelease
+        // "1.0.0" contains no prerelease identifiers
+        assert!(!is_prerelease_version("1.0.0"));
+        // Versions with only numeric parts after hyphen
+        assert!(!is_prerelease_version("1.0.0-1"));
+        // CalVer dates should not trigger prerelease
+        assert!(!is_prerelease_version("2024.1.15"));
+        assert!(!is_prerelease_version("25.12.0"));
+    }
+
+    #[test]
+    fn test_is_prerelease_pep440_edge_cases() {
+        // Post-release (PEP 440) - NOT prerelease
+        // Note: our current implementation treats post-release specially via the
+        // digit+letter+digit pattern; these should NOT match since 'p' is not a/b/c
+        assert!(!is_prerelease_version("1.0.0.post1"));
+        // dev0 IS prerelease (contains "dev")
+        assert!(is_prerelease_version("1.0.0.dev0"));
+        // Combined: dev + rc
+        assert!(is_prerelease_version("1.0.0.dev1rc1"));
+    }
+
+    #[test]
+    fn test_compare_versions_single_component() {
+        // Single component versions (e.g., Rust crate "1")
+        assert_eq!(compare_versions("1", "2"), std::cmp::Ordering::Less);
+        assert_eq!(compare_versions("10", "9"), std::cmp::Ordering::Greater);
+        assert_eq!(compare_versions("1", "1"), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn test_version_info_ordering_consistency() {
+        // Verify Ord/PartialOrd consistency for VersionInfo
+        let v1 = VersionInfo::now("1.0.0");
+        let v2 = VersionInfo::now("1.0.0");
+        let v3 = VersionInfo::now("2.0.0");
+
+        // Reflexive
+        assert_eq!(v1.cmp(&v2), std::cmp::Ordering::Equal);
+        // Asymmetric
+        assert_eq!(v1.cmp(&v3), std::cmp::Ordering::Less);
+        assert_eq!(v3.cmp(&v1), std::cmp::Ordering::Greater);
+        // PartialOrd matches Ord
+        assert_eq!(v1.partial_cmp(&v3), Some(std::cmp::Ordering::Less));
+    }
 }

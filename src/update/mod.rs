@@ -64,13 +64,13 @@ fn extract_upper_bound(raw: &str) -> Option<(String, bool)> {
         }
     }
 
-    if let Some(caps) = UPPER_BOUND_LTE_RE.captures(raw) {
+    if let Some(caps) = UPPER_BOUND_LTE_RE.captures(trimmed) {
         if let Some(m) = caps.get(1) {
             return Some((normalize_bound_version(m.as_str()), true));
         }
     }
 
-    if let Some(caps) = UPPER_BOUND_LT_RE.captures(raw) {
+    if let Some(caps) = UPPER_BOUND_LT_RE.captures(trimmed) {
         if let Some(m) = caps.get(1) {
             return Some((normalize_bound_version(m.as_str()), false));
         }
@@ -784,6 +784,155 @@ mod tests {
         assert_eq!(super::extract_upper_bound(">=1.0"), None);
         // Only lower bound with >
         assert_eq!(super::extract_upper_bound(">1.0"), None);
+    }
+
+    #[test]
+    fn test_extract_upper_bound_whitespace_handling() {
+        // Regression test: leading/trailing whitespace should be trimmed (bug fix)
+        assert_eq!(
+            super::extract_upper_bound("  >=1.0,<2.0  "),
+            Some(("2.0".to_string(), false))
+        );
+        assert_eq!(
+            super::extract_upper_bound("  >=1.0,<=2.0  "),
+            Some(("2.0".to_string(), true))
+        );
+        assert_eq!(
+            super::extract_upper_bound(" 4.0.0..<5.0.0 "),
+            Some(("5.0.0".to_string(), false))
+        );
+        assert_eq!(
+            super::extract_upper_bound(" 4.0.0...4.9.9 "),
+            Some(("4.9.9".to_string(), true))
+        );
+        assert_eq!(
+            super::extract_upper_bound("  1.2.0 - 2.0.0  "),
+            Some(("2.0.0".to_string(), true))
+        );
+        assert_eq!(
+            super::extract_upper_bound("  [1.0,2.0)  "),
+            Some(("2.0".to_string(), false))
+        );
+    }
+
+    #[test]
+    fn test_extract_upper_bound_maven_inclusive_bracket() {
+        // Maven-style inclusive bracket: [1.0,2.0]
+        assert_eq!(
+            super::extract_upper_bound("[1.0,2.0]"),
+            Some(("2.0".to_string(), true))
+        );
+        // Maven-style exclusive paren: (1.0,2.0)
+        assert_eq!(
+            super::extract_upper_bound("(1.0,2.0)"),
+            Some(("2.0".to_string(), false))
+        );
+        // Maven lower-unbounded: (,2.0)
+        assert_eq!(
+            super::extract_upper_bound("(,2.0)"),
+            Some(("2.0".to_string(), false))
+        );
+        // Maven single version: [1.0]
+        assert_eq!(super::extract_upper_bound("[1.0]"), None);
+    }
+
+    #[test]
+    fn test_extract_upper_bound_v_prefix_normalization() {
+        // V prefix should be stripped from the returned upper bound
+        assert_eq!(
+            super::extract_upper_bound(">=v1.0.0,<V2.0.0"),
+            Some(("2.0.0".to_string(), false))
+        );
+        assert_eq!(
+            super::extract_upper_bound("v1.0.0...v2.0.0"),
+            Some(("2.0.0".to_string(), true))
+        );
+        assert_eq!(
+            super::extract_upper_bound("v1.0.0..<v3.0.0"),
+            Some(("3.0.0".to_string(), false))
+        );
+    }
+
+    #[test]
+    fn test_judge_hyphen_range_respects_upper_bound() {
+        // npm hyphen range: 1.0.0 - 2.0.0 means >=1.0.0 <=2.0.0 (inclusive)
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_range_dependency("lodash", "1.0.0 - 2.0.0", "1.0.0", Language::Node);
+        let versions = vec![
+            make_version_info("1.0.0", 100),
+            make_version_info("1.5.0", 50),
+            make_version_info("2.0.0", 30), // included (hyphen range is inclusive)
+            make_version_info("2.1.0", 10), // excluded
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_update());
+        if let UpdateResult::Update { new_version, .. } = result {
+            assert_eq!(new_version, "2.0.0");
+        }
+    }
+
+    #[test]
+    fn test_judge_maven_range_exclusive() {
+        // Maven range: [1.0,2.0) means >=1.0 and <2.0
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_range_dependency("org.example:lib", "[1.0,2.0)", "1.0", Language::Java);
+        let versions = vec![
+            make_version_info("1.0", 100),
+            make_version_info("1.9", 50),
+            make_version_info("2.0", 10), // excluded by exclusive upper bound
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_update());
+        if let UpdateResult::Update { new_version, .. } = result {
+            assert_eq!(new_version, "1.9");
+        }
+    }
+
+    #[test]
+    fn test_judge_maven_range_inclusive() {
+        // Maven range: [1.0,2.0] means >=1.0 and <=2.0
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_range_dependency("org.example:lib", "[1.0,2.0]", "1.0", Language::Java);
+        let versions = vec![
+            make_version_info("1.0", 100),
+            make_version_info("1.9", 50),
+            make_version_info("2.0", 30), // included by inclusive upper bound
+            make_version_info("2.1", 10), // excluded
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_update());
+        if let UpdateResult::Update { new_version, .. } = result {
+            assert_eq!(new_version, "2.0");
+        }
+    }
+
+    #[test]
+    fn test_judge_swift_half_open_range_respects_upper_bound() {
+        // Swift half-open range: 4.0.0..<5.0.0 means >=4.0.0 and <5.0.0
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_range_dependency("vapor/vapor", "4.0.0..<5.0.0", "4.0.0", Language::Swift);
+        let versions = vec![
+            make_version_info("4.0.0", 100),
+            make_version_info("4.99.0", 50),
+            make_version_info("5.0.0", 10), // excluded by half-open range
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_update());
+        if let UpdateResult::Update { new_version, .. } = result {
+            assert_eq!(new_version, "4.99.0");
+        }
     }
 
     fn make_range_dependency(
