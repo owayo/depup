@@ -62,6 +62,9 @@ pub enum UpdateResult {
         dependency: Dependency,
         /// The reason for skipping
         reason: SkipReason,
+        /// When the current version was released (for AlreadyLatest)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        released_at: Option<DateTime<Utc>>,
     },
 }
 
@@ -90,7 +93,11 @@ impl UpdateResult {
 
     /// Creates a Skip result
     pub fn skip(dependency: Dependency, reason: SkipReason) -> Self {
-        UpdateResult::Skip { dependency, reason }
+        UpdateResult::Skip {
+            dependency,
+            reason,
+            released_at: None,
+        }
     }
 
     /// Creates a Skip result for pinned version
@@ -101,6 +108,18 @@ impl UpdateResult {
     /// Creates a Skip result for already at latest
     pub fn skip_already_latest(dependency: Dependency) -> Self {
         Self::skip(dependency, SkipReason::AlreadyLatest)
+    }
+
+    /// Creates a Skip result for already at latest with release date
+    pub fn skip_already_latest_with_date(
+        dependency: Dependency,
+        released_at: DateTime<Utc>,
+    ) -> Self {
+        UpdateResult::Skip {
+            dependency,
+            reason: SkipReason::AlreadyLatest,
+            released_at: Some(released_at),
+        }
     }
 
     /// Creates a Skip result for excluded package
@@ -162,7 +181,9 @@ impl fmt::Display for UpdateResult {
                 }
                 Ok(())
             }
-            UpdateResult::Skip { dependency, reason } => {
+            UpdateResult::Skip {
+                dependency, reason, ..
+            } => {
                 write!(f, "{}: skipped ({})", dependency.name, reason)
             }
         }
@@ -277,9 +298,15 @@ mod tests {
         assert!(result.is_skip());
         assert_eq!(result.package_name(), "lodash");
 
-        if let UpdateResult::Skip { dependency, reason } = result {
+        if let UpdateResult::Skip {
+            dependency,
+            reason,
+            released_at,
+        } = result
+        {
             assert_eq!(dependency, dep);
             assert_eq!(reason, SkipReason::Excluded);
+            assert!(released_at.is_none());
         } else {
             panic!("Expected Skip variant");
         }
@@ -302,8 +329,36 @@ mod tests {
         let dep = sample_dependency();
         let result = UpdateResult::skip_already_latest(dep);
 
-        if let UpdateResult::Skip { reason, .. } = result {
+        if let UpdateResult::Skip {
+            reason,
+            released_at,
+            ..
+        } = result
+        {
             assert_eq!(reason, SkipReason::AlreadyLatest);
+            assert!(released_at.is_none());
+        } else {
+            panic!("Expected Skip variant");
+        }
+    }
+
+    #[test]
+    fn test_update_result_skip_already_latest_with_date() {
+        use chrono::TimeZone;
+        let dep = sample_dependency();
+        let date = Utc.with_ymd_and_hms(2025, 1, 15, 12, 30, 0).unwrap();
+        let result = UpdateResult::skip_already_latest_with_date(dep.clone(), date);
+
+        assert!(result.is_skip());
+        if let UpdateResult::Skip {
+            dependency,
+            reason,
+            released_at,
+        } = result
+        {
+            assert_eq!(dependency, dep);
+            assert_eq!(reason, SkipReason::AlreadyLatest);
+            assert_eq!(released_at, Some(date));
         } else {
             panic!("Expected Skip variant");
         }

@@ -4,7 +4,7 @@
 //! - Fixed versions: `1.2.3`, `1.2.3-SNAPSHOT`, `1.2.3-alpha1`
 //! - Prefix versions: `1.2.+` (matches any version starting with 1.2)
 //! - Dynamic versions: `latest.release`, `latest.integration`
-//! - Maven-style ranges: `[1.0,2.0]`, `[1.0,)`, `(,2.0]`, `[1.0,2.0)`
+//! - Maven-style ranges: `[1.0,2.0]`, `[1.0,)`, `(,2.0]`, `[1.0,2.0)`, `]1.0,2.0[`
 //!
 //! Note: Variable references (e.g., `$version`, `${version}`)
 //! are resolved by the manifest parser.
@@ -34,7 +34,7 @@ static DYNAMIC_VERSION_RE: LazyLock<Regex> =
 // Maven-style range: [1.0,2.0], [1.0,), (,2.0], [1.0,2.0)
 // Format: [(] lower , upper [)] where lower/upper can be empty or version
 static MAVEN_RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^[\[\(](\d+(?:\.\d+)*(?:[.-][A-Za-z0-9]+)?)?\s*,\s*(\d+(?:\.\d+)*(?:[.-][A-Za-z0-9]+)?)?[\]\)]$").unwrap()
+    Regex::new(r"^[\[\(\]](\d+(?:\.\d+)*(?:[.-][A-Za-z0-9]+)?)?\s*,\s*(\d+(?:\.\d+)*(?:[.-][A-Za-z0-9]+)?)?[\]\)\[]$").unwrap()
 });
 
 impl VersionParser for JavaVersionParser {
@@ -287,6 +287,22 @@ mod tests {
     #[test]
     fn test_parse_gradle_maven_range_exclusive() {
         let spec = parse("(1.0.0,2.0.0)").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1.0.0"); // lower bound
+        assert!(!spec.is_pinned());
+    }
+
+    #[test]
+    fn test_parse_gradle_maven_range_alt_brackets() {
+        let spec = parse("]1.0.0,2.0.0[").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1.0.0"); // lower bound
+        assert!(!spec.is_pinned());
+    }
+
+    #[test]
+    fn test_parse_gradle_maven_range_alt_upper_exclusive() {
+        let spec = parse("[1.0.0,2.0.0[").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Range);
         assert_eq!(spec.version, "1.0.0"); // lower bound
         assert!(!spec.is_pinned());

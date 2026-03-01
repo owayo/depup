@@ -37,7 +37,7 @@ static UPPER_BOUND_HYPHEN_RE: LazyLock<Regex> =
 /// Regex to extract Maven-style ranges (`[1.0,2.0)`, `(,2.0]`) from Range constraints.
 static MAVEN_RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r"^([\[\(])\s*({VERSION_TOKEN})?\s*,\s*({VERSION_TOKEN})?\s*([\]\)])$"
+        r"^([\[\(\]])\s*({VERSION_TOKEN})?\s*,\s*({VERSION_TOKEN})?\s*([\]\)\[])$"
     ))
     .unwrap()
 });
@@ -231,7 +231,10 @@ impl UpdateJudge {
         if version_info::compare_versions(dependency.version(), &latest.version)
             != std::cmp::Ordering::Less
         {
-            return UpdateResult::skip_already_latest(dependency.clone());
+            return UpdateResult::skip_already_latest_with_date(
+                dependency.clone(),
+                latest.released_at,
+            );
         }
 
         // Return update result with release date
@@ -305,8 +308,15 @@ mod tests {
 
         let result = judge.judge(&dep, &versions);
         assert!(result.is_skip());
-        if let UpdateResult::Skip { reason, .. } = result {
+        if let UpdateResult::Skip {
+            reason,
+            released_at,
+            ..
+        } = result
+        {
             assert_eq!(reason, SkipReason::AlreadyLatest);
+            // released_at should be set from the latest version info
+            assert!(released_at.is_some());
         }
     }
 
@@ -777,6 +787,14 @@ mod tests {
             Some(("2.0".to_string(), true))
         );
         assert_eq!(
+            super::extract_upper_bound("]1.0,2.0["),
+            Some(("2.0".to_string(), false))
+        );
+        assert_eq!(
+            super::extract_upper_bound("[1.0,2.0["),
+            Some(("2.0".to_string(), false))
+        );
+        assert_eq!(
             super::extract_upper_bound(">=1.0.0,<v2.0.0"),
             Some(("2.0.0".to_string(), false))
         );
@@ -881,6 +899,26 @@ mod tests {
         let judge = UpdateJudge::new(filter);
 
         let dep = make_range_dependency("org.example:lib", "[1.0,2.0)", "1.0", Language::Java);
+        let versions = vec![
+            make_version_info("1.0", 100),
+            make_version_info("1.9", 50),
+            make_version_info("2.0", 10), // excluded by exclusive upper bound
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_update());
+        if let UpdateResult::Update { new_version, .. } = result {
+            assert_eq!(new_version, "1.9");
+        }
+    }
+
+    #[test]
+    fn test_judge_maven_range_exclusive_alt_brackets() {
+        // Maven alternate bracket notation: ]1.0,2.0[ means >1.0 and <2.0
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_range_dependency("org.example:lib", "]1.0,2.0[", "1.0", Language::Java);
         let versions = vec![
             make_version_info("1.0", 100),
             make_version_info("1.9", 50),

@@ -93,6 +93,13 @@ impl VersionChangeType {
     }
 }
 
+/// Package info for skip display in verbose mode
+struct SkipPackageInfo {
+    name: String,
+    version: String,
+    released_at: Option<DateTime<Utc>>,
+}
+
 /// Text formatter for human-readable output
 pub struct TextFormatter {
     /// Verbosity level
@@ -235,35 +242,6 @@ impl TextFormatter {
         }
     }
 
-    /// Format a single skip line
-    fn format_skip_line(
-        &self,
-        name: &str,
-        reason: &SkipReason,
-        max_name_len: usize,
-        writer: &mut dyn Write,
-    ) -> std::io::Result<()> {
-        let reason_str = self.format_skip_reason(reason);
-
-        if self.color {
-            let name_display = format!("{:width$}", name, width = max_name_len);
-            writeln!(
-                writer,
-                "  {} {}",
-                name_display.dimmed(),
-                format!("({})", reason_str).dimmed()
-            )
-        } else {
-            writeln!(
-                writer,
-                "  {:width$} ({})",
-                name,
-                reason_str,
-                width = max_name_len
-            )
-        }
-    }
-
     /// Format manifest with grouped updates
     fn format_manifest_grouped(
         &self,
@@ -312,15 +290,33 @@ impl TextFormatter {
             for (reason, count, packages) in &skip_reasons {
                 if self.color {
                     if self.verbosity == Verbosity::Verbose {
-                        // Verbose: show package names
+                        // Verbose: show individual package lines with version and date
                         writeln!(
                             writer,
-                            "  {} {} ({}): {}",
+                            "  {} {}:",
                             count.to_string().yellow(),
                             reason.dimmed(),
-                            packages.len(),
-                            packages.join(", ").dimmed()
                         )?;
+                        let max_name = packages
+                            .iter()
+                            .map(|p| p.name.len())
+                            .max()
+                            .unwrap_or(0)
+                            .max(20);
+                        for pkg in packages {
+                            let date_str = pkg
+                                .released_at
+                                .map(|d| format!("  ({})", d.format("%Y/%m/%d %H:%M")))
+                                .unwrap_or_default();
+                            writeln!(
+                                writer,
+                                "    {:width$} {}{}",
+                                pkg.name.dimmed(),
+                                pkg.version.dimmed(),
+                                date_str.dimmed(),
+                                width = max_name
+                            )?;
+                        }
                     } else {
                         // Normal: just show counts
                         writeln!(
@@ -331,7 +327,27 @@ impl TextFormatter {
                         )?;
                     }
                 } else if self.verbosity == Verbosity::Verbose {
-                    writeln!(writer, "  {} {}: {}", count, reason, packages.join(", "))?;
+                    writeln!(writer, "  {} {}:", count, reason)?;
+                    let max_name = packages
+                        .iter()
+                        .map(|p| p.name.len())
+                        .max()
+                        .unwrap_or(0)
+                        .max(20);
+                    for pkg in packages {
+                        let date_str = pkg
+                            .released_at
+                            .map(|d| format!("  ({})", d.format("%Y/%m/%d %H:%M")))
+                            .unwrap_or_default();
+                        writeln!(
+                            writer,
+                            "    {:width$} {}{}",
+                            pkg.name,
+                            pkg.version,
+                            date_str,
+                            width = max_name
+                        )?;
+                    }
                 } else {
                     writeln!(writer, "  {} {}", count, reason)?;
                 }
@@ -448,16 +464,51 @@ impl TextFormatter {
         // Write skips in verbose mode
         if self.verbosity == Verbosity::Verbose && !skips.is_empty() {
             writeln!(writer)?;
-            if self.color {
-                writeln!(writer, "  {}", "Skipped:".dimmed())?;
-            } else {
-                writeln!(writer, "  Skipped:")?;
-            }
-            let skip_results: Vec<&UpdateResult> = skips.to_vec();
-            let skip_max_len = self.max_name_length(&skip_results).max(20);
-            for result in &skips {
-                if let UpdateResult::Skip { dependency, reason } = result {
-                    self.format_skip_line(&dependency.name, reason, skip_max_len, writer)?;
+            let skip_reasons = self.summarize_skip_reasons(&skips);
+            for (reason, count, packages) in &skip_reasons {
+                let max_name = packages
+                    .iter()
+                    .map(|p| p.name.len())
+                    .max()
+                    .unwrap_or(0)
+                    .max(20);
+                if self.color {
+                    writeln!(
+                        writer,
+                        "  {} {}:",
+                        count.to_string().yellow(),
+                        reason.dimmed(),
+                    )?;
+                    for pkg in packages {
+                        let date_str = pkg
+                            .released_at
+                            .map(|d| format!("  ({})", d.format("%Y/%m/%d %H:%M")))
+                            .unwrap_or_default();
+                        writeln!(
+                            writer,
+                            "    {:width$} {}{}",
+                            pkg.name.dimmed(),
+                            pkg.version.dimmed(),
+                            date_str.dimmed(),
+                            width = max_name
+                        )?;
+                    }
+                } else {
+                    writeln!(writer, "  {} {}:", count, reason)?;
+                    for pkg in packages {
+                        let date_str = pkg
+                            .released_at
+                            .map(|d| format!("  ({})", d.format("%Y/%m/%d %H:%M")))
+                            .unwrap_or_default();
+                        writeln!(
+                            writer,
+                            "    {:width$} {}{}",
+                            pkg.name,
+                            pkg.version,
+                            date_str,
+                            width = max_name
+                        )?;
+                    }
                 }
             }
         }
@@ -519,15 +570,27 @@ impl TextFormatter {
     }
 
     /// Summarize skip reasons from a list of skip results
-    /// Returns: Vec<(reason_string, count, package_names)>
-    fn summarize_skip_reasons(&self, skips: &[&UpdateResult]) -> Vec<(String, usize, Vec<String>)> {
+    /// Returns: Vec<(reason_string, count, package_infos)>
+    fn summarize_skip_reasons(
+        &self,
+        skips: &[&UpdateResult],
+    ) -> Vec<(String, usize, Vec<SkipPackageInfo>)> {
         use std::collections::HashMap;
-        let mut groups: HashMap<String, Vec<String>> = HashMap::new();
+        let mut groups: HashMap<String, Vec<SkipPackageInfo>> = HashMap::new();
 
         for result in skips {
-            if let UpdateResult::Skip { dependency, reason } = result {
+            if let UpdateResult::Skip {
+                dependency,
+                reason,
+                released_at,
+            } = result
+            {
                 let key = self.format_skip_reason(reason);
-                groups.entry(key).or_default().push(dependency.name.clone());
+                groups.entry(key).or_default().push(SkipPackageInfo {
+                    name: dependency.name.clone(),
+                    version: dependency.version_spec.version.clone(),
+                    released_at: *released_at,
+                });
             }
         }
 
@@ -912,9 +975,9 @@ mod tests {
         formatter.format(&result, &mut output).unwrap();
         let output_str = String::from_utf8(output).unwrap();
 
-        // Verbose mode should show skipped packages and language breakdown
+        // Verbose mode should show skipped packages with version and language breakdown
         assert!(output_str.contains("express"));
-        assert!(output_str.contains("Skipped:"));
+        assert!(output_str.contains("4.18.0")); // version shown
         assert!(output_str.contains("latest"));
         assert!(output_str.contains("By language:"));
     }

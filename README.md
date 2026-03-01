@@ -232,6 +232,8 @@ depup respects upper-bound range constraints (both exclusive and inclusive):
 "1.2.0 - 2.0.0"    → preserved as-is, updates up to and including 2.0.0 (npm hyphen)
 "[1.0,2.0)"        → preserved as-is, updates only below 2.0 (Maven-style)
 "[1.0,2.0]"        → preserved as-is, updates up to and including 2.0 (Maven-style)
+"]1.0,2.0["        → preserved as-is, updates only below 2.0 (Maven alt brackets)
+"[1.0,2.0["        → preserved as-is, updates only below 2.0 (Maven alt upper bracket)
 ```
 
 When a dependency has an upper bound constraint (e.g., `<4.0.0`, `<=2.0`, `...4.9.9`), depup will:

@@ -117,7 +117,7 @@ make help                # Makefileヘルプ
 - バージョン比較は数値ベースの semver 比較を使用 (文字列比較ではない)
 - プレリリースバージョン (alpha/beta/canary/dev/rc) はデフォルトでフィルタされる
 - Go は常に pinned 扱い (`--include-pinned` 不要)
-- Range制約 (`>=X,<Y` / `>=X,<=Y` / `A..<B` / `A...B` / `A - B` / `[A,B)` / `[A,B]`) では上限を超えるバージョンは除外 (`<=` / `...` / `A - B` / `]` は上限値を含む)
+- Range制約 (`>=X,<Y` / `>=X,<=Y` / `A..<B` / `A...B` / `A - B` / `[A,B)` / `[A,B]` / `]A,B[` / `[A,B[`) では上限を超えるバージョンは除外 (`<=` / `...` / `A - B` / `]` は上限値を含む)
 - Tauriプロジェクトでは npm/crate のバージョンを自動同期
 - Swift は GitHub Tags API を使用 (`GITHUB_TOKEN`/`GH_TOKEN` で認証可能)
 - Swift の非 GitHub URL はスキップされる (警告なし)

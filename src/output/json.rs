@@ -96,6 +96,9 @@ struct JsonSkip {
     version: String,
     /// Skip reason
     reason: String,
+    /// When the current version was released (ISO 8601)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    released_at: Option<String>,
 }
 
 impl JsonFormatter {
@@ -140,11 +143,17 @@ impl JsonFormatter {
             manifest
                 .skips()
                 .filter_map(|result| {
-                    if let UpdateResult::Skip { dependency, reason } = result {
+                    if let UpdateResult::Skip {
+                        dependency,
+                        reason,
+                        released_at,
+                    } = result
+                    {
                         Some(JsonSkip {
                             name: dependency.name.clone(),
                             version: dependency.version_spec.version.clone(),
                             reason: Self::skip_reason_to_string(reason),
+                            released_at: released_at.map(|d| d.to_rfc3339()),
                         })
                     } else {
                         None
