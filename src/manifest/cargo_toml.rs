@@ -11,7 +11,7 @@
 use crate::domain::{Dependency, Language};
 use crate::error::ManifestError;
 use crate::manifest::ManifestParser;
-use crate::parser::{get_parser, VersionParser};
+use crate::parser::{VersionParser, get_parser};
 use regex::Regex;
 use std::path::PathBuf;
 use toml::Value;
@@ -62,10 +62,10 @@ impl ManifestParser for CargoTomlParser {
         }
 
         // Parse workspace.dependencies (for Cargo workspace root Cargo.toml)
-        if let Some(workspace) = toml.get("workspace").and_then(|w| w.as_table()) {
-            if let Some(deps) = workspace.get("dependencies").and_then(|d| d.as_table()) {
-                parse_cargo_dependencies(deps, parser.as_ref(), false, &mut dependencies);
-            }
+        if let Some(workspace) = toml.get("workspace").and_then(|w| w.as_table())
+            && let Some(deps) = workspace.get("dependencies").and_then(|d| d.as_table())
+        {
+            parse_cargo_dependencies(deps, parser.as_ref(), false, &mut dependencies);
         }
 
         Ok(dependencies)
@@ -90,18 +90,19 @@ impl ManifestParser for CargoTomlParser {
 
         // Pattern for simple version: package = "1.0.0" or package = "^1.0.0"
         let simple_pattern = format!(r#"(?m)^(\s*{})\s*=\s*"([^"]+)""#, regex::escape(package));
-        if let Ok(re) = Regex::new(&simple_pattern) {
-            if let Some(caps) = re.captures(&result) {
-                let old_version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-                // Check if this is a simple version string (not a path or git dependency)
-                if !old_version.contains('/') && !old_version.starts_with('{') {
-                    if let Some(spec) = parser.parse(old_version) {
-                        let new_ver = spec.format_updated(new_version);
-                        let replacement = format!(r#"{} = "{}""#, &caps[1], new_ver);
-                        result = re.replace(&result, replacement.as_str()).to_string();
-                        updated = true;
-                    }
-                }
+        if let Ok(re) = Regex::new(&simple_pattern)
+            && let Some(caps) = re.captures(&result)
+        {
+            let old_version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+            // Check if this is a simple version string (not a path or git dependency)
+            if !old_version.contains('/')
+                && !old_version.starts_with('{')
+                && let Some(spec) = parser.parse(old_version)
+            {
+                let new_ver = spec.format_updated(new_version);
+                let replacement = format!(r#"{} = "{}""#, &caps[1], new_ver);
+                result = re.replace(&result, replacement.as_str()).to_string();
+                updated = true;
             }
         }
 
@@ -111,15 +112,15 @@ impl ManifestParser for CargoTomlParser {
             r#"(?m)({})\s*=\s*\{{\s*version\s*=\s*"([^"]+)""#,
             regex::escape(package)
         );
-        if let Ok(re) = Regex::new(&table_pattern) {
-            if let Some(caps) = re.captures(&result) {
-                let old_version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-                if let Some(spec) = parser.parse(old_version) {
-                    let new_ver = spec.format_updated(new_version);
-                    let replacement = format!(r#"{} = {{ version = "{}""#, &caps[1], new_ver);
-                    result = re.replace(&result, replacement.as_str()).to_string();
-                    updated = true;
-                }
+        if let Ok(re) = Regex::new(&table_pattern)
+            && let Some(caps) = re.captures(&result)
+        {
+            let old_version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+            if let Some(spec) = parser.parse(old_version) {
+                let new_ver = spec.format_updated(new_version);
+                let replacement = format!(r#"{} = {{ version = "{}""#, &caps[1], new_ver);
+                result = re.replace(&result, replacement.as_str()).to_string();
+                updated = true;
             }
         }
 
@@ -131,15 +132,15 @@ impl ManifestParser for CargoTomlParser {
             r#"(?m)(\[(?:dependencies|dev-dependencies|build-dependencies|workspace\.dependencies)\.{}[^\]]*\][^\[]*version\s*=\s*)"([^"]+)""#,
             regex::escape(package)
         );
-        if let Ok(re) = Regex::new(&multiline_pattern) {
-            if let Some(caps) = re.captures(&result) {
-                let old_version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-                if let Some(spec) = parser.parse(old_version) {
-                    let new_ver = spec.format_updated(new_version);
-                    let replacement = format!(r#"{}"{}""#, &caps[1], new_ver);
-                    result = re.replace(&result, replacement.as_str()).to_string();
-                    updated = true;
-                }
+        if let Ok(re) = Regex::new(&multiline_pattern)
+            && let Some(caps) = re.captures(&result)
+        {
+            let old_version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+            if let Some(spec) = parser.parse(old_version) {
+                let new_ver = spec.format_updated(new_version);
+                let replacement = format!(r#"{}"{}""#, &caps[1], new_ver);
+                result = re.replace(&result, replacement.as_str()).to_string();
+                updated = true;
             }
         }
 
@@ -170,15 +171,15 @@ fn parse_cargo_dependencies(
             _ => None,
         };
 
-        if let Some(version_str) = version_str {
-            if let Some(spec) = parser.parse(&version_str) {
-                let dep = if is_dev {
-                    Dependency::development(name.clone(), spec, Language::Rust)
-                } else {
-                    Dependency::production(name.clone(), spec, Language::Rust)
-                };
-                output.push(dep);
-            }
+        if let Some(version_str) = version_str
+            && let Some(spec) = parser.parse(&version_str)
+        {
+            let dep = if is_dev {
+                Dependency::development(name.clone(), spec, Language::Rust)
+            } else {
+                Dependency::production(name.clone(), spec, Language::Rust)
+            };
+            output.push(dep);
         }
     }
 }

@@ -70,14 +70,14 @@ impl RegistryAdapter for PyPIAdapter {
             let mut earliest_time: Option<DateTime<Utc>> = None;
 
             for file_info in release_files {
-                if let Some(time_str) = &file_info.upload_time_iso_8601 {
-                    if let Ok(time) = time_str.parse::<DateTime<Utc>>() {
-                        earliest_time = Some(match earliest_time {
-                            Some(current) if time < current => time,
-                            Some(current) => current,
-                            None => time,
-                        });
-                    }
+                if let Some(time_str) = &file_info.upload_time_iso_8601
+                    && let Ok(time) = time_str.parse::<DateTime<Utc>>()
+                {
+                    earliest_time = Some(match earliest_time {
+                        Some(current) if time < current => time,
+                        Some(current) => current,
+                        None => time,
+                    });
                 }
             }
 

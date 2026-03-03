@@ -92,11 +92,11 @@ impl RegistryAdapter for PackagistAdapter {
                 }
 
                 // Parse the release timestamp
-                if let Some(ref time_str) = version_info.time {
-                    if let Ok(released_at) = time_str.parse::<DateTime<Utc>>() {
-                        let normalized = Self::normalize_version(&version_info.version);
-                        versions.push(VersionInfo::new(&normalized, released_at));
-                    }
+                if let Some(ref time_str) = version_info.time
+                    && let Ok(released_at) = time_str.parse::<DateTime<Utc>>()
+                {
+                    let normalized = Self::normalize_version(&version_info.version);
+                    versions.push(VersionInfo::new(&normalized, released_at));
                 }
             }
         }

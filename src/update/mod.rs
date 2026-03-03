@@ -9,7 +9,7 @@ mod filter;
 mod version_info;
 
 pub use filter::UpdateFilter;
-pub use version_info::{compare_versions, is_prerelease_version, VersionInfo};
+pub use version_info::{VersionInfo, compare_versions, is_prerelease_version};
 
 use crate::domain::{Dependency, SkipReason, UpdateResult, VersionSpecKind};
 use chrono::{DateTime, Utc};
@@ -18,6 +18,8 @@ use std::sync::LazyLock;
 
 /// Common version token used in range upper-bound extraction.
 const VERSION_TOKEN: &str = r"[vV]?\d+(?:\.\d+)*(?:[-+][0-9A-Za-z.-]+)?";
+/// Mavenレンジ専用のバージョントークン。`2.0.Final` のような qualifier を許容する。
+const MAVEN_VERSION_TOKEN: &str = r"[vV]?\d+(?:\.[0-9A-Za-z]+)*(?:[-+][0-9A-Za-z.-]+)?";
 
 /// Regex to extract inclusive upper bound (`<=X`) from Range constraints.
 static UPPER_BOUND_LTE_RE: LazyLock<Regex> =
@@ -37,7 +39,7 @@ static UPPER_BOUND_HYPHEN_RE: LazyLock<Regex> =
 /// Regex to extract Maven-style ranges (`[1.0,2.0)`, `(,2.0]`) from Range constraints.
 static MAVEN_RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r"^([\[\(\]])\s*({VERSION_TOKEN})?\s*,\s*({VERSION_TOKEN})?\s*([\]\)\[])$"
+        r"^([\[\(\]])\s*({MAVEN_VERSION_TOKEN})?\s*,\s*({MAVEN_VERSION_TOKEN})?\s*([\]\)\[])$"
     ))
     .unwrap()
 });
@@ -58,34 +60,34 @@ fn normalize_bound_version(version: &str) -> String {
 fn extract_upper_bound(raw: &str) -> Option<(String, bool)> {
     let trimmed = raw.trim();
 
-    if let Some(caps) = UPPER_BOUND_SWIFT_HALF_OPEN_RE.captures(trimmed) {
-        if let Some(m) = caps.get(1) {
-            return Some((normalize_bound_version(m.as_str()), false));
-        }
+    if let Some(caps) = UPPER_BOUND_SWIFT_HALF_OPEN_RE.captures(trimmed)
+        && let Some(m) = caps.get(1)
+    {
+        return Some((normalize_bound_version(m.as_str()), false));
     }
 
-    if let Some(caps) = UPPER_BOUND_LTE_RE.captures(trimmed) {
-        if let Some(m) = caps.get(1) {
-            return Some((normalize_bound_version(m.as_str()), true));
-        }
+    if let Some(caps) = UPPER_BOUND_LTE_RE.captures(trimmed)
+        && let Some(m) = caps.get(1)
+    {
+        return Some((normalize_bound_version(m.as_str()), true));
     }
 
-    if let Some(caps) = UPPER_BOUND_LT_RE.captures(trimmed) {
-        if let Some(m) = caps.get(1) {
-            return Some((normalize_bound_version(m.as_str()), false));
-        }
+    if let Some(caps) = UPPER_BOUND_LT_RE.captures(trimmed)
+        && let Some(m) = caps.get(1)
+    {
+        return Some((normalize_bound_version(m.as_str()), false));
     }
 
-    if let Some(caps) = UPPER_BOUND_SWIFT_CLOSED_RE.captures(trimmed) {
-        if let Some(m) = caps.get(1) {
-            return Some((normalize_bound_version(m.as_str()), true));
-        }
+    if let Some(caps) = UPPER_BOUND_SWIFT_CLOSED_RE.captures(trimmed)
+        && let Some(m) = caps.get(1)
+    {
+        return Some((normalize_bound_version(m.as_str()), true));
     }
 
-    if let Some(caps) = UPPER_BOUND_HYPHEN_RE.captures(trimmed) {
-        if let Some(m) = caps.get(1) {
-            return Some((normalize_bound_version(m.as_str()), true));
-        }
+    if let Some(caps) = UPPER_BOUND_HYPHEN_RE.captures(trimmed)
+        && let Some(m) = caps.get(1)
+    {
+        return Some((normalize_bound_version(m.as_str()), true));
     }
 
     if let Some(caps) = MAVEN_RANGE_RE.captures(trimmed) {
@@ -852,6 +854,11 @@ mod tests {
         );
         // Maven single version: [1.0]
         assert_eq!(super::extract_upper_bound("[1.0]"), None);
+        // Maven qualifier付き上限: [1.0,2.0.Final)
+        assert_eq!(
+            super::extract_upper_bound("[1.0,2.0.Final)"),
+            Some(("2.0.Final".to_string(), false))
+        );
     }
 
     #[test]
@@ -923,6 +930,26 @@ mod tests {
             make_version_info("1.0", 100),
             make_version_info("1.9", 50),
             make_version_info("2.0", 10), // excluded by exclusive upper bound
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_update());
+        if let UpdateResult::Update { new_version, .. } = result {
+            assert_eq!(new_version, "1.9");
+        }
+    }
+
+    #[test]
+    fn test_judge_maven_range_with_qualifier_upper_bound() {
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let dep =
+            make_range_dependency("org.example:lib", "[1.0,2.0.Final)", "1.0", Language::Java);
+        let versions = vec![
+            make_version_info("1.0", 100),
+            make_version_info("1.9", 50),
+            make_version_info("2.1", 10), // 上限より大きいので除外されるべき
         ];
 
         let result = judge.judge(&dep, &versions);

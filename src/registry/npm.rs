@@ -6,7 +6,7 @@
 use crate::domain::Language;
 use crate::error::RegistryError;
 use crate::registry::{HttpClient, RegistryAdapter};
-use crate::update::{compare_versions, VersionInfo};
+use crate::update::{VersionInfo, compare_versions};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -72,18 +72,18 @@ impl RegistryAdapter for NpmAdapter {
             // This handles cases where npm has published pre-release versions
             // (e.g., 7.3.0-integration-...) with version numbers higher than
             // the current stable release (e.g., 7.2.0)
-            if let Some(latest) = latest_version {
-                if compare_versions(&version, latest) == std::cmp::Ordering::Greater {
-                    // This version is newer than the official latest - skip it
-                    continue;
-                }
+            if let Some(latest) = latest_version
+                && compare_versions(&version, latest) == std::cmp::Ordering::Greater
+            {
+                // This version is newer than the official latest - skip it
+                continue;
             }
 
             // Get the publish time for this version
-            if let Some(time_str) = response.time.get(&version) {
-                if let Ok(released_at) = time_str.parse::<DateTime<Utc>>() {
-                    versions.push(VersionInfo::new(&version, released_at));
-                }
+            if let Some(time_str) = response.time.get(&version)
+                && let Ok(released_at) = time_str.parse::<DateTime<Utc>>()
+            {
+                versions.push(VersionInfo::new(&version, released_at));
             }
         }
 

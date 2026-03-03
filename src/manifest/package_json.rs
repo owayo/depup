@@ -9,7 +9,7 @@
 use crate::domain::{Dependency, Language};
 use crate::error::ManifestError;
 use crate::manifest::ManifestParser;
-use crate::parser::{get_parser, VersionParser};
+use crate::parser::{VersionParser, get_parser};
 use regex::Regex;
 use serde_json::{Map, Value};
 use std::path::PathBuf;
@@ -119,11 +119,12 @@ fn normalize_node_constraint(version: &str) -> Option<(&str, Option<String>)> {
 
     // npm alias: npm:real-package@^1.2.3
     if let Some(rest) = trimmed.strip_prefix("npm:") {
-        if let Some(at_pos) = rest.rfind('@') {
-            if at_pos > 0 && at_pos + 1 < rest.len() {
-                let prefix = format!("npm:{}@", &rest[..at_pos]);
-                return Some((&rest[at_pos + 1..], Some(prefix)));
-            }
+        if let Some(at_pos) = rest.rfind('@')
+            && at_pos > 0
+            && at_pos + 1 < rest.len()
+        {
+            let prefix = format!("npm:{}@", &rest[..at_pos]);
+            return Some((&rest[at_pos + 1..], Some(prefix)));
         }
         return None;
     }
@@ -160,17 +161,16 @@ fn parse_dependency_object(
     output: &mut Vec<Dependency>,
 ) {
     for (name, version_value) in deps {
-        if let Some(version_str) = version_value.as_str() {
-            if let Some((parse_target, _alias_prefix)) = normalize_node_constraint(version_str) {
-                if let Some(spec) = parser.parse(parse_target) {
-                    let dep = if is_dev {
-                        Dependency::development(name.clone(), spec, Language::Node)
-                    } else {
-                        Dependency::production(name.clone(), spec, Language::Node)
-                    };
-                    output.push(dep);
-                }
-            }
+        if let Some(version_str) = version_value.as_str()
+            && let Some((parse_target, _alias_prefix)) = normalize_node_constraint(version_str)
+            && let Some(spec) = parser.parse(parse_target)
+        {
+            let dep = if is_dev {
+                Dependency::development(name.clone(), spec, Language::Node)
+            } else {
+                Dependency::production(name.clone(), spec, Language::Node)
+            };
+            output.push(dep);
         }
     }
 }

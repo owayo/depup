@@ -8,7 +8,7 @@
 use crate::domain::{Dependency, Language};
 use crate::error::ManifestError;
 use crate::manifest::ManifestParser;
-use crate::parser::{get_parser, VersionParser};
+use crate::parser::{VersionParser, get_parser};
 use regex::Regex;
 use std::path::PathBuf;
 use std::sync::LazyLock;
@@ -79,12 +79,11 @@ impl ManifestParser for GoModParser {
             }
 
             // Parse require block entry
-            if in_require_block {
-                if let Some(caps) = BLOCK_ENTRY_RE.captures(trimmed) {
-                    if let Some(dep) = parse_go_dependency(&caps, parser.as_ref(), is_pinned) {
-                        dependencies.push(dep);
-                    }
-                }
+            if in_require_block
+                && let Some(caps) = BLOCK_ENTRY_RE.captures(trimmed)
+                && let Some(dep) = parse_go_dependency(&caps, parser.as_ref(), is_pinned)
+            {
+                dependencies.push(dep);
             }
         }
 

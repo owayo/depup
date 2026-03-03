@@ -20,7 +20,8 @@ use std::sync::LazyLock;
 const GITHUB_API_URL: &str = "https://api.github.com";
 
 /// Semver tag pattern (with optional 'v' prefix)
-static SEMVER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^v?(\d+\.\d+\.\d+)$").unwrap());
+static SEMVER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[vV]?(\d+\.\d+\.\d+)$").unwrap());
 
 /// GitHub Tags API adapter
 pub struct GitHubTagsAdapter {
@@ -217,6 +218,7 @@ mod tests {
     fn test_semver_regex_matches() {
         assert!(SEMVER_RE.is_match("1.0.0"));
         assert!(SEMVER_RE.is_match("v1.0.0"));
+        assert!(SEMVER_RE.is_match("V1.0.0"));
         assert!(SEMVER_RE.is_match("v10.20.30"));
         assert!(!SEMVER_RE.is_match("1.0"));
         assert!(!SEMVER_RE.is_match("v1.0"));
@@ -227,6 +229,9 @@ mod tests {
     #[test]
     fn test_semver_regex_extracts_version() {
         let caps = SEMVER_RE.captures("v1.2.3").unwrap();
+        assert_eq!(caps.get(1).unwrap().as_str(), "1.2.3");
+
+        let caps = SEMVER_RE.captures("V1.2.3").unwrap();
         assert_eq!(caps.get(1).unwrap().as_str(), "1.2.3");
 
         let caps = SEMVER_RE.captures("1.2.3").unwrap();

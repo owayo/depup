@@ -115,15 +115,15 @@ fn parse_dependency_object(
             continue;
         }
 
-        if let Some(version_str) = version_value.as_str() {
-            if let Some(spec) = parser.parse(version_str) {
-                let dep = if is_dev {
-                    Dependency::development(name.clone(), spec, Language::Php)
-                } else {
-                    Dependency::production(name.clone(), spec, Language::Php)
-                };
-                output.push(dep);
-            }
+        if let Some(version_str) = version_value.as_str()
+            && let Some(spec) = parser.parse(version_str)
+        {
+            let dep = if is_dev {
+                Dependency::development(name.clone(), spec, Language::Php)
+            } else {
+                Dependency::production(name.clone(), spec, Language::Php)
+            };
+            output.push(dep);
         }
     }
 }

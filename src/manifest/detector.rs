@@ -114,15 +114,13 @@ pub fn detect_manifests(dir: &Path) -> Vec<ManifestInfo> {
     }
 
     // Check for pnpm workspace packages if pnpm-workspace.yaml exists
-    if is_pnpm_workspace {
-        if let Ok(workspace_packages) = detect_pnpm_workspace_packages(dir) {
-            for package_path in workspace_packages {
-                let package_json_path = package_path.join("package.json");
-                if package_json_path.exists() {
-                    // Don't add if it's the root package.json
-                    if package_json_path != dir.join("package.json") {
-                        manifests.push(ManifestInfo::new(&package_json_path, Language::Node));
-                    }
+    if is_pnpm_workspace && let Ok(workspace_packages) = detect_pnpm_workspace_packages(dir) {
+        for package_path in workspace_packages {
+            let package_json_path = package_path.join("package.json");
+            if package_json_path.exists() {
+                // Don't add if it's the root package.json
+                if package_json_path != dir.join("package.json") {
+                    manifests.push(ManifestInfo::new(&package_json_path, Language::Node));
                 }
             }
         }

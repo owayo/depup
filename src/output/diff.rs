@@ -23,11 +23,7 @@ impl DiffFormatter {
 
     /// Get the dry-run prefix if applicable
     fn dry_run_prefix(&self) -> &'static str {
-        if self.dry_run {
-            "(dry-run) "
-        } else {
-            ""
-        }
+        if self.dry_run { "(dry-run) " } else { "" }
     }
 }
 

@@ -73,10 +73,10 @@ impl CratesIoAdapter {
             last_request.map(|t| t.elapsed())
         };
 
-        if let Some(elapsed) = elapsed {
-            if elapsed < RATE_LIMIT_INTERVAL {
-                tokio::time::sleep(RATE_LIMIT_INTERVAL - elapsed).await;
-            }
+        if let Some(elapsed) = elapsed
+            && elapsed < RATE_LIMIT_INTERVAL
+        {
+            tokio::time::sleep(RATE_LIMIT_INTERVAL - elapsed).await;
         }
 
         // Update last request time

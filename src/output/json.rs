@@ -345,10 +345,12 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&output_str).unwrap();
 
         // Verbose mode should include skips
-        assert!(!parsed["manifests"][0]["skips"]
-            .as_array()
-            .unwrap()
-            .is_empty());
+        assert!(
+            !parsed["manifests"][0]["skips"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(parsed["manifests"][0]["skips"][0]["name"], "express");
         assert_eq!(
             parsed["manifests"][0]["skips"][0]["reason"],
@@ -356,10 +358,12 @@ mod tests {
         );
 
         // Should include by_language breakdown
-        assert!(!parsed["summary"]["by_language"]
-            .as_array()
-            .unwrap()
-            .is_empty());
+        assert!(
+            !parsed["summary"]["by_language"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

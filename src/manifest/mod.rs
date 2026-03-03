@@ -20,15 +20,15 @@ mod writer;
 
 pub use cargo_toml::CargoTomlParser;
 pub use composer_json::ComposerJsonParser;
-pub use detector::{detect_manifests, ManifestFile, ManifestInfo};
+pub use detector::{ManifestFile, ManifestInfo, detect_manifests};
 pub use gemfile::GemfileParser;
 pub use go_mod::GoModParser;
 pub use gradle::GradleParser;
 pub use package_json::PackageJsonParser;
 pub use package_swift::PackageSwiftParser;
-pub use pnpm_settings::{has_pnpm_workspace, PnpmSettings};
+pub use pnpm_settings::{PnpmSettings, has_pnpm_workspace};
 pub use pyproject_toml::PyprojectTomlParser;
-pub use writer::{read_manifest, write_manifest, ManifestWriter, WriteResult};
+pub use writer::{ManifestWriter, WriteResult, read_manifest, write_manifest};
 
 use crate::domain::{Dependency, Language};
 use crate::error::ManifestError;

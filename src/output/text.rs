@@ -926,9 +926,11 @@ mod tests {
             formatter.format_skip_reason(&SkipReason::NotInOnlyList),
             "not in --only"
         );
-        assert!(formatter
-            .format_skip_reason(&SkipReason::FetchFailed("timeout".to_string()))
-            .contains("fetch failed"));
+        assert!(
+            formatter
+                .format_skip_reason(&SkipReason::FetchFailed("timeout".to_string()))
+                .contains("fetch failed")
+        );
     }
 
     #[test]

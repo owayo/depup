@@ -958,12 +958,13 @@ mod registry_response_parsing {
 
         // Dev version should be filtered in actual implementation
         let dev = &versions[2];
-        assert!(dev
-            .get("version")
-            .unwrap()
-            .as_str()
-            .unwrap()
-            .contains("dev"));
+        assert!(
+            dev.get("version")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .contains("dev")
+        );
     }
 
     /// Test RubyGems version filtering (yanked)
@@ -1127,7 +1128,7 @@ mod pipeline_tests {
     use super::*;
     use chrono::Utc;
     use depup::domain::ManifestUpdateResult;
-    use depup::manifest::{detect_manifests, get_parser, ManifestWriter};
+    use depup::manifest::{ManifestWriter, detect_manifests, get_parser};
     use depup::update::{UpdateFilter, UpdateJudge, VersionInfo};
 
     /// Test full pipeline: detect -> parse -> judge -> write (without network)

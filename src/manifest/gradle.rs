@@ -354,10 +354,10 @@ impl GradleParser {
                 None
             };
 
-        if let Some(var_name) = var_name {
-            if let Some(var_def) = variables.get(var_name) {
-                return (var_def.value.clone(), Some(var_name.to_string()));
-            }
+        if let Some(var_name) = var_name
+            && let Some(var_def) = variables.get(var_name)
+        {
+            return (var_def.value.clone(), Some(var_name.to_string()));
         }
 
         // Not a variable reference, return as-is (strip quotes if present)
@@ -431,29 +431,27 @@ impl ManifestParser for GradleParser {
             // Check map notation
             if let Some((_dep, var_name)) =
                 self.parse_map_notation(line, &variables, parser.as_ref())
+                && _dep.name == package
             {
-                if _dep.name == package {
-                    variable_for_package = var_name;
-                    break;
-                }
+                variable_for_package = var_name;
+                break;
             }
 
             // Check string notation
             if let Some((_dep, var_name)) =
                 self.parse_string_notation(line, &variables, parser.as_ref())
+                && _dep.name == package
             {
-                if _dep.name == package {
-                    variable_for_package = var_name;
-                    break;
-                }
+                variable_for_package = var_name;
+                break;
             }
         }
 
         // If using variable, update the variable definition
-        if let Some(var_name) = variable_for_package {
-            if let Some(var_def) = variables.get(&var_name) {
-                return self.update_variable_definition(content, var_def, new_version);
-            }
+        if let Some(var_name) = variable_for_package
+            && let Some(var_def) = variables.get(&var_name)
+        {
+            return self.update_variable_definition(content, var_def, new_version);
         }
 
         // Otherwise, update the direct version in the dependency line

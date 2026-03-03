@@ -14,8 +14,8 @@ use depup::cli::CliArgs;
 use depup::config::DepupConfig;
 use depup::domain::Language;
 use depup::orchestrator::{Orchestrator, OrchestratorResult};
-use depup::output::{create_formatter, OutputConfig};
-use depup::package_manager::{run_installs, SystemPackageManager};
+use depup::output::{OutputConfig, create_formatter};
+use depup::package_manager::{SystemPackageManager, run_installs};
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -32,15 +32,15 @@ async fn main() -> ExitCode {
     }
 
     // Change directory if --cd is specified
-    if let Some(ref dir) = args.directory {
-        if let Err(e) = std::env::set_current_dir(dir) {
-            eprintln!(
-                "Error: cannot change to directory '{}': {}",
-                dir.display(),
-                e
-            );
-            return ExitCode::FAILURE;
-        }
+    if let Some(ref dir) = args.directory
+        && let Err(e) = std::env::set_current_dir(dir)
+    {
+        eprintln!(
+            "Error: cannot change to directory '{}': {}",
+            dir.display(),
+            e
+        );
+        return ExitCode::FAILURE;
     }
 
     // Run the main logic and handle errors

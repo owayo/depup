@@ -10,14 +10,14 @@
 use crate::cli::CliArgs;
 use crate::domain::{Language, ManifestUpdateResult, SkipReason, UpdateResult, UpdateSummary};
 use crate::manifest::{
-    detect_manifests, get_parser, has_pnpm_workspace, ManifestWriter, PnpmSettings, WriteResult,
+    ManifestWriter, PnpmSettings, WriteResult, detect_manifests, get_parser, has_pnpm_workspace,
 };
 use crate::progress::Progress;
 use crate::registry::{
     CratesIoAdapter, GitHubTagsAdapter, GoProxyAdapter, HttpClient, MavenCentralAdapter,
     NpmAdapter, PackagistAdapter, PyPIAdapter, RegistryAdapter, RubyGemsAdapter,
 };
-use crate::tauri_sync::{TauriVersionSync, TAURI_CRATE, TAURI_NPM_PACKAGES};
+use crate::tauri_sync::{TAURI_CRATE, TAURI_NPM_PACKAGES, TauriVersionSync};
 use crate::update::{UpdateFilter, UpdateJudge, VersionInfo};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -621,14 +621,12 @@ impl Orchestrator {
         });
 
         // Check if versions already match - if so, no sync needed
-        if let (Some(npm_v), Some(crate_v)) = (npm_effective, crate_effective) {
-            if let (Some(npm_mm), Some(crate_mm)) =
+        if let (Some(npm_v), Some(crate_v)) = (npm_effective, crate_effective)
+            && let (Some(npm_mm), Some(crate_mm)) =
                 (extract_major_minor(npm_v), extract_major_minor(crate_v))
-            {
-                if npm_mm == crate_mm {
-                    return;
-                }
-            }
+            && npm_mm == crate_mm
+        {
+            return;
         }
 
         // Versions don't match - need to sync
@@ -694,18 +692,18 @@ impl Orchestrator {
         }
 
         // Apply crate version adjustment
-        if let Some(ref target) = crate_target_version {
-            if let Some((manifest_idx, result_idx, original, _)) = crate_info {
-                match original {
-                    UpdateResult::Update { dependency, .. } => {
-                        let adjusted = UpdateResult::update(dependency, target);
-                        summary.manifests[manifest_idx].results[result_idx] = adjusted;
-                    }
-                    UpdateResult::Skip { dependency, .. } => {
-                        let adjusted = UpdateResult::update(dependency, target);
-                        summary.manifests[manifest_idx].results[result_idx] = adjusted;
-                        summary.manifests[manifest_idx].modified = true;
-                    }
+        if let Some(ref target) = crate_target_version
+            && let Some((manifest_idx, result_idx, original, _)) = crate_info
+        {
+            match original {
+                UpdateResult::Update { dependency, .. } => {
+                    let adjusted = UpdateResult::update(dependency, target);
+                    summary.manifests[manifest_idx].results[result_idx] = adjusted;
+                }
+                UpdateResult::Skip { dependency, .. } => {
+                    let adjusted = UpdateResult::update(dependency, target);
+                    summary.manifests[manifest_idx].results[result_idx] = adjusted;
+                    summary.manifests[manifest_idx].modified = true;
                 }
             }
         }

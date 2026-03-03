@@ -11,7 +11,7 @@
 use crate::domain::{Dependency, Language, VersionSpecKind};
 use crate::error::ManifestError;
 use crate::manifest::ManifestParser;
-use crate::parser::{get_parser, VersionParser};
+use crate::parser::{VersionParser, get_parser};
 use regex::Regex;
 use std::path::PathBuf;
 use std::sync::LazyLock;
@@ -44,10 +44,10 @@ impl ManifestParser for PyprojectTomlParser {
             .and_then(|d| d.as_array())
         {
             for dep in deps {
-                if let Some(dep_str) = dep.as_str() {
-                    if let Some(parsed) = parse_pep508_dependency(dep_str, parser.as_ref(), false) {
-                        dependencies.push(parsed);
-                    }
+                if let Some(dep_str) = dep.as_str()
+                    && let Some(parsed) = parse_pep508_dependency(dep_str, parser.as_ref(), false)
+                {
+                    dependencies.push(parsed);
                 }
             }
         }
@@ -61,12 +61,11 @@ impl ManifestParser for PyprojectTomlParser {
             for (_group, deps) in optional {
                 if let Some(deps_array) = deps.as_array() {
                     for dep in deps_array {
-                        if let Some(dep_str) = dep.as_str() {
-                            if let Some(parsed) =
+                        if let Some(dep_str) = dep.as_str()
+                            && let Some(parsed) =
                                 parse_pep508_dependency(dep_str, parser.as_ref(), false)
-                            {
-                                dependencies.push(parsed);
-                            }
+                        {
+                            dependencies.push(parsed);
                         }
                     }
                 }
@@ -79,12 +78,11 @@ impl ManifestParser for PyprojectTomlParser {
                 let is_dev = group_name == "dev" || group_name == "test" || group_name == "lint";
                 if let Some(deps_array) = deps.as_array() {
                     for dep in deps_array {
-                        if let Some(dep_str) = dep.as_str() {
-                            if let Some(parsed) =
+                        if let Some(dep_str) = dep.as_str()
+                            && let Some(parsed) =
                                 parse_pep508_dependency(dep_str, parser.as_ref(), is_dev)
-                            {
-                                dependencies.push(parsed);
-                            }
+                        {
+                            dependencies.push(parsed);
                         }
                     }
                 }
@@ -152,10 +150,10 @@ impl ManifestParser for PyprojectTomlParser {
             .and_then(|d| d.as_array())
         {
             for dep in deps {
-                if let Some(dep_str) = dep.as_str() {
-                    if let Some(parsed) = parse_pep508_dependency(dep_str, parser.as_ref(), true) {
-                        dependencies.push(parsed);
-                    }
+                if let Some(dep_str) = dep.as_str()
+                    && let Some(parsed) = parse_pep508_dependency(dep_str, parser.as_ref(), true)
+                {
+                    dependencies.push(parsed);
                 }
             }
         }
@@ -183,15 +181,15 @@ impl ManifestParser for PyprojectTomlParser {
 
         // Pattern for Poetry-style dependencies: name = "^1.0.0" or name = { version = "^1.0.0" }
         let simple_pattern = format!(r#"(?m)^(\s*{}\s*=\s*)"([^"]+)"#, regex::escape(package));
-        if let Ok(re) = Regex::new(&simple_pattern) {
-            if let Some(caps) = re.captures(&result) {
-                let old_version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-                if let Some(spec) = parser.parse(old_version) {
-                    let new_ver = spec.format_updated(new_version);
-                    let replacement = format!(r#"{}"{}"#, &caps[1], new_ver);
-                    result = re.replace(&result, replacement.as_str()).to_string();
-                    updated = true;
-                }
+        if let Ok(re) = Regex::new(&simple_pattern)
+            && let Some(caps) = re.captures(&result)
+        {
+            let old_version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+            if let Some(spec) = parser.parse(old_version) {
+                let new_ver = spec.format_updated(new_version);
+                let replacement = format!(r#"{}"{}"#, &caps[1], new_ver);
+                result = re.replace(&result, replacement.as_str()).to_string();
+                updated = true;
             }
         }
 
@@ -200,15 +198,15 @@ impl ManifestParser for PyprojectTomlParser {
             r#"(?m)({}\s*=\s*\{{\s*[^}}]*version\s*=\s*)"([^"]+)""#,
             regex::escape(package)
         );
-        if let Ok(re) = Regex::new(&table_pattern) {
-            if let Some(caps) = re.captures(&result) {
-                let old_version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-                if let Some(spec) = parser.parse(old_version) {
-                    let new_ver = spec.format_updated(new_version);
-                    let replacement = format!(r#"{}"{}"#, &caps[1], new_ver);
-                    result = re.replace(&result, replacement.as_str()).to_string();
-                    updated = true;
-                }
+        if let Ok(re) = Regex::new(&table_pattern)
+            && let Some(caps) = re.captures(&result)
+        {
+            let old_version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+            if let Some(spec) = parser.parse(old_version) {
+                let new_ver = spec.format_updated(new_version);
+                let replacement = format!(r#"{}"{}"#, &caps[1], new_ver);
+                result = re.replace(&result, replacement.as_str()).to_string();
+                updated = true;
             }
         }
 
@@ -236,19 +234,20 @@ impl ManifestParser for PyprojectTomlParser {
                         ("", raw_version)
                     };
 
-                    if pkg_name == package && !version_part.is_empty() {
-                        if let Some(spec) = parser.parse(version_part) {
-                            // Range型（>=X,<Y）は複合制約のため元の指定子をそのまま保持
-                            let new_ver = if spec.kind == VersionSpecKind::Range {
-                                version_part.to_string()
-                            } else {
-                                spec.format_updated(new_version)
-                            };
-                            let new_dep = format!("{}{}{}", package, extras_str, new_ver);
-                            result = result
-                                .replace(&format!(r#""{full_dep}""#), &format!(r#""{new_dep}""#));
-                            updated = true;
-                        }
+                    if pkg_name == package
+                        && !version_part.is_empty()
+                        && let Some(spec) = parser.parse(version_part)
+                    {
+                        // Range型（>=X,<Y）は複合制約のため元の指定子をそのまま保持
+                        let new_ver = if spec.kind == VersionSpecKind::Range {
+                            version_part.to_string()
+                        } else {
+                            spec.format_updated(new_version)
+                        };
+                        let new_dep = format!("{}{}{}", package, extras_str, new_ver);
+                        result =
+                            result.replace(&format!(r#""{full_dep}""#), &format!(r#""{new_dep}""#));
+                        updated = true;
                     }
                 }
             }
@@ -276,10 +275,10 @@ fn parse_pep508_dependency(
     let mut version_part = caps.get(2).map(|m| m.as_str()).unwrap_or("").trim();
 
     // Handle extras like package[extra]>=1.0 - strip [extra] from version_part
-    if version_part.starts_with('[') {
-        if let Some(idx) = version_part.find(']') {
-            version_part = version_part[idx + 1..].trim();
-        }
+    if version_part.starts_with('[')
+        && let Some(idx) = version_part.find(']')
+    {
+        version_part = version_part[idx + 1..].trim();
     }
 
     // Remove any environment markers (after ;)
@@ -1082,8 +1081,10 @@ dev = [
         // self-reference (style-bert-vits2[torch]) やバージョンなしはスキップ
         assert!(!deps.iter().any(|d| d.name == "style-bert-vits2"));
         assert!(!deps.iter().any(|d| d.name == "accelerate"));
-        assert!(!deps
-            .iter()
-            .any(|d| d.name == "GPUtil" || d.name == "gputil"));
+        assert!(
+            !deps
+                .iter()
+                .any(|d| d.name == "GPUtil" || d.name == "gputil")
+        );
     }
 }
