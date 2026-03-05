@@ -321,7 +321,9 @@ impl ManifestParser for PackageSwiftParser {
         let after = &content[end_pos..];
 
         let mut updated = false;
-        let new_section = version_re.replace_all(version_section, |_caps: &regex::Captures| {
+        // replace (replace_all ではなく) を使い、最初のバージョンのみ置換する。
+        // レンジ構文 ("1.0.0"..<"2.0.0") で上限まで置換されるのを防ぐ。
+        let new_section = version_re.replace(version_section, |_caps: &regex::Captures| {
             updated = true;
             format!("\"{}\"", new_version)
         });
@@ -668,6 +670,27 @@ let package = Package(
     }
 
     // --- Realistic Package.swift ---
+
+    #[test]
+    fn test_update_version_range_preserves_upper_bound() {
+        // レンジ構文で上限が誤って置換されないことを確認
+        let content = r#"
+// swift-tools-version: 5.9
+import PackageDescription
+
+let package = Package(
+    name: "MyApp",
+    dependencies: [
+        .package(url: "https://github.com/apple/swift-nio.git", "1.0.0"..<"2.0.0"),
+    ]
+)
+"#;
+
+        let result = PackageSwiftParser
+            .update_version(content, "apple/swift-nio", "1.5.0")
+            .unwrap();
+        assert!(result.contains(r#""1.5.0"..<"2.0.0""#));
+    }
 
     #[test]
     fn test_parse_realistic_package_swift() {

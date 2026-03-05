@@ -316,4 +316,33 @@ mod tests {
         assert_eq!(spec.kind, VersionSpecKind::GreaterOrEqual);
         assert_eq!(spec.version, "2.3");
     }
+
+    #[test]
+    fn test_parse_exact_wildcard_as_range() {
+        // ==1.2.* は >=1.2.0, <1.3.0 と同値なので Range として扱う
+        let spec = parse("==1.2.*").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+    }
+
+    #[test]
+    fn test_parse_not_equal_wildcard_as_range() {
+        // !=1.2.* は Range として扱う
+        let spec = parse("!=1.2.*").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+    }
+
+    #[test]
+    fn test_parse_compatible_release_two_part() {
+        // ~=1.2 は >=1.2, <2.0 と同値
+        let spec = parse("~=1.2").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Tilde);
+        assert_eq!(spec.version, "1.2");
+        assert_eq!(spec.prefix, Some("~=".to_string()));
+    }
+
+    #[test]
+    fn test_parse_wildcard_partial_minor() {
+        let spec = parse("1.2.*").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Wildcard);
+    }
 }

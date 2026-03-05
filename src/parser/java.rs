@@ -315,4 +315,31 @@ mod tests {
         assert_eq!(spec.version, "1");
         assert!(!spec.is_pinned());
     }
+
+    #[test]
+    fn test_parse_maven_range_with_qualifier() {
+        // qualifier 付き Maven レンジ
+        let spec = parse("[1.0,2.0.Final)").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1.0");
+    }
+
+    #[test]
+    fn test_parse_plus_alone_not_supported() {
+        // + 単独はサポートしない
+        assert!(parse("+").is_none());
+    }
+
+    #[test]
+    fn test_parse_strict_version_not_supported() {
+        // !! strict notation はサポートしない
+        assert!(parse("!!1.2.3").is_none());
+    }
+
+    #[test]
+    fn test_format_updated_prefix_version() {
+        // プレフィックスバージョンの更新
+        let spec = parse("5.3.+").unwrap();
+        assert_eq!(spec.format_updated("5.4"), "5.4");
+    }
 }

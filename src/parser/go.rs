@@ -189,4 +189,26 @@ mod tests {
     fn test_language() {
         assert_eq!(GoVersionParser.language(), Language::Go);
     }
+
+    #[test]
+    fn test_parse_extended_pseudo_version_with_prefix() {
+        // リリースタグ後のコミット
+        let spec = parse("v1.2.4-0.20210101120000-abcdef123456").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.prefix, Some("v".to_string()));
+    }
+
+    #[test]
+    fn test_parse_prerelease_extended_pseudo_version() {
+        // プレリリースタグ後のコミット
+        let spec = parse("v1.2.4-beta.0.20210101120000-abcdef123456").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+    }
+
+    #[test]
+    fn test_parse_build_metadata() {
+        // ビルドメタデータ (+incompatible 以外)
+        let spec = parse("v2.0.0+meta").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+    }
 }

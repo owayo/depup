@@ -65,10 +65,11 @@ fn parse_duration(s: &str) -> Option<Duration> {
 
     let num: u64 = num_str.parse().ok()?;
 
+    // checked_mul でオーバーフローを防止（不正な設定値による panic/wrap を回避）
     let seconds = match unit {
-        'd' => num * 24 * 60 * 60,      // days
-        'w' => num * 7 * 24 * 60 * 60,  // weeks
-        'm' => num * 30 * 24 * 60 * 60, // months (30 days)
+        'd' => num.checked_mul(86_400)?,
+        'w' => num.checked_mul(604_800)?,
+        'm' => num.checked_mul(2_592_000)?,
         _ => return None,
     };
 
@@ -396,5 +397,11 @@ mod tests {
         let dir = create_temp_dir();
         fs::write(dir.path().join("pnpm-lock.yaml"), "").unwrap();
         assert!(has_pnpm_workspace(dir.path()));
+    }
+
+    #[test]
+    fn test_parse_duration_overflow() {
+        // 巨大な数値でオーバーフローしないことを確認
+        assert!(parse_duration("99999999999999999999d").is_none());
     }
 }

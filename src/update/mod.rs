@@ -1164,6 +1164,80 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_upper_bound_maven_exclusive() {
+        // Maven 半開区間の上限抽出
+        let result = extract_upper_bound("[1.0,2.0)");
+        assert_eq!(result, Some(("2.0".to_string(), false)));
+    }
+
+    #[test]
+    fn test_extract_upper_bound_maven_inclusive() {
+        // Maven 閉区間の上限抽出
+        let result = extract_upper_bound("[1.0,2.0]");
+        assert_eq!(result, Some(("2.0".to_string(), true)));
+    }
+
+    #[test]
+    fn test_extract_upper_bound_maven_alt_brackets() {
+        // Maven 代替記法 ]1.0,2.0[ = exclusive both
+        let result = extract_upper_bound("]1.0,2.0[");
+        assert_eq!(result, Some(("2.0".to_string(), false)));
+    }
+
+    #[test]
+    fn test_extract_upper_bound_swift_half_open() {
+        // Swift 半開レンジ（引用符なしの内部表現）
+        let result = extract_upper_bound("1.0.0..<2.0.0");
+        assert_eq!(result, Some(("2.0.0".to_string(), false)));
+    }
+
+    #[test]
+    fn test_extract_upper_bound_swift_closed() {
+        // Swift 閉レンジ（引用符なしの内部表現）
+        let result = extract_upper_bound("1.0.0...2.0.0");
+        assert_eq!(result, Some(("2.0.0".to_string(), true)));
+    }
+
+    #[test]
+    fn test_extract_upper_bound_hyphen_range() {
+        let result = extract_upper_bound("1.0.0 - 2.0.0");
+        assert_eq!(result, Some(("2.0.0".to_string(), true)));
+    }
+
+    #[test]
+    fn test_extract_upper_bound_lte() {
+        let result = extract_upper_bound(">=1.0.0 <=2.0.0");
+        assert_eq!(result, Some(("2.0.0".to_string(), true)));
+    }
+
+    #[test]
+    fn test_extract_upper_bound_lt() {
+        let result = extract_upper_bound(">=1.0.0 <2.0.0");
+        assert_eq!(result, Some(("2.0.0".to_string(), false)));
+    }
+
+    #[test]
+    fn test_extract_upper_bound_v_prefix() {
+        // v接頭辞は除去される
+        let result = extract_upper_bound(">=v1.0.0 <v2.0.0");
+        assert_eq!(result, Some(("2.0.0".to_string(), false)));
+    }
+
+    #[test]
+    fn test_extract_upper_bound_maven_qualifier() {
+        // Maven qualifier 付き上限
+        let result = extract_upper_bound("[1.0,2.0.Final)");
+        assert_eq!(result, Some(("2.0.Final".to_string(), false)));
+    }
+
+    #[test]
+    fn test_extract_upper_bound_no_upper() {
+        // 上限なし
+        let result = extract_upper_bound(">=1.0.0");
+        assert_eq!(result, None);
+    }
+
+    #[test]
     fn test_judge_short_version_can_still_update() {
         // But if there's a newer version, short versions should still update
         let filter = UpdateFilter::new();

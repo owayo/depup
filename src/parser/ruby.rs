@@ -375,4 +375,24 @@ mod tests {
         assert_eq!(spec.kind, VersionSpecKind::Exact);
         assert_eq!(spec.version, "1.2.3.4");
     }
+
+    #[test]
+    fn test_parse_pessimistic_single_segment() {
+        // ~> 0 は >= 0, < 1
+        let spec = parse("~> 0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Tilde);
+    }
+
+    #[test]
+    fn test_parse_compound_space_separator() {
+        // スペース区切りの複合制約
+        let spec = parse(">= 1.0 < 2.0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+    }
+
+    #[test]
+    fn test_parse_no_version() {
+        // バージョンなし（空文字列）
+        assert!(parse("").is_none());
+    }
 }

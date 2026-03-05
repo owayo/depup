@@ -8,7 +8,7 @@ depup は複数のプログラミング言語のパッケージ依存関係を�
 
 ## Tech Stack
 
-- **Language**: Rust (Edition 2021)
+- **Language**: Rust (Edition 2024)
 - **Async Runtime**: tokio (full features)
 - **HTTP Client**: reqwest (json feature)
 - **CLI Framework**: clap (derive feature)

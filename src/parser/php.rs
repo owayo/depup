@@ -439,4 +439,40 @@ mod tests {
         let parser = PhpVersionParser;
         assert_eq!(parser.language(), Language::Php);
     }
+
+    #[test]
+    fn test_parse_stability_flag_stripped() {
+        // @dev, @alpha 等の安定性フラグは除去される
+        let spec = parse("^1.0@dev").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Caret);
+        assert_eq!(spec.version, "1.0");
+    }
+
+    #[test]
+    fn test_parse_dev_branch_not_parseable() {
+        // dev-main ブランチ参照はパースされない
+        assert!(parse("dev-main").is_none());
+    }
+
+    #[test]
+    fn test_parse_v_prefix_stripped() {
+        // v接頭辞は正規化で除去される
+        let spec = parse("v1.2.3").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "1.2.3");
+    }
+
+    #[test]
+    fn test_parse_x_notation_uppercase() {
+        let spec = parse("1.X").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Wildcard);
+    }
+
+    #[test]
+    fn test_parse_compound_comma() {
+        // カンマ区切りの複合制約
+        let spec = parse(">=1.0,<2.0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1.0");
+    }
 }

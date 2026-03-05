@@ -33,8 +33,9 @@ static LT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^<([\d]+(?:\.[\d]+)*(?:-[\w.]+)?)$").unwrap());
 static BARE_VERSION_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^([\d]+(?:\.[\d]+)*(?:-[\w.]+)?)$").unwrap());
-static RANGE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[<>=]+[\d]+(?:\.[\d]+)*,\s*[<>=]+[\d]+(?:\.[\d]+)*$").unwrap());
+static RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[<>=]+\s*[\d]+(?:\.[\d]+)*\s*,\s*[<>=]+\s*[\d]+(?:\.[\d]+)*$").unwrap()
+});
 static WILDCARD_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\*$|^[\d]+(?:\.[\d]+)*\.\*$").unwrap());
 
@@ -243,6 +244,35 @@ mod tests {
     fn test_parse_range_no_space() {
         let spec = parse(">=1.0,<2.0").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Range);
+    }
+
+    #[test]
+    fn test_parse_range_with_spaces_after_operators() {
+        // Cargo はオペレータ後のスペースを許容する
+        let spec = parse(">= 1.0, < 2.0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1.0");
+    }
+
+    #[test]
+    fn test_parse_partial_version_major_minor() {
+        // Cargo では部分バージョンは caret 相当
+        let spec = parse("1.2").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Caret);
+        assert_eq!(spec.version, "1.2");
+    }
+
+    #[test]
+    fn test_parse_partial_version_major_only() {
+        let spec = parse("1").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Caret);
+        assert_eq!(spec.version, "1");
+    }
+
+    #[test]
+    fn test_parse_build_metadata_not_supported() {
+        // ビルドメタデータ付きバージョンは Cargo.toml では使用されない
+        assert!(parse("1.0.0+build").is_none());
     }
 
     #[test]
