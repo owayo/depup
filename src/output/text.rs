@@ -152,15 +152,6 @@ impl TextFormatter {
         }
     }
 
-    /// Apply a color function if color is enabled, otherwise return plain text
-    fn maybe_color(&self, text: &str, color_fn: fn(&str) -> colored::ColoredString) -> String {
-        if self.color {
-            color_fn(text).to_string()
-        } else {
-            text.to_string()
-        }
-    }
-
     /// Format a skip reason for display
     fn format_skip_reason(&self, reason: &SkipReason) -> String {
         match reason {
@@ -647,16 +638,20 @@ impl OutputFormatter for TextFormatter {
         // Update breakdown
         if updates > 0 {
             let mut parts = Vec::new();
-            let color_pairs: &[(usize, fn(&str) -> colored::ColoredString, &str)] = &[
-                (major, Colorize::red, "major"),
-                (minor, Colorize::yellow, "minor"),
-                (patch, Colorize::green, "patch"),
-                (new, Colorize::cyan, "new"),
-                (unknown, Colorize::dimmed, "other"),
+            let color_pairs: &[(usize, Color, &str)] = &[
+                (major, Color::Red, "major"),
+                (minor, Color::Yellow, "minor"),
+                (patch, Color::Green, "patch"),
+                (new, Color::Cyan, "new"),
+                (unknown, Color::Dimmed, "other"),
             ];
-            for &(count, color_fn, label) in color_pairs {
+            for &(count, color, label) in color_pairs {
                 if count > 0 {
-                    parts.push(format!("{} {}", self.colored_count(count, color_fn), label));
+                    parts.push(format!(
+                        "{} {}",
+                        self.apply_color(&count.to_string(), color),
+                        label
+                    ));
                 }
             }
             writeln!(
