@@ -10,7 +10,8 @@
 use crate::cli::CliArgs;
 use crate::domain::{Language, ManifestUpdateResult, SkipReason, UpdateResult, UpdateSummary};
 use crate::manifest::{
-    ManifestWriter, PnpmSettings, WriteResult, detect_manifests, get_parser, has_pnpm_workspace,
+    ManifestInfo, ManifestWriter, PnpmSettings, WriteResult, detect_manifests, get_parser,
+    has_pnpm_workspace,
 };
 use crate::progress::Progress;
 use crate::registry::{
@@ -134,13 +135,42 @@ impl Orchestrator {
     /// Run the update workflow with optional progress display
     pub async fn run_with_progress(&self, show_progress: bool) -> OrchestratorResult {
         let mut progress = Progress::new(show_progress);
-        let mut summary = UpdateSummary::new(self.args.dry_run);
-        let mut errors = Vec::new();
 
         // Step 1: Detect manifest files
         progress.spinner("Detecting manifest files...");
         let manifests = detect_manifests(&self.args.path);
         progress.finish_and_clear();
+
+        self.process_manifests(&manifests, &mut progress).await
+    }
+
+    /// Run the update workflow across multiple directories (monorepo mode)
+    ///
+    /// Detects manifests in each directory, shares the version cache,
+    /// and produces a combined result.
+    pub async fn run_directories(&self, directories: &[PathBuf]) -> OrchestratorResult {
+        let mut progress = Progress::new(!self.args.quiet);
+
+        // Step 1: Detect manifest files across all directories
+        progress.spinner("Detecting manifest files...");
+        let mut all_manifests = Vec::new();
+        for dir in directories {
+            let manifests = detect_manifests(dir);
+            all_manifests.extend(manifests);
+        }
+        progress.finish_and_clear();
+
+        self.process_manifests(&all_manifests, &mut progress).await
+    }
+
+    /// Process detected manifests: parse, fetch versions, judge updates, and write results
+    async fn process_manifests(
+        &self,
+        manifests: &[ManifestInfo],
+        progress: &mut Progress,
+    ) -> OrchestratorResult {
+        let mut summary = UpdateSummary::new(self.args.dry_run);
+        let mut errors = Vec::new();
 
         if manifests.is_empty() {
             return OrchestratorResult {
@@ -158,7 +188,7 @@ impl Orchestrator {
         progress.spinner("Parsing manifests...");
         let mut parsed_manifests = Vec::new();
 
-        for manifest_info in &manifests {
+        for manifest_info in manifests {
             // Check language filter
             if !self.should_process_language(manifest_info.language) {
                 continue;
@@ -256,149 +286,6 @@ impl Orchestrator {
         progress.finish_and_clear();
 
         // Collect write errors
-        for result in &write_results {
-            for error in &result.errors {
-                errors.push(OrchestratorError::WriteError {
-                    path: result.path.display().to_string(),
-                    message: error.clone(),
-                });
-            }
-        }
-
-        OrchestratorResult {
-            summary,
-            write_results,
-            errors,
-        }
-    }
-
-    /// Run the update workflow across multiple directories (monorepo mode)
-    ///
-    /// Detects manifests in each directory, shares the version cache,
-    /// and produces a combined result.
-    pub async fn run_directories(&self, directories: &[PathBuf]) -> OrchestratorResult {
-        let show_progress = !self.args.quiet;
-        let mut progress = Progress::new(show_progress);
-        let mut summary = UpdateSummary::new(self.args.dry_run);
-        let mut errors = Vec::new();
-
-        // Step 1: Detect manifest files across all directories
-        progress.spinner("Detecting manifest files...");
-        let mut all_manifests = Vec::new();
-        for dir in directories {
-            let manifests = detect_manifests(dir);
-            all_manifests.extend(manifests);
-        }
-        progress.finish_and_clear();
-
-        if all_manifests.is_empty() {
-            return OrchestratorResult {
-                summary,
-                write_results: Vec::new(),
-                errors,
-            };
-        }
-
-        // Build update filter from CLI args
-        let filter = self.build_filter();
-        let judge = UpdateJudge::new(filter);
-
-        // Step 2: Parse manifests and collect all dependencies
-        progress.spinner("Parsing manifests...");
-        let mut parsed_manifests = Vec::new();
-
-        for manifest_info in &all_manifests {
-            if !self.should_process_language(manifest_info.language) {
-                continue;
-            }
-
-            let parser = get_parser(manifest_info.language);
-            let content = match std::fs::read_to_string(&manifest_info.path) {
-                Ok(c) => c,
-                Err(e) => {
-                    errors.push(OrchestratorError::ManifestParseError {
-                        path: manifest_info.path.display().to_string(),
-                        message: e.to_string(),
-                    });
-                    continue;
-                }
-            };
-
-            let dependencies = match parser.parse(&content) {
-                Ok(deps) => deps,
-                Err(e) => {
-                    errors.push(OrchestratorError::ManifestParseError {
-                        path: manifest_info.path.display().to_string(),
-                        message: e.to_string(),
-                    });
-                    continue;
-                }
-            };
-
-            parsed_manifests.push((manifest_info, dependencies));
-        }
-        progress.finish_and_clear();
-
-        // Count total dependencies for progress bar
-        let total_deps: usize = parsed_manifests.iter().map(|(_, deps)| deps.len()).sum();
-
-        // Step 3: Fetch versions and judge updates (cache shared across dirs)
-        progress.start(total_deps as u64, "Checking dependencies");
-
-        for (manifest_info, dependencies) in parsed_manifests {
-            let mut manifest_result =
-                ManifestUpdateResult::new(&manifest_info.path, manifest_info.language);
-            let adapter = self.get_adapter(manifest_info.language);
-
-            for dep in dependencies {
-                progress.set_message(&format!("Checking {}", &dep.name));
-
-                if let Some(reason) = judge.should_skip(&dep) {
-                    manifest_result.add_result(UpdateResult::skip(dep, reason));
-                    progress.inc();
-                    continue;
-                }
-
-                let versions = match self.fetch_versions(&*adapter, &dep.name).await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        errors.push(OrchestratorError::RegistryError {
-                            package: dep.name.clone(),
-                            message: e.to_string(),
-                        });
-                        manifest_result
-                            .add_result(UpdateResult::skip(dep, SkipReason::FetchFailed(e)));
-                        progress.inc();
-                        continue;
-                    }
-                };
-
-                let result = judge.judge(&dep, &versions);
-                manifest_result.add_result(result);
-                progress.inc();
-            }
-
-            summary.add_manifest(manifest_result);
-        }
-        progress.finish_and_clear();
-
-        // Step 3.5: Synchronize Tauri versions per directory group
-        let is_tauri = all_manifests.iter().any(|m| m.is_tauri_rust);
-        if is_tauri {
-            progress.spinner("Synchronizing Tauri versions...");
-            self.synchronize_tauri_versions(&mut summary, &mut errors)
-                .await;
-            progress.finish_and_clear();
-        }
-
-        // Step 4: Apply updates (unless dry-run)
-        if !self.args.dry_run {
-            progress.spinner("Writing updates...");
-        }
-        let writer = ManifestWriter::new(self.args.dry_run);
-        let write_results = writer.apply_all_updates(&summary.manifests, get_parser);
-        progress.finish_and_clear();
-
         for result in &write_results {
             for error in &result.errors {
                 errors.push(OrchestratorError::WriteError {

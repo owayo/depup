@@ -100,6 +100,16 @@ struct SkipPackageInfo {
     released_at: Option<DateTime<Utc>>,
 }
 
+/// Named color for conditional styling
+#[derive(Clone, Copy)]
+enum Color {
+    Red,
+    Green,
+    Yellow,
+    Cyan,
+    Dimmed,
+}
+
 /// Text formatter for human-readable output
 pub struct TextFormatter {
     /// Verbosity level
@@ -139,6 +149,15 @@ impl TextFormatter {
             }
         } else {
             String::new()
+        }
+    }
+
+    /// Apply a color function if color is enabled, otherwise return plain text
+    fn maybe_color(&self, text: &str, color_fn: fn(&str) -> colored::ColoredString) -> String {
+        if self.color {
+            color_fn(text).to_string()
+        } else {
+            text.to_string()
         }
     }
 
@@ -266,92 +285,20 @@ impl TextFormatter {
         // If no updates but have skips, show skip summary (even in non-verbose mode)
         if updates.is_empty() && !skips.is_empty() {
             let path_display = manifest.path.display().to_string();
-            if self.color {
-                let lang_display = format!("({})", manifest.language);
-                writeln!(
-                    writer,
-                    "{} {} — {} updates, {} {}",
-                    path_display.bold(),
-                    lang_display.dimmed(),
-                    "0".dimmed(),
-                    skip_count.to_string().yellow(),
-                    if skip_count == 1 { "skip" } else { "skips" }
-                )?;
-            } else {
-                writeln!(
-                    writer,
-                    "{} ({}) — 0 updates, {} skips",
-                    path_display, manifest.language, skip_count
-                )?;
-            }
+            let lang_display = format!("({})", manifest.language);
+            writeln!(
+                writer,
+                "{} {} — {} updates, {} {}",
+                self.maybe_bold(&path_display),
+                self.maybe_dimmed(&lang_display),
+                self.maybe_dimmed("0"),
+                self.apply_color(&skip_count.to_string(), Color::Yellow),
+                if skip_count == 1 { "skip" } else { "skips" }
+            )?;
 
             // Show skip reasons summary
             let skip_reasons = self.summarize_skip_reasons(&skips);
-            for (reason, count, packages) in &skip_reasons {
-                if self.color {
-                    if self.verbosity == Verbosity::Verbose {
-                        // Verbose: show individual package lines with version and date
-                        writeln!(
-                            writer,
-                            "  {} {}:",
-                            count.to_string().yellow(),
-                            reason.dimmed(),
-                        )?;
-                        let max_name = packages
-                            .iter()
-                            .map(|p| p.name.len())
-                            .max()
-                            .unwrap_or(0)
-                            .max(20);
-                        for pkg in packages {
-                            let date_str = pkg
-                                .released_at
-                                .map(|d| format!("  ({})", d.format("%Y/%m/%d %H:%M")))
-                                .unwrap_or_default();
-                            writeln!(
-                                writer,
-                                "    {:width$} {}{}",
-                                pkg.name.dimmed(),
-                                pkg.version.dimmed(),
-                                date_str.dimmed(),
-                                width = max_name
-                            )?;
-                        }
-                    } else {
-                        // Normal: just show counts
-                        writeln!(
-                            writer,
-                            "  {} {}",
-                            count.to_string().yellow(),
-                            reason.dimmed()
-                        )?;
-                    }
-                } else if self.verbosity == Verbosity::Verbose {
-                    writeln!(writer, "  {} {}:", count, reason)?;
-                    let max_name = packages
-                        .iter()
-                        .map(|p| p.name.len())
-                        .max()
-                        .unwrap_or(0)
-                        .max(20);
-                    for pkg in packages {
-                        let date_str = pkg
-                            .released_at
-                            .map(|d| format!("  ({})", d.format("%Y/%m/%d %H:%M")))
-                            .unwrap_or_default();
-                        writeln!(
-                            writer,
-                            "    {:width$} {}{}",
-                            pkg.name,
-                            pkg.version,
-                            date_str,
-                            width = max_name
-                        )?;
-                    }
-                } else {
-                    writeln!(writer, "  {} {}", count, reason)?;
-                }
-            }
+            self.write_skip_reasons(&skip_reasons, self.verbosity == Verbosity::Verbose, writer)?;
             writeln!(writer)?;
             return Ok(());
         }
@@ -368,30 +315,22 @@ impl TextFormatter {
 
         // Write manifest header with counts
         let path_display = manifest.path.display().to_string();
-        if self.color {
-            let lang_display = format!("({})", manifest.language);
-            write!(writer, "{}", prefix)?;
-            write!(writer, "{}", path_display.bold())?;
-            write!(writer, " {}", lang_display.dimmed())?;
-            writeln!(
-                writer,
-                " — {} {}, {} {}",
-                update_count.to_string().green(),
-                if update_count == 1 {
-                    "update"
-                } else {
-                    "updates"
-                },
-                skip_count.to_string().dimmed(),
-                if skip_count == 1 { "skip" } else { "skips" }
-            )?;
-        } else {
-            writeln!(
-                writer,
-                "{}{} ({}) — {} updates, {} skips",
-                prefix, path_display, manifest.language, update_count, skip_count
-            )?;
-        }
+        let lang_display = format!("({})", manifest.language);
+        writeln!(
+            writer,
+            "{}{} {} — {} {}, {} {}",
+            prefix,
+            self.maybe_bold(&path_display),
+            self.maybe_dimmed(&lang_display),
+            self.apply_color(&update_count.to_string(), Color::Green),
+            if update_count == 1 {
+                "update"
+            } else {
+                "updates"
+            },
+            self.maybe_dimmed(&skip_count.to_string()),
+            if skip_count == 1 { "skip" } else { "skips" }
+        )?;
 
         // Get max name length for alignment (use partitioned vectors)
         let all_results: Vec<&UpdateResult> = prod_updates
@@ -465,52 +404,7 @@ impl TextFormatter {
         if self.verbosity == Verbosity::Verbose && !skips.is_empty() {
             writeln!(writer)?;
             let skip_reasons = self.summarize_skip_reasons(&skips);
-            for (reason, count, packages) in &skip_reasons {
-                let max_name = packages
-                    .iter()
-                    .map(|p| p.name.len())
-                    .max()
-                    .unwrap_or(0)
-                    .max(20);
-                if self.color {
-                    writeln!(
-                        writer,
-                        "  {} {}:",
-                        count.to_string().yellow(),
-                        reason.dimmed(),
-                    )?;
-                    for pkg in packages {
-                        let date_str = pkg
-                            .released_at
-                            .map(|d| format!("  ({})", d.format("%Y/%m/%d %H:%M")))
-                            .unwrap_or_default();
-                        writeln!(
-                            writer,
-                            "    {:width$} {}{}",
-                            pkg.name.dimmed(),
-                            pkg.version.dimmed(),
-                            date_str.dimmed(),
-                            width = max_name
-                        )?;
-                    }
-                } else {
-                    writeln!(writer, "  {} {}:", count, reason)?;
-                    for pkg in packages {
-                        let date_str = pkg
-                            .released_at
-                            .map(|d| format!("  ({})", d.format("%Y/%m/%d %H:%M")))
-                            .unwrap_or_default();
-                        writeln!(
-                            writer,
-                            "    {:width$} {}{}",
-                            pkg.name,
-                            pkg.version,
-                            date_str,
-                            width = max_name
-                        )?;
-                    }
-                }
-            }
+            self.write_skip_reasons(&skip_reasons, true, writer)?;
         }
 
         writeln!(writer)?;
@@ -569,6 +463,86 @@ impl TextFormatter {
         result
     }
 
+    /// Apply bold styling if color is enabled
+    fn maybe_bold(&self, text: &str) -> String {
+        if self.color {
+            text.bold().to_string()
+        } else {
+            text.to_string()
+        }
+    }
+
+    /// Apply dimmed styling if color is enabled
+    fn maybe_dimmed(&self, text: &str) -> String {
+        if self.color {
+            text.dimmed().to_string()
+        } else {
+            text.to_string()
+        }
+    }
+
+    /// Apply a named color to text if color is enabled
+    fn apply_color(&self, text: &str, color: Color) -> String {
+        if self.color {
+            match color {
+                Color::Red => text.red().to_string(),
+                Color::Green => text.green().to_string(),
+                Color::Yellow => text.yellow().to_string(),
+                Color::Cyan => text.cyan().to_string(),
+                Color::Dimmed => text.dimmed().to_string(),
+            }
+        } else {
+            text.to_string()
+        }
+    }
+
+    /// Write skip reason lines (verbose: with package details, normal: count only)
+    fn write_skip_reasons(
+        &self,
+        skip_reasons: &[(String, usize, Vec<SkipPackageInfo>)],
+        verbose: bool,
+        writer: &mut dyn Write,
+    ) -> std::io::Result<()> {
+        for (reason, count, packages) in skip_reasons {
+            if verbose {
+                writeln!(
+                    writer,
+                    "  {} {}:",
+                    self.apply_color(&count.to_string(), Color::Yellow),
+                    self.maybe_dimmed(reason),
+                )?;
+                let max_name = packages
+                    .iter()
+                    .map(|p| p.name.len())
+                    .max()
+                    .unwrap_or(0)
+                    .max(20);
+                for pkg in packages {
+                    let date_str = pkg
+                        .released_at
+                        .map(|d| format!("  ({})", d.format("%Y/%m/%d %H:%M")))
+                        .unwrap_or_default();
+                    writeln!(
+                        writer,
+                        "    {:width$} {}{}",
+                        self.maybe_dimmed(&pkg.name),
+                        self.maybe_dimmed(&pkg.version),
+                        self.maybe_dimmed(&date_str),
+                        width = max_name
+                    )?;
+                }
+            } else {
+                writeln!(
+                    writer,
+                    "  {} {}",
+                    self.apply_color(&count.to_string(), Color::Yellow),
+                    self.maybe_dimmed(reason)
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Summarize skip reasons from a list of skip results
     /// Returns: Vec<(reason_string, count, package_infos)>
     fn summarize_skip_reasons(
@@ -622,13 +596,12 @@ impl OutputFormatter for TextFormatter {
         if !result.errors.is_empty() && self.verbosity != Verbosity::Quiet {
             if self.color {
                 writeln!(writer, "{}:", "Errors".red().bold())?;
+                for error in &result.errors {
+                    writeln!(writer, "  {} {}", "✗".red(), error)?;
+                }
             } else {
                 writeln!(writer, "Errors:")?;
-            }
-            for error in &result.errors {
-                if self.color {
-                    writeln!(writer, "  {} {}", "✗".red(), error)?;
-                } else {
+                for error in &result.errors {
                     writeln!(writer, "  - {}", error)?;
                 }
             }
@@ -653,15 +626,14 @@ impl OutputFormatter for TextFormatter {
         if self.verbosity == Verbosity::Quiet {
             // Minimal output
             if updates > 0 {
-                if self.color {
-                    writeln!(writer, "{}{} updated", prefix, updates.to_string().green(),)?;
-                } else {
-                    writeln!(writer, "{}{} updated", prefix, updates)?;
-                }
-            } else if self.color {
-                writeln!(writer, "{}{}", prefix, "No updates".dimmed())?;
+                writeln!(
+                    writer,
+                    "{}{} updated",
+                    prefix,
+                    self.apply_color(&updates.to_string(), Color::Green)
+                )?;
             } else {
-                writeln!(writer, "{}No updates", prefix)?;
+                writeln!(writer, "{}{}", prefix, self.maybe_dimmed("No updates"))?;
             }
             return Ok(());
         }
@@ -670,119 +642,74 @@ impl OutputFormatter for TextFormatter {
         let (major, minor, patch, new, unknown) = self.count_by_change_type(summary);
 
         // Normal/verbose output
-        if self.color {
-            writeln!(writer, "{}{}:", prefix, "Summary".bold())?;
+        writeln!(writer, "{}{}:", prefix, self.maybe_bold("Summary"))?;
 
-            // Update breakdown
-            if updates > 0 {
-                write!(
-                    writer,
-                    "  {} package(s) updated",
-                    updates.to_string().green()
-                )?;
-                write!(writer, " (")?;
-                let mut parts = Vec::new();
-                if major > 0 {
-                    parts.push(format!("{} {}", major.to_string().red(), "major"));
+        // Update breakdown
+        if updates > 0 {
+            let mut parts = Vec::new();
+            let color_pairs: &[(usize, fn(&str) -> colored::ColoredString, &str)] = &[
+                (major, Colorize::red, "major"),
+                (minor, Colorize::yellow, "minor"),
+                (patch, Colorize::green, "patch"),
+                (new, Colorize::cyan, "new"),
+                (unknown, Colorize::dimmed, "other"),
+            ];
+            for &(count, color_fn, label) in color_pairs {
+                if count > 0 {
+                    parts.push(format!("{} {}", self.colored_count(count, color_fn), label));
                 }
-                if minor > 0 {
-                    parts.push(format!("{} {}", minor.to_string().yellow(), "minor"));
-                }
-                if patch > 0 {
-                    parts.push(format!("{} {}", patch.to_string().green(), "patch"));
-                }
-                if new > 0 {
-                    parts.push(format!("{} {}", new.to_string().cyan(), "new"));
-                }
-                if unknown > 0 {
-                    parts.push(format!("{} {}", unknown.to_string().dimmed(), "other"));
-                }
-                write!(writer, "{}", parts.join(", "))?;
-                writeln!(writer, ")")?;
-            } else {
-                writeln!(writer, "  {}", "No packages updated".dimmed())?;
             }
-
-            // Skip summary
-            if skips > 0 {
-                write!(
-                    writer,
-                    "  {} package(s) skipped",
-                    skips.to_string().dimmed()
-                )?;
-                if self.verbosity == Verbosity::Verbose {
-                    let skip_counts = self.count_by_skip_reason(summary);
-                    if !skip_counts.is_empty() {
-                        write!(writer, " (")?;
-                        let parts: Vec<_> = skip_counts
-                            .iter()
-                            .map(|(reason, count)| format!("{} {}", count, reason))
-                            .collect();
-                        write!(writer, "{}", parts.join(", ").dimmed())?;
-                        write!(writer, ")")?;
-                    }
-                }
-                writeln!(writer)?;
-            }
+            writeln!(
+                writer,
+                "  {} package(s) updated ({})",
+                self.apply_color(&updates.to_string(), Color::Green),
+                parts.join(", ")
+            )?;
         } else {
-            writeln!(writer, "{}Summary:", prefix)?;
-            if updates > 0 {
-                let mut parts = Vec::new();
-                if major > 0 {
-                    parts.push(format!("{} major", major));
+            writeln!(writer, "  {}", self.maybe_dimmed("No packages updated"))?;
+        }
+
+        // Skip summary
+        if skips > 0 {
+            write!(
+                writer,
+                "  {} package(s) skipped",
+                self.maybe_dimmed(&skips.to_string())
+            )?;
+            if self.verbosity == Verbosity::Verbose {
+                let skip_counts = self.count_by_skip_reason(summary);
+                if !skip_counts.is_empty() {
+                    let parts: Vec<_> = skip_counts
+                        .iter()
+                        .map(|(reason, count)| format!("{} {}", count, reason))
+                        .collect();
+                    write!(writer, " ({})", self.maybe_dimmed(&parts.join(", ")))?;
                 }
-                if minor > 0 {
-                    parts.push(format!("{} minor", minor));
-                }
-                if patch > 0 {
-                    parts.push(format!("{} patch", patch));
-                }
-                if new > 0 {
-                    parts.push(format!("{} new", new));
-                }
-                if unknown > 0 {
-                    parts.push(format!("{} other", unknown));
-                }
-                writeln!(
-                    writer,
-                    "  {} package(s) updated ({})",
-                    updates,
-                    parts.join(", ")
-                )?;
-            } else {
-                writeln!(writer, "  No packages updated")?;
             }
-            writeln!(writer, "  {} package(s) skipped", skips)?;
+            writeln!(writer)?;
         }
 
         // Verbose: show breakdown by language
         if self.verbosity == Verbosity::Verbose {
             writeln!(writer)?;
-            if self.color {
-                writeln!(writer, "{}:", "By language".dimmed())?;
-            } else {
-                writeln!(writer, "By language:")?;
-            }
+            writeln!(writer, "{}:", self.maybe_dimmed("By language"))?;
             for language in Language::all() {
                 let manifests: Vec<_> = summary.by_language(*language).collect();
                 if !manifests.is_empty() {
                     let lang_updates: usize = manifests.iter().map(|m| m.update_count()).sum();
                     let lang_skips: usize = manifests.iter().map(|m| m.skip_count()).sum();
-                    if self.color {
-                        writeln!(
-                            writer,
-                            "  {}: {} updated, {} skipped",
-                            language.to_string().cyan(),
-                            lang_updates.to_string().green(),
-                            lang_skips.to_string().dimmed()
-                        )?;
+                    let lang_name = if self.color {
+                        language.to_string().cyan().to_string()
                     } else {
-                        writeln!(
-                            writer,
-                            "  {}: {} updated, {} skipped",
-                            language, lang_updates, lang_skips
-                        )?;
-                    }
+                        language.to_string()
+                    };
+                    writeln!(
+                        writer,
+                        "  {}: {} updated, {} skipped",
+                        lang_name,
+                        self.apply_color(&lang_updates.to_string(), Color::Green),
+                        self.maybe_dimmed(&lang_skips.to_string())
+                    )?;
                 }
             }
         }
