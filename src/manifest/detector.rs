@@ -97,13 +97,13 @@ pub fn detect_manifests(dir: &Path) -> Vec<ManifestInfo> {
 
     // Check for Cargo workspace members
     let cargo_toml_path = dir.join("Cargo.toml");
-    if cargo_toml_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&cargo_toml_path) {
-            for member_dir in detect_cargo_workspace_members(dir, &content) {
-                let member_cargo = member_dir.join("Cargo.toml");
-                if member_cargo.exists() && !manifests.iter().any(|m| m.path == member_cargo) {
-                    manifests.push(ManifestInfo::new(&member_cargo, Language::Rust));
-                }
+    if cargo_toml_path.exists()
+        && let Ok(content) = std::fs::read_to_string(&cargo_toml_path)
+    {
+        for member_dir in detect_cargo_workspace_members(dir, &content) {
+            let member_cargo = member_dir.join("Cargo.toml");
+            if member_cargo.exists() && !manifests.iter().any(|m| m.path == member_cargo) {
+                manifests.push(ManifestInfo::new(&member_cargo, Language::Rust));
             }
         }
     }
