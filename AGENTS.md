@@ -85,7 +85,7 @@ tests/
 |----------|----------|----------|
 | Node.js | package.json | npm |
 | Python | pyproject.toml | PyPI |
-| Rust | Cargo.toml | crates.io |
+| Rust | Cargo.toml (workspace members 自動検出) | crates.io |
 | Go | go.mod | Go Proxy |
 | Ruby | Gemfile | RubyGems |
 | PHP | composer.json | Packagist |
@@ -119,6 +119,7 @@ make help                # Makefileヘルプ
 - Go は常に pinned 扱い (`--include-pinned` 不要)
 - Range制約 (`>=X,<Y` / `>=X,<=Y` / `A..<B` / `A...B` / `A - B` / `[A,B)` / `[A,B]` / `]A,B[` / `[A,B[`) では上限を超えるバージョンは除外 (`<=` / `...` / `A - B` / `]` は上限値を含む)
 - Maven 形式の qualifier 付き上限（例: `[1.0,2.0.Final)`）も上限制約として解釈される
+- Cargo workspace の `[workspace] members` に指定されたメンバークレートの Cargo.toml も自動検出
 - Tauriプロジェクトでは npm/crate のバージョンを自動同期
 - Swift は GitHub Tags API を使用 (`GITHUB_TOKEN`/`GH_TOKEN` で認証可能)
 - Swift の GitHub タグは `v1.2.3` と `V1.2.3` の両方を認識する

@@ -95,21 +95,32 @@ pub fn detect_manifests(dir: &Path) -> Vec<ManifestInfo> {
         }
     }
 
+    // Check for Cargo workspace members
+    let cargo_toml_path = dir.join("Cargo.toml");
+    if cargo_toml_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&cargo_toml_path) {
+            for member_dir in detect_cargo_workspace_members(dir, &content) {
+                let member_cargo = member_dir.join("Cargo.toml");
+                if member_cargo.exists() && !manifests.iter().any(|m| m.path == member_cargo) {
+                    manifests.push(ManifestInfo::new(&member_cargo, Language::Rust));
+                }
+            }
+        }
+    }
+
     // Check for Tauri project (src-tauri/Cargo.toml)
     let tauri_cargo_path = dir.join("src-tauri").join("Cargo.toml");
     if tauri_cargo_path.exists() {
-        // Only add if we haven't already added a root Cargo.toml
-        let has_root_cargo = manifests
-            .iter()
-            .any(|m| m.language == Language::Rust && m.path == dir.join("Cargo.toml"));
-
-        // Always add Tauri Cargo.toml
-        let tauri_info = ManifestInfo::new(&tauri_cargo_path, Language::Rust).with_tauri_rust(true);
-        manifests.push(tauri_info);
-
-        // If there's no root Cargo.toml but src-tauri exists, this is likely a Tauri-only project
-        if !has_root_cargo {
-            // The Tauri Cargo.toml is already added above
+        // If already added by workspace member detection, just mark as Tauri
+        if let Some(existing) = manifests
+            .iter_mut()
+            .find(|m| m.language == Language::Rust && m.path == tauri_cargo_path)
+        {
+            existing.is_tauri_rust = true;
+        } else {
+            let tauri_info =
+                ManifestInfo::new(&tauri_cargo_path, Language::Rust).with_tauri_rust(true);
+            manifests.push(tauri_info);
         }
     }
 
@@ -192,6 +203,29 @@ fn detect_pnpm_workspace_packages(dir: &Path) -> Result<Vec<PathBuf>, std::io::E
     }
 
     Ok(packages)
+}
+
+/// Parse Cargo.toml workspace members and return their directories
+fn detect_cargo_workspace_members(dir: &Path, content: &str) -> Vec<PathBuf> {
+    let toml: toml::Value = match toml::from_str(content) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+
+    let members = match toml
+        .get("workspace")
+        .and_then(|w| w.get("members"))
+        .and_then(|m| m.as_array())
+    {
+        Some(m) => m,
+        None => return Vec::new(),
+    };
+
+    members
+        .iter()
+        .filter_map(|v| v.as_str())
+        .map(|member| dir.join(member))
+        .collect()
 }
 
 /// Check if a directory is a Tauri project
@@ -397,6 +431,136 @@ mod tests {
             .find(|m| m.path == dir.path().join("package.json"))
             .unwrap();
         assert!(root.is_workspace_root);
+    }
+
+    #[test]
+    fn test_detect_cargo_workspace_members() {
+        let dir = create_temp_dir();
+
+        // Create workspace root Cargo.toml
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            r#"[workspace]
+members = ["crates/core", "crates/cli"]
+resolver = "2"
+
+[workspace.dependencies]
+serde = "1"
+"#,
+        )
+        .unwrap();
+
+        // Create member crate directories with Cargo.toml
+        fs::create_dir_all(dir.path().join("crates").join("core")).unwrap();
+        fs::write(
+            dir.path().join("crates").join("core").join("Cargo.toml"),
+            r#"[package]
+name = "core"
+version = "0.1.0"
+
+[dependencies]
+tokio = "1"
+"#,
+        )
+        .unwrap();
+
+        fs::create_dir_all(dir.path().join("crates").join("cli")).unwrap();
+        fs::write(
+            dir.path().join("crates").join("cli").join("Cargo.toml"),
+            r#"[package]
+name = "cli"
+version = "0.1.0"
+
+[dependencies]
+clap = "4"
+"#,
+        )
+        .unwrap();
+
+        let manifests = detect_manifests(dir.path());
+        let rust_manifests: Vec<_> = manifests
+            .iter()
+            .filter(|m| m.language == Language::Rust)
+            .collect();
+
+        // Should find: root Cargo.toml + crates/core + crates/cli
+        assert_eq!(rust_manifests.len(), 3);
+        assert!(
+            rust_manifests
+                .iter()
+                .any(|m| m.path == dir.path().join("Cargo.toml"))
+        );
+        assert!(
+            rust_manifests
+                .iter()
+                .any(|m| m.path.ends_with("crates/core/Cargo.toml"))
+        );
+        assert!(
+            rust_manifests
+                .iter()
+                .any(|m| m.path.ends_with("crates/cli/Cargo.toml"))
+        );
+    }
+
+    #[test]
+    fn test_detect_cargo_workspace_no_duplicate_with_tauri() {
+        let dir = create_temp_dir();
+
+        // Create workspace root with src-tauri as member
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            r#"[workspace]
+members = ["src-tauri"]
+"#,
+        )
+        .unwrap();
+
+        fs::create_dir(dir.path().join("src-tauri")).unwrap();
+        fs::write(
+            dir.path().join("src-tauri").join("Cargo.toml"),
+            r#"[package]
+name = "app"
+version = "0.1.0"
+"#,
+        )
+        .unwrap();
+
+        let manifests = detect_manifests(dir.path());
+        let rust_manifests: Vec<_> = manifests
+            .iter()
+            .filter(|m| m.language == Language::Rust)
+            .collect();
+
+        // src-tauri should appear only once (as tauri, not duplicated by workspace member)
+        let tauri_paths: Vec<_> = rust_manifests
+            .iter()
+            .filter(|m| m.path.ends_with("src-tauri/Cargo.toml"))
+            .collect();
+        assert_eq!(tauri_paths.len(), 1);
+        assert!(tauri_paths[0].is_tauri_rust);
+    }
+
+    #[test]
+    fn test_detect_cargo_workspace_member_missing_dir() {
+        let dir = create_temp_dir();
+
+        // Create workspace root with member that doesn't exist
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            r#"[workspace]
+members = ["crates/nonexistent"]
+"#,
+        )
+        .unwrap();
+
+        let manifests = detect_manifests(dir.path());
+        let rust_manifests: Vec<_> = manifests
+            .iter()
+            .filter(|m| m.language == Language::Rust)
+            .collect();
+
+        // Only root Cargo.toml, nonexistent member ignored
+        assert_eq!(rust_manifests.len(), 1);
     }
 
     #[test]
