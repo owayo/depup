@@ -1,38 +1,43 @@
-//! Java/Gradle version specification parser
+//! Java/Gradle のバージョン指定パーサ
 //!
-//! Handles:
-//! - Fixed versions: `1.2.3`, `1.2.3-SNAPSHOT`, `1.2.3-alpha1`
-//! - Prefix versions: `1.2.+` (matches any version starting with 1.2)
-//! - Dynamic versions: `latest.release`, `latest.integration`
-//! - Maven-style ranges: `[1.0,2.0]`, `[1.0,)`, `(,2.0]`, `[1.0,2.0)`, `]1.0,2.0[`
+//! 対応する構文:
+//! - 固定バージョン: `1.2.3`, `1.2.3-SNAPSHOT`, `1.2.3-alpha1`
+//! - strict 記法: `1.2.3!!`
+//! - プレフィックス指定: `1.2.+` (`1.2` 系を許可)
+//! - 動的指定: `latest.release`, `latest.integration`
+//! - Maven 形式レンジ: `[1.0,2.0]`, `[1.0,)`, `(,2.0]`, `[1.0,2.0)`, `]1.0,2.0[`
 //!
-//! Note: Variable references (e.g., `$version`, `${version}`)
-//! are resolved by the manifest parser.
+//! 備考: 変数参照 (例: `$version`, `${version}`) は
+//! マニフェストパーサ側で解決する。
 
 use crate::domain::{Language, VersionSpec, VersionSpecKind};
 use crate::parser::VersionParser;
 use regex::Regex;
 use std::sync::LazyLock;
 
-/// Parser for Java/Gradle version specifications
+/// Java/Gradle のバージョン指定パーサ
 pub struct JavaVersionParser;
 
-// Regex patterns for Gradle version specifications
+// Gradle バージョン指定の正規表現
 
-// Standard version: 1.2.3 or 1.2.3-SNAPSHOT or 1.2.3.RELEASE
+// 通常バージョン: 1.2.3 / 1.2.3-SNAPSHOT / 1.2.3.RELEASE
 static VERSION_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(\d+(?:\.\d+)*(?:[.-][A-Za-z0-9]+)*)$").unwrap());
 
-// Prefix version: 1.2.+ or 1.+
+// strict 記法: 1.2.3!!
+static STRICT_VERSION_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(\d+(?:\.\d+)*(?:[.-][A-Za-z0-9]+)*)!!$").unwrap());
+
+// プレフィックス指定: 1.2.+ / 1.+
 static PREFIX_VERSION_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(\d+(?:\.\d+)*)\.\+$").unwrap());
 
-// Dynamic versions: latest.release, latest.integration
+// 動的指定: latest.release / latest.integration
 static DYNAMIC_VERSION_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(latest\.(?:release|integration))$").unwrap());
 
-// Maven-style range: [1.0,2.0], [1.0,), (,2.0], [1.0,2.0)
-// Format: [(] lower , upper [)] where lower/upper can be empty or version
+// Maven 形式レンジ: [1.0,2.0], [1.0,), (,2.0], [1.0,2.0)
+// 形式: [(] lower , upper [)] (lower/upper は空またはバージョン)
 static MAVEN_RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^[\[\(\]](\d+(?:\.\d+)*(?:[.-][A-Za-z0-9]+)?)?\s*,\s*(\d+(?:\.\d+)*(?:[.-][A-Za-z0-9]+)?)?[\]\)\[]$").unwrap()
 });
@@ -45,13 +50,13 @@ impl VersionParser for JavaVersionParser {
             return None;
         }
 
-        // Check for Maven-style range: [1.0,2.0], [1.0,), (,2.0]
+        // Maven 形式レンジを判定: [1.0,2.0], [1.0,), (,2.0]
         if MAVEN_RANGE_RE.is_match(trimmed) {
-            // Extract the lower bound as the base version, if present
+            // 下限があれば下限を基準バージョンとして採用
             if let Some(caps) = MAVEN_RANGE_RE.captures(trimmed) {
                 let lower = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                 let upper = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-                // Use lower bound as version if present, otherwise use upper
+                // 下限がなければ上限を採用
                 let version = if !lower.is_empty() {
                     lower
                 } else if !upper.is_empty() {
@@ -63,7 +68,15 @@ impl VersionParser for JavaVersionParser {
             }
         }
 
-        // Check for prefix version: 1.2.+
+        // strict 記法を判定: 1.2.3!!
+        if let Some(caps) = STRICT_VERSION_RE.captures(trimmed) {
+            let version = caps.get(1)?.as_str();
+            return Some(
+                VersionSpec::new(VersionSpecKind::Exact, trimmed, version).with_suffix("!!"),
+            );
+        }
+
+        // プレフィックス指定を判定: 1.2.+
         if let Some(caps) = PREFIX_VERSION_RE.captures(trimmed) {
             let version = caps.get(1)?.as_str();
             return Some(VersionSpec::new(
@@ -73,12 +86,12 @@ impl VersionParser for JavaVersionParser {
             ));
         }
 
-        // Check for dynamic version: latest.release, latest.integration
+        // 動的指定を判定: latest.release, latest.integration
         if DYNAMIC_VERSION_RE.is_match(trimmed) {
             return Some(VersionSpec::new(VersionSpecKind::Wildcard, trimmed, ""));
         }
 
-        // Check for standard version (including prerelease identifiers)
+        // 通常バージョンを判定 (プレリリース識別子含む)
         if let Some(caps) = VERSION_RE.captures(trimmed) {
             let version = caps.get(1)?.as_str();
             return Some(VersionSpec::new(VersionSpecKind::Exact, trimmed, version));
@@ -100,7 +113,7 @@ mod tests {
         JavaVersionParser.parse(version)
     }
 
-    // Basic version tests
+    // 基本バージョンのテスト
     #[test]
     fn test_parse_simple_version() {
         let spec = parse("1.2.3").unwrap();
@@ -130,7 +143,7 @@ mod tests {
         assert_eq!(spec.version, "1.2.3.4");
     }
 
-    // Prerelease version tests
+    // プレリリース系バージョンのテスト
     #[test]
     fn test_parse_snapshot() {
         let spec = parse("1.2.3-SNAPSHOT").unwrap();
@@ -173,7 +186,7 @@ mod tests {
         assert_eq!(spec.version, "4.0.0.Final");
     }
 
-    // Edge case tests
+    // エッジケースのテスト
     #[test]
     fn test_parse_empty() {
         assert!(parse("").is_none());
@@ -191,8 +204,7 @@ mod tests {
 
     #[test]
     fn test_parse_variable_reference() {
-        // Variable references should not be parsed by version parser
-        // They are handled by manifest parser
+        // 変数参照はここでは解釈しない (マニフェストパーサで処理)
         assert!(parse("$wicketVersion").is_none());
         assert!(parse("${wicketVersion}").is_none());
     }
@@ -204,7 +216,7 @@ mod tests {
         assert_eq!(spec.version, "1.2.3");
     }
 
-    // Format updated tests
+    // 更新時フォーマット保持のテスト
     #[test]
     fn test_format_updated_simple() {
         let spec = parse("1.2.3").unwrap();
@@ -217,14 +229,14 @@ mod tests {
         assert_eq!(spec.format_updated("2.0.0"), "2.0.0");
     }
 
-    // Language test
+    // language のテスト
     #[test]
     fn test_java_parser_language() {
         let parser = JavaVersionParser;
         assert_eq!(parser.language(), Language::Java);
     }
 
-    // Gradle version range tests (user-requested)
+    // Gradle バージョン指定のテスト
     // implementation("org.springframework:spring-core:5.3.8")
     #[test]
     fn test_parse_gradle_exact_version() {
@@ -331,14 +343,23 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_strict_version_not_supported() {
-        // !! strict notation はサポートしない
+    fn test_parse_strict_version() {
+        let spec = parse("1.2.3!!").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "1.2.3");
+        assert!(spec.is_pinned());
+        assert_eq!(spec.format_updated("2.0.0"), "2.0.0!!");
+    }
+
+    #[test]
+    fn test_parse_strict_version_prefix_not_supported() {
+        // 先頭 !! の形式はサポートしない
         assert!(parse("!!1.2.3").is_none());
     }
 
     #[test]
     fn test_format_updated_prefix_version() {
-        // プレフィックスバージョンの更新
+        // プレフィックス指定の更新
         let spec = parse("5.3.+").unwrap();
         assert_eq!(spec.format_updated("5.4"), "5.4");
     }

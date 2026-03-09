@@ -1,12 +1,12 @@
-//! Gradle manifest parser for Java projects
+//! Java プロジェクト向け Gradle マニフェストパーサ
 //!
-//! Handles:
+//! 対応内容:
 //! - build.gradle (Groovy DSL)
 //! - build.gradle.kts (Kotlin DSL)
-//! - Variable definitions (def, val, ext block)
-//! - Map notation dependencies: group: 'x', name: 'y', version: 'z'
-//! - String notation dependencies: 'group:name:version'
-//! - Variable references in versions
+//! - 変数定義 (def, val, ext block)
+//! - map 記法依存: group: 'x', name: 'y', version: 'z'
+//! - 文字列記法依存: 'group:name:version'
+//! - バージョン内の変数参照
 
 use crate::domain::{Dependency, Language, VersionSpec, VersionSpecKind};
 use crate::error::ManifestError;
@@ -17,44 +17,44 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
-/// Parser for build.gradle and build.gradle.kts files
+/// build.gradle / build.gradle.kts 用パーサ
 pub struct GradleParser;
 
-/// Information about a variable definition
+/// 変数定義情報
 #[derive(Debug, Clone)]
 struct VariableDefinition {
-    /// Variable value
+    /// 変数の値
     value: String,
-    /// Line number (1-based)
+    /// 行番号 (1-based)
     line_number: usize,
-    /// Quote character used (' or ")
+    /// 使用されているクォート文字 (' または ")
     quote_char: char,
 }
 
-// Regex patterns for Gradle DSL
+// Gradle DSL 用の正規表現
 
-// Variable definition (Groovy): def wicketVersion = '1.2.3' or "1.2.3"
+// 変数定義 (Groovy): def wicketVersion = '1.2.3' または "1.2.3"
 static VAR_DEF_GROOVY_SINGLE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"^\s*def\s+(\w+)\s*=\s*'([^']+)'"#).unwrap());
 static VAR_DEF_GROOVY_DOUBLE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"^\s*def\s+(\w+)\s*=\s*"([^"]+)""#).unwrap());
 
-// Variable definition (Kotlin): val wicketVersion = "1.2.3"
+// 変数定義 (Kotlin): val wicketVersion = "1.2.3"
 static VAR_DEF_KOTLIN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"^\s*val\s+(\w+)\s*=\s*"([^"]+)""#).unwrap());
 
-// ext block variable: wicketVersion = '1.2.3' or "1.2.3"
+// ext ブロック内変数: wicketVersion = '1.2.3' または "1.2.3"
 static EXT_VAR_SINGLE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"^\s*(\w+)\s*=\s*'([^']+)'"#).unwrap());
 static EXT_VAR_DOUBLE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"^\s*(\w+)\s*=\s*"([^"]+)""#).unwrap());
 
-// ext block start
+// ext ブロック開始
 static EXT_BLOCK_START: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*ext\s*\{").unwrap());
 
-// Map notation dependency: implementation group: 'x', name: 'y', version: 'z'
-// Also handles: implementation(group: 'x', name: 'y', version: 'z')
-// Note: Uses non-backreference pattern (accepts either quote type)
+// map 記法依存: implementation group: 'x', name: 'y', version: 'z'
+// implementation(group: 'x', name: 'y', version: 'z') も処理
+// 非後方参照パターンを使用 (シングル/ダブルクォート両対応)
 static DEP_MAP: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"^\s*(\w+)\s*[\(\s]+group:\s*['"]([^'"]+)['"]\s*,\s*name:\s*['"]([^'"]+)['"]\s*,\s*version:\s*['"]?([^'",\)\s]+)['"]?"#,
@@ -62,18 +62,18 @@ static DEP_MAP: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
-// String notation dependency: implementation 'group:name:version'
-// Note: Uses non-backreference pattern (accepts either quote type)
+// 文字列記法依存: implementation 'group:name:version'
+// 非後方参照パターンを使用 (シングル/ダブルクォート両対応)
 static DEP_STRING: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"^\s*(\w+)\s*[\(\s]*['"]([^:'"]+):([^:'"]+):([^'"]+)['"]"#).unwrap()
 });
 
-// String notation with variable interpolation: implementation "group:name:$version"
+// 変数展開あり文字列記法: implementation "group:name:$version"
 static DEP_STRING_VAR: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"^\s*(\w+)\s*[\(\s]*"([^:"]+):([^:"]+):\$\{?(\w+)\}?""#).unwrap()
 });
 
-// Development configurations
+// 開発用 configuration
 const DEV_CONFIGURATIONS: [&str; 6] = [
     "testImplementation",
     "testCompileOnly",
@@ -84,7 +84,7 @@ const DEV_CONFIGURATIONS: [&str; 6] = [
 ];
 
 impl GradleParser {
-    /// Extract variable definitions from content
+    /// content から変数定義を抽出
     fn extract_variables(&self, content: &str) -> HashMap<String, VariableDefinition> {
         let mut variables = HashMap::new();
         let mut in_ext_block = false;
@@ -94,16 +94,16 @@ impl GradleParser {
             let line_number = line_idx + 1;
             let trimmed = line.trim();
 
-            // Skip empty lines and comments
+            // 空行とコメントをスキップ
             if trimmed.is_empty() || trimmed.starts_with("//") {
                 continue;
             }
 
-            // Track ext block
+            // ext ブロックの開始/終了を追跡
             if EXT_BLOCK_START.is_match(trimmed) {
                 in_ext_block = true;
                 brace_depth = 1;
-                // Check for single-line ext block
+                // 1 行完結の ext ブロックを判定
                 if trimmed.contains('}') {
                     brace_depth = 0;
                     in_ext_block = false;
@@ -111,7 +111,7 @@ impl GradleParser {
                 continue;
             }
 
-            // Track brace depth in ext block
+            // ext ブロック内のネスト深さを追跡
             if in_ext_block {
                 brace_depth += trimmed.matches('{').count();
                 brace_depth = brace_depth.saturating_sub(trimmed.matches('}').count());
@@ -120,7 +120,7 @@ impl GradleParser {
                 }
             }
 
-            // Check for Groovy def variable (single quotes)
+            // Groovy def 変数 (シングルクォート) を判定
             if let Some(caps) = VAR_DEF_GROOVY_SINGLE.captures(line) {
                 let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                 let value = caps.get(2).map(|m| m.as_str()).unwrap_or("");
@@ -138,7 +138,7 @@ impl GradleParser {
                 continue;
             }
 
-            // Check for Groovy def variable (double quotes)
+            // Groovy def 変数 (ダブルクォート) を判定
             if let Some(caps) = VAR_DEF_GROOVY_DOUBLE.captures(line) {
                 let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                 let value = caps.get(2).map(|m| m.as_str()).unwrap_or("");
@@ -156,7 +156,7 @@ impl GradleParser {
                 continue;
             }
 
-            // Check for Kotlin val variable
+            // Kotlin val 変数を判定
             if let Some(caps) = VAR_DEF_KOTLIN.captures(line) {
                 let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                 let value = caps.get(2).map(|m| m.as_str()).unwrap_or("");
@@ -174,13 +174,13 @@ impl GradleParser {
                 continue;
             }
 
-            // Check for ext block variable (single quotes)
+            // ext ブロック変数 (シングルクォート) を判定
             if in_ext_block {
                 if let Some(caps) = EXT_VAR_SINGLE.captures(line) {
                     let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                     let value = caps.get(2).map(|m| m.as_str()).unwrap_or("");
 
-                    // Skip common non-version variables
+                    // 一般的な非バージョン変数は除外
                     if !name.is_empty()
                         && !value.is_empty()
                         && !name.starts_with("source")
@@ -199,12 +199,12 @@ impl GradleParser {
                     continue;
                 }
 
-                // Check for ext block variable (double quotes)
+                // ext ブロック変数 (ダブルクォート) を判定
                 if let Some(caps) = EXT_VAR_DOUBLE.captures(line) {
                     let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                     let value = caps.get(2).map(|m| m.as_str()).unwrap_or("");
 
-                    // Skip common non-version variables
+                    // 一般的な非バージョン変数は除外
                     if !name.is_empty()
                         && !value.is_empty()
                         && !name.starts_with("source")
@@ -227,7 +227,7 @@ impl GradleParser {
         variables
     }
 
-    /// Parse a map notation dependency
+    /// map 記法依存をパース
     fn parse_map_notation(
         &self,
         line: &str,
@@ -241,10 +241,10 @@ impl GradleParser {
         let artifact = caps.get(3).map(|m| m.as_str())?;
         let version_raw = caps.get(4).map(|m| m.as_str())?;
 
-        // Check if version is a variable reference
+        // version が変数参照か判定
         let (version, variable_name) = self.resolve_version(version_raw, variables);
 
-        // Parse the version
+        // バージョン文字列をパース
         let spec = if version.is_empty() {
             VersionSpec::new(VersionSpecKind::Any, "", "")
         } else {
@@ -263,21 +263,21 @@ impl GradleParser {
         Some((dep, variable_name))
     }
 
-    /// Parse a string notation dependency
+    /// 文字列記法依存をパース
     fn parse_string_notation(
         &self,
         line: &str,
         variables: &HashMap<String, VariableDefinition>,
         parser: &dyn crate::parser::VersionParser,
     ) -> Option<(Dependency, Option<String>)> {
-        // Try string notation with variable interpolation first
+        // まず変数展開あり文字列記法を試す
         if let Some(caps) = DEP_STRING_VAR.captures(line) {
             let config = caps.get(1).map(|m| m.as_str())?;
             let group = caps.get(2).map(|m| m.as_str())?;
             let artifact = caps.get(3).map(|m| m.as_str())?;
             let var_name = caps.get(4).map(|m| m.as_str())?;
 
-            // Resolve variable
+            // 変数参照を解決
             let version = variables
                 .get(var_name)
                 .map(|v| v.value.clone())
@@ -301,7 +301,7 @@ impl GradleParser {
             return Some((dep, Some(var_name.to_string())));
         }
 
-        // Try standard string notation
+        // 通常の文字列記法を試す
         let caps = DEP_STRING.captures(line)?;
 
         let config = caps.get(1).map(|m| m.as_str())?;
@@ -322,7 +322,7 @@ impl GradleParser {
         Some((dep, None))
     }
 
-    /// Resolve a version value, handling variable references
+    /// 変数参照を考慮してバージョン値を解決
     fn resolve_version(
         &self,
         version_raw: &str,
@@ -330,10 +330,10 @@ impl GradleParser {
     ) -> (String, Option<String>) {
         let trimmed = version_raw.trim();
 
-        // Check for variable reference patterns
-        // Pattern 1: $variableName
-        // Pattern 2: ${variableName}
-        // Pattern 3: variableName (unquoted)
+        // 変数参照パターンを判定
+        // パターン1: $variableName
+        // パターン2: ${variableName}
+        // パターン3: variableName (非クォート)
 
         let var_name =
             if let Some(inner) = trimmed.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
@@ -348,7 +348,7 @@ impl GradleParser {
                     .map(|c| c.is_ascii_digit())
                     .unwrap_or(false)
             {
-                // Unquoted non-numeric value might be a variable
+                // 非クォートかつ非数値始まりは変数の可能性がある
                 Some(trimmed)
             } else {
                 None
@@ -360,7 +360,7 @@ impl GradleParser {
             return (var_def.value.clone(), Some(var_name.to_string()));
         }
 
-        // Not a variable reference, return as-is (strip quotes if present)
+        // 変数参照でなければそのまま返す (前後のクォートのみ除去)
         let version = trimmed
             .trim_start_matches(['\'', '"'])
             .trim_end_matches(['\'', '"']);
@@ -377,12 +377,12 @@ impl ManifestParser for GradleParser {
         for line in content.lines() {
             let trimmed = line.trim();
 
-            // Skip empty lines and comments
+            // 空行とコメントをスキップ
             if trimmed.is_empty() || trimmed.starts_with("//") {
                 continue;
             }
 
-            // Try map notation first
+            // map 記法を先に試す
             if let Some((dep, var_name)) =
                 self.parse_map_notation(line, &variables, parser.as_ref())
             {
@@ -395,7 +395,7 @@ impl ManifestParser for GradleParser {
                 continue;
             }
 
-            // Try string notation
+            // 文字列記法を試す
             if let Some((dep, var_name)) =
                 self.parse_string_notation(line, &variables, parser.as_ref())
             {
@@ -424,11 +424,11 @@ impl ManifestParser for GradleParser {
         let parser = get_parser(Language::Java);
         let variables = self.extract_variables(content);
 
-        // Find which variable (if any) is used for this package
+        // このパッケージに使われている変数名を特定
         let mut variable_for_package: Option<String> = None;
 
         for line in content.lines() {
-            // Check map notation
+            // map 記法を確認
             if let Some((_dep, var_name)) =
                 self.parse_map_notation(line, &variables, parser.as_ref())
                 && _dep.name == package
@@ -437,7 +437,7 @@ impl ManifestParser for GradleParser {
                 break;
             }
 
-            // Check string notation
+            // 文字列記法を確認
             if let Some((_dep, var_name)) =
                 self.parse_string_notation(line, &variables, parser.as_ref())
                 && _dep.name == package
@@ -447,20 +447,20 @@ impl ManifestParser for GradleParser {
             }
         }
 
-        // If using variable, update the variable definition
+        // 変数経由の場合は変数定義を更新
         if let Some(var_name) = variable_for_package
             && let Some(var_def) = variables.get(&var_name)
         {
             return self.update_variable_definition(content, var_def, new_version);
         }
 
-        // Otherwise, update the direct version in the dependency line
+        // それ以外は依存行の直接バージョンを更新
         self.update_direct_version(content, package, new_version)
     }
 }
 
 impl GradleParser {
-    /// Update a variable definition with a new version
+    /// 新しいバージョンで変数定義を更新
     fn update_variable_definition(
         &self,
         content: &str,
@@ -470,62 +470,69 @@ impl GradleParser {
         let lines: Vec<&str> = content.lines().collect();
         let mut result = Vec::new();
         let quote = var_def.quote_char;
+        let version_parser = get_parser(Language::Java);
+        let formatted_version = version_parser
+            .parse(&var_def.value)
+            .map(|spec| spec.format_updated(new_version))
+            .unwrap_or_else(|| new_version.to_string());
 
         for (idx, line) in lines.iter().enumerate() {
             let line_number = idx + 1;
 
             if line_number == var_def.line_number {
-                // This is the line to update
-                // Try to preserve the original structure
+                // 更新対象行。元の構造を保持して置換する
 
-                // Handle def variable = 'value' (single quotes)
+                // def variable = 'value' (シングルクォート)
                 if let Some(caps) = VAR_DEF_GROOVY_SINGLE.captures(line) {
                     let prefix = &line[..caps.get(0).unwrap().start()];
                     let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                     result.push(format!(
                         "{}def {} = {}{}{}",
-                        prefix, name, quote, new_version, quote
+                        prefix, name, quote, formatted_version, quote
                     ));
                     continue;
                 }
 
-                // Handle def variable = "value" (double quotes)
+                // def variable = "value" (ダブルクォート)
                 if let Some(caps) = VAR_DEF_GROOVY_DOUBLE.captures(line) {
                     let prefix = &line[..caps.get(0).unwrap().start()];
                     let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                     result.push(format!(
                         "{}def {} = {}{}{}",
-                        prefix, name, quote, new_version, quote
+                        prefix, name, quote, formatted_version, quote
                     ));
                     continue;
                 }
 
-                // Handle val variable = "value"
+                // val variable = "value"
                 if let Some(caps) = VAR_DEF_KOTLIN.captures(line) {
                     let prefix = &line[..caps.get(0).unwrap().start()];
                     let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                    result.push(format!("{}val {} = \"{}\"", prefix, name, new_version));
+                    result.push(format!(
+                        "{}val {} = \"{}\"",
+                        prefix, name, formatted_version
+                    ));
                     continue;
                 }
 
-                // Handle ext block variable = 'value' (single quotes)
+                // ext ブロック変数 = 'value' (シングルクォート)
                 if let Some(caps) = EXT_VAR_SINGLE.captures(line) {
                     let prefix = &line[..caps.get(0).unwrap().start()];
                     let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                     result.push(format!(
                         "{}{} = {}{}{}",
-                        prefix, name, quote, new_version, quote
+                        prefix, name, quote, formatted_version, quote
                     ));
                     continue;
                 }
 
-                // Handle ext block variable = "value" (double quotes)
+                // ext ブロック変数 = "value" (ダブルクォート)
                 if let Some(caps) = EXT_VAR_DOUBLE.captures(line) {
                     let prefix = &line[..caps.get(0).unwrap().start()];
                     let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                     result.push(format!(
                         "{}{} = {}{}{}",
-                        prefix, name, quote, new_version, quote
+                        prefix, name, quote, formatted_version, quote
                     ));
                     continue;
                 }
@@ -537,7 +544,7 @@ impl GradleParser {
         Ok(result.join("\n"))
     }
 
-    /// Update a direct version in a dependency line
+    /// 依存行の直接バージョンを更新
     fn update_direct_version(
         &self,
         content: &str,
@@ -555,9 +562,16 @@ impl GradleParser {
         let (group, artifact) = (parts[0], parts[1]);
         let escaped_group = regex::escape(group);
         let escaped_artifact = regex::escape(artifact);
+        let version_parser = get_parser(Language::Java);
+        let format_updated = |current_version: &str| -> String {
+            version_parser
+                .parse(current_version)
+                .map(|spec| spec.format_updated(new_version))
+                .unwrap_or_else(|| new_version.to_string())
+        };
 
-        // Try to update map notation: group: 'x', name: 'y', version: 'z'
-        // Use non-backreference pattern (accepts either quote type)
+        // map 記法を更新: group: 'x', name: 'y', version: 'z'
+        // 非後方参照パターンでシングル/ダブルクォート両対応
         let map_pattern = format!(
             r#"(group:\s*['"]{}['"]\s*,\s*name:\s*['"]{}['"]\s*,\s*version:\s*)(['"])([^'"]+)['"]"#,
             escaped_group, escaped_artifact
@@ -572,17 +586,22 @@ impl GradleParser {
         let result = map_re.replace(content, |caps: &regex::Captures| {
             let prefix = &caps[1];
             let quote = &caps[2];
+            let current_version = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+            let updated_version = format_updated(current_version);
             updated = true;
-            format!("{}{}{}{}", prefix, quote, new_version, quote)
+            format!("{}{}{}{}", prefix, quote, updated_version, quote)
         });
 
         if updated {
             return Ok(result.to_string());
         }
 
-        // Try to update string notation: 'group:artifact:version'
-        // Use non-backreference pattern (accepts either quote type)
-        let string_pattern = format!(r#"(['"]){}:{}:[^'"]+['"]"#, escaped_group, escaped_artifact);
+        // 文字列記法を更新: 'group:artifact:version'
+        // 非後方参照パターンでシングル/ダブルクォート両対応
+        let string_pattern = format!(
+            r#"(['"]){}:{}:([^'"]+)['"]"#,
+            escaped_group, escaped_artifact
+        );
         let string_re =
             Regex::new(&string_pattern).map_err(|e| ManifestError::InvalidVersionSpec {
                 path: PathBuf::from("build.gradle"),
@@ -592,8 +611,13 @@ impl GradleParser {
 
         let result = string_re.replace(content, |caps: &regex::Captures| {
             let quote = &caps[1];
+            let current_version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+            let updated_version = format_updated(current_version);
             updated = true;
-            format!("{}{}:{}:{}{}", quote, group, artifact, new_version, quote)
+            format!(
+                "{}{}:{}:{}{}",
+                quote, group, artifact, updated_version, quote
+            )
         });
 
         if updated {
@@ -617,7 +641,7 @@ mod tests {
         GradleParser.parse(content)
     }
 
-    // Basic dependency parsing tests
+    // 基本的な依存関係パースのテスト
 
     #[test]
     fn test_parse_string_notation() {
@@ -717,7 +741,7 @@ dependencies {
         assert_eq!(dev_deps.len(), 1);
     }
 
-    // Variable definition tests
+    // 変数定義のテスト
 
     #[test]
     fn test_parse_groovy_variable() {
@@ -743,7 +767,7 @@ dependencies {
     implementation(group = "org.apache.wicket", name = "wicket-core", version = wicketVersion)
 }
 "#;
-        // Note: Kotlin DSL uses different syntax, but the variable extraction should still work
+        // Kotlin DSL は構文が異なるが、変数抽出は機能する必要がある
         let parser = GradleParser;
         let vars = parser.extract_variables(content);
         assert_eq!(
@@ -796,7 +820,7 @@ dependencies {
         assert_eq!(deps[0].version_spec.version, "9.12.0");
     }
 
-    // Version update tests
+    // バージョン更新のテスト
 
     #[test]
     fn test_update_version_string_notation() {
@@ -837,7 +861,7 @@ dependencies {
             .update_version(content, "org.apache.wicket:wicket-core", "10.0.0")
             .unwrap();
         assert!(result.contains("def wicketVersion = '10.0.0'"));
-        // Original variable reference should be preserved
+        // 元の変数参照は保持される
         assert!(result.contains("version: wicketVersion"));
     }
 
@@ -872,6 +896,34 @@ dependencies {
     }
 
     #[test]
+    fn test_update_version_preserves_strict_notation() {
+        let content = r#"
+dependencies {
+    implementation "org.springframework:spring-core:5.3.23!!"
+}
+"#;
+        let result = GradleParser
+            .update_version(content, "org.springframework:spring-core", "6.0.0")
+            .unwrap();
+        assert!(result.contains("\"org.springframework:spring-core:6.0.0!!\""));
+    }
+
+    #[test]
+    fn test_update_variable_preserves_strict_notation() {
+        let content = r#"
+def springVersion = '5.3.23!!'
+
+dependencies {
+    implementation "org.springframework:spring-core:$springVersion"
+}
+"#;
+        let result = GradleParser
+            .update_version(content, "org.springframework:spring-core", "6.0.0")
+            .unwrap();
+        assert!(result.contains("def springVersion = '6.0.0!!'"));
+    }
+
+    #[test]
     fn test_update_version_not_found() {
         let content = r#"
 dependencies {
@@ -882,7 +934,7 @@ dependencies {
         assert!(result.is_err());
     }
 
-    // Edge case tests
+    // エッジケースのテスト
 
     #[test]
     fn test_parse_empty() {
@@ -893,7 +945,7 @@ dependencies {
     #[test]
     fn test_parse_comments_only() {
         let content = r#"
-// This is a comment
+// これはコメントです
 // implementation 'commented:out:1.0.0'
 "#;
         let deps = parse(content).unwrap();
@@ -930,7 +982,7 @@ dependencies {
         assert_eq!(parser.language(), Language::Java);
     }
 
-    // Real-world example test
+    // 実運用に近い例のテスト
     #[test]
     fn test_parse_realistic_build_gradle() {
         let content = r#"
@@ -958,7 +1010,7 @@ dependencies {
         let deps = parse(content).unwrap();
         assert_eq!(deps.len(), 5);
 
-        // Check specific dependencies
+        // 主要な依存関係を確認
         let spring_boot = deps
             .iter()
             .find(|d| d.name.contains("spring-boot-starter-web"));

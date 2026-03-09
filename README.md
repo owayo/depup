@@ -9,6 +9,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/owayo/depup/actions/workflows/release.yml"><img src="https://github.com/owayo/depup/actions/workflows/release.yml/badge.svg?branch=main" alt="Release"></a>
   <a href="https://github.com/owayo/depup/actions/workflows/ci.yml"><img src="https://github.com/owayo/depup/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
   <a href="https://github.com/owayo/depup/releases"><img src="https://img.shields.io/github/v/release/owayo/depup" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
@@ -97,7 +98,39 @@ cargo install --path .
 
 ### From GitHub Releases
 
-Download the latest binary from [GitHub Releases](https://github.com/owayo/depup/releases).
+Download the latest binary from [Releases](https://github.com/owayo/depup/releases).
+
+#### macOS (Apple Silicon)
+
+```bash
+curl -L https://github.com/owayo/depup/releases/latest/download/depup-aarch64-apple-darwin.tar.gz | tar xz
+sudo mv depup /usr/local/bin/
+```
+
+#### macOS (Intel)
+
+```bash
+curl -L https://github.com/owayo/depup/releases/latest/download/depup-x86_64-apple-darwin.tar.gz | tar xz
+sudo mv depup /usr/local/bin/
+```
+
+#### Linux (x86_64)
+
+```bash
+curl -L https://github.com/owayo/depup/releases/latest/download/depup-x86_64-unknown-linux-gnu.tar.gz | tar xz
+sudo mv depup /usr/local/bin/
+```
+
+#### Linux (ARM64)
+
+```bash
+curl -L https://github.com/owayo/depup/releases/latest/download/depup-aarch64-unknown-linux-gnu.tar.gz | tar xz
+sudo mv depup /usr/local/bin/
+```
+
+#### Windows
+
+Download `depup-x86_64-pc-windows-msvc.zip` from [Releases](https://github.com/owayo/depup/releases), extract, and add to PATH.
 
 ## Quickstart
 
@@ -202,7 +235,8 @@ Pinned versions are intentionally fixed and excluded from updates by default:
 | Ruby | `'~> 1.2.3'`, `'>= 1.2.3'` | ✅ |
 | PHP | `"1.2.3"` | ❌ |
 | PHP | `"^1.2.3"`, `"~1.2.3"` | ✅ |
-| Java | Fixed version in Gradle | ✅ |
+| Java | Fixed version in Gradle | ❌ |
+| Java | Strict version in Gradle (`1.2.3!!`) | ❌ |
 | Swift | `exact: "1.2.3"` | ❌ |
 | Swift | `from: "1.2.3"`, `.upToNextMinor` | ✅ |
 
@@ -218,6 +252,7 @@ depup preserves the original version range format:
 "^1.2.3" → "^2.0.0"  (caret preserved)
 "~1.2.3" → "~1.3.0"  (tilde preserved)
 ">=1.0.0" → ">=2.0.0" (range preserved)
+"1.2.3!!" → "2.0.0!!" (Gradle strict preserved)
 ```
 
 ### Range Constraints
