@@ -192,25 +192,32 @@ fn parse_go_dependency(
     let comment = caps.get(3).map(|m| m.as_str()).unwrap_or("");
     let is_indirect = comment.contains("indirect");
 
-    let spec = parser.parse(version)?;
+    let mut spec = parser.parse(version)?;
 
-    // Mark as pinned if has // pinned comment
+    // // pinned コメント付きの場合、GoPinned として扱い更新対象から除外する
+    if is_pinned {
+        use crate::domain::{VersionSpec, VersionSpecKind};
+        let mut pinned_spec = VersionSpec::new(
+            VersionSpecKind::GoPinned,
+            spec.raw.clone(),
+            spec.version.clone(),
+        );
+        if let Some(ref prefix) = spec.prefix {
+            pinned_spec = pinned_spec.with_prefix(prefix.clone());
+        }
+        if let Some(ref suffix) = spec.suffix {
+            pinned_spec = pinned_spec.with_suffix(suffix.clone());
+        }
+        spec = pinned_spec;
+    }
+
     let dep = if is_indirect {
-        // Indirect dependencies are treated as dev dependencies
         Dependency::development(module, spec, Language::Go)
     } else {
         Dependency::production(module, spec, Language::Go)
     };
 
-    // If pinned, we need to mark it somehow
-    // For Go, we'll rely on the is_pinned() method checking for Exact kind
-    // But since Go versions are always "exact", we need to check the comment
-    // This is handled by the update logic - pinned packages should be skipped
-    // Note: We can't directly mark pinned in the current Dependency struct
-    // The updater will need to re-read the file to check for pinned comments
-    let _ = is_pinned; // Acknowledge the flag even though we can't act on it yet
-
-    Some(dep.clone())
+    Some(dep)
 }
 
 #[cfg(test)]
@@ -306,8 +313,8 @@ require github.com/critical/lib v1.0.0 // pinned
 
         let deps = parse(content).unwrap();
         assert_eq!(deps.len(), 1);
-        // All Go versions are Exact, so is_pinned() will return true
-        // The pinned comment is for additional indication
+        // // pinned コメント付きは GoPinned として扱われる
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::GoPinned);
         assert!(deps[0].is_pinned());
     }
 
@@ -555,6 +562,82 @@ retract (
 
         let deps = parse(content).unwrap();
         assert_eq!(deps.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_pinned_in_require_block() {
+        // require ブロック内の // pinned コメントも GoPinned として扱われる
+        let content = r#"
+module example.com/myproject
+
+go 1.21
+
+require (
+	github.com/gin-gonic/gin v1.9.1
+	github.com/critical/lib v1.0.0 // pinned
+	github.com/stretchr/testify v1.8.4
+)
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 3);
+
+        let critical = deps
+            .iter()
+            .find(|d| d.name == "github.com/critical/lib")
+            .unwrap();
+        assert_eq!(critical.version_spec.kind, VersionSpecKind::GoPinned);
+        assert!(critical.is_pinned());
+
+        // 他の依存は通常の Exact
+        let gin = deps
+            .iter()
+            .find(|d| d.name == "github.com/gin-gonic/gin")
+            .unwrap();
+        assert_eq!(gin.version_spec.kind, VersionSpecKind::Exact);
+    }
+
+    #[test]
+    fn test_update_preserves_pinned_comment() {
+        // update_version は // pinned コメントを保持する
+        let content = r#"module example.com/myproject
+
+go 1.21
+
+require github.com/critical/lib v1.0.0 // pinned
+"#;
+
+        let result = GoModParser
+            .update_version(content, "github.com/critical/lib", "v2.0.0")
+            .unwrap();
+        assert!(result.contains("v2.0.0"));
+        assert!(result.contains("// pinned"));
+    }
+
+    #[test]
+    fn test_update_preserves_trailing_newline() {
+        // 末尾改行を持つファイルは更新後も保持する
+        let content =
+            "module example.com/myproject\n\ngo 1.21\n\nrequire github.com/gin-gonic/gin v1.9.1\n";
+
+        let result = GoModParser
+            .update_version(content, "github.com/gin-gonic/gin", "v1.10.0")
+            .unwrap();
+        assert!(result.ends_with('\n'));
+        assert!(result.contains("v1.10.0"));
+    }
+
+    #[test]
+    fn test_update_no_trailing_newline_when_original_lacks_it() {
+        // 末尾改行がないファイルは更新後も付けない
+        let content =
+            "module example.com/myproject\n\ngo 1.21\n\nrequire github.com/gin-gonic/gin v1.9.1";
+
+        let result = GoModParser
+            .update_version(content, "github.com/gin-gonic/gin", "v1.10.0")
+            .unwrap();
+        assert!(!result.ends_with('\n'));
+        assert!(result.contains("v1.10.0"));
     }
 
     #[test]

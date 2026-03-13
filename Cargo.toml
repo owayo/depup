@@ -7,7 +7,7 @@ description = "Multi-language dependency updater CLI tool"
 license = "MIT"
 
 [dependencies]
-clap = { version = "4.5.60", features = ["derive"] }
+clap = { version = "4.6.0", features = ["derive"] }
 tokio = { version = "1.50.0", features = ["full"] }
 reqwest = { version = "0.13.2", features = ["json"] }
 toml = "1.0.6"
@@ -23,6 +23,6 @@ indicatif = "0.18.4"
 colored = "3.1.1"
 
 [dev-dependencies]
-assert_cmd = "2.1.2"
+assert_cmd = "2.2.0"
 predicates = "3.1.4"
-tempfile = "3.26.0"
+tempfile = "3.27.0"

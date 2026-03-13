@@ -140,6 +140,12 @@ impl UpdateJudge {
             }
         }
 
+        // GoPinned (// pinned コメント付き) は always_pinned に関係なくスキップ
+        if dependency.version_spec.kind == VersionSpecKind::GoPinned && !self.filter.include_pinned
+        {
+            return Some(SkipReason::Pinned);
+        }
+
         // Check pinned version (unless --include-pinned or language always uses pinned versions)
         // Languages like Go and Java don't have range specifiers, so all versions are pinned.
         // For these languages, we should always include them even without --include-pinned.
@@ -1235,6 +1241,71 @@ mod tests {
         // 上限なし
         let result = extract_upper_bound(">=1.0.0");
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_should_skip_go_pinned_without_include_pinned() {
+        // GoPinned (// pinned コメント付き) は include_pinned なしでスキップされるべき
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let spec = VersionSpec::new(VersionSpecKind::GoPinned, "v1.0.0", "1.0.0");
+        let dep = Dependency::new("github.com/critical/lib", spec, false, Language::Go);
+
+        assert_eq!(judge.should_skip(&dep), Some(SkipReason::Pinned));
+    }
+
+    #[test]
+    fn test_should_skip_go_pinned_with_include_pinned() {
+        // GoPinned でも --include-pinned なら更新対象になる
+        let filter = UpdateFilter::new().with_include_pinned(true);
+        let judge = UpdateJudge::new(filter);
+
+        let spec = VersionSpec::new(VersionSpecKind::GoPinned, "v1.0.0", "1.0.0");
+        let dep = Dependency::new("github.com/critical/lib", spec, false, Language::Go);
+
+        assert!(judge.should_skip(&dep).is_none());
+    }
+
+    #[test]
+    fn test_judge_go_pinned_skips_update() {
+        // GoPinned 依存は judge でもスキップされるべき
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let spec = VersionSpec::new(VersionSpecKind::GoPinned, "v1.0.0", "1.0.0");
+        let dep = Dependency::new("github.com/critical/lib", spec, false, Language::Go);
+        let versions = vec![make_version_info("2.0.0", 10)];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_skip());
+        if let UpdateResult::Skip { reason, .. } = result {
+            assert_eq!(reason, SkipReason::Pinned);
+        }
+    }
+
+    #[test]
+    fn test_judge_go_pinned_with_include_pinned_updates() {
+        // GoPinned でも --include-pinned なら更新される
+        let filter = UpdateFilter::new().with_include_pinned(true);
+        let judge = UpdateJudge::new(filter);
+
+        let spec = VersionSpec::new(VersionSpecKind::GoPinned, "v1.0.0", "1.0.0");
+        let dep = Dependency::new("github.com/critical/lib", spec, false, Language::Go);
+        let versions = vec![make_version_info("2.0.0", 10)];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_update());
+        if let UpdateResult::Update { new_version, .. } = result {
+            assert_eq!(new_version, "2.0.0");
+        }
+    }
+
+    #[test]
+    fn test_extract_upper_bound_maven_alt_inclusive() {
+        // Maven 代替記法 ]1.0,2.0] = exclusive lower, inclusive upper
+        let result = extract_upper_bound("]1.0,2.0]");
+        assert_eq!(result, Some(("2.0".to_string(), true)));
     }
 
     #[test]

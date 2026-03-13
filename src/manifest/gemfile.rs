@@ -242,7 +242,12 @@ impl ManifestParser for GemfileParser {
         }
 
         if updated {
-            return Ok(lines.join("\n"));
+            let mut joined = lines.join("\n");
+            // 元のファイルが末尾改行を持つ場合は保持する
+            if content.ends_with('\n') {
+                joined.push('\n');
+            }
+            return Ok(joined);
         }
 
         Err(ManifestError::InvalidVersionSpec {
@@ -562,6 +567,28 @@ gem 'playwright-ruby-client', '1.57.1'
         // Other gems should be unchanged
         assert!(result.contains("gem 'nokogiri'"));
         assert!(result.contains("gem 'playwright-ruby-client', '1.57.1'"));
+    }
+
+    #[test]
+    fn test_update_versionless_gem_preserves_trailing_newline() {
+        // バージョンなし gem の更新で末尾改行を保持する
+        let content = "gem 'rmagick'\ngem 'nokogiri'\n";
+        let result = GemfileParser
+            .update_version(content, "rmagick", "5.3.0")
+            .unwrap();
+        assert!(result.contains("gem 'rmagick', '5.3.0'"));
+        assert!(result.ends_with('\n'));
+    }
+
+    #[test]
+    fn test_update_versionless_gem_no_trailing_newline() {
+        // 末尾改行がないファイルは付けない
+        let content = "gem 'rmagick'";
+        let result = GemfileParser
+            .update_version(content, "rmagick", "5.3.0")
+            .unwrap();
+        assert!(result.contains("gem 'rmagick', '5.3.0'"));
+        assert!(!result.ends_with('\n'));
     }
 
     #[test]

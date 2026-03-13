@@ -269,6 +269,7 @@ depup respects upper-bound range constraints (both exclusive and inclusive):
 "[1.0,2.0]"        → preserved as-is, updates up to and including 2.0 (Maven-style)
 "[1.0,2.0.Final)"  → preserved as-is, updates only below 2.0.Final (Maven qualifier)
 "]1.0,2.0["        → preserved as-is, updates only below 2.0 (Maven alt brackets)
+"]1.0,2.0]"        → preserved as-is, updates up to and including 2.0 (Maven alt inclusive)
 "[1.0,2.0["        → preserved as-is, updates only below 2.0 (Maven alt upper bracket)
 ```
 

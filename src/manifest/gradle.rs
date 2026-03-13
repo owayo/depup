@@ -541,7 +541,12 @@ impl GradleParser {
             result.push(line.to_string());
         }
 
-        Ok(result.join("\n"))
+        let mut joined = result.join("\n");
+        // 元のファイルが末尾改行を持つ場合は保持する
+        if content.ends_with('\n') {
+            joined.push('\n');
+        }
+        Ok(joined)
     }
 
     /// 依存行の直接バージョンを更新
@@ -921,6 +926,28 @@ dependencies {
             .update_version(content, "org.springframework:spring-core", "6.0.0")
             .unwrap();
         assert!(result.contains("def springVersion = '6.0.0!!'"));
+    }
+
+    #[test]
+    fn test_update_variable_preserves_trailing_newline() {
+        // 変数定義の更新で末尾改行を保持する
+        let content = "def wicketVersion = '9.12.0'\n\ndependencies {\n    implementation group: 'org.apache.wicket', name: 'wicket-core', version: wicketVersion\n}\n";
+        let result = GradleParser
+            .update_version(content, "org.apache.wicket:wicket-core", "10.0.0")
+            .unwrap();
+        assert!(result.contains("def wicketVersion = '10.0.0'"));
+        assert!(result.ends_with('\n'));
+    }
+
+    #[test]
+    fn test_update_variable_no_trailing_newline() {
+        // 末尾改行がないファイルは付けない
+        let content = "def wicketVersion = '9.12.0'\n\ndependencies {\n    implementation group: 'org.apache.wicket', name: 'wicket-core', version: wicketVersion\n}";
+        let result = GradleParser
+            .update_version(content, "org.apache.wicket:wicket-core", "10.0.0")
+            .unwrap();
+        assert!(result.contains("def wicketVersion = '10.0.0'"));
+        assert!(!result.ends_with('\n'));
     }
 
     #[test]

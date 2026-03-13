@@ -255,7 +255,7 @@
 | Maven lower-open | `(1.0, 2.0]` | 下限開放 | Range |
 | Maven open-upper | `[1.0, )` | 上限なし | Range |
 | Maven open-lower | `(, 2.0]` | 下限なし | Range |
-| Strict version | `!!1.2.3` | 厳密バージョン | ー |
+| Strict version | `1.2.3!!` | 厳密バージョン（サフィックス形式） | Exact (suffix `!!` 保持) |
 | Reject version | `1.2.+` reject `1.2.5` | 拒否指定 | ー |
 | Prefer version | `1.+` prefer `1.2.3` | 優先指定 | ー |
 | Version catalog | `libs.xxx` | バージョンカタログ | ー |

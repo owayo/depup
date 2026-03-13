@@ -116,9 +116,9 @@ make help                # Makefileヘルプ
 
 - バージョン比較は数値ベースの semver 比較を使用 (文字列比較ではない)
 - プレリリースバージョン (alpha/beta/canary/dev/rc) はデフォルトでフィルタされる
-- Go は常に pinned 扱い (`--include-pinned` 不要)
+- Go は常に pinned 扱い (`--include-pinned` 不要) だが、`// pinned` コメント付き依存は `--include-pinned` がないとスキップされる
 - Java/Gradle の strict 記法（例: `1.2.3!!`）は固定バージョンとして解釈され、`!!` を保持して更新される
-- Range制約 (`>=X,<Y` / `>=X,<=Y` / `A..<B` / `A...B` / `A - B` / `[A,B)` / `[A,B]` / `]A,B[` / `[A,B[`) では上限を超えるバージョンは除外 (`<=` / `...` / `A - B` / `]` は上限値を含む)
+- Range制約 (`>=X,<Y` / `>=X,<=Y` / `A..<B` / `A...B` / `A - B` / `[A,B)` / `[A,B]` / `]A,B[` / `[A,B[` / `]A,B]`) では上限を超えるバージョンは除外 (`<=` / `...` / `A - B` / 閉じ `]` は上限値を含む)
 - Maven 形式の qualifier 付き上限（例: `[1.0,2.0.Final)`）も上限制約として解釈される
 - Cargo workspace の `[workspace] members` に指定されたメンバークレートの Cargo.toml も自動検出
 - Tauriプロジェクトでは npm/crate のバージョンを自動同期
