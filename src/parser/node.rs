@@ -1,27 +1,26 @@
-//! Node.js (npm/yarn/pnpm) version specification parser
+//! Node.js (npm/yarn/pnpm) のバージョン指定パーサ。
 //!
-//! Handles version formats:
-//! - Exact: `1.2.3`
+//! 対応する形式:
+//! - 固定: `1.2.3`
 //! - Caret: `^1.2.3`, `^1.2`, `^1`
 //! - Tilde: `~1.2.3`, `~1.2`, `~1`
-//! - Comparison: `>=1.2.3`, `>1.2.3`, `<=1.2.3`, `<1.2.3`
-//! - Wildcard: `*`, `1.x`, `1.2.*`
-//! - Range: `>=1.0.0 <2.0.0`, `1.0.0 - 2.0.0`, `^1 || ^2`
-//! - Tag: `latest`, `next`
+//! - 比較演算子: `>=1.2.3`, `>1.2.3`, `<=1.2.3`, `<1.2.3`
+//! - ワイルドカード: `1.x`, `1.2.*`
+//! - レンジ: `>=1.0.0 <2.0.0`, `1.0.0 - 2.0.0`, `^1 || ^2`
 
 use crate::domain::{Language, VersionSpec, VersionSpecKind};
 use crate::parser::VersionParser;
 use regex::Regex;
 use std::sync::LazyLock;
 
-/// Node.js version specification parser
+/// Node.js バージョン指定パーサ
 pub struct NodeVersionParser;
 
-/// Normalize partial version to full semver (e.g., "2" -> "2.0.0", "2.1" -> "2.1.0")
+/// 部分指定を完全な semver に正規化する。例: `2` -> `2.0.0`
 fn normalize_version(version: &str) -> String {
     let version = version.strip_prefix('v').unwrap_or(version);
 
-    // Handle prerelease/build suffix
+    // プレリリースやビルドメタデータは後ろに戻す
     let (base, suffix) = if let Some(idx) = version.find(['-', '+']) {
         (&version[..idx], Some(&version[idx..]))
     } else {
@@ -41,8 +40,8 @@ fn normalize_version(version: &str) -> String {
     }
 }
 
-// Regex patterns for Node.js version specifications
-// These patterns accept partial versions (e.g., ^2, ~2.1)
+// Node.js のバージョン指定用正規表現
+// ^2 や ~2.1 のような部分指定も受け付ける
 static CARET_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\^\s*(v?\d+(?:\.\d+){0,2}(?:[-+][\w.-]+)?)$").unwrap());
 static TILDE_RE: LazyLock<Regex> =
@@ -94,6 +93,10 @@ fn has_multi_comparator(raw: &str) -> bool {
     count >= 2
 }
 
+fn is_fully_floating_wildcard(raw: &str) -> bool {
+    !raw.chars().any(|ch| ch.is_ascii_digit())
+}
+
 impl VersionParser for NodeVersionParser {
     fn parse(&self, version_str: &str) -> Option<VersionSpec> {
         let trimmed = version_str.trim();
@@ -102,7 +105,7 @@ impl VersionParser for NodeVersionParser {
             return None;
         }
 
-        // Check for comparator-based compound ranges first
+        // 比較演算子を複数含む複合レンジを先に判定する
         if has_compound_range(trimmed) || has_multi_comparator(trimmed) {
             return Some(VersionSpec::new(
                 VersionSpecKind::Range,
@@ -111,7 +114,7 @@ impl VersionParser for NodeVersionParser {
             ));
         }
 
-        // Check for caret range (^1.2.3, ^1.2, ^1)
+        // Caret レンジ
         if let Some(caps) = CARET_RE.captures(trimmed) {
             let version = normalize_version(caps.get(1)?.as_str());
             return Some(
@@ -119,7 +122,7 @@ impl VersionParser for NodeVersionParser {
             );
         }
 
-        // Check for tilde range (~1.2.3, ~1.2, ~1)
+        // Tilde レンジ
         if let Some(caps) = TILDE_RE.captures(trimmed) {
             let version = normalize_version(caps.get(1)?.as_str());
             return Some(
@@ -127,7 +130,7 @@ impl VersionParser for NodeVersionParser {
             );
         }
 
-        // Check for greater than or equal (>=1.2.3, >=1.2, >=1)
+        // 以上
         if let Some(caps) = GTE_RE.captures(trimmed) {
             let version = normalize_version(caps.get(1)?.as_str());
             return Some(
@@ -136,7 +139,7 @@ impl VersionParser for NodeVersionParser {
             );
         }
 
-        // Check for greater than (>1.2.3, >1.2, >1)
+        // より大きい
         if let Some(caps) = GT_RE.captures(trimmed) {
             let version = normalize_version(caps.get(1)?.as_str());
             return Some(
@@ -144,7 +147,7 @@ impl VersionParser for NodeVersionParser {
             );
         }
 
-        // Check for less than or equal (<=1.2.3, <=1.2, <=1)
+        // 以下
         if let Some(caps) = LTE_RE.captures(trimmed) {
             let version = normalize_version(caps.get(1)?.as_str());
             return Some(
@@ -152,7 +155,7 @@ impl VersionParser for NodeVersionParser {
             );
         }
 
-        // Check for less than (<1.2.3, <1.2, <1)
+        // より小さい
         if let Some(caps) = LT_RE.captures(trimmed) {
             let version = normalize_version(caps.get(1)?.as_str());
             return Some(
@@ -167,10 +170,18 @@ impl VersionParser for NodeVersionParser {
             );
         }
 
-        // Check for wildcard (*, 1.x, 1.2.*)
+        // `*` は完全な浮動指定なので更新対象にしない
+        if matches!(trimmed, "*" | "x" | "X") {
+            return None;
+        }
+
+        // `1.x` や `1.2.*` は形を保ったまま更新する
         if WILDCARD_RE.is_match(trimmed)
             && (trimmed.contains('x') || trimmed.contains('X') || trimmed.contains('*'))
         {
+            if is_fully_floating_wildcard(trimmed) {
+                return None;
+            }
             return Some(VersionSpec::new(
                 VersionSpecKind::Wildcard,
                 trimmed,
@@ -178,7 +189,7 @@ impl VersionParser for NodeVersionParser {
             ));
         }
 
-        // Check for exact version / partial version (1.2.3, 1.2, 1)
+        // 固定バージョンまたは部分指定
         if let Some(caps) = EXACT_RE.captures(trimmed) {
             let raw_version = caps.get(1)?.as_str();
             let normalized = normalize_version(raw_version);
@@ -196,9 +207,9 @@ impl VersionParser for NodeVersionParser {
             ));
         }
 
-        // npm dist-tags (latest, next, canary) behave like moving targets.
+        // npm dist-tag は常に移動する参照なので更新対象にしない
         if TAG_RE.is_match(trimmed) {
-            return Some(VersionSpec::new(VersionSpecKind::Wildcard, trimmed, ""));
+            return None;
         }
 
         None
@@ -359,9 +370,7 @@ mod tests {
 
     #[test]
     fn test_parse_wildcard_star() {
-        let spec = parse("*").unwrap();
-        assert_eq!(spec.kind, VersionSpecKind::Wildcard);
-        assert!(!spec.is_pinned());
+        assert!(parse("*").is_none());
     }
 
     #[test]
@@ -374,6 +383,18 @@ mod tests {
     fn test_parse_wildcard_minor() {
         let spec = parse("1.2.*").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Wildcard);
+    }
+
+    #[test]
+    fn test_parse_wildcard_full_tuple() {
+        let spec = parse("1.x.x").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Wildcard);
+        assert_eq!(spec.format_updated("2.3.4"), "2.x.x");
+    }
+
+    #[test]
+    fn test_parse_fully_floating_multi_segment_wildcard() {
+        assert!(parse("x.x").is_none());
     }
 
     #[test]
@@ -392,9 +413,7 @@ mod tests {
 
     #[test]
     fn test_parse_tag_latest() {
-        let spec = parse("latest").unwrap();
-        assert_eq!(spec.kind, VersionSpecKind::Wildcard);
-        assert_eq!(spec.version, "");
+        assert!(parse("latest").is_none());
     }
 
     #[test]
@@ -446,6 +465,24 @@ mod tests {
     fn test_format_updated_tilde_partial() {
         let spec = parse("~2.1").unwrap();
         assert_eq!(spec.format_updated("2.2.0"), "~2.2.0");
+    }
+
+    #[test]
+    fn test_format_updated_wildcard_x() {
+        let spec = parse("1.x").unwrap();
+        assert_eq!(spec.format_updated("2.3.4"), "2.x");
+    }
+
+    #[test]
+    fn test_format_updated_wildcard_minor() {
+        let spec = parse("1.2.*").unwrap();
+        assert_eq!(spec.format_updated("2.3.4"), "2.3.*");
+    }
+
+    #[test]
+    fn test_format_updated_wildcard_v_prefix() {
+        let spec = parse("v1.*").unwrap();
+        assert_eq!(spec.format_updated("2.3.4"), "v2.*");
     }
 
     #[test]

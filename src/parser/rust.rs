@@ -1,22 +1,22 @@
-//! Rust (Cargo) version specification parser
+//! Rust (Cargo) のバージョン指定パーサ。
 //!
-//! Handles version formats:
-//! - Exact pinned: `=1.2.3`
-//! - Caret (default): `1.2.3` or `^1.2.3`
+//! 対応する形式:
+//! - 固定: `=1.2.3`
+//! - Caret: `1.2.3`, `^1.2.3`
 //! - Tilde: `~1.2.3`
-//! - Comparison: `>=1.2.3`, `>1.2.3`, `<=1.2.3`, `<1.2.3`
-//! - Wildcard: `*`, `1.*`
-//! - Range: `>=1.0, <2.0`
+//! - 比較演算子: `>=1.2.3`, `>1.2.3`, `<=1.2.3`, `<1.2.3`
+//! - ワイルドカード: `1.*`
+//! - レンジ: `>=1.0, <2.0`
 
 use crate::domain::{Language, VersionSpec, VersionSpecKind};
 use crate::parser::VersionParser;
 use regex::Regex;
 use std::sync::LazyLock;
 
-/// Rust/Cargo version specification parser
+/// Rust/Cargo バージョン指定パーサ
 pub struct RustVersionParser;
 
-// Regex patterns for Rust version specifications
+// Rust のバージョン指定用正規表現
 static EXACT_PINNED_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^=([\d]+(?:\.[\d]+)*(?:-[\w.]+)?)$").unwrap());
 static CARET_EXPLICIT_RE: LazyLock<Regex> =
@@ -47,7 +47,7 @@ impl VersionParser for RustVersionParser {
             return None;
         }
 
-        // Check for exact pinned version (=1.2.3)
+        // 固定バージョン
         if let Some(caps) = EXACT_PINNED_RE.captures(trimmed) {
             let version = caps.get(1)?.as_str();
             return Some(
@@ -55,7 +55,7 @@ impl VersionParser for RustVersionParser {
             );
         }
 
-        // Check for explicit caret (^1.2.3)
+        // 明示的 Caret
         if let Some(caps) = CARET_EXPLICIT_RE.captures(trimmed) {
             let version = caps.get(1)?.as_str();
             return Some(
@@ -63,7 +63,7 @@ impl VersionParser for RustVersionParser {
             );
         }
 
-        // Check for tilde (~1.2.3)
+        // Tilde
         if let Some(caps) = TILDE_RE.captures(trimmed) {
             let version = caps.get(1)?.as_str();
             return Some(
@@ -71,7 +71,7 @@ impl VersionParser for RustVersionParser {
             );
         }
 
-        // Check for greater than or equal (>=1.2.3)
+        // 以上
         if let Some(caps) = GTE_RE.captures(trimmed) {
             let version = caps.get(1)?.as_str();
             return Some(
@@ -80,7 +80,7 @@ impl VersionParser for RustVersionParser {
             );
         }
 
-        // Check for greater than (>1.2.3)
+        // より大きい
         if let Some(caps) = GT_RE.captures(trimmed) {
             let version = caps.get(1)?.as_str();
             return Some(
@@ -88,7 +88,7 @@ impl VersionParser for RustVersionParser {
             );
         }
 
-        // Check for less than or equal (<=1.2.3)
+        // 以下
         if let Some(caps) = LTE_RE.captures(trimmed) {
             let version = caps.get(1)?.as_str();
             return Some(
@@ -96,7 +96,7 @@ impl VersionParser for RustVersionParser {
             );
         }
 
-        // Check for less than (<1.2.3)
+        // より小さい
         if let Some(caps) = LT_RE.captures(trimmed) {
             let version = caps.get(1)?.as_str();
             return Some(
@@ -104,9 +104,9 @@ impl VersionParser for RustVersionParser {
             );
         }
 
-        // Check for range (>=1.0, <2.0)
+        // レンジ
         if RANGE_RE.is_match(trimmed) {
-            // Extract the first version from range for reference
+            // 比較基準として先頭のバージョンを残す
             let first_version = trimmed
                 .split(',')
                 .next()
@@ -124,7 +124,12 @@ impl VersionParser for RustVersionParser {
             ));
         }
 
-        // Check for wildcard (*, 1.*)
+        // `*` は完全な浮動指定なので更新対象にしない
+        if trimmed == "*" {
+            return None;
+        }
+
+        // `1.*` は形を保ったまま更新する
         if WILDCARD_RE.is_match(trimmed) {
             return Some(VersionSpec::new(
                 VersionSpecKind::Wildcard,
@@ -133,10 +138,9 @@ impl VersionParser for RustVersionParser {
             ));
         }
 
-        // Check for bare version (1.2.3) - treated as caret in Cargo
+        // 裸のバージョンは Cargo では Caret 扱い
         if let Some(caps) = BARE_VERSION_RE.captures(trimmed) {
             let version = caps.get(1)?.as_str();
-            // In Cargo, bare versions like "1.2.3" are equivalent to "^1.2.3"
             return Some(VersionSpec::new(VersionSpecKind::Caret, trimmed, version));
         }
 
@@ -277,9 +281,7 @@ mod tests {
 
     #[test]
     fn test_parse_wildcard_star() {
-        let spec = parse("*").unwrap();
-        assert_eq!(spec.kind, VersionSpecKind::Wildcard);
-        assert!(!spec.is_pinned());
+        assert!(parse("*").is_none());
     }
 
     #[test]
@@ -331,6 +333,18 @@ mod tests {
     fn test_format_updated_tilde() {
         let spec = parse("~1.2.3").unwrap();
         assert_eq!(spec.format_updated("1.3.0"), "~1.3.0");
+    }
+
+    #[test]
+    fn test_format_updated_wildcard_partial() {
+        let spec = parse("1.*").unwrap();
+        assert_eq!(spec.format_updated("2.3.4"), "2.*");
+    }
+
+    #[test]
+    fn test_format_updated_wildcard_minor() {
+        let spec = parse("1.2.*").unwrap();
+        assert_eq!(spec.format_updated("2.3.4"), "2.3.*");
     }
 
     #[test]

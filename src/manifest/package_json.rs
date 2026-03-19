@@ -1,6 +1,6 @@
-//! package.json parser for Node.js projects
+//! Node.js プロジェクト向けの `package.json` パーサ。
 //!
-//! Handles:
+//! 対応対象:
 //! - dependencies
 //! - devDependencies
 //! - peerDependencies
@@ -14,7 +14,7 @@ use regex::Regex;
 use serde_json::{Map, Value};
 use std::path::PathBuf;
 
-/// Parser for package.json files
+/// `package.json` 用パーサ
 pub struct PackageJsonParser;
 
 impl ManifestParser for PackageJsonParser {
@@ -28,22 +28,22 @@ impl ManifestParser for PackageJsonParser {
         let mut dependencies = Vec::new();
         let parser = get_parser(Language::Node);
 
-        // Parse regular dependencies
+        // 通常の依存関係を解釈する
         if let Some(deps) = json.get("dependencies").and_then(|v| v.as_object()) {
             parse_dependency_object(deps, parser.as_ref(), false, &mut dependencies);
         }
 
-        // Parse devDependencies
+        // 開発依存を解釈する
         if let Some(deps) = json.get("devDependencies").and_then(|v| v.as_object()) {
             parse_dependency_object(deps, parser.as_ref(), true, &mut dependencies);
         }
 
-        // Parse peerDependencies (treated as regular dependencies)
+        // peerDependencies は通常依存として扱う
         if let Some(deps) = json.get("peerDependencies").and_then(|v| v.as_object()) {
             parse_dependency_object(deps, parser.as_ref(), false, &mut dependencies);
         }
 
-        // Parse optionalDependencies
+        // optionalDependencies を解釈する
         if let Some(deps) = json.get("optionalDependencies").and_then(|v| v.as_object()) {
             parse_dependency_object(deps, parser.as_ref(), false, &mut dependencies);
         }
@@ -63,9 +63,9 @@ impl ManifestParser for PackageJsonParser {
     ) -> Result<String, ManifestError> {
         let parser = get_parser(Language::Node);
 
-        // Use regex-based text replacement to preserve original formatting and key order
-        // Pattern matches: "package-name": "version" with flexible whitespace
-        // Escape special characters in package name (e.g., @scope/package)
+        // 元の整形とキー順を保つため、テキスト置換で更新する
+        // `"package-name": "version"` を空白ゆらぎ込みで拾う
+        // `@scope/package` のような特殊文字は正規表現用にエスケープする
         let escaped_package = regex::escape(package);
         let pattern = format!(r#"("{}"\s*:\s*)"([^"]+)""#, escaped_package);
 
@@ -77,7 +77,7 @@ impl ManifestParser for PackageJsonParser {
 
         let mut updated = false;
         let result = re.replace(content, |caps: &regex::Captures| {
-            let prefix = &caps[1]; // "package": or "package" :
+            let prefix = &caps[1]; // `"package":` または `"package" :`
             let old_version = &caps[2];
 
             if let Some((parse_target, alias_prefix)) = normalize_node_constraint(old_version) {
@@ -93,7 +93,7 @@ impl ManifestParser for PackageJsonParser {
                 }
                 caps[0].to_string()
             } else {
-                // If we can't parse the version, keep the original
+                // 解釈できないものは元の値を維持する
                 caps[0].to_string()
             }
         });
@@ -110,14 +110,14 @@ impl ManifestParser for PackageJsonParser {
     }
 }
 
-/// Returns `(parse_target, alias_prefix_if_any)` for npm aliases, or None for non-updatable protocols.
+/// npm alias 用に `(解釈対象, alias 接頭辞)` を返す。更新不可な protocol は `None`。
 fn normalize_node_constraint(version: &str) -> Option<(&str, Option<String>)> {
     let trimmed = version.trim();
     if trimmed.is_empty() {
         return None;
     }
 
-    // npm alias: npm:real-package@^1.2.3
+    // npm alias: `npm:real-package@^1.2.3`
     if let Some(rest) = trimmed.strip_prefix("npm:") {
         if let Some(at_pos) = rest.rfind('@')
             && at_pos > 0
@@ -129,7 +129,7 @@ fn normalize_node_constraint(version: &str) -> Option<(&str, Option<String>)> {
         return None;
     }
 
-    // Protocol references that are not registry semver constraints
+    // レジストリの semver 制約ではない protocol 参照
     const NON_UPDATABLE_PREFIXES: &[&str] = &[
         "workspace:",
         "file:",
@@ -341,7 +341,7 @@ mod tests {
     fn test_parse_wildcard() {
         let content = r#"{
             "dependencies": {
-                "pkg": "*"
+                "pkg": "1.x"
             }
         }"#;
 
@@ -351,8 +351,62 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_skips_bare_wildcard() {
+        let content = r#"{
+            "dependencies": {
+                "pkg": "*"
+            }
+        }"#;
+
+        let deps = parse(content).unwrap();
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_update_version_preserves_wildcard_shape() {
+        let content = r#"{
+  "dependencies": {
+    "pkg": "1.x"
+  }
+}"#;
+
+        let result = PackageJsonParser
+            .update_version(content, "pkg", "2.3.4")
+            .unwrap();
+        assert!(result.contains("\"pkg\": \"2.x\""));
+    }
+
+    #[test]
+    fn test_update_version_preserves_full_tuple_wildcard_shape() {
+        let content = r#"{
+  "dependencies": {
+    "pkg": "1.x.x"
+  }
+}"#;
+
+        let result = PackageJsonParser
+            .update_version(content, "pkg", "2.3.4")
+            .unwrap();
+        assert!(result.contains("\"pkg\": \"2.x.x\""));
+    }
+
+    #[test]
+    fn test_update_version_preserves_v_prefix_wildcard_shape() {
+        let content = r#"{
+  "dependencies": {
+    "pkg": "v1.*"
+  }
+}"#;
+
+        let result = PackageJsonParser
+            .update_version(content, "pkg", "2.3.4")
+            .unwrap();
+        assert!(result.contains("\"pkg\": \"v2.*\""));
+    }
+
+    #[test]
     fn test_update_version_preserves_key_order() {
-        // Keys are intentionally NOT in alphabetical order
+        // キー順保持を確認するため、あえてアルファベット順にしていない
         let content = r#"{
   "name": "test-package",
   "version": "1.0.0",
@@ -370,15 +424,15 @@ mod tests {
             .update_version(content, "axios", "1.5.0")
             .unwrap();
 
-        // Verify the original key order is preserved
+        // 元のキー順が保たれることを確認する
         assert_eq!(result, content.replace("^1.0.0", "^1.5.0"));
 
-        // Double-check by finding positions - zod should come before axios
+        // 位置でも再確認し、`zod` が `axios` より前にあることを確かめる
         let zod_pos = result.find("\"zod\"").unwrap();
         let axios_pos = result.find("\"axios\"").unwrap();
         let lodash_pos = result.find("\"lodash\"").unwrap();
-        assert!(zod_pos < axios_pos, "zod should come before axios");
-        assert!(axios_pos < lodash_pos, "axios should come before lodash");
+        assert!(zod_pos < axios_pos, "zod は axios より前にあるべき");
+        assert!(axios_pos < lodash_pos, "axios は lodash より前にあるべき");
     }
 
     #[test]
@@ -403,18 +457,18 @@ mod tests {
 
     #[test]
     fn test_update_version_preserves_formatting() {
-        // Test various formatting styles
+        // さまざまな空白パターンでも書式を保つ
         let content_with_spaces = r#"{"dependencies": { "lodash" : "^4.17.21" }}"#;
         let result = PackageJsonParser
             .update_version(content_with_spaces, "lodash", "4.18.0")
             .unwrap();
-        // Should preserve the original spacing around the colon
+        // コロン前後の空白を維持する
         assert!(result.contains("\"lodash\" : \"^4.18.0\""));
     }
 
     #[test]
     fn test_parse_ignores_non_string_versions() {
-        // Non-string version values (objects, numbers, booleans, null) should be ignored
+        // 文字列以外のバージョン値は無視する
         let content = r#"{
             "dependencies": {
                 "lodash": "^4.17.21",
@@ -432,7 +486,7 @@ mod tests {
 
     #[test]
     fn test_parse_ignores_link_protocol() {
-        // link: protocol dependencies should be ignored
+        // `link:` 依存は無視する
         let content = r#"{
             "dependencies": {
                 "lodash": "^4.17.21",
@@ -447,7 +501,7 @@ mod tests {
 
     #[test]
     fn test_parse_ignores_file_protocol() {
-        // file: protocol dependencies should be ignored
+        // `file:` 依存は無視する
         let content = r#"{
             "dependencies": {
                 "express": "^4.18.0",
@@ -462,7 +516,7 @@ mod tests {
 
     #[test]
     fn test_parse_ignores_git_url() {
-        // git:// and github: URLs should be ignored
+        // `git://` と `github:` URL は無視する
         let content = r#"{
             "dependencies": {
                 "axios": "^1.0.0",
@@ -478,7 +532,7 @@ mod tests {
 
     #[test]
     fn test_parse_workspace_protocol() {
-        // workspace: protocol (pnpm/yarn workspaces) should be handled
+        // `workspace:` protocol は検出されても更新対象にはしない
         let content = r#"{
             "dependencies": {
                 "lodash": "^4.17.21",
@@ -487,14 +541,14 @@ mod tests {
         }"#;
 
         let deps = parse(content).unwrap();
-        // workspace: dependencies should be ignored (no version to update)
+        // `workspace:` 依存は更新対象バージョンを持たないので無視する
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].name, "lodash");
     }
 
     #[test]
     fn test_parse_empty_version_string() {
-        // Empty string version should be ignored
+        // 空文字のバージョンは無視する
         let content = r#"{
             "dependencies": {
                 "valid": "^1.0.0",

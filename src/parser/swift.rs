@@ -1,18 +1,18 @@
-//! Swift version specification parser
+//! Swift (SPM) のバージョン指定パーサ。
 //!
-//! Handles plain semver version strings (e.g., "1.2.3").
-//! Version constraint types (from:, exact:, .upToNextMinor, ranges)
-//! are determined by the manifest parser, not here.
+//! プレーンな semver 文字列 (例: "1.2.3") を解釈する。
+//! バージョン制約の種類 (from:, exact:, .upToNextMinor, ranges) は
+//! マニフェストパーサ側で決定する。
 
 use crate::domain::{Language, VersionSpec, VersionSpecKind};
 use crate::parser::VersionParser;
 use regex::Regex;
 use std::sync::LazyLock;
 
-/// Parser for Swift version specifications
+/// Swift バージョン指定パーサ
 pub struct SwiftVersionParser;
 
-/// Bare semver version: 1.2.3 or 1.2
+/// 裸の semver バージョン: 1.2.3 or 1.2
 static BARE_VERSION_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(\d+(?:\.\d+)*)$").unwrap());
 
@@ -97,5 +97,24 @@ mod tests {
     fn test_format_updated() {
         let spec = parse("1.2.3").unwrap();
         assert_eq!(spec.format_updated("2.0.0"), "2.0.0");
+    }
+
+    #[test]
+    fn test_parse_four_part_version() {
+        let spec = parse("1.2.3.4").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "1.2.3.4");
+    }
+
+    #[test]
+    fn test_parse_rejects_prerelease_suffix() {
+        // Swift パーサはプレーンな数値バージョンのみ受理する
+        assert!(parse("1.2.3-beta").is_none());
+    }
+
+    #[test]
+    fn test_parse_rejects_v_prefix() {
+        // Swift のバージョン文字列に v 接頭辞は付かない
+        assert!(parse("v1.2.3").is_none());
     }
 }

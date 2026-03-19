@@ -4,7 +4,7 @@
 //! - 固定バージョン: `1.2.3`, `1.2.3-SNAPSHOT`, `1.2.3-alpha1`
 //! - strict 記法: `1.2.3!!`
 //! - プレフィックス指定: `1.2.+` (`1.2` 系を許可)
-//! - 動的指定: `latest.release`, `latest.integration`
+//! - 動的指定: `latest.release`, `latest.integration` (更新対象外)
 //! - Maven 形式レンジ: `[1.0,2.0]`, `[1.0,)`, `(,2.0]`, `[1.0,2.0)`, `]1.0,2.0[`
 //!
 //! 備考: 変数参照 (例: `$version`, `${version}`) は
@@ -86,9 +86,9 @@ impl VersionParser for JavaVersionParser {
             ));
         }
 
-        // 動的指定を判定: latest.release, latest.integration
+        // `latest.release` は常に移動する参照なので更新対象にしない
         if DYNAMIC_VERSION_RE.is_match(trimmed) {
-            return Some(VersionSpec::new(VersionSpecKind::Wildcard, trimmed, ""));
+            return None;
         }
 
         // 通常バージョンを判定 (プレリリース識別子含む)
@@ -258,16 +258,12 @@ mod tests {
     // implementation("org.springframework:spring-core:latest.release")
     #[test]
     fn test_parse_gradle_latest_release() {
-        let spec = parse("latest.release").unwrap();
-        assert_eq!(spec.kind, VersionSpecKind::Wildcard);
-        assert!(!spec.is_pinned());
+        assert!(parse("latest.release").is_none());
     }
 
     #[test]
     fn test_parse_gradle_latest_integration() {
-        let spec = parse("latest.integration").unwrap();
-        assert_eq!(spec.kind, VersionSpecKind::Wildcard);
-        assert!(!spec.is_pinned());
+        assert!(parse("latest.integration").is_none());
     }
 
     // implementation("org.springframework:spring-core:[5.2.0, 5.3.8]")
@@ -361,6 +357,12 @@ mod tests {
     fn test_format_updated_prefix_version() {
         // プレフィックス指定の更新
         let spec = parse("5.3.+").unwrap();
-        assert_eq!(spec.format_updated("5.4"), "5.4");
+        assert_eq!(spec.format_updated("5.4.2"), "5.4.+");
+    }
+
+    #[test]
+    fn test_format_updated_prefix_version_single_segment() {
+        let spec = parse("5.+").unwrap();
+        assert_eq!(spec.format_updated("6.1.0"), "6.+");
     }
 }

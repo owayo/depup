@@ -252,8 +252,15 @@ depup preserves the original version range format:
 "^1.2.3" → "^2.0.0"  (caret preserved)
 "~1.2.3" → "~1.3.0"  (tilde preserved)
 ">=1.0.0" → ">=2.0.0" (range preserved)
+"1.x" → "2.x" (wildcard shape preserved)
+"1.x.x" → "2.x.x" (all wildcard positions preserved)
+"1.2.*" → "1.3.*" (wildcard shape preserved)
+"v1.*" → "v2.*" (leading `v` preserved)
+"5.3.+" → "5.4.+" (Gradle prefix preserved)
 "1.2.3!!" → "2.0.0!!" (Gradle strict preserved)
 ```
+
+Floating selectors such as `"*"`, npm dist-tags like `"latest"`, and Gradle dynamic selectors like `"latest.release"` are skipped to avoid changing them into exact versions.
 
 ### Range Constraints
 

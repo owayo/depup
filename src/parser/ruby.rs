@@ -1,53 +1,53 @@
-//! Ruby version specification parser
+//! Ruby (RubyGems/Bundler) のバージョン指定パーサ。
 //!
-//! Handles:
-//! - Fixed versions: `= 1.2.3`, `1.2.3`
-//! - Pessimistic constraints: `~> 1.2`, `~> 1.2.3`
-//! - Comparison operators: `>=`, `<`, `>`, `<=`
-//! - Compound constraints: `>= 1.0, < 2.0`, `>= 1.0 < 2.0`
+//! 対応する形式:
+//! - 固定: `= 1.2.3`, `1.2.3`
+//! - ペシミスティック制約: `~> 1.2`, `~> 1.2.3`
+//! - 比較演算子: `>=`, `<`, `>`, `<=`
+//! - 複合制約: `>= 1.0, < 2.0`, `>= 1.0 < 2.0`
 
 use crate::domain::{Language, VersionSpec, VersionSpecKind};
 use crate::parser::VersionParser;
 use regex::Regex;
 use std::sync::LazyLock;
 
-/// Parser for Ruby version specifications
+/// Ruby バージョン指定パーサ
 pub struct RubyVersionParser;
 
-// Regex patterns for Ruby version specifications
-// Ruby allows optional space between operator and version
+// Ruby バージョン指定用正規表現
+// 演算子とバージョンの間のスペースは省略可
 
-// Pessimistic constraint: ~> 1.2 or ~> 1.2.3
+// ペシミスティック制約: ~> 1.2 or ~> 1.2.3
 static PESSIMISTIC_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^~>\s*(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)?)$").unwrap());
 
-// Exact with = prefix: = 1.2.3
+// = 接頭辞付き固定: = 1.2.3
 static EXACT_EQ_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^=\s*(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)?)$").unwrap());
 
-// Greater than or equal: >= 1.2.3
+// 以上: >= 1.2.3
 static GTE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^>=\s*(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)?)$").unwrap());
 
-// Greater than: > 1.2.3
+// より大きい: > 1.2.3
 static GT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^>\s*(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)?)$").unwrap());
 
-// Less than or equal: <= 1.2.3
+// 以下: <= 1.2.3
 static LTE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^<=\s*(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)?)$").unwrap());
 
-// Less than: < 1.2.3
+// より小さい: < 1.2.3
 static LT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^<\s*(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)?)$").unwrap());
 static NOT_EQUAL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^!=\s*(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)?)$").unwrap());
 
-// Bare version (exact): 1.2.3
+// 裸のバージョン (固定): 1.2.3
 static BARE_VERSION_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)?)$").unwrap());
 
-// Compound constraint pattern (to detect before individual parsing)
+// 複合制約パターン (個別パースの前に検出する)
 static COMPOUND_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r",").unwrap());
 static COMPOUND_SPACE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[<>=~!].*\s+[<>=~!]").unwrap());
@@ -62,7 +62,7 @@ fn extract_first_version(raw: &str) -> String {
 }
 
 impl RubyVersionParser {
-    /// Parse a single version constraint (not compound)
+    /// 単一のバージョン制約を解釈する（複合制約ではない）
     fn parse_single(&self, version_str: &str) -> Option<VersionSpec> {
         let trimmed = version_str.trim();
 
@@ -70,7 +70,7 @@ impl RubyVersionParser {
             return None;
         }
 
-        // Check for pessimistic constraint (~> 1.2.3)
+        // ペシミスティック制約 (~> 1.2.3)
         if let Some(caps) = PESSIMISTIC_RE.captures(trimmed) {
             let version = caps.get(1)?.as_str();
             return Some(
@@ -78,7 +78,7 @@ impl RubyVersionParser {
             );
         }
 
-        // Check for exact with = prefix (= 1.2.3)
+        // = 接頭辞付き固定 (= 1.2.3)
         if let Some(caps) = EXACT_EQ_RE.captures(trimmed) {
             let version = caps.get(1)?.as_str();
             return Some(
@@ -86,7 +86,7 @@ impl RubyVersionParser {
             );
         }
 
-        // Check for greater than or equal (>= 1.2.3)
+        // 以上 (>= 1.2.3)
         if let Some(caps) = GTE_RE.captures(trimmed) {
             let version = caps.get(1)?.as_str();
             return Some(
@@ -95,7 +95,7 @@ impl RubyVersionParser {
             );
         }
 
-        // Check for greater than (> 1.2.3)
+        // より大きい (> 1.2.3)
         if let Some(caps) = GT_RE.captures(trimmed) {
             let version = caps.get(1)?.as_str();
             return Some(
@@ -103,7 +103,7 @@ impl RubyVersionParser {
             );
         }
 
-        // Check for less than or equal (<= 1.2.3)
+        // 以下 (<= 1.2.3)
         if let Some(caps) = LTE_RE.captures(trimmed) {
             let version = caps.get(1)?.as_str();
             return Some(
@@ -111,7 +111,7 @@ impl RubyVersionParser {
             );
         }
 
-        // Check for less than (< 1.2.3)
+        // より小さい (< 1.2.3)
         if let Some(caps) = LT_RE.captures(trimmed) {
             let version = caps.get(1)?.as_str();
             return Some(
@@ -124,7 +124,7 @@ impl RubyVersionParser {
             return Some(VersionSpec::new(VersionSpecKind::Range, trimmed, version));
         }
 
-        // Check for bare version (1.2.3) - treated as exact
+        // 裸のバージョン (1.2.3) — 固定扱い
         if let Some(caps) = BARE_VERSION_RE.captures(trimmed) {
             let version = caps.get(1)?.as_str();
             return Some(VersionSpec::new(VersionSpecKind::Exact, trimmed, version));
@@ -142,7 +142,7 @@ impl VersionParser for RubyVersionParser {
             return None;
         }
 
-        // Check for compound constraints (>= 1.0, < 2.0)
+        // 複合制約 (>= 1.0, < 2.0)
         if COMPOUND_RE.is_match(trimmed) {
             return Some(VersionSpec::new(
                 VersionSpecKind::Range,
@@ -159,7 +159,7 @@ impl VersionParser for RubyVersionParser {
             ));
         }
 
-        // Parse single constraint
+        // 単一制約として解釈する
         self.parse_single(trimmed)
     }
 
@@ -394,5 +394,33 @@ mod tests {
     fn test_parse_no_version() {
         // バージョンなし（空文字列）
         assert!(parse("").is_none());
+    }
+
+    #[test]
+    fn test_parse_prerelease_version() {
+        // プレリリースバージョン
+        let spec = parse("1.2.3.pre").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "1.2.3.pre");
+    }
+
+    #[test]
+    fn test_format_updated_pessimistic_minor() {
+        let spec = parse("~> 1.2").unwrap();
+        assert_eq!(spec.format_updated("2.0"), "~> 2.0");
+    }
+
+    #[test]
+    fn test_format_updated_not_equal() {
+        let spec = parse("!= 1.5.0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+    }
+
+    #[test]
+    fn test_parse_pessimistic_four_segments() {
+        // ~> 1.2.3.4 のような4セグメントペシミスティック制約
+        let spec = parse("~> 1.2.3.4").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Tilde);
+        assert_eq!(spec.version, "1.2.3.4");
     }
 }

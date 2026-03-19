@@ -1,68 +1,66 @@
-//! PHP version specification parser
+//! PHP のバージョン指定パーサ。
 //!
-//! Handles:
-//! - Fixed versions: `1.2.3`
-//! - Caret ranges: `^1.2.3`
-//! - Tilde ranges: `~1.2.3`
-//! - Comparison operators: `>=`, `<`, `>`, `<=`
-//! - Compound constraints: `>=1.0 <2.0`, `^1 || ^2`, `1.0 - 2.0`
-//! - Wildcards: `1.2.*`, `1.x`, `*`
+//! 対応する形式:
+//! - 固定: `1.2.3`
+//! - Caret: `^1.2.3`
+//! - Tilde: `~1.2.3`
+//! - 比較演算子: `>=`, `<`, `>`, `<=`
+//! - 複合制約: `>=1.0 <2.0`, `^1 || ^2`, `1.0 - 2.0`
+//! - ワイルドカード: `1.2.*`, `1.x`
 
 use crate::domain::{Language, VersionSpec, VersionSpecKind};
 use crate::parser::VersionParser;
 use regex::Regex;
 use std::sync::LazyLock;
 
-/// Parser for PHP version specifications
+/// PHP バージョン指定パーサ
 pub struct PhpVersionParser;
 
-// Regex patterns for PHP version specifications
-// PHP/Composer uses standard semver-like patterns
+// PHP のバージョン指定用正規表現
 
-// Caret range: ^1.2.3
+// Caret: ^1.2.3
 static CARET_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\^\s*(v?\d+(?:\.\d+){0,2}(?:[-+][\w.-]+)?)$").unwrap());
 
-// Tilde range: ~1.2.3
+// Tilde: ~1.2.3
 static TILDE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^~\s*(v?\d+(?:\.\d+){0,2}(?:[-+][\w.-]+)?)$").unwrap());
 
-// Greater than or equal: >=1.2.3
+// 以上: >=1.2.3
 static GTE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^>=\s*(v?\d+(?:\.\d+){0,2}(?:[-+][\w.-]+)?)$").unwrap());
 
-// Greater than: >1.2.3
+// より大きい: >1.2.3
 static GT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^>\s*(v?\d+(?:\.\d+){0,2}(?:[-+][\w.-]+)?)$").unwrap());
 
-// Less than or equal: <=1.2.3
+// 以下: <=1.2.3
 static LTE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^<=\s*(v?\d+(?:\.\d+){0,2}(?:[-+][\w.-]+)?)$").unwrap());
 
-// Less than: <1.2.3
+// より小さい: <1.2.3
 static LT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^<\s*(v?\d+(?:\.\d+){0,2}(?:[-+][\w.-]+)?)$").unwrap());
 static NOT_EQUAL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^!=\s*(v?\d+(?:\.\d+){0,2}(?:[-+][\w.-]+)?)$").unwrap());
 
-// Wildcard: 1.2.*, 1.x, *
+// ワイルドカード: 1.2.*, 1.x, *
 static WILDCARD_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(?:v?(?:\d+|[xX*])(?:\.(?:\d+|[xX*])){0,2}|\*)$").unwrap());
 
-// Bare version (exact): 1.2.3
+// 固定バージョン: 1.2.3
 static BARE_VERSION_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(v?\d+(?:\.\d+){0,2}(?:[-+][\w.-]+)?)$").unwrap());
 
-// Compound constraint pattern - OR separator
+// 複合制約用パターン
 static COMPOUND_OR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\|\|?").unwrap());
 static HYPHEN_RANGE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s-\s").unwrap());
 
-// Space-separated compound: requires two operator-prefixed constraints
-// e.g., ">=1.0 <2.0" or "^1.0 !=1.5"
-// NOT ">=1.0" or ">= 1.0.0" (single constraint with optional space)
+// 空白区切りの複合制約。
+// 例: ">=1.0 <2.0", "^1.0 !=1.5"
+// 単一制約の ">=1.0" や ">= 1.0.0" は含めない
 static COMPOUND_SPACE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    // Match patterns like: >=1.0 <2.0, ^1.0 ~2.0, etc.
-    // First constraint, then space, then another constraint starting with operator
+    // 先頭の制約に続いて、空白区切りで別の演算子付き制約が続く形だけを拾う
     Regex::new(r"^[<>=^~!].*\s+[<>=^~!]").unwrap()
 });
 static COMPOUND_COMMA_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r",").unwrap());
@@ -81,7 +79,7 @@ fn extract_first_version(raw: &str) -> String {
 }
 
 impl PhpVersionParser {
-    /// Parse a single version constraint (not compound)
+    /// 単一制約を解釈する
     fn parse_single(&self, version_str: &str) -> Option<VersionSpec> {
         let trimmed = version_str.trim().split('@').next().unwrap_or("").trim();
 
@@ -89,7 +87,7 @@ impl PhpVersionParser {
             return None;
         }
 
-        // Check for caret range (^1.2.3)
+        // Caret
         if let Some(caps) = CARET_RE.captures(trimmed) {
             let version = normalize_version(caps.get(1)?.as_str());
             return Some(
@@ -97,7 +95,7 @@ impl PhpVersionParser {
             );
         }
 
-        // Check for tilde range (~1.2.3)
+        // Tilde
         if let Some(caps) = TILDE_RE.captures(trimmed) {
             let version = normalize_version(caps.get(1)?.as_str());
             return Some(
@@ -105,7 +103,7 @@ impl PhpVersionParser {
             );
         }
 
-        // Check for greater than or equal (>=1.2.3)
+        // 以上
         if let Some(caps) = GTE_RE.captures(trimmed) {
             let version = normalize_version(caps.get(1)?.as_str());
             return Some(
@@ -114,7 +112,7 @@ impl PhpVersionParser {
             );
         }
 
-        // Check for greater than (>1.2.3)
+        // より大きい
         if let Some(caps) = GT_RE.captures(trimmed) {
             let version = normalize_version(caps.get(1)?.as_str());
             return Some(
@@ -122,7 +120,7 @@ impl PhpVersionParser {
             );
         }
 
-        // Check for less than or equal (<=1.2.3)
+        // 以下
         if let Some(caps) = LTE_RE.captures(trimmed) {
             let version = normalize_version(caps.get(1)?.as_str());
             return Some(
@@ -130,7 +128,7 @@ impl PhpVersionParser {
             );
         }
 
-        // Check for less than (<1.2.3)
+        // より小さい
         if let Some(caps) = LT_RE.captures(trimmed) {
             let version = normalize_version(caps.get(1)?.as_str());
             return Some(
@@ -143,7 +141,12 @@ impl PhpVersionParser {
             return Some(VersionSpec::new(VersionSpecKind::Range, trimmed, version));
         }
 
-        // Check for wildcard (*, 1.2.*, 1.x)
+        // `*` は完全な浮動指定なので更新対象にしない
+        if matches!(trimmed, "*" | "x" | "X") {
+            return None;
+        }
+
+        // `1.2.*` や `1.x` は形を保ったまま更新する
         if WILDCARD_RE.is_match(trimmed)
             && (trimmed.contains('x') || trimmed.contains('X') || trimmed.contains('*'))
         {
@@ -155,7 +158,7 @@ impl PhpVersionParser {
             return Some(spec);
         }
 
-        // Check for bare version (1.2.3) - treated as exact
+        // 固定バージョン
         if let Some(caps) = BARE_VERSION_RE.captures(trimmed) {
             let version = normalize_version(caps.get(1)?.as_str());
             return Some(VersionSpec::new(VersionSpecKind::Exact, trimmed, version));
@@ -173,7 +176,7 @@ impl VersionParser for PhpVersionParser {
             return None;
         }
 
-        // Check for OR compound constraints (||, |)
+        // OR を含む複合制約
         if COMPOUND_OR_RE.is_match(trimmed)
             || HYPHEN_RANGE_RE.is_match(trimmed)
             || COMPOUND_COMMA_RE.is_match(trimmed)
@@ -185,7 +188,7 @@ impl VersionParser for PhpVersionParser {
             ));
         }
 
-        // Check for space-separated compound constraints (>=1.0 <2.0)
+        // 空白区切りの複合制約
         if COMPOUND_SPACE_RE.is_match(trimmed) {
             return Some(VersionSpec::new(
                 VersionSpecKind::Range,
@@ -194,7 +197,7 @@ impl VersionParser for PhpVersionParser {
             ));
         }
 
-        // Parse single constraint
+        // 単一制約として解釈する
         self.parse_single(trimmed)
     }
 
@@ -211,7 +214,7 @@ mod tests {
         PhpVersionParser.parse(version)
     }
 
-    // Caret range tests
+    // Caret のテスト
     #[test]
     fn test_parse_caret() {
         let spec = parse("^1.2.3").unwrap();
@@ -235,7 +238,7 @@ mod tests {
         assert_eq!(spec.version, "1");
     }
 
-    // Tilde range tests
+    // Tilde のテスト
     #[test]
     fn test_parse_tilde() {
         let spec = parse("~1.2.3").unwrap();
@@ -252,7 +255,7 @@ mod tests {
         assert_eq!(spec.version, "1.2");
     }
 
-    // Comparison operator tests
+    // 比較演算子のテスト
     #[test]
     fn test_parse_greater_or_equal() {
         let spec = parse(">=1.0").unwrap();
@@ -293,7 +296,7 @@ mod tests {
         assert_eq!(spec.prefix, Some("<".to_string()));
     }
 
-    // Wildcard tests
+    // ワイルドカードのテスト
     #[test]
     fn test_parse_wildcard() {
         let spec = parse("1.2.*").unwrap();
@@ -316,7 +319,12 @@ mod tests {
         assert_eq!(spec.kind, VersionSpecKind::Wildcard);
     }
 
-    // Exact version tests
+    #[test]
+    fn test_parse_bare_wildcard_is_skipped() {
+        assert!(parse("*").is_none());
+    }
+
+    // 固定バージョンのテスト
     #[test]
     fn test_parse_exact() {
         let spec = parse("1.2.3").unwrap();
@@ -333,7 +341,7 @@ mod tests {
         assert_eq!(spec.version, "1.2");
     }
 
-    // Compound constraint tests
+    // 複合制約のテスト
     #[test]
     fn test_parse_compound_space() {
         let spec = parse(">=1.0 <2.0").unwrap();
@@ -379,7 +387,7 @@ mod tests {
         assert_eq!(spec.version, "1.5.0");
     }
 
-    // Edge case tests
+    // 境界ケースのテスト
     #[test]
     fn test_parse_empty() {
         assert!(parse("").is_none());
@@ -402,7 +410,7 @@ mod tests {
         assert_eq!(spec.version, "1.2.3");
     }
 
-    // Format updated tests
+    // 更新書式のテスト
     #[test]
     fn test_format_updated_caret() {
         let spec = parse("^1.2.3").unwrap();
@@ -424,7 +432,7 @@ mod tests {
     #[test]
     fn test_format_updated_wildcard() {
         let spec = parse("1.2.*").unwrap();
-        assert_eq!(spec.format_updated("1.3"), "1.3.*");
+        assert_eq!(spec.format_updated("1.3.4"), "1.3.*");
     }
 
     #[test]
@@ -433,7 +441,7 @@ mod tests {
         assert_eq!(spec.format_updated("2.0"), ">=2.0");
     }
 
-    // Language test
+    // language のテスト
     #[test]
     fn test_php_parser_language() {
         let parser = PhpVersionParser;
@@ -474,5 +482,45 @@ mod tests {
         let spec = parse(">=1.0,<2.0").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Range);
         assert_eq!(spec.version, "1.0");
+    }
+
+    #[test]
+    fn test_parse_dev_branch_with_hash() {
+        // dev-main#abc1234 はパースされない
+        assert!(parse("dev-main#abc1234").is_none());
+    }
+
+    #[test]
+    fn test_parse_x_dev_branch() {
+        // 1.x-dev はバージョン風ブランチ名
+        assert!(parse("1.x-dev").is_none());
+    }
+
+    #[test]
+    fn test_parse_inline_alias() {
+        // 1.0.0 as 1.1.0 はインラインエイリアス — 複合とみなしてRange
+        let spec = parse("1.0.0 as 1.1.0");
+        // "as" は演算子として認識されないため、パースできなくてよい
+        assert!(spec.is_none() || spec.unwrap().kind == VersionSpecKind::Exact);
+    }
+
+    #[test]
+    fn test_parse_stability_flag_alpha() {
+        let spec = parse("^1.0@alpha").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Caret);
+        assert_eq!(spec.version, "1.0");
+    }
+
+    #[test]
+    fn test_parse_caret_with_prerelease() {
+        let spec = parse("^1.2.3-beta.1").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Caret);
+        assert_eq!(spec.version, "1.2.3-beta.1");
+    }
+
+    #[test]
+    fn test_format_updated_wildcard_x() {
+        let spec = parse("1.x").unwrap();
+        assert_eq!(spec.format_updated("2.3.4"), "2.x");
     }
 }

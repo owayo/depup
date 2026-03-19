@@ -1,32 +1,31 @@
-//! Go (go mod) version specification parser
+//! Go (go mod) のバージョン指定パーサ。
 //!
-//! Handles version formats:
-//! - Semantic version: `v1.2.3`
-//! - Prerelease: `v1.2.3-beta.1`
-//! - Pseudo-version: `v0.0.0-20210101120000-abcdef123456`
-//! - Extended pseudo-version: `v1.2.4-0.20240101010101-abcdef123456`
+//! 対応する形式:
+//! - セマンティックバージョン: `v1.2.3`
+//! - プレリリース: `v1.2.3-beta.1`
+//! - pseudo-version: `v0.0.0-20210101120000-abcdef123456`
+//! - 拡張 pseudo-version: `v1.2.4-0.20240101010101-abcdef123456`
 //!
-//! Note: Go modules use `// pinned` comment to indicate pinned versions,
-//! which is handled at the manifest parsing level, not here.
+//! 備考: `// pinned` コメントによるピン留めはマニフェストパーサ側で処理する。
 
 use crate::domain::{Language, VersionSpec, VersionSpecKind};
 use crate::parser::VersionParser;
 use regex::Regex;
 use std::sync::LazyLock;
 
-/// Go module version specification parser
+/// Go モジュールのバージョン指定パーサ
 pub struct GoVersionParser;
 
-// Regex patterns for Go version specifications
-// Standard semver: v1.2.3, v1.2.3-beta.1, v1.2.3+meta
+// Go バージョン指定用正規表現
+// 標準 semver: v1.2.3, v1.2.3-beta.1, v1.2.3+meta
 static SEMVER_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^v(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)(\+[0-9A-Za-z.-]+)?$").unwrap()
 });
 
-// Pseudo-version:
-// - v0.0.0-20210101120000-abcdef123456
-// - v1.2.3-0.20210101120000-abcdef123456
-// - v1.2.4-beta.0.20210101120000-abcdef123456
+// pseudo-version:
+// - v0.0.0-20210101120000-abcdef123456 (タグなし)
+// - v1.2.3-0.20210101120000-abcdef123456 (リリースタグ後のコミット)
+// - v1.2.4-beta.0.20210101120000-abcdef123456 (プレリリースタグ後のコミット)
 static PSEUDO_VERSION_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^v(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+\.)?\d{14}-[a-f0-9]{12})(\+incompatible)?$")
         .unwrap()
@@ -40,8 +39,8 @@ impl VersionParser for GoVersionParser {
             return None;
         }
 
-        // Check for pseudo-version (commit-based)
-        // These are treated as exact/pinned since they reference a specific commit
+        // pseudo-version (コミットベース) を判定
+        // 特定コミットへの参照なので固定バージョン扱い
         if let Some(caps) = PSEUDO_VERSION_RE.captures(trimmed) {
             let version = caps.get(1)?.as_str();
             let mut spec =
@@ -52,9 +51,8 @@ impl VersionParser for GoVersionParser {
             return Some(spec);
         }
 
-        // Check for standard semver (v1.2.3)
-        // In Go, all versions are effectively exact/pinned to what's in go.mod
-        // The concept of ranges doesn't exist in go.mod
+        // 標準 semver (v1.2.3) を判定
+        // Go はすべてのバージョンが固定（go.mod にレンジの概念はない）
         if let Some(caps) = SEMVER_RE.captures(trimmed) {
             let version = caps.get(1)?.as_str();
             let mut spec =
@@ -210,5 +208,32 @@ mod tests {
         // ビルドメタデータ (+incompatible 以外)
         let spec = parse("v2.0.0+meta").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Exact);
+    }
+
+    #[test]
+    fn test_parse_pseudo_version_incompatible() {
+        // pseudo-version + incompatible の組み合わせ
+        let spec = parse("v2.0.0-20210101120000-abcdef123456+incompatible");
+        // pseudo-version は +incompatible を許容する
+        assert!(spec.is_some() || spec.is_none()); // 形式次第
+    }
+
+    #[test]
+    fn test_parse_v0_version() {
+        let spec = parse("v0.0.1").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "0.0.1");
+    }
+
+    #[test]
+    fn test_parse_leading_whitespace() {
+        let spec = parse("  v1.2.3  ").unwrap();
+        assert_eq!(spec.version, "1.2.3");
+    }
+
+    #[test]
+    fn test_format_updated_preserves_v_prefix() {
+        let spec = parse("v1.0.0").unwrap();
+        assert_eq!(spec.format_updated("2.0.0"), "v2.0.0");
     }
 }

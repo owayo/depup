@@ -1,22 +1,22 @@
-//! Python (pip/poetry) version specification parser
+//! Python (pip/poetry) のバージョン指定パーサ。
 //!
-//! Handles version formats:
-//! - Exact: `==1.2.3`
+//! 対応する形式:
+//! - 固定: `==1.2.3`
 //! - Caret: `^1.2.3` (Poetry)
-//! - Tilde: `~1.2.3` or `~=1.2.3` (compatible release)
-//! - Comparison: `>=1.2.3`, `>1.2.3`, `<=1.2.3`, `<1.2.3`, `!=1.2.3`, `===1.2.3`
-//! - Wildcard: `*`, `1.*`
-//! - Range: `>=1.0,<2.0`
+//! - Tilde: `~1.2.3`, `~=1.2.3`
+//! - 比較演算子: `>=1.2.3`, `>1.2.3`, `<=1.2.3`, `<1.2.3`, `!=1.2.3`, `===1.2.3`
+//! - ワイルドカード: `1.*`
+//! - レンジ: `>=1.0,<2.0`
 
 use crate::domain::{Language, VersionSpec, VersionSpecKind};
 use crate::parser::VersionParser;
 use regex::Regex;
 use std::sync::LazyLock;
 
-/// Python version specification parser
+/// Python バージョン指定パーサ
 pub struct PythonVersionParser;
 
-// Regex patterns for Python version specifications
+// Python のバージョン指定用正規表現
 static CARET_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\^\s*([0-9A-Za-z][0-9A-Za-z._!+-]*(?:\*)?)$").unwrap());
 static TILDE_RE: LazyLock<Regex> =
@@ -69,7 +69,7 @@ impl VersionParser for PythonVersionParser {
             return None;
         }
 
-        // Check for caret (^1.2.3) - Poetry style
+        // Poetry の Caret
         if let Some(caps) = CARET_RE.captures(trimmed) {
             let version = normalize_for_compare(caps.get(1)?.as_str());
             return Some(
@@ -110,7 +110,7 @@ impl VersionParser for PythonVersionParser {
             });
         }
 
-        // Check for range (>=1.0,<2.0), including arbitrary spaces
+        // 空白を含むレンジも許容する
         if RANGE_RE.is_match(trimmed) {
             return Some(VersionSpec::new(
                 VersionSpecKind::Range,
@@ -119,7 +119,12 @@ impl VersionParser for PythonVersionParser {
             ));
         }
 
-        // Check for wildcard (*, 1.*)
+        // `*` は完全な浮動指定なので更新対象にしない
+        if trimmed == "*" {
+            return None;
+        }
+
+        // `1.*` は形を保ったまま更新する
         if WILDCARD_RE.is_match(trimmed) {
             return Some(VersionSpec::new(
                 VersionSpecKind::Wildcard,
@@ -245,8 +250,7 @@ mod tests {
 
     #[test]
     fn test_parse_wildcard_star() {
-        let spec = parse("*").unwrap();
-        assert_eq!(spec.kind, VersionSpecKind::Wildcard);
+        assert!(parse("*").is_none());
     }
 
     #[test]
@@ -281,6 +285,12 @@ mod tests {
     fn test_format_updated_gte() {
         let spec = parse(">=1.2.3").unwrap();
         assert_eq!(spec.format_updated("2.0.0"), ">=2.0.0");
+    }
+
+    #[test]
+    fn test_format_updated_wildcard_partial() {
+        let spec = parse("1.2.*").unwrap();
+        assert_eq!(spec.format_updated("2.3.4"), "2.3.*");
     }
 
     #[test]

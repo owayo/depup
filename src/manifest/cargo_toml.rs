@@ -389,6 +389,19 @@ serde = "1.0.0"
     }
 
     #[test]
+    fn test_update_wildcard_version_preserves_shape() {
+        let content = r#"
+[dependencies]
+serde = "1.*"
+"#;
+
+        let result = CargoTomlParser
+            .update_version(content, "serde", "2.3.4")
+            .unwrap();
+        assert!(result.contains("\"2.*\""));
+    }
+
+    #[test]
     fn test_update_caret_version() {
         let content = r#"
 [dependencies]

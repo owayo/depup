@@ -636,7 +636,7 @@ gem 'pg', '~> 1.5'
 
         let parser = get_parser(Language::Php);
         let updated = parser
-            .update_version(content, "vendor/package", "1.3")
+            .update_version(content, "vendor/package", "1.3.4")
             .unwrap();
         assert!(
             updated.contains("\"1.3.*\""),

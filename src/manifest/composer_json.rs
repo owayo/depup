@@ -331,7 +331,7 @@ mod tests {
 }"#;
 
         let result = ComposerJsonParser
-            .update_version(content, "vendor/package", "1.3")
+            .update_version(content, "vendor/package", "1.3.4")
             .unwrap();
         assert!(result.contains("\"1.3.*\""));
     }

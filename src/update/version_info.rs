@@ -468,17 +468,45 @@ mod tests {
 
     #[test]
     fn test_version_info_ordering_consistency() {
-        // Verify Ord/PartialOrd consistency for VersionInfo
+        // Ord/PartialOrd の一貫性検証
         let v1 = VersionInfo::now("1.0.0");
         let v2 = VersionInfo::now("1.0.0");
         let v3 = VersionInfo::now("2.0.0");
 
-        // Reflexive
+        // 反射的
         assert_eq!(v1.cmp(&v2), std::cmp::Ordering::Equal);
-        // Asymmetric
+        // 反対称
         assert_eq!(v1.cmp(&v3), std::cmp::Ordering::Less);
         assert_eq!(v3.cmp(&v1), std::cmp::Ordering::Greater);
-        // PartialOrd matches Ord
+        // PartialOrd は Ord と一致する
         assert_eq!(v1.partial_cmp(&v3), Some(std::cmp::Ordering::Less));
+    }
+
+    #[test]
+    fn test_compare_versions_empty_string() {
+        // 空文字列は 0 として扱われる
+        assert_eq!(compare_versions("", ""), std::cmp::Ordering::Equal);
+        assert_eq!(compare_versions("", "1.0.0"), std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn test_compare_versions_qualifier_suffix() {
+        // Java 風の qualifier (RELEASE, Final) は非数値部で終了する
+        assert_eq!(
+            compare_versions("5.0.0", "5.0.0.RELEASE"),
+            std::cmp::Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn test_is_prerelease_java_snapshot() {
+        assert!(is_prerelease_version("1.0.0-SNAPSHOT"));
+    }
+
+    #[test]
+    fn test_is_prerelease_release_suffix_not_prerelease() {
+        // RELEASE サフィックスはプレリリースではない
+        assert!(!is_prerelease_version("5.0.0.RELEASE"));
+        assert!(!is_prerelease_version("4.0.0.Final"));
     }
 }
