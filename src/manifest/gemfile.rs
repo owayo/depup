@@ -1,11 +1,11 @@
-//! Gemfile parser for Ruby projects
+//! Ruby プロジェクト向けの `Gemfile` パーサ。
 //!
-//! Handles:
-//! - gem declarations with version constraints
-//! - Development group dependencies
-//! - Pessimistic version constraints (~>)
-//! - Multiple version constraints
-//! - Both single and double quotes
+//! 対応対象:
+//! - バージョン制約付き `gem` 宣言
+//! - 開発グループ依存関係
+//! - ペシミスティック制約 (`~>`)
+//! - 複数バージョン制約の解析
+//! - シングルクォートとダブルクォート
 
 use crate::domain::{Dependency, Language, VersionSpec, VersionSpecKind};
 use crate::error::ManifestError;
@@ -15,13 +15,12 @@ use regex::Regex;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
-/// Parser for Gemfile files
+/// `Gemfile` 用パーサ
 pub struct GemfileParser;
 
-// Regex for gem declaration: gem 'name' or gem "name", with optional version(s)
-// Captures: name, and optionally version constraints
+// `gem 'name'` または `gem "name"` を解釈する正規表現
 static GEM_RE: LazyLock<Regex> = LazyLock::new(|| {
-    // Match gem 'name' or gem "name" with optional version constraints
+    // 例:
     // gem 'rails', '~> 7.0'
     // gem "pg", ">= 0.18", "< 2.0"
     // gem 'bcrypt'
@@ -31,21 +30,22 @@ static GEM_RE: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
-// Regex for group block start
+// `group ... do` 開始行
 static GROUP_START_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // 例:
     // group :development do
     // group :development, :test do
     Regex::new(r"^\s*group\s+(.+?)\s+do\s*$").unwrap()
 });
 
-// Regex for group block end
+// `group` ブロック終端
 static GROUP_END_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*end\s*(?:#.*)?$").unwrap());
 
-// Check if a group is development-only
+// 開発用グループかどうかを判定する
 fn is_dev_group(group_line: &str) -> bool {
     let lowered = group_line.to_lowercase();
-    // Check for :development, :test symbols
+    // `:development` と `:test` を開発系として扱う
     lowered.contains(":development") || lowered.contains(":test")
 }
 
@@ -53,37 +53,30 @@ impl ManifestParser for GemfileParser {
     fn parse(&self, content: &str) -> Result<Vec<Dependency>, ManifestError> {
         let mut dependencies = Vec::new();
         let parser = get_parser(Language::Ruby);
-        let mut in_dev_group = false;
-        let mut group_depth = 0;
+        let mut group_stack = Vec::new();
 
         for line in content.lines() {
             let trimmed = line.trim();
 
-            // Skip empty lines and comments
+            // 空行とコメントは無視する
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
             }
 
-            // Check for group start
+            // `group ... do` を積む
             if let Some(caps) = GROUP_START_RE.captures(trimmed) {
-                group_depth += 1;
                 let group_spec = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                if is_dev_group(group_spec) {
-                    in_dev_group = true;
-                }
+                group_stack.push(is_dev_group(group_spec));
                 continue;
             }
 
-            // Check for group end
-            if GROUP_END_RE.is_match(trimmed) && group_depth > 0 {
-                group_depth -= 1;
-                if group_depth == 0 {
-                    in_dev_group = false;
-                }
+            // 対応する `end` で 1 段だけ戻す
+            if GROUP_END_RE.is_match(trimmed) && !group_stack.is_empty() {
+                group_stack.pop();
                 continue;
             }
 
-            // Check for gem declaration
+            // `gem` 宣言を解釈する
             if let Some(caps) = GEM_RE.captures(line) {
                 let name = caps.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
 
@@ -91,7 +84,7 @@ impl ManifestParser for GemfileParser {
                     continue;
                 }
 
-                // Collect version constraints (up to 3)
+                // 最大 3 個までのバージョン制約を回収する
                 let mut version_parts = Vec::new();
                 for i in 2..=4 {
                     if let Some(v) = caps.get(i) {
@@ -99,20 +92,19 @@ impl ManifestParser for GemfileParser {
                     }
                 }
 
-                // Create dependency with version spec
+                // バージョン指定から `VersionSpec` を組み立てる
                 let spec = if version_parts.is_empty() {
-                    // No version specified - use Any kind
+                    // バージョン指定がなければ `Any`
                     VersionSpec::new(VersionSpecKind::Any, "", "")
                 } else {
-                    // Parse the version constraint(s)
                     let version_str = version_parts.join(", ");
                     match parser.parse(&version_str) {
                         Some(s) => s,
-                        None => continue, // Skip if parsing fails
+                        None => continue,
                     }
                 };
 
-                let dep = if in_dev_group {
+                let dep = if group_stack.iter().copied().any(|is_dev| is_dev) {
                     Dependency::development(name, spec, Language::Ruby)
                 } else {
                     Dependency::production(name, spec, Language::Ruby)
@@ -136,39 +128,7 @@ impl ManifestParser for GemfileParser {
     ) -> Result<String, ManifestError> {
         let parser = get_parser(Language::Ruby);
         let escaped_name = regex::escape(package);
-
-        // First, try to update existing version
-        // gem 'package' or gem "package" followed by version
-        let version_pattern = format!(r#"(gem\s+['"]{escaped_name}['"]\s*,\s*['"])([^'"]+)(['"])"#);
-
-        let version_re =
-            Regex::new(&version_pattern).map_err(|e| ManifestError::InvalidVersionSpec {
-                path: PathBuf::from("Gemfile"),
-                spec: package.to_string(),
-                message: format!("invalid regex pattern: {}", e),
-            })?;
-
         let mut updated = false;
-        let result = version_re.replace(content, |caps: &regex::Captures| {
-            let prefix = &caps[1];
-            let old_version = &caps[2];
-            let suffix = &caps[3];
-
-            if let Some(spec) = parser.parse(old_version) {
-                updated = true;
-                let new_ver = spec.format_updated(new_version);
-                format!("{}{}{}", prefix, new_ver, suffix)
-            } else {
-                caps[0].to_string()
-            }
-        });
-
-        if updated {
-            return Ok(result.to_string());
-        }
-
-        // If no existing version, try to add version to unversioned gem
-        // Pattern for gem without version: gem 'package' (not followed by comma and version)
         let no_version_pattern = format!(
             r#"(gem\s+)(['"])({escaped_name})(['"])(\s*(?:,\s*(?:require|group|git|path|branch|ref|tag|source|platforms?)\s*:|#|$))"#
         );
@@ -180,32 +140,6 @@ impl ManifestParser for GemfileParser {
                 message: format!("invalid regex pattern: {}", e),
             })?;
 
-        let result = no_version_re.replace(content, |caps: &regex::Captures| {
-            let gem_keyword = &caps[1];
-            let quote_start = &caps[2];
-            let name = &caps[3];
-            let quote_end = &caps[4];
-            let suffix = &caps[5];
-            updated = true;
-            // Add version with same quote style
-            format!(
-                "{}{}{}{}, {}{}{}{}",
-                gem_keyword,
-                quote_start,
-                name,
-                quote_end,
-                quote_start,
-                new_version,
-                quote_end,
-                suffix
-            )
-        });
-
-        if updated {
-            return Ok(result.to_string());
-        }
-
-        // Try simpler pattern for gems at end of line or followed by newline
         let simple_pattern = format!(r#"(gem\s+)(['"])({escaped_name})(['"])(\s*)$"#);
 
         let simple_re =
@@ -215,30 +149,106 @@ impl ManifestParser for GemfileParser {
                 message: format!("invalid regex pattern: {}", e),
             })?;
 
-        // Process line by line for end-of-line matching
-        let mut lines: Vec<String> = Vec::new();
+        let mut lines = Vec::new();
         for line in content.lines() {
-            if let Some(caps) = simple_re.captures(line) {
-                let gem_keyword = &caps[1];
-                let quote_start = &caps[2];
-                let name = &caps[3];
-                let quote_end = &caps[4];
-                let trailing = &caps[5];
-                updated = true;
-                lines.push(format!(
-                    "{}{}{}{}, {}{}{}{}",
-                    gem_keyword,
-                    quote_start,
-                    name,
-                    quote_end,
-                    quote_start,
-                    new_version,
-                    quote_end,
-                    trailing
-                ));
-            } else {
-                lines.push(line.to_string());
+            if !updated
+                && let Some(caps) = GEM_RE.captures(line)
+                && caps.get(1).map(|m| m.as_str()) == Some(package)
+            {
+                let mut version_parts = Vec::new();
+                for i in 2..=4 {
+                    if let Some(m) = caps.get(i) {
+                        version_parts.push(m);
+                    }
+                }
+
+                match version_parts.len() {
+                    0 => {
+                        if let Some(caps) = no_version_re.captures(line) {
+                            let gem_keyword = &caps[1];
+                            let quote_start = &caps[2];
+                            let name = &caps[3];
+                            let quote_end = &caps[4];
+                            let suffix = &caps[5];
+                            let matched_range = caps.get(0).unwrap().range();
+                            updated = true;
+                            let inserted = format!(
+                                "{}{}{}{}, {}{}{}{}",
+                                gem_keyword,
+                                quote_start,
+                                name,
+                                quote_end,
+                                quote_start,
+                                new_version,
+                                quote_end,
+                                suffix
+                            );
+                            let mut updated_line =
+                                String::with_capacity(line.len() + inserted.len() + 8);
+                            updated_line.push_str(&line[..matched_range.start]);
+                            updated_line.push_str(&inserted);
+                            updated_line.push_str(&line[matched_range.end..]);
+                            lines.push(updated_line);
+                            continue;
+                        }
+
+                        if let Some(caps) = simple_re.captures(line) {
+                            let gem_keyword = &caps[1];
+                            let quote_start = &caps[2];
+                            let name = &caps[3];
+                            let quote_end = &caps[4];
+                            let trailing = &caps[5];
+                            updated = true;
+                            lines.push(format!(
+                                "{}{}{}{}, {}{}{}{}",
+                                gem_keyword,
+                                quote_start,
+                                name,
+                                quote_end,
+                                quote_start,
+                                new_version,
+                                quote_end,
+                                trailing
+                            ));
+                            continue;
+                        }
+                    }
+                    1 => {
+                        let old_version = version_parts[0].as_str();
+                        if let Some(spec) = parser.parse(old_version) {
+                            if spec.kind == VersionSpecKind::Range {
+                                return Err(ManifestError::InvalidVersionSpec {
+                                    path: PathBuf::from("Gemfile"),
+                                    spec: package.to_string(),
+                                    message: "複合制約や除外制約は安全に書き換えられません"
+                                        .to_string(),
+                                });
+                            }
+
+                            let new_ver = spec.format_updated(new_version);
+                            let version_range = version_parts[0].range();
+                            let mut updated_line = String::with_capacity(
+                                line.len() - old_version.len() + new_ver.len(),
+                            );
+                            updated_line.push_str(&line[..version_range.start]);
+                            updated_line.push_str(&new_ver);
+                            updated_line.push_str(&line[version_range.end..]);
+                            updated = true;
+                            lines.push(updated_line);
+                            continue;
+                        }
+                    }
+                    _ => {
+                        return Err(ManifestError::InvalidVersionSpec {
+                            path: PathBuf::from("Gemfile"),
+                            spec: package.to_string(),
+                            message: "複合バージョン制約は安全に書き換えられません".to_string(),
+                        });
+                    }
+                }
             }
+
+            lines.push(line.to_string());
         }
 
         if updated {
@@ -314,7 +324,7 @@ gem 'rails', '~> 7.0'
     fn test_parse_no_version() {
         let content = r#"gem 'some_gem'"#;
         let deps = parse(content).unwrap();
-        // Gems without version should be included with Any kind
+        // バージョンなしの gem は `Any` として扱う
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].name, "some_gem");
         assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Any);
@@ -333,14 +343,14 @@ gem 'rtesseract'
         let deps = parse(content).unwrap();
         assert_eq!(deps.len(), 5);
 
-        // Check unversioned gems
+        // バージョンなしの gem を確認する
         assert_eq!(deps[0].name, "rmagick");
         assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Any);
 
         assert_eq!(deps[1].name, "nokogiri");
         assert_eq!(deps[1].version_spec.kind, VersionSpecKind::Any);
 
-        // Check versioned gem
+        // バージョン付きの gem を確認する
         assert_eq!(deps[2].name, "playwright-ruby-client");
         assert_eq!(deps[2].version_spec.kind, VersionSpecKind::Exact);
         assert_eq!(deps[2].version_spec.version, "1.57.1");
@@ -386,6 +396,26 @@ end
     }
 
     #[test]
+    fn test_parse_nested_dev_group_does_not_leak() {
+        let content = r#"
+group :production do
+  group :development do
+    gem 'rubocop', '~> 1.0'
+  end
+  gem 'pg', '~> 1.1'
+end
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 2);
+
+        let rubocop = deps.iter().find(|dep| dep.name == "rubocop").unwrap();
+        let pg = deps.iter().find(|dep| dep.name == "pg").unwrap();
+
+        assert!(rubocop.is_dev);
+        assert!(!pg.is_dev);
+    }
+
+    #[test]
     fn test_parse_mixed_groups() {
         let content = r#"
 source 'https://rubygems.org'
@@ -410,14 +440,14 @@ gem 'bcrypt', '~> 3.1.7'
         let prod_deps: Vec<_> = deps.iter().filter(|d| !d.is_dev).collect();
         let dev_deps: Vec<_> = deps.iter().filter(|d| d.is_dev).collect();
 
-        assert_eq!(prod_deps.len(), 3); // rails, pg, bcrypt
-        assert_eq!(dev_deps.len(), 3); // rspec-rails, factory_bot_rails, web-console
+        assert_eq!(prod_deps.len(), 3); // rails, pg, bcrypt の 3 件
+        assert_eq!(dev_deps.len(), 3); // 開発系 3 件
     }
 
     #[test]
     fn test_parse_with_comments() {
         let content = r#"
-# This is a comment
+# コメント
 gem 'rails', '~> 7.0' # inline comment
 "#;
         let deps = parse(content).unwrap();
@@ -449,7 +479,7 @@ gem 'pg', '~> 1.1'
             .update_version(content, "rails", "7.1.0")
             .unwrap();
         assert!(result.contains("'~> 7.1.0'"));
-        assert!(result.contains("gem 'pg'")); // Other gems unchanged
+        assert!(result.contains("gem 'pg'")); // 他の gem は変更しない
     }
 
     #[test]
@@ -503,7 +533,7 @@ gem 'pg', '~> 1.1'
 
     #[test]
     fn test_parse_gem_with_git_source() {
-        // Gems with git source should be parsed if they have a version
+        // git ソースでもバージョンがあれば解釈する
         let content = r#"gem 'rails', '~> 7.0', git: 'https://github.com/rails/rails'"#;
         let deps = parse(content).unwrap();
         assert_eq!(deps.len(), 1);
@@ -564,7 +594,7 @@ gem 'playwright-ruby-client', '1.57.1'
             .update_version(content, "rmagick", "5.3.0")
             .unwrap();
         assert!(result.contains("gem 'rmagick', '5.3.0'"));
-        // Other gems should be unchanged
+        // 他の gem は変更しない
         assert!(result.contains("gem 'nokogiri'"));
         assert!(result.contains("gem 'playwright-ruby-client', '1.57.1'"));
     }
@@ -598,16 +628,30 @@ gem 'rmagick'
 gem 'rails', '~> 7.0'
 gem 'nokogiri'
 "#;
-        // Update versioned gem
+        // バージョン付き gem の更新
         let result = GemfileParser
             .update_version(content, "rails", "7.1.0")
             .unwrap();
         assert!(result.contains("'~> 7.1.0'"));
 
-        // Update unversioned gem
+        // バージョンなし gem の更新
         let result2 = GemfileParser
             .update_version(content, "rmagick", "5.3.0")
             .unwrap();
         assert!(result2.contains("gem 'rmagick', '5.3.0'"));
+    }
+
+    #[test]
+    fn test_update_version_not_equal_constraint_returns_err() {
+        let content = r#"gem 'rack', '!= 2.2.4'"#;
+        let result = GemfileParser.update_version(content, "rack", "3.0.0");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_update_version_compound_constraint_returns_err() {
+        let content = r#"gem 'pg', '>= 0.18', '< 2.0'"#;
+        let result = GemfileParser.update_version(content, "pg", "1.5.0");
+        assert!(result.is_err());
     }
 }

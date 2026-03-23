@@ -1,10 +1,10 @@
-//! Manifest file writing and update operations
+//! マニフェストファイルの書き戻し処理。
 //!
-//! This module provides:
-//! - ManifestWriter for applying version updates to manifest files
-//! - Dry-run mode support (no actual file modifications)
-//! - Format preservation when updating versions
-//! - Parse error handling with graceful continuation
+//! 提供内容:
+//! - マニフェストへバージョン更新を適用する `ManifestWriter`
+//! - ファイルを書き換えない dry-run モード
+//! - 更新時の書式保持
+//! - 失敗時も継続できるエラーハンドリング
 
 use crate::domain::{Language, ManifestUpdateResult, UpdateResult};
 use crate::error::ManifestError;
@@ -12,29 +12,29 @@ use crate::manifest::ManifestParser;
 use std::fs;
 use std::path::Path;
 
-/// Writer for manifest files that applies version updates
+/// マニフェストへの更新を書き戻すライター
 pub struct ManifestWriter {
-    /// Whether to run in dry-run mode (no file modifications)
+    /// dry-run モードで動作するかどうか
     dry_run: bool,
 }
 
-/// Result of applying updates to a manifest file
+/// マニフェスト 1 件への適用結果
 #[derive(Debug)]
 pub struct WriteResult {
-    /// Path to the manifest file
+    /// 対象マニフェストのパス
     pub path: std::path::PathBuf,
-    /// Number of updates successfully applied
+    /// 実際に反映された更新数
     pub updates_applied: usize,
-    /// Number of updates that failed
+    /// 失敗した更新数
     pub updates_failed: usize,
-    /// Whether the file was actually modified
+    /// 実ファイルが変更されたかどうか
     pub file_modified: bool,
-    /// Errors encountered during update
+    /// 更新中に発生したエラー
     pub errors: Vec<String>,
 }
 
 impl WriteResult {
-    /// Create a new WriteResult
+    /// 新しい `WriteResult` を作る
     fn new(path: impl Into<std::path::PathBuf>) -> Self {
         Self {
             path: path.into(),
@@ -45,34 +45,34 @@ impl WriteResult {
         }
     }
 
-    /// Returns true if any updates were successfully applied
+    /// 実際に反映された更新があるかどうか
     pub fn has_updates(&self) -> bool {
         self.updates_applied > 0
     }
 
-    /// Returns true if any errors occurred
+    /// エラーがあるかどうか
     pub fn has_errors(&self) -> bool {
         !self.errors.is_empty()
     }
 }
 
 impl ManifestWriter {
-    /// Create a new ManifestWriter
+    /// 新しい `ManifestWriter` を作る
     pub fn new(dry_run: bool) -> Self {
         Self { dry_run }
     }
 
-    /// Create a ManifestWriter in dry-run mode
+    /// dry-run 用の `ManifestWriter` を作る
     pub fn dry_run() -> Self {
         Self { dry_run: true }
     }
 
-    /// Check if this writer is in dry-run mode
+    /// dry-run モードかどうか
     pub fn is_dry_run(&self) -> bool {
         self.dry_run
     }
 
-    /// Apply updates from a ManifestUpdateResult to the actual file
+    /// `ManifestUpdateResult` の更新をファイルへ適用する
     pub fn apply_updates(
         &self,
         manifest_result: &ManifestUpdateResult,
@@ -81,13 +81,13 @@ impl ManifestWriter {
         let path = &manifest_result.path;
         let mut result = WriteResult::new(path);
 
-        // Read current file content
+        // 現在のファイル内容を読む
         let content = fs::read_to_string(path).map_err(|e| ManifestError::ReadError {
             path: path.clone(),
             source: e,
         })?;
 
-        // Apply each update sequentially
+        // 更新は順番に適用する
         let mut current_content = content.clone();
 
         for update in manifest_result.results.iter() {
@@ -99,8 +99,10 @@ impl ManifestWriter {
             {
                 match parser.update_version(&current_content, &dependency.name, new_version) {
                     Ok(updated_content) => {
-                        current_content = updated_content;
-                        result.updates_applied += 1;
+                        if updated_content != current_content {
+                            current_content = updated_content;
+                            result.updates_applied += 1;
+                        }
                     }
                     Err(e) => {
                         result.updates_failed += 1;
@@ -112,7 +114,7 @@ impl ManifestWriter {
             }
         }
 
-        // Write back to file if not in dry-run mode and there were changes
+        // dry-run でなく、実際に変更がある場合のみ書き戻す
         if result.updates_applied > 0 && !self.dry_run {
             fs::write(path, &current_content).map_err(|e| ManifestError::WriteError {
                 path: path.clone(),
@@ -124,7 +126,7 @@ impl ManifestWriter {
         Ok(result)
     }
 
-    /// Apply updates to multiple manifest files
+    /// 複数のマニフェストへ更新を適用する
     pub fn apply_all_updates(
         &self,
         manifests: &[ManifestUpdateResult],
@@ -133,7 +135,7 @@ impl ManifestWriter {
         manifests
             .iter()
             .filter_map(|manifest| {
-                // Only process manifests that have updates
+                // 更新対象があるマニフェストだけ処理する
                 if !manifest.has_updates() {
                     return None;
                 }
@@ -154,7 +156,7 @@ impl ManifestWriter {
     }
 }
 
-/// Read a manifest file content safely
+/// マニフェストの内容を安全に読み込む
 pub fn read_manifest(path: &Path) -> Result<String, ManifestError> {
     fs::read_to_string(path).map_err(|e| ManifestError::ReadError {
         path: path.to_path_buf(),
@@ -162,7 +164,7 @@ pub fn read_manifest(path: &Path) -> Result<String, ManifestError> {
     })
 }
 
-/// Write content to a manifest file
+/// マニフェストへ内容を書き込む
 pub fn write_manifest(path: &Path, content: &str) -> Result<(), ManifestError> {
     fs::write(path, content).map_err(|e| ManifestError::WriteError {
         path: path.to_path_buf(),
@@ -174,8 +176,30 @@ pub fn write_manifest(path: &Path, content: &str) -> Result<(), ManifestError> {
 mod tests {
     use super::*;
     use crate::domain::{Dependency, VersionSpec, VersionSpecKind};
+    use crate::manifest::ManifestParser;
     use std::io::Write;
     use tempfile::TempDir;
+
+    struct NoOpParser;
+
+    impl ManifestParser for NoOpParser {
+        fn parse(&self, _content: &str) -> Result<Vec<Dependency>, ManifestError> {
+            Ok(Vec::new())
+        }
+
+        fn language(&self) -> Language {
+            Language::Node
+        }
+
+        fn update_version(
+            &self,
+            content: &str,
+            _package: &str,
+            _new_version: &str,
+        ) -> Result<String, ManifestError> {
+            Ok(content.to_string())
+        }
+    }
 
     fn sample_dependency(name: &str, version: &str, language: Language) -> Dependency {
         let spec = VersionSpec::new(VersionSpecKind::Caret, format!("^{}", version), version)
@@ -252,9 +276,9 @@ mod tests {
         let result = writer.apply_updates(&manifest_result, &parser).unwrap();
 
         assert_eq!(result.updates_applied, 1);
-        assert!(!result.file_modified); // Not modified in dry-run mode
+        assert!(!result.file_modified); // dry-run では書き換えない
 
-        // Verify file content unchanged
+        // ファイル内容は変わらない
         let content = fs::read_to_string(&path).unwrap();
         assert!(content.contains("4.17.21"));
         assert!(!content.contains("4.18.0"));
@@ -281,7 +305,7 @@ mod tests {
         assert_eq!(result.updates_applied, 1);
         assert!(result.file_modified);
 
-        // Verify file content changed
+        // ファイル内容が更新されることを確認する
         let content = fs::read_to_string(&path).unwrap();
         assert!(content.contains("^4.18.0"));
         assert!(!content.contains("4.17.21"));
@@ -313,10 +337,10 @@ mod tests {
         assert_eq!(result.updates_applied, 2);
         assert!(result.file_modified);
 
-        // Verify both packages updated
+        // 両方の依存が更新されることを確認する
         let content = fs::read_to_string(&path).unwrap();
-        assert!(content.contains("^4.18.0")); // lodash
-        assert!(content.contains("^4.19.0")); // express
+        assert!(content.contains("^4.18.0")); // lodash が更新される
+        assert!(content.contains("^4.19.0")); // express が更新される
     }
 
     #[test]
@@ -331,11 +355,11 @@ mod tests {
 
         let mut manifest_result = ManifestUpdateResult::new(&path, Language::Node);
 
-        // Valid update
+        // 正常な更新
         let dep1 = sample_dependency("lodash", "4.17.21", Language::Node);
         manifest_result.add_result(UpdateResult::update(dep1, "4.18.0"));
 
-        // Invalid update (package doesn't exist)
+        // 失敗する更新（対象パッケージが存在しない）
         let dep2 = sample_dependency("nonexistent", "1.0.0", Language::Node);
         manifest_result.add_result(UpdateResult::update(dep2, "2.0.0"));
 
@@ -346,7 +370,7 @@ mod tests {
         assert_eq!(result.updates_applied, 1);
         assert_eq!(result.updates_failed, 1);
         assert!(result.has_errors());
-        assert!(result.file_modified); // File still modified for successful updates
+        assert!(result.file_modified); // 成功分は書き戻される
     }
 
     #[test]
@@ -359,7 +383,7 @@ mod tests {
 }"#;
         let path = create_temp_package_json(&temp_dir, original_content);
 
-        // ManifestUpdateResult with only skips, no updates
+        // 更新対象がないケース
         let manifest_result = ManifestUpdateResult::new(&path, Language::Node);
 
         let writer = ManifestWriter::new(false);
@@ -383,6 +407,32 @@ mod tests {
         let result = writer.apply_updates(&manifest_result, &parser);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_apply_updates_no_op_is_not_counted() {
+        let temp_dir = TempDir::new().unwrap();
+        let original_content = r#"{
+  "dependencies": {
+    "lodash": "^4.17.21"
+  }
+}"#;
+        let path = create_temp_package_json(&temp_dir, original_content);
+
+        let mut manifest_result = ManifestUpdateResult::new(&path, Language::Node);
+        let dep = sample_dependency("lodash", "4.17.21", Language::Node);
+        manifest_result.add_result(UpdateResult::update(dep, "4.18.0"));
+
+        let writer = ManifestWriter::new(false);
+        let result = writer.apply_updates(&manifest_result, &NoOpParser).unwrap();
+
+        assert_eq!(result.updates_applied, 0);
+        assert_eq!(result.updates_failed, 0);
+        assert!(!result.file_modified);
+        assert!(!result.has_errors());
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(content, original_content);
     }
 
     #[test]
@@ -426,7 +476,7 @@ mod tests {
 }"#;
         let path = create_temp_package_json(&temp_dir, original_content);
 
-        // Make file read-only
+        // 読み取り専用にする
         let mut perms = fs::metadata(&path).unwrap().permissions();
         perms.set_mode(0o444);
         fs::set_permissions(&path, perms).unwrap();
@@ -439,7 +489,7 @@ mod tests {
         let parser = crate::manifest::PackageJsonParser;
         let result = writer.apply_updates(&manifest_result, &parser);
 
-        // Restore permissions for cleanup
+        // 後始末のため権限を戻す
         let mut perms = fs::metadata(&path).unwrap().permissions();
         perms.set_mode(0o644);
         fs::set_permissions(&path, perms).unwrap();
@@ -464,7 +514,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let path = create_temp_package_json(&temp_dir, r#"{"dependencies": {}}"#);
 
-        // ManifestUpdateResult with no updates
+        // 更新がない `ManifestUpdateResult`
         let manifest_result = ManifestUpdateResult::new(&path, Language::Node);
 
         let writer = ManifestWriter::new(false);
@@ -472,7 +522,7 @@ mod tests {
             Box::new(crate::manifest::PackageJsonParser)
         });
 
-        // Should skip manifests with no updates
+        // 更新がないマニフェストは返さない
         assert!(results.is_empty());
     }
 
