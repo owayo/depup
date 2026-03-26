@@ -1013,15 +1013,69 @@ mod tests {
 
     #[test]
     fn test_version_change_type_new() {
-        // Empty old version
+        // 空のバージョンは新規追加
         assert_eq!(
             VersionChangeType::from_versions("", "1.0.0"),
             VersionChangeType::New
         );
-        // Dash representing no version
+        // ダッシュもバージョンなし扱い
         assert_eq!(
             VersionChangeType::from_versions("-", "1.0.0"),
             VersionChangeType::New
+        );
+    }
+
+    #[test]
+    fn test_version_change_type_with_prerelease() {
+        // プレリリースサフィックス付きバージョン（-で分割されるため数値部分のみ比較）
+        assert_eq!(
+            VersionChangeType::from_versions("1.0.0-alpha", "2.0.0"),
+            VersionChangeType::Major
+        );
+        assert_eq!(
+            VersionChangeType::from_versions("1.0.0-beta.1", "1.1.0"),
+            VersionChangeType::Minor
+        );
+    }
+
+    #[test]
+    fn test_version_change_type_unknown() {
+        // パースできないバージョン
+        assert_eq!(
+            VersionChangeType::from_versions("latest", "2.0.0"),
+            VersionChangeType::Unknown
+        );
+        assert_eq!(
+            VersionChangeType::from_versions("abc", "def"),
+            VersionChangeType::Unknown
+        );
+    }
+
+    #[test]
+    fn test_version_change_type_label() {
+        // ラベル文字列の確認
+        assert_eq!(VersionChangeType::Major.label(), "major");
+        assert_eq!(VersionChangeType::Minor.label(), "minor");
+        assert_eq!(VersionChangeType::Patch.label(), "patch");
+        assert_eq!(VersionChangeType::New.label(), "new");
+        assert_eq!(VersionChangeType::Unknown.label(), "?");
+    }
+
+    #[test]
+    fn test_version_change_type_same_major_minor_different_patch() {
+        // パッチのみ異なる場合
+        assert_eq!(
+            VersionChangeType::from_versions("1.2.3", "1.2.10"),
+            VersionChangeType::Patch
+        );
+    }
+
+    #[test]
+    fn test_version_change_type_four_segment() {
+        // 4セグメントバージョン（Ruby等、3セグメント目までで比較）
+        assert_eq!(
+            VersionChangeType::from_versions("1.2.3.4", "2.0.0.0"),
+            VersionChangeType::Major
         );
     }
 }

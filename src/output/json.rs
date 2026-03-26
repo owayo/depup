@@ -395,4 +395,116 @@ mod tests {
         assert_eq!(parsed["updates"], 0);
         assert_eq!(parsed["skips"], 0);
     }
+
+    #[test]
+    fn test_format_manifest_json() {
+        // 単一マニフェストのJSON出力を確認
+        let formatter = JsonFormatter::new(Verbosity::Normal);
+        let mut manifest = ManifestUpdateResult::new(PathBuf::from("Cargo.toml"), Language::Rust);
+        let dep = sample_dependency("serde", "1.0.0");
+        manifest.add_result(UpdateResult::update(dep, "1.1.0"));
+
+        let mut output = Vec::new();
+        formatter.format_manifest(&manifest, &mut output).unwrap();
+        let output_str = String::from_utf8(output).unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&output_str).unwrap();
+        assert_eq!(parsed["path"], "Cargo.toml");
+        assert_eq!(parsed["language"], "Rust");
+        assert_eq!(parsed["updates"][0]["name"], "serde");
+        assert_eq!(parsed["updates"][0]["from"], "1.0.0");
+        assert_eq!(parsed["updates"][0]["to"], "1.1.0");
+    }
+
+    #[test]
+    fn test_format_json_dry_run() {
+        // dry-run フラグの出力確認
+        let formatter = JsonFormatter::new(Verbosity::Normal);
+        let summary = UpdateSummary::new(true);
+        let result = OrchestratorResult {
+            summary,
+            write_results: Vec::new(),
+            errors: Vec::new(),
+        };
+        let mut output = Vec::new();
+
+        formatter.format(&result, &mut output).unwrap();
+        let output_str = String::from_utf8(output).unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&output_str).unwrap();
+        assert_eq!(parsed["dry_run"], true);
+    }
+
+    #[test]
+    fn test_format_json_with_errors() {
+        // エラーが含まれる場合の出力確認
+        use crate::orchestrator::OrchestratorError;
+        let formatter = JsonFormatter::new(Verbosity::Normal);
+        let summary = UpdateSummary::new(false);
+        let result = OrchestratorResult {
+            summary,
+            write_results: Vec::new(),
+            errors: vec![OrchestratorError::RegistryError {
+                package: "serde".into(),
+                message: "fetch failed: timeout".into(),
+            }],
+        };
+        let mut output = Vec::new();
+
+        formatter.format(&result, &mut output).unwrap();
+        let output_str = String::from_utf8(output).unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&output_str).unwrap();
+        let errors = parsed["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].as_str().unwrap().contains("fetch failed"));
+    }
+
+    #[test]
+    fn test_skip_reason_to_string_all_variants() {
+        // 全SkipReason変換の確認
+        assert_eq!(
+            JsonFormatter::skip_reason_to_string(&SkipReason::NotInOnlyList),
+            "not_in_only_list"
+        );
+        assert_eq!(
+            JsonFormatter::skip_reason_to_string(&SkipReason::FetchFailed("timeout".into())),
+            "fetch_failed: timeout"
+        );
+        assert_eq!(
+            JsonFormatter::skip_reason_to_string(&SkipReason::LanguageFiltered),
+            "language_filtered"
+        );
+        assert_eq!(
+            JsonFormatter::skip_reason_to_string(&SkipReason::NoSuitableVersion),
+            "no_suitable_version"
+        );
+        assert_eq!(
+            JsonFormatter::skip_reason_to_string(&SkipReason::ParseError("invalid".into())),
+            "parse_error: invalid"
+        );
+    }
+
+    #[test]
+    fn test_format_json_empty_result() {
+        // 更新もスキップもない空の結果
+        let formatter = JsonFormatter::new(Verbosity::Normal);
+        let summary = UpdateSummary::new(false);
+        let result = OrchestratorResult {
+            summary,
+            write_results: Vec::new(),
+            errors: Vec::new(),
+        };
+        let mut output = Vec::new();
+
+        formatter.format(&result, &mut output).unwrap();
+        let output_str = String::from_utf8(output).unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&output_str).unwrap();
+        assert_eq!(parsed["summary"]["updates"], 0);
+        assert_eq!(parsed["summary"]["skips"], 0);
+        assert!(parsed["manifests"].as_array().unwrap().is_empty());
+        // エラーがない場合はerrorsフィールドが省略される
+        assert!(parsed.get("errors").is_none() || parsed["errors"].as_array().unwrap().is_empty());
+    }
 }

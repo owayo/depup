@@ -253,4 +253,76 @@ missing
         assert_eq!(dirs.len(), 1);
         assert_eq!(dirs[0], dir.path().to_path_buf(), "root only");
     }
+
+    #[test]
+    fn test_parse_windows_line_endings() {
+        // Windows 形式の改行コード (CRLF) でもパースできる
+        let dir = create_test_dir();
+        fs::create_dir(dir.path().join("gui")).unwrap();
+        fs::create_dir(dir.path().join("web")).unwrap();
+
+        let content = "gui\r\nweb\r\n";
+        let config = DepupConfig::parse(content, dir.path()).unwrap();
+        assert_eq!(config.directories.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_whitespace_only_lines() {
+        // 空白のみの行はスキップされる
+        let dir = create_test_dir();
+        fs::create_dir(dir.path().join("app")).unwrap();
+
+        let content = "   \n\t\n  app  \n  \n";
+        let config = DepupConfig::parse(content, dir.path()).unwrap();
+        assert_eq!(config.directories.len(), 1);
+        assert_eq!(config.directories[0], dir.path().join("app"));
+    }
+
+    #[test]
+    fn test_parse_hash_in_directory_name() {
+        // ディレクトリ名に # が含まれる場合、# 以降はコメントとして切り捨てられる
+        // これは仕様通り（# はコメント開始文字）
+        let dir = create_test_dir();
+        fs::create_dir(dir.path().join("app")).unwrap();
+
+        let content = "app#comment\n";
+        let config = DepupConfig::parse(content, dir.path()).unwrap();
+        // "app#comment" は # でコメントが切り取られ "app" になる
+        assert_eq!(config.directories.len(), 1);
+        assert_eq!(config.directories[0], dir.path().join("app"));
+    }
+
+    #[test]
+    fn test_parse_all_nonexistent_directories() {
+        // 全てのディレクトリが存在しない場合、空のリストが返る
+        let dir = create_test_dir();
+        let content = "missing1\nmissing2\nmissing3\n";
+        let config = DepupConfig::parse(content, dir.path()).unwrap();
+        assert!(config.directories.is_empty());
+    }
+
+    #[test]
+    fn test_parse_duplicate_directories() {
+        // 同じディレクトリが複数回指定された場合、重複して含まれる
+        let dir = create_test_dir();
+        fs::create_dir(dir.path().join("app")).unwrap();
+
+        let content = "app\napp\n";
+        let config = DepupConfig::parse(content, dir.path()).unwrap();
+        assert_eq!(config.directories.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_nested_directories() {
+        // ネストされたディレクトリパスもサポート
+        let dir = create_test_dir();
+        fs::create_dir_all(dir.path().join("packages/frontend")).unwrap();
+        fs::create_dir_all(dir.path().join("packages/backend")).unwrap();
+
+        let content = "packages/frontend\npackages/backend\n";
+        let config = DepupConfig::parse(content, dir.path()).unwrap();
+        assert_eq!(config.directories.len(), 2);
+        assert_eq!(config.directories[0], dir.path().join("packages/frontend"));
+        assert_eq!(config.directories[1], dir.path().join("packages/backend"));
+    }
 }

@@ -244,4 +244,103 @@ mod tests {
 
         assert!(output_str.contains("# 0 package(s) updated"));
     }
+
+    #[test]
+    fn test_format_summary_with_skips() {
+        // スキップ数もサマリに含まれる
+        let formatter = DiffFormatter::new(false);
+        let mut summary = UpdateSummary::new(false);
+        let mut manifest = ManifestUpdateResult::new(PathBuf::from("package.json"), Language::Node);
+
+        let dep = sample_dependency("express", "4.18.0");
+        manifest.add_result(UpdateResult::skip(
+            dep,
+            crate::domain::SkipReason::AlreadyLatest,
+        ));
+        summary.add_manifest(manifest);
+
+        let mut output = Vec::new();
+        formatter.format_summary(&summary, &mut output).unwrap();
+        let output_str = String::from_utf8(output).unwrap();
+
+        assert!(output_str.contains("0 package(s) updated"));
+        assert!(output_str.contains("1 skipped"));
+    }
+
+    #[test]
+    fn test_format_manifest_no_updates() {
+        // 更新なしのマニフェストは出力されない
+        let formatter = DiffFormatter::new(false);
+        let manifest = ManifestUpdateResult::new(PathBuf::from("package.json"), Language::Node);
+
+        let mut output = Vec::new();
+        formatter.format_manifest(&manifest, &mut output).unwrap();
+        let output_str = String::from_utf8(output).unwrap();
+
+        assert!(output_str.is_empty());
+    }
+
+    #[test]
+    fn test_format_diff_multiple_updates() {
+        // 複数パッケージの更新
+        let formatter = DiffFormatter::new(false);
+        let mut summary = UpdateSummary::new(false);
+        let mut manifest = ManifestUpdateResult::new(PathBuf::from("package.json"), Language::Node);
+
+        let dep1 = sample_dependency("lodash", "4.17.21");
+        manifest.add_result(UpdateResult::update(dep1, "4.18.0"));
+
+        let dep2 = sample_dependency("axios", "1.6.0");
+        manifest.add_result(UpdateResult::update(dep2, "1.7.0"));
+
+        summary.add_manifest(manifest);
+
+        let result = OrchestratorResult {
+            summary,
+            write_results: Vec::new(),
+            errors: Vec::new(),
+        };
+
+        let mut output = Vec::new();
+        formatter.format(&result, &mut output).unwrap();
+        let output_str = String::from_utf8(output).unwrap();
+
+        assert!(output_str.contains("@@ lodash @@"));
+        assert!(output_str.contains("@@ axios @@"));
+        assert!(output_str.contains("# 2 package(s) would be updated"));
+    }
+
+    #[test]
+    fn test_format_diff_multiple_manifests() {
+        // 複数マニフェストファイルの更新
+        let formatter = DiffFormatter::new(false);
+        let mut summary = UpdateSummary::new(false);
+
+        let mut manifest1 =
+            ManifestUpdateResult::new(PathBuf::from("package.json"), Language::Node);
+        let dep1 = sample_dependency("lodash", "4.17.21");
+        manifest1.add_result(UpdateResult::update(dep1, "4.18.0"));
+
+        let mut manifest2 = ManifestUpdateResult::new(PathBuf::from("Cargo.toml"), Language::Rust);
+        let spec = VersionSpec::new(VersionSpecKind::Caret, "^1.0.0".to_string(), "1.0.0")
+            .with_prefix("^");
+        let dep2 = Dependency::new("serde", spec, false, Language::Rust);
+        manifest2.add_result(UpdateResult::update(dep2, "1.1.0"));
+
+        summary.add_manifest(manifest1);
+        summary.add_manifest(manifest2);
+
+        let result = OrchestratorResult {
+            summary,
+            write_results: Vec::new(),
+            errors: Vec::new(),
+        };
+
+        let mut output = Vec::new();
+        formatter.format(&result, &mut output).unwrap();
+        let output_str = String::from_utf8(output).unwrap();
+
+        assert!(output_str.contains("--- a/package.json"));
+        assert!(output_str.contains("--- a/Cargo.toml"));
+    }
 }
