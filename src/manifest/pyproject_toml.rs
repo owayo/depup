@@ -1,14 +1,14 @@
-//! pyproject.toml parser for Python projects
+//! Python プロジェクト向けの `pyproject.toml` パーサ。
 //!
-//! Handles:
-//! - project.dependencies (PEP 621)
-//! - project.optional-dependencies (PEP 621)
-//! - dependency-groups (PEP 735)
-//! - tool.poetry.dependencies (Poetry)
-//! - tool.poetry.dev-dependencies (Poetry)
-//! - tool.rye.dev-dependencies (Rye)
+//! 対応対象:
+//! - `project.dependencies`（PEP 621）
+//! - `project.optional-dependencies`（PEP 621）
+//! - `dependency-groups`（PEP 735）
+//! - `tool.poetry.dependencies`（Poetry）
+//! - `tool.poetry.dev-dependencies`（Poetry）
+//! - `tool.rye.dev-dependencies`（Rye）
 
-use crate::domain::{Dependency, Language, VersionSpecKind};
+use crate::domain::{Dependency, Language};
 use crate::error::ManifestError;
 use crate::manifest::ManifestParser;
 use crate::parser::{VersionParser, get_parser};
@@ -17,11 +17,11 @@ use std::path::PathBuf;
 use std::sync::LazyLock;
 use toml::Value;
 
-/// Parser for pyproject.toml files
+/// `pyproject.toml` 用パーサ
 pub struct PyprojectTomlParser;
 
-// Regex to parse PEP 508 dependency specifiers
-// Matches: package-name>=1.0,<2.0 or package-name==1.0 or package-name^1.0, etc.
+// PEP 508 依存指定を解釈する正規表現
+// 例: `package-name>=1.0,<2.0`, `package-name==1.0`, `package-name^1.0`
 static PEP508_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^([a-zA-Z0-9][-a-zA-Z0-9._]*)\s*(.*)$").unwrap());
 
@@ -37,7 +37,7 @@ impl ManifestParser for PyprojectTomlParser {
         let mut dependencies = Vec::new();
         let parser = get_parser(Language::Python);
 
-        // Parse PEP 621 project.dependencies
+        // PEP 621 の `project.dependencies` を読む
         if let Some(deps) = toml
             .get("project")
             .and_then(|p| p.get("dependencies"))
@@ -52,7 +52,7 @@ impl ManifestParser for PyprojectTomlParser {
             }
         }
 
-        // Parse PEP 621 project.optional-dependencies
+        // PEP 621 の `project.optional-dependencies` を読む
         if let Some(optional) = toml
             .get("project")
             .and_then(|p| p.get("optional-dependencies"))
@@ -72,7 +72,7 @@ impl ManifestParser for PyprojectTomlParser {
             }
         }
 
-        // Parse PEP 735 dependency-groups
+        // PEP 735 の `dependency-groups` を読む
         if let Some(groups) = toml.get("dependency-groups").and_then(|d| d.as_table()) {
             for (group_name, deps) in groups {
                 let is_dev = group_name == "dev" || group_name == "test" || group_name == "lint";
@@ -89,7 +89,7 @@ impl ManifestParser for PyprojectTomlParser {
             }
         }
 
-        // Parse Poetry dependencies
+        // Poetry の依存関係を読む
         if let Some(poetry_deps) = toml
             .get("tool")
             .and_then(|t| t.get("poetry"))
@@ -97,7 +97,7 @@ impl ManifestParser for PyprojectTomlParser {
             .and_then(|d| d.as_table())
         {
             for (name, value) in poetry_deps {
-                // Skip python version requirement
+                // Python 自体の要求バージョンは依存更新対象にしない
                 if name == "python" {
                     continue;
                 }
@@ -107,7 +107,7 @@ impl ManifestParser for PyprojectTomlParser {
             }
         }
 
-        // Parse Poetry dev-dependencies
+        // Poetry の開発依存を読む
         if let Some(dev_deps) = toml
             .get("tool")
             .and_then(|t| t.get("poetry"))
@@ -121,7 +121,7 @@ impl ManifestParser for PyprojectTomlParser {
             }
         }
 
-        // Parse Poetry group dependencies (Poetry 1.2+)
+        // Poetry 1.2+ のグループ依存を読む
         if let Some(groups) = toml
             .get("tool")
             .and_then(|t| t.get("poetry"))
@@ -142,7 +142,7 @@ impl ManifestParser for PyprojectTomlParser {
             }
         }
 
-        // Parse Rye dev-dependencies
+        // Rye の開発依存を読む
         if let Some(deps) = toml
             .get("tool")
             .and_then(|t| t.get("rye"))
@@ -171,29 +171,29 @@ impl ManifestParser for PyprojectTomlParser {
         package: &str,
         new_version: &str,
     ) -> Result<String, ManifestError> {
-        // For TOML, we need to be careful to preserve formatting
-        // We'll do a simple string replacement approach
+        // TOML の整形を壊さないよう、単純な文字列置換で差し替える
         let parser = get_parser(Language::Python);
 
-        // Try to find and update the version in the content
+        // バージョン文字列を見つけて更新する
         let mut result = content.to_string();
         let mut updated = false;
 
-        // Pattern for Poetry-style dependencies: name = "^1.0.0" or name = { version = "^1.0.0" }
+        // Poetry 形式: `name = "^1.0.0"` / `name = { version = "^1.0.0" }`
         let simple_pattern = format!(r#"(?m)^(\s*{}\s*=\s*)"([^"]+)"#, regex::escape(package));
         if let Ok(re) = Regex::new(&simple_pattern)
             && let Some(caps) = re.captures(&result)
         {
             let old_version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-            if let Some(spec) = parser.parse(old_version) {
-                let new_ver = spec.format_updated(new_version);
+            if let Some(spec) = parser.parse(old_version)
+                && let Some(new_ver) = spec.try_format_updated(new_version)
+            {
                 let replacement = format!(r#"{}"{}"#, &caps[1], new_ver);
                 result = re.replace(&result, replacement.as_str()).to_string();
                 updated = true;
             }
         }
 
-        // Pattern for Poetry inline table: name = { version = "^1.0.0", ... }
+        // Poetry の inline table 形式: `name = { version = "^1.0.0", ... }`
         let table_pattern = format!(
             r#"(?m)({}\s*=\s*\{{\s*[^}}]*version\s*=\s*)"([^"]+)""#,
             regex::escape(package)
@@ -202,15 +202,16 @@ impl ManifestParser for PyprojectTomlParser {
             && let Some(caps) = re.captures(&result)
         {
             let old_version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-            if let Some(spec) = parser.parse(old_version) {
-                let new_ver = spec.format_updated(new_version);
+            if let Some(spec) = parser.parse(old_version)
+                && let Some(new_ver) = spec.try_format_updated(new_version)
+            {
                 let replacement = format!(r#"{}"{}"#, &caps[1], new_ver);
                 result = re.replace(&result, replacement.as_str()).to_string();
                 updated = true;
             }
         }
 
-        // Pattern for PEP 508 in array: "package>=1.0,<2.0" or "package[extras]>=1.0"
+        // 配列中の PEP 508 形式: `"package>=1.0,<2.0"` / `"package[extras]>=1.0"`
         let pep508_pattern = format!(
             r#""({}(?:\[[^\]]*\])?(?:\s*[<>=!~^]+[^"]+)?)""#,
             regex::escape(package)
@@ -223,7 +224,7 @@ impl ManifestParser for PyprojectTomlParser {
                     let pkg_name = pep_caps.get(1).map(|m| m.as_str()).unwrap_or("");
                     let raw_version = pep_caps.get(2).map(|m| m.as_str()).unwrap_or("").trim();
 
-                    // Strip extras [extra] from version part, preserving for replacement
+                    // `package[extra]>=1.0` の extras 部分を切り出して保持する
                     let (extras_str, version_part) = if raw_version.starts_with('[') {
                         if let Some(idx) = raw_version.find(']') {
                             (&raw_version[..=idx], raw_version[idx + 1..].trim())
@@ -237,13 +238,8 @@ impl ManifestParser for PyprojectTomlParser {
                     if pkg_name == package
                         && !version_part.is_empty()
                         && let Some(spec) = parser.parse(version_part)
+                        && let Some(new_ver) = spec.try_format_updated(new_version)
                     {
-                        // Range型（>=X,<Y）は複合制約のため元の指定子をそのまま保持
-                        let new_ver = if spec.kind == VersionSpecKind::Range {
-                            version_part.to_string()
-                        } else {
-                            spec.format_updated(new_version)
-                        };
                         let new_dep = format!("{}{}{}", package, extras_str, new_ver);
                         result =
                             result.replace(&format!(r#""{full_dep}""#), &format!(r#""{new_dep}""#));
@@ -274,14 +270,14 @@ fn parse_pep508_dependency(
     let name = caps.get(1)?.as_str();
     let mut version_part = caps.get(2).map(|m| m.as_str()).unwrap_or("").trim();
 
-    // Handle extras like package[extra]>=1.0 - strip [extra] from version_part
+    // `package[extra]>=1.0` の extras を version 部分から取り除く
     if version_part.starts_with('[')
         && let Some(idx) = version_part.find(']')
     {
         version_part = version_part[idx + 1..].trim();
     }
 
-    // Remove any environment markers (after ;)
+    // 環境マーカー（`;` 以降）は更新判定の対象外にする
     let version_part = version_part
         .split(';')
         .next()
@@ -374,7 +370,7 @@ pydantic = "~2.0"
 "#;
 
         let deps = parse(content).unwrap();
-        // python should be skipped
+        // `python` 自体の指定はスキップされる
         assert_eq!(deps.len(), 2);
 
         let requests = deps.iter().find(|d| d.name == "requests").unwrap();
@@ -414,7 +410,7 @@ sphinx = "^6.0.0"
         assert!(pytest.is_dev);
 
         let sphinx = deps.iter().find(|d| d.name == "sphinx").unwrap();
-        assert!(!sphinx.is_dev); // docs group is not dev
+        assert!(!sphinx.is_dev); // docs グループは開発依存ではない
     }
 
     #[test]
@@ -440,17 +436,17 @@ docs = [
         assert_eq!(deps.len(), 4);
 
         let ruff = deps.iter().find(|d| d.name == "ruff").unwrap();
-        assert!(ruff.is_dev); // dev group is dev
+        assert!(ruff.is_dev); // dev グループは開発依存
         assert_eq!(ruff.version_spec.kind, VersionSpecKind::GreaterOrEqual);
 
         let pytest = deps.iter().find(|d| d.name == "pytest").unwrap();
-        assert!(pytest.is_dev); // dev group is dev
+        assert!(pytest.is_dev); // dev グループは開発依存
 
         let mypy = deps.iter().find(|d| d.name == "mypy").unwrap();
-        assert!(mypy.is_dev); // lint group is dev
+        assert!(mypy.is_dev); // lint グループは開発依存
 
         let sphinx = deps.iter().find(|d| d.name == "sphinx").unwrap();
-        assert!(!sphinx.is_dev); // docs group is not dev
+        assert!(!sphinx.is_dev); // docs グループは開発依存ではない
     }
 
     #[test]
@@ -562,7 +558,7 @@ dev-dependencies = [
         assert!(!requests.is_dev);
 
         let ruff = deps.iter().find(|d| d.name == "ruff").unwrap();
-        assert!(ruff.is_dev); // Rye dev-dependencies should be marked as dev
+        assert!(ruff.is_dev); // Rye の dev-dependencies は開発依存になる
         assert_eq!(ruff.version_spec.kind, VersionSpecKind::GreaterOrEqual);
 
         let pytest = deps.iter().find(|d| d.name == "pytest").unwrap();
@@ -592,7 +588,7 @@ dependencies = [
 
     #[test]
     fn test_update_pep508_range_preserves_constraint() {
-        // Range型（>=X,<Y）は複合制約のため更新時に元の指定子を保持すべき
+        // 下限つき Range は上限制約を保ったまま下限だけ更新する
         let content = r#"
 [project]
 dependencies = [
@@ -601,18 +597,16 @@ dependencies = [
 "#;
 
         let result = PyprojectTomlParser
-            .update_version(content, "paramiko", "4.0.0")
+            .update_version(content, "paramiko", "3.9.1")
             .unwrap();
 
-        // Range型は元の指定子が保持されるべき
         assert!(
-            result.contains("paramiko>=3.5.0,<4.0.0"),
-            "Range constraint should be preserved, got: {}",
+            result.contains("paramiko>=3.9.1,<4.0.0"),
+            "Range constraint should keep the upper bound, got: {}",
             result
         );
-        // バグの症状: パッケージ名とバージョンがくっついてしまう
         assert!(
-            !result.contains("paramiko4.0.0"),
+            !result.contains("paramiko3.9.1"),
             "Version should not be concatenated with package name"
         );
     }
@@ -630,10 +624,9 @@ dependencies = [
             .update_version(content, "requests", "2.31.0")
             .unwrap();
 
-        // Range型は元の指定子が保持されるべき
         assert!(
-            result.contains("requests>=2.0, <3.0"),
-            "Range constraint with space should be preserved, got: {}",
+            result.contains("requests>=2.31.0, <3.0"),
+            "Range constraint with space should update the lower bound, got: {}",
             result
         );
     }
@@ -661,7 +654,7 @@ dependencies = [
 
     #[test]
     fn test_parse_pep508_without_version_is_skipped() {
-        // Dependencies without version specifiers should be skipped
+        // バージョン指定のない依存はスキップする
         let content = r#"
 [project]
 dependencies = [
@@ -677,7 +670,7 @@ dependencies = [
 
     #[test]
     fn test_parse_poetry_path_dependency_skipped() {
-        // Path dependencies in Poetry format should be skipped
+        // Poetry 形式の path 依存はスキップする
         let content = r#"
 [tool.poetry.dependencies]
 python = "^3.8"
@@ -692,7 +685,7 @@ local-pkg = { path = "../local-pkg" }
 
     #[test]
     fn test_parse_poetry_git_dependency_skipped() {
-        // Git dependencies in Poetry format should be skipped
+        // Poetry 形式の git 依存はスキップする
         let content = r#"
 [tool.poetry.dependencies]
 python = "^3.8"
@@ -707,7 +700,7 @@ my-pkg = { git = "https://github.com/user/my-pkg.git", branch = "main" }
 
     #[test]
     fn test_parse_pep508_with_url_skipped() {
-        // URL dependencies should be skipped
+        // URL 依存はスキップする
         let content = r#"
 [project]
 dependencies = [
@@ -723,7 +716,7 @@ dependencies = [
 
     #[test]
     fn test_parse_pep508_with_spaces_in_version() {
-        // PEP 508 allows spaces around operators; both spaced and compact forms should parse.
+        // PEP 508 では演算子前後の空白を許容する
         let content = r#"
 [project]
 dependencies = [
@@ -740,7 +733,7 @@ dependencies = [
 
     #[test]
     fn test_update_pep508_with_extras() {
-        // PEP 508 extras like coverage[toml]>=6.5 should be updated correctly
+        // PEP 508 の extras 付き依存も正しく更新する
         let content = r#"
 [project]
 dependencies = [
@@ -781,7 +774,7 @@ dependencies = [
 
     #[test]
     fn test_update_pep508_extras_with_range() {
-        // Range型 + extras の組み合わせ
+        // Range 型 + extras の組み合わせ
         let content = r#"
 [project]
 dependencies = [
@@ -793,12 +786,24 @@ dependencies = [
             .update_version(content, "coverage", "7.6.0")
             .unwrap();
 
-        // Range型は元の制約を保持すべき
         assert!(
-            result.contains("coverage[toml]>=6.5,<8.0"),
-            "Range constraint with extras should be preserved, got: {}",
+            result.contains("coverage[toml]>=7.6.0,<8.0"),
+            "Range constraint with extras should update the lower bound, got: {}",
             result
         );
+    }
+
+    #[test]
+    fn test_update_pep508_not_equal_constraint_returns_err() {
+        let content = r#"
+[project]
+dependencies = [
+    "requests!=2.31.0",
+]
+"#;
+
+        let result = PyprojectTomlParser.update_version(content, "requests", "2.32.0");
+        assert!(result.is_err());
     }
 
     #[test]
@@ -894,18 +899,18 @@ dev = [
 
         let deps = parse(content).unwrap();
 
-        // dependencies: numba, numpy, pydantic
+        // `dependencies` から通常依存を取得できることを確認する
         assert!(deps.iter().any(|d| d.name == "numba"));
         assert!(deps.iter().any(|d| d.name == "numpy"));
         assert!(deps.iter().any(|d| d.name == "pydantic"));
 
-        // optional-dependencies: self-reference はバージョンなしなのでスキップ
+        // `optional-dependencies` 内の自己参照はバージョンなしなのでスキップする
         assert!(!deps.iter().any(|d| d.name == "style-bert-vits2"));
 
         // onnx は train と infer 両方に出現するので2つ
         assert_eq!(deps.iter().filter(|d| d.name == "onnx").count(), 2);
 
-        // dependency-groups: coverage のみ (pytest, scipy, ruff はバージョンなし)
+        // `dependency-groups` では `coverage` のみが対象になる
         let coverage = deps.iter().find(|d| d.name == "coverage").unwrap();
         assert!(coverage.is_dev);
         assert_eq!(coverage.version_spec.kind, VersionSpecKind::GreaterOrEqual);
@@ -979,7 +984,7 @@ dev = [
 
     #[test]
     fn test_parse_full_optional_dependencies_groups() {
-        // optional-dependencies の全グループがパースされるか検証
+        // `optional-dependencies` の全グループが解釈されるか確認する
         let content = r#"
 [project]
 name = "style-bert-vits2"
@@ -1031,7 +1036,7 @@ dev = [
         let names: Vec<&str> = deps.iter().map(|d| d.name.as_str()).collect();
         println!("Parsed deps: {:?}", names);
 
-        // project.dependencies (3)
+        // `project.dependencies` の 3 件
         assert!(deps.iter().any(|d| d.name == "numba"), "numba missing");
         assert!(deps.iter().any(|d| d.name == "numpy"), "numpy missing");
         assert!(
@@ -1039,14 +1044,14 @@ dev = [
             "pydantic missing"
         );
 
-        // torch group (2 with versions)
+        // `torch` グループのうちバージョン付き 2 件
         assert!(deps.iter().any(|d| d.name == "torch"), "torch missing");
         assert!(
             deps.iter().any(|d| d.name == "torchaudio"),
             "torchaudio missing"
         );
 
-        // train group
+        // `train` グループ
         assert!(
             deps.iter().any(|d| d.name == "faster-whisper"),
             "faster-whisper missing"
@@ -1062,7 +1067,7 @@ dev = [
             "protobuf missing"
         );
 
-        // infer group (gradio, onnx は train にも出現するので重複あり)
+        // `infer` グループでは `gradio` と `onnx` が重複して現れる
         assert!(
             deps.iter().filter(|d| d.name == "gradio").count() >= 2,
             "gradio should appear in both train and infer"
@@ -1072,13 +1077,13 @@ dev = [
             "onnx should appear in both train and infer"
         );
 
-        // dependency-groups: coverage[toml] のみ
+        // `dependency-groups` では `coverage[toml]` のみが対象になる
         assert!(
             deps.iter().any(|d| d.name == "coverage"),
             "coverage missing"
         );
 
-        // self-reference (style-bert-vits2[torch]) やバージョンなしはスキップ
+        // 自己参照 (`style-bert-vits2[torch]`) やバージョンなし依存はスキップする
         assert!(!deps.iter().any(|d| d.name == "style-bert-vits2"));
         assert!(!deps.iter().any(|d| d.name == "accelerate"));
         assert!(

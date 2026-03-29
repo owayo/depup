@@ -307,17 +307,13 @@ mod tests {
     }
 
     #[test]
-    fn test_format_updated_range_has_no_prefix_suffix() {
-        // Range型はprefix/suffixが設定されていないため、
-        // format_updatedは新バージョンのみを返す（これは期待される動作）
-        // 呼び出し側でRange型を特別に処理する必要がある
+    fn test_format_updated_range_keeps_upper_bound() {
+        // Range 型は上限制約を残したまま下限だけを更新する
         let spec = parse(">=3.5.0,<4.0.0").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Range);
         assert!(spec.prefix.is_none());
         assert!(spec.suffix.is_none());
-        // 注意: Range型のformat_updatedは不完全な結果を返すため、
-        // 呼び出し側（pyproject_toml.rs）でRange型を特別に処理している
-        assert_eq!(spec.format_updated("4.0.0"), "4.0.0");
+        assert_eq!(spec.format_updated("3.9.1"), ">=3.9.1,<4.0.0");
     }
 
     #[test]

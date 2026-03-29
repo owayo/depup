@@ -1,12 +1,12 @@
-//! Cargo.toml parser for Rust projects
+//! Rust プロジェクト向けの `Cargo.toml` パーサ。
 //!
-//! Handles:
-//! - dependencies
-//! - dev-dependencies
-//! - build-dependencies
-//! - workspace.dependencies (for Cargo workspace root)
-//! - Inline table format: { version = "1.0" }
-//! - Workspace dependencies
+//! 対応対象:
+//! - `dependencies`
+//! - `dev-dependencies`
+//! - `build-dependencies`
+//! - `workspace.dependencies`（ワークスペースルート）
+//! - inline table 形式: `{ version = "1.0" }`
+//! - workspace 依存関係
 
 use crate::domain::{Dependency, Language};
 use crate::error::ManifestError;
@@ -16,7 +16,7 @@ use regex::Regex;
 use std::path::PathBuf;
 use toml::Value;
 
-/// Parser for Cargo.toml files
+/// `Cargo.toml` 用パーサ
 pub struct CargoTomlParser;
 
 impl ManifestParser for CargoTomlParser {
@@ -31,22 +31,22 @@ impl ManifestParser for CargoTomlParser {
         let mut dependencies = Vec::new();
         let parser = get_parser(Language::Rust);
 
-        // Parse regular dependencies
+        // 通常の依存関係を読む
         if let Some(deps) = toml.get("dependencies").and_then(|d| d.as_table()) {
             parse_cargo_dependencies(deps, parser.as_ref(), false, &mut dependencies);
         }
 
-        // Parse dev-dependencies
+        // 開発依存を読む
         if let Some(deps) = toml.get("dev-dependencies").and_then(|d| d.as_table()) {
             parse_cargo_dependencies(deps, parser.as_ref(), true, &mut dependencies);
         }
 
-        // Parse build-dependencies (treated as dev dependencies)
+        // build-dependencies は開発依存として扱う
         if let Some(deps) = toml.get("build-dependencies").and_then(|d| d.as_table()) {
             parse_cargo_dependencies(deps, parser.as_ref(), true, &mut dependencies);
         }
 
-        // Parse target-specific dependencies
+        // target 固有依存を読む
         if let Some(target) = toml.get("target").and_then(|t| t.as_table()) {
             for (_target_name, target_config) in target {
                 if let Some(deps) = target_config.get("dependencies").and_then(|d| d.as_table()) {
@@ -61,7 +61,7 @@ impl ManifestParser for CargoTomlParser {
             }
         }
 
-        // Parse workspace.dependencies (for Cargo workspace root Cargo.toml)
+        // ワークスペースルートの `workspace.dependencies` を読む
         if let Some(workspace) = toml.get("workspace").and_then(|w| w.as_table())
             && let Some(deps) = workspace.get("dependencies").and_then(|d| d.as_table())
         {
@@ -81,33 +81,33 @@ impl ManifestParser for CargoTomlParser {
         package: &str,
         new_version: &str,
     ) -> Result<String, ManifestError> {
-        // Strip semver build metadata (+...) to avoid Cargo warnings
+        // Cargo 警告を避けるため semver の build metadata (`+...`) は落とす
         let new_version = new_version.split('+').next().unwrap_or(new_version);
 
         let parser = get_parser(Language::Rust);
         let mut result = content.to_string();
         let mut updated = false;
 
-        // Pattern for simple version: package = "1.0.0" or package = "^1.0.0"
+        // 単純な依存宣言: `package = "1.0.0"` / `package = "^1.0.0"`
         let simple_pattern = format!(r#"(?m)^(\s*{})\s*=\s*"([^"]+)""#, regex::escape(package));
         if let Ok(re) = Regex::new(&simple_pattern)
             && let Some(caps) = re.captures(&result)
         {
             let old_version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-            // Check if this is a simple version string (not a path or git dependency)
+            // パス依存や git 依存ではない通常のバージョン文字列だけを対象にする
             if !old_version.contains('/')
                 && !old_version.starts_with('{')
                 && let Some(spec) = parser.parse(old_version)
+                && let Some(new_ver) = spec.try_format_updated(new_version)
             {
-                let new_ver = spec.format_updated(new_version);
                 let replacement = format!(r#"{} = "{}""#, &caps[1], new_ver);
                 result = re.replace(&result, replacement.as_str()).to_string();
                 updated = true;
             }
         }
 
-        // Pattern for inline table: package = { version = "1.0.0", ... }
-        // Match only the version value part to preserve the rest of the line
+        // inline table 形式: `package = { version = "1.0.0", ... }`
+        // 行の残りを保つため、version の値だけを差し替える
         let table_pattern = format!(
             r#"(?m)({})\s*=\s*\{{\s*version\s*=\s*"([^"]+)""#,
             regex::escape(package)
@@ -116,18 +116,19 @@ impl ManifestParser for CargoTomlParser {
             && let Some(caps) = re.captures(&result)
         {
             let old_version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-            if let Some(spec) = parser.parse(old_version) {
-                let new_ver = spec.format_updated(new_version);
+            if let Some(spec) = parser.parse(old_version)
+                && let Some(new_ver) = spec.try_format_updated(new_version)
+            {
                 let replacement = format!(r#"{} = {{ version = "{}""#, &caps[1], new_ver);
                 result = re.replace(&result, replacement.as_str()).to_string();
                 updated = true;
             }
         }
 
-        // Pattern for multi-line table format:
+        // 複数行テーブル:
         // [dependencies.package]
         // version = "1.0.0"
-        // Also handles [workspace.dependencies.package]
+        // [workspace.dependencies.package] も含めて処理する
         let multiline_pattern = format!(
             r#"(?m)(\[(?:dependencies|dev-dependencies|build-dependencies|workspace\.dependencies)\.{}[^\]]*\][^\[]*version\s*=\s*)"([^"]+)""#,
             regex::escape(package)
@@ -136,8 +137,9 @@ impl ManifestParser for CargoTomlParser {
             && let Some(caps) = re.captures(&result)
         {
             let old_version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-            if let Some(spec) = parser.parse(old_version) {
-                let new_ver = spec.format_updated(new_version);
+            if let Some(spec) = parser.parse(old_version)
+                && let Some(new_ver) = spec.try_format_updated(new_version)
+            {
                 let replacement = format!(r#"{}"{}""#, &caps[1], new_ver);
                 result = re.replace(&result, replacement.as_str()).to_string();
                 updated = true;
@@ -164,9 +166,9 @@ fn parse_cargo_dependencies(
 ) {
     for (name, value) in deps {
         let version_str = match value {
-            // Simple string: package = "1.0.0"
+            // 単純な文字列: `package = "1.0.0"`
             Value::String(s) => Some(s.clone()),
-            // Inline table: package = { version = "1.0.0", features = [...] }
+            // inline table 形式: `package = { version = "1.0.0", features = [...] }`
             Value::Table(t) => t.get("version").and_then(|v| v.as_str()).map(String::from),
             _ => None,
         };
@@ -327,7 +329,7 @@ my-crate = { git = "https://github.com/example/my-crate" }
 "#;
 
         let deps = parse(content).unwrap();
-        // Git dependencies without version should be skipped
+        // バージョンを持たない git 依存はスキップする
         assert!(deps.is_empty());
     }
 
@@ -339,7 +341,7 @@ local-crate = { path = "../local-crate" }
 "#;
 
         let deps = parse(content).unwrap();
-        // Path dependencies without version should be skipped
+        // バージョンを持たない path 依存はスキップする
         assert!(deps.is_empty());
     }
 
@@ -351,7 +353,7 @@ serde = { workspace = true }
 "#;
 
         let deps = parse(content).unwrap();
-        // Workspace dependencies without explicit version should be skipped
+        // 明示バージョンのない workspace 依存はスキップする
         assert!(deps.is_empty());
     }
 
@@ -412,6 +414,19 @@ tokio = "^1.28.0"
             .update_version(content, "tokio", "1.35.0")
             .unwrap();
         assert!(result.contains("\"^1.35.0\""));
+    }
+
+    #[test]
+    fn test_update_range_version_keeps_upper_bound() {
+        let content = r#"
+[dependencies]
+serde = ">=1.0, <2.0"
+"#;
+
+        let result = CargoTomlParser
+            .update_version(content, "serde", "1.9.3")
+            .unwrap();
+        assert!(result.contains("\">=1.9.3, <2.0\""));
     }
 
     #[test]
@@ -483,12 +498,12 @@ version = "0.21"
             .update_version(content, "tree-sitter", "0.26.3")
             .unwrap();
 
-        // Check that version is properly quoted
+        // version が正しく引用符で囲まれていることを確認する
         assert!(result.contains("version = \"0.26.3\""));
-        // Ensure closing quote exists
+        // 閉じ引用符が欠けていないことを確認する
         assert!(!result.contains("\"0.26.3\n"));
 
-        // Update second package
+        // 2つ目のパッケージも更新する
         let result2 = CargoTomlParser
             .update_version(&result, "tree-sitter-bash", "0.25.1")
             .unwrap();
@@ -514,10 +529,10 @@ features = ["derive"]
 
     #[test]
     fn test_update_mixed_dependency_formats() {
-        // Real-world Cargo.toml with mixed formats:
-        // - Simple format: pkg = "version"
-        // - Inline table: pkg = { version = "...", features = [...] }
-        // - Multiline table: [dependencies.pkg]
+        // 実運用に近い混在形式の Cargo.toml:
+        // - 単純形式: `pkg = "version"`
+        // - inline table 形式: `pkg = { version = "...", features = [...] }`
+        // - 複数行テーブル: `[dependencies.pkg]`
         let content = r#"[package]
 name = "example-hooks"
 version = "0.1.0"
@@ -549,32 +564,32 @@ default = ["ast-parser"]
 ast-parser = ["ts-parser", "ts-bash"]
 "#;
 
-        // Test simple format update
+        // 単純形式の更新
         let result = CargoTomlParser
             .update_version(content, "serde_json", "1.0.140")
             .unwrap();
         assert!(result.contains("serde_json = \"1.0.140\""));
 
-        // Test inline table format update
+        // inline table 形式の更新
         let result = CargoTomlParser
             .update_version(&result, "clap", "4.5.0")
             .unwrap();
         assert!(result.contains("version = \"4.5.0\""));
         assert!(result.contains("features = [\"derive\"]"));
 
-        // Test another inline table
+        // 別の inline table も更新する
         let result = CargoTomlParser
             .update_version(&result, "tracing-subscriber", "0.3.20")
             .unwrap();
         assert!(result.contains("version = \"0.3.20\""));
         assert!(result.contains("features = [\"env-filter\"]"));
 
-        // Test multiline table format - must have proper closing quotes
+        // 複数行テーブル形式の更新でも引用符が壊れないことを確認する
         let result = CargoTomlParser
             .update_version(&result, "ts-parser", "0.26.3")
             .unwrap();
         assert!(result.contains("version = \"0.26.3\""));
-        // Verify closing quote exists (not broken)
+        // 閉じ引用符が壊れていないことを確認する
         assert!(!result.contains("\"0.26.3\n["));
 
         let result = CargoTomlParser
@@ -583,13 +598,13 @@ ast-parser = ["ts-parser", "ts-bash"]
         assert!(result.contains("version = \"0.25.1\""));
         assert!(!result.contains("\"0.25.1\n["));
 
-        // Verify all updates are preserved
+        // すべての更新結果が保持されていることを確認する
         assert!(result.contains("serde_json = \"1.0.140\""));
         assert!(result.contains("clap = { version = \"4.5.0\""));
         assert!(result.contains("version = \"0.26.3\""));
         assert!(result.contains("version = \"0.25.1\""));
 
-        // Verify unrelated content is preserved
+        // 関係ない内容が保持されていることを確認する
         assert!(result.contains("[features]"));
         assert!(result.contains("ast-parser = [\"ts-parser\", \"ts-bash\"]"));
     }
@@ -645,7 +660,7 @@ thiserror = "2"
             .update_version(content, "serde_json", "1.0.140")
             .unwrap();
         assert!(result.contains("serde_json = \"1.0.140\""));
-        // Ensure other dependencies are preserved
+        // 他の依存関係が保持されていることを確認する
         assert!(result.contains("thiserror = \"2\""));
     }
 
@@ -694,7 +709,7 @@ features = ["derive"]
 
     #[test]
     fn test_parse_full_workspace_cargo_toml() {
-        // Real-world example from the user
+        // ユーザーの実例に近いワークスペース構成
         let content = r#"
 [workspace]
 resolver = "2"
@@ -739,10 +754,10 @@ swift-bridge-build = "0.1"
 "#;
 
         let deps = parse(content).unwrap();
-        // Should parse all workspace.dependencies (16 total)
+        // `workspace.dependencies` をすべて解釈できることを確認する（合計16件）
         assert_eq!(deps.len(), 16);
 
-        // Verify some specific dependencies
+        // 代表的な依存関係の内容を確認する
         let portable_pty = deps.iter().find(|d| d.name == "portable-pty").unwrap();
         assert_eq!(portable_pty.version_spec.version, "0.9");
 
@@ -769,27 +784,27 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 "#;
 
-        // Update simple format
+        // 単純形式を更新する
         let result = CargoTomlParser
             .update_version(content, "portable-pty", "0.10.0")
             .unwrap();
         assert!(result.contains("portable-pty = \"0.10.0\""));
 
-        // Update inline table format
+        // inline table 形式を更新する
         let result = CargoTomlParser
             .update_version(&result, "tokio", "1.45.0")
             .unwrap();
         assert!(result.contains("version = \"1.45.0\""));
         assert!(result.contains("features = [\"full\"]"));
 
-        // Verify workspace metadata is preserved
+        // workspace メタデータが保持されていることを確認する
         assert!(result.contains("resolver = \"2\""));
         assert!(result.contains("members = [\"crates/core\"]"));
     }
 
     #[test]
     fn test_parse_workspace_with_regular_dependencies() {
-        // Workspace root with both workspace.dependencies and regular dependencies
+        // `workspace.dependencies` と通常依存が共存する workspace ルート
         let content = r#"
 [workspace]
 resolver = "2"
@@ -809,18 +824,18 @@ criterion = "0.5"
         let deps = parse(content).unwrap();
         assert_eq!(deps.len(), 4);
 
-        // Workspace dependencies
+        // workspace 依存
         let tokio = deps.iter().find(|d| d.name == "tokio").unwrap();
         assert!(!tokio.is_dev);
 
         let serde = deps.iter().find(|d| d.name == "serde").unwrap();
         assert!(!serde.is_dev);
 
-        // Regular dependencies
+        // 通常依存
         let clap = deps.iter().find(|d| d.name == "clap").unwrap();
         assert!(!clap.is_dev);
 
-        // Dev dependencies
+        // 開発依存
         let criterion = deps.iter().find(|d| d.name == "criterion").unwrap();
         assert!(criterion.is_dev);
     }
@@ -832,11 +847,11 @@ criterion = "0.5"
 toml = "0.8.0"
 "#;
 
-        // crates.io returns versions like "1.0.0+spec-1.1.0"
+        // crates.io は `"1.0.0+spec-1.1.0"` のような build metadata 付きで返す場合がある
         let result = CargoTomlParser
             .update_version(content, "toml", "1.0.0+spec-1.1.0")
             .unwrap();
-        // Build metadata should be stripped
+        // build metadata は書き込み前に除去する
         assert!(result.contains("\"1.0.0\""));
         assert!(!result.contains("+spec-1.1.0"));
     }

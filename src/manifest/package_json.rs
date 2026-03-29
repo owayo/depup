@@ -81,9 +81,10 @@ impl ManifestParser for PackageJsonParser {
             let old_version = &caps[2];
 
             if let Some((parse_target, alias_prefix)) = normalize_node_constraint(old_version) {
-                if let Some(spec) = parser.parse(parse_target) {
+                if let Some(spec) = parser.parse(parse_target)
+                    && let Some(new_ver) = spec.try_format_updated(new_version)
+                {
                     updated = true;
-                    let new_ver = spec.format_updated(new_version);
                     let rendered = if let Some(alias) = alias_prefix {
                         format!("{}{}", alias, new_ver)
                     } else {
@@ -402,6 +403,32 @@ mod tests {
             .update_version(content, "pkg", "2.3.4")
             .unwrap();
         assert!(result.contains("\"pkg\": \"v2.*\""));
+    }
+
+    #[test]
+    fn test_update_version_range_keeps_upper_bound() {
+        let content = r#"{
+  "dependencies": {
+    "pkg": ">=1.0.0 <2.0.0"
+  }
+}"#;
+
+        let result = PackageJsonParser
+            .update_version(content, "pkg", "1.9.3")
+            .unwrap();
+        assert!(result.contains("\"pkg\": \">=1.9.3 <2.0.0\""));
+    }
+
+    #[test]
+    fn test_update_version_or_constraint_returns_err() {
+        let content = r#"{
+  "dependencies": {
+    "pkg": "^1 || ^2"
+  }
+}"#;
+
+        let result = PackageJsonParser.update_version(content, "pkg", "2.5.0");
+        assert!(result.is_err());
     }
 
     #[test]

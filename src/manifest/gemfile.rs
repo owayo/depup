@@ -225,7 +225,13 @@ impl ManifestParser for GemfileParser {
                                 });
                             }
 
-                            let new_ver = spec.format_updated(new_version);
+                            let Some(new_ver) = spec.try_format_updated(new_version) else {
+                                return Err(ManifestError::InvalidVersionSpec {
+                                    path: PathBuf::from("Gemfile"),
+                                    spec: package.to_string(),
+                                    message: "この制約は安全に書き換えられません".to_string(),
+                                });
+                            };
                             let version_range = version_parts[0].range();
                             let mut updated_line = String::with_capacity(
                                 line.len() - old_version.len() + new_ver.len(),

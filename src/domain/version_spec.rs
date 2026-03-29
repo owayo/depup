@@ -59,12 +59,7 @@ pub struct VersionSpec {
     pub suffix: Option<String>,
 }
 
-fn format_wildcard_like(raw: &str, new_version: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if matches!(trimmed, "*" | "x" | "X") {
-        return Some(trimmed.to_string());
-    }
-
+fn extract_numeric_parts(new_version: &str) -> Option<Vec<String>> {
     let numeric_head = new_version
         .strip_prefix('v')
         .or_else(|| new_version.strip_prefix('V'))
@@ -73,19 +68,24 @@ fn format_wildcard_like(raw: &str, new_version: &str) -> Option<String> {
         .next()
         .unwrap_or("");
 
-    if numeric_head.is_empty() {
-        return Some(trimmed.to_string());
-    }
-
-    let mut parts: Vec<String> = numeric_head
+    let parts: Vec<String> = numeric_head
         .split('.')
         .filter(|part| !part.is_empty())
         .map(ToString::to_string)
         .collect();
 
-    if parts.is_empty() {
+    if parts.is_empty() { None } else { Some(parts) }
+}
+
+fn format_wildcard_like(raw: &str, new_version: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if matches!(trimmed, "*" | "x" | "X") {
         return Some(trimmed.to_string());
     }
+
+    let Some(mut parts) = extract_numeric_parts(new_version) else {
+        return Some(trimmed.to_string());
+    };
 
     let segments: Vec<&str> = trimmed.split('.').collect();
     while parts.len() < segments.len() {
@@ -127,6 +127,133 @@ fn format_wildcard_like(raw: &str, new_version: &str) -> Option<String> {
     Some(rebuilt.join("."))
 }
 
+fn format_partial_version_like(raw: &str, new_version: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let (prefix, core) = if let Some(rest) = trimmed.strip_prefix('v') {
+        ("v", rest)
+    } else if let Some(rest) = trimmed.strip_prefix('V') {
+        ("V", rest)
+    } else {
+        ("", trimmed)
+    };
+
+    if core.is_empty()
+        || !core
+            .split('.')
+            .all(|segment| !segment.is_empty() && segment.chars().all(|ch| ch.is_ascii_digit()))
+    {
+        return None;
+    }
+
+    let segment_count = core.split('.').count();
+    let mut parts = extract_numeric_parts(new_version)?;
+    while parts.len() < segment_count {
+        parts.push("0".to_string());
+    }
+
+    Some(format!("{}{}", prefix, parts[..segment_count].join(".")))
+}
+
+fn preserve_version_prefix(template: &str, new_version: &str) -> String {
+    let stripped = new_version
+        .strip_prefix('v')
+        .or_else(|| new_version.strip_prefix('V'))
+        .unwrap_or(new_version);
+
+    if template.starts_with('V') {
+        format!("V{}", stripped)
+    } else if template.starts_with('v') {
+        format!("v{}", stripped)
+    } else {
+        stripped.to_string()
+    }
+}
+
+fn find_first_version_token(raw: &str) -> Option<(usize, usize)> {
+    let chars: Vec<(usize, char)> = raw.char_indices().collect();
+
+    for (index, &(start, ch)) in chars.iter().enumerate() {
+        let looks_like_start = ch.is_ascii_digit()
+            || ((ch == 'v' || ch == 'V')
+                && chars
+                    .get(index + 1)
+                    .map(|(_, next)| next.is_ascii_digit())
+                    .unwrap_or(false));
+        if !looks_like_start {
+            continue;
+        }
+
+        let mut end = raw.len();
+        for &(candidate_end, candidate) in chars.iter().skip(index + 1) {
+            if !(candidate.is_ascii_alphanumeric()
+                || matches!(candidate, '.' | '*' | '+' | '-' | '_'))
+            {
+                end = candidate_end;
+                break;
+            }
+        }
+
+        return Some((start, end));
+    }
+
+    None
+}
+
+fn format_range_like(raw: &str, new_version: &str) -> Option<String> {
+    let trimmed = raw.trim();
+
+    if trimmed.contains("||")
+        || trimmed.starts_with("!=")
+        || trimmed.contains(",!=")
+        || trimmed.contains(" !==")
+        || trimmed.starts_with("===")
+    {
+        return None;
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("==") {
+        let spacing_len = rest.len() - rest.trim_start().len();
+        let spacing = &rest[..spacing_len];
+        let body = rest.trim();
+        if body.contains('*') {
+            return format_wildcard_like(body, new_version)
+                .map(|formatted| format!("=={}{}", spacing, formatted));
+        }
+    }
+
+    let has_explicit_range_syntax = trimmed.contains('<')
+        || trimmed.contains('>')
+        || trimmed.contains(',')
+        || trimmed.contains(" - ")
+        || trimmed.contains("..<")
+        || trimmed.contains("...");
+
+    if !has_explicit_range_syntax
+        && !trimmed.starts_with('[')
+        && !trimmed.starts_with('(')
+        && !trimmed.starts_with(']')
+    {
+        return format_partial_version_like(trimmed, new_version);
+    }
+
+    if matches!(trimmed.chars().next(), Some('[' | '(' | ']'))
+        && let Some(comma_index) = trimmed.find(',')
+        && trimmed[1..comma_index].trim().is_empty()
+    {
+        return None;
+    }
+
+    let (start, end) = find_first_version_token(raw)?;
+    let token = &raw[start..end];
+    let replacement = if token.contains('*') {
+        format_wildcard_like(token, new_version)?
+    } else {
+        preserve_version_prefix(token, new_version)
+    };
+
+    Some(format!("{}{}{}", &raw[..start], replacement, &raw[end..]))
+}
+
 impl VersionSpec {
     /// 新しい VersionSpec を作る
     pub fn new(kind: VersionSpecKind, raw: impl Into<String>, version: impl Into<String>) -> Self {
@@ -156,27 +283,33 @@ impl VersionSpec {
         self.kind.is_pinned()
     }
 
+    /// 安全に更新後の文字列表現を組み立てられる場合だけ返す
+    pub fn try_format_updated(&self, new_version: &str) -> Option<String> {
+        match self.kind {
+            VersionSpecKind::Wildcard => format_wildcard_like(&self.raw, new_version),
+            VersionSpecKind::Range => format_range_like(&self.raw, new_version),
+            _ => {
+                let mut result = String::new();
+
+                if let Some(ref prefix) = self.prefix {
+                    result.push_str(prefix);
+                }
+
+                result.push_str(new_version);
+
+                if let Some(ref suffix) = self.suffix {
+                    result.push_str(suffix);
+                }
+
+                Some(result)
+            }
+        }
+    }
+
     /// 元の書式を保ちながら新しいバージョン文字列を組み立てる
     pub fn format_updated(&self, new_version: &str) -> String {
-        if self.kind == VersionSpecKind::Wildcard
-            && let Some(formatted) = format_wildcard_like(&self.raw, new_version)
-        {
-            return formatted;
-        }
-
-        let mut result = String::new();
-
-        if let Some(ref prefix) = self.prefix {
-            result.push_str(prefix);
-        }
-
-        result.push_str(new_version);
-
-        if let Some(ref suffix) = self.suffix {
-            result.push_str(suffix);
-        }
-
-        result
+        self.try_format_updated(new_version)
+            .unwrap_or_else(|| self.raw.clone())
     }
 }
 
@@ -315,6 +448,66 @@ mod tests {
     fn test_format_updated_floating_multi_segment_wildcard_stays_same() {
         let spec = VersionSpec::new(VersionSpecKind::Wildcard, "x.x", "");
         assert_eq!(spec.format_updated("2.3.4"), "x.x");
+    }
+
+    #[test]
+    fn test_try_format_updated_range_replaces_lower_bound() {
+        let spec = VersionSpec::new(VersionSpecKind::Range, ">=1.0,<2.0", "1.0");
+        assert_eq!(
+            spec.try_format_updated("1.9.3").as_deref(),
+            Some(">=1.9.3,<2.0")
+        );
+    }
+
+    #[test]
+    fn test_try_format_updated_range_preserves_spacing() {
+        let spec = VersionSpec::new(VersionSpecKind::Range, ">= 1.0, < 2.0", "1.0");
+        assert_eq!(
+            spec.try_format_updated("1.9.3").as_deref(),
+            Some(">= 1.9.3, < 2.0")
+        );
+    }
+
+    #[test]
+    fn test_try_format_updated_range_hyphen_updates_left_side() {
+        let spec = VersionSpec::new(VersionSpecKind::Range, "1.0 - 2.0", "1.0");
+        assert_eq!(
+            spec.try_format_updated("1.9.3").as_deref(),
+            Some("1.9.3 - 2.0")
+        );
+    }
+
+    #[test]
+    fn test_try_format_updated_range_maven_updates_lower_bound() {
+        let spec = VersionSpec::new(VersionSpecKind::Range, "[1.0,2.0)", "1.0");
+        assert_eq!(
+            spec.try_format_updated("1.9.3").as_deref(),
+            Some("[1.9.3,2.0)")
+        );
+    }
+
+    #[test]
+    fn test_try_format_updated_range_partial_version_preserves_shape() {
+        let spec = VersionSpec::new(VersionSpecKind::Range, "1.2", "1.2.0");
+        assert_eq!(spec.try_format_updated("2.3.4").as_deref(), Some("2.3"));
+    }
+
+    #[test]
+    fn test_try_format_updated_range_python_prefix_wildcard() {
+        let spec = VersionSpec::new(VersionSpecKind::Range, "==1.2.*", "1.2");
+        assert_eq!(spec.try_format_updated("2.3.4").as_deref(), Some("==2.3.*"));
+    }
+
+    #[test]
+    fn test_try_format_updated_range_rejects_not_equal() {
+        let spec = VersionSpec::new(VersionSpecKind::Range, "!=1.2.3", "1.2.3");
+        assert!(spec.try_format_updated("2.0.0").is_none());
+    }
+
+    #[test]
+    fn test_try_format_updated_range_rejects_or_constraint() {
+        let spec = VersionSpec::new(VersionSpecKind::Range, "^1 || ^2", "1");
+        assert!(spec.try_format_updated("2.0.0").is_none());
     }
 
     #[test]

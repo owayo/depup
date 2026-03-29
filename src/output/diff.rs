@@ -1,27 +1,27 @@
-//! Diff output formatter for showing changes
+//! 変更内容を unified diff 風に表示するフォーマッタ。
 //!
-//! This module provides:
-//! - Unified diff format display
-//! - Before/after version comparison
+//! 提供内容:
+//! - unified diff 形式の表示
+//! - 更新前後バージョンの比較
 
 use crate::domain::{ManifestUpdateResult, UpdateResult, UpdateSummary};
 use crate::orchestrator::OrchestratorResult;
 use crate::output::OutputFormatter;
 use std::io::Write;
 
-/// Diff formatter for showing version changes
+/// バージョン変更を diff 形式で表示するフォーマッタ
 pub struct DiffFormatter {
-    /// Whether this is a dry-run
+    /// dry-run かどうか
     dry_run: bool,
 }
 
 impl DiffFormatter {
-    /// Create a new diff formatter
+    /// 新しい `DiffFormatter` を作る
     pub fn new(dry_run: bool) -> Self {
         Self { dry_run }
     }
 
-    /// Get the dry-run prefix if applicable
+    /// 必要なら dry-run 接頭辞を返す
     fn dry_run_prefix(&self) -> &'static str {
         if self.dry_run { "(dry-run) " } else { "" }
     }
@@ -32,16 +32,16 @@ impl OutputFormatter for DiffFormatter {
         let prefix = self.dry_run_prefix();
 
         for manifest in &result.summary.manifests {
-            // Skip manifests with no updates
+            // 更新のないマニフェストは出力しない
             if !manifest.has_updates() {
                 continue;
             }
 
-            // Write diff header
+            // diff ヘッダを書く
             writeln!(writer, "{}--- a/{}", prefix, manifest.path.display())?;
             writeln!(writer, "{}+++ b/{}", prefix, manifest.path.display())?;
 
-            // Write each update as a diff hunk
+            // 各更新を diff hunk として書く
             for result in manifest.updates() {
                 if let UpdateResult::Update {
                     dependency,
@@ -50,7 +50,10 @@ impl OutputFormatter for DiffFormatter {
                 } = result
                 {
                     let old_version = &dependency.version_spec.raw;
-                    let new_formatted = dependency.version_spec.format_updated(new_version);
+                    let new_formatted = dependency
+                        .version_spec
+                        .try_format_updated(new_version)
+                        .unwrap_or_else(|| dependency.version_spec.raw.clone());
 
                     writeln!(writer, "@@ {} @@", dependency.name)?;
                     writeln!(writer, "-  \"{}\": \"{}\"", dependency.name, old_version)?;
@@ -61,7 +64,7 @@ impl OutputFormatter for DiffFormatter {
             writeln!(writer)?;
         }
 
-        // Write summary at the end
+        // 最後にサマリを書く
         let updates = result.summary.total_updates();
         writeln!(
             writer,
@@ -101,11 +104,11 @@ impl OutputFormatter for DiffFormatter {
             return Ok(());
         }
 
-        // Write diff header
+        // diff ヘッダを書く
         writeln!(writer, "{}--- a/{}", prefix, manifest.path.display())?;
         writeln!(writer, "{}+++ b/{}", prefix, manifest.path.display())?;
 
-        // Write each update as a diff hunk
+        // 各更新を diff hunk として書く
         for result in manifest.updates() {
             if let UpdateResult::Update {
                 dependency,
@@ -114,7 +117,10 @@ impl OutputFormatter for DiffFormatter {
             } = result
             {
                 let old_version = &dependency.version_spec.raw;
-                let new_formatted = dependency.version_spec.format_updated(new_version);
+                let new_formatted = dependency
+                    .version_spec
+                    .try_format_updated(new_version)
+                    .unwrap_or_else(|| dependency.version_spec.raw.clone());
 
                 writeln!(writer, "@@ {} @@", dependency.name)?;
                 writeln!(writer, "-  \"{}\": \"{}\"", dependency.name, old_version)?;
@@ -178,7 +184,7 @@ mod tests {
         formatter.format(&result, &mut output).unwrap();
         let output_str = String::from_utf8(output).unwrap();
 
-        // Verify diff format
+        // diff 形式で出力されることを確認する
         assert!(output_str.contains("--- a/package.json"));
         assert!(output_str.contains("+++ b/package.json"));
         assert!(output_str.contains("@@ lodash @@"));
@@ -213,7 +219,7 @@ mod tests {
         formatter.format(&result, &mut output).unwrap();
         let output_str = String::from_utf8(output).unwrap();
 
-        // Should just have the summary line
+        // サマリ行だけが出力される
         assert!(output_str.contains("# 0 package(s) would be updated"));
         assert!(!output_str.contains("---"));
     }

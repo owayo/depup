@@ -54,7 +54,7 @@
 
 - **Multi-Language Support**: Node.js, Python, Rust, Go, Ruby, PHP, Java, Swift
 - **Manifest Updates**: Directly updates version specifications in manifest files
-- **Smart Version Handling**: Preserves version range formats (^, ~, >=)
+- **Smart Version Handling**: Preserves version range formats (^, ~, >=) while keeping upper bounds intact
 - **Pinned Version Detection**: Skips intentionally pinned versions by default
 - **Age Filter**: Only update to versions released N days/weeks ago
 - **pnpm Integration**: Respects `minimumReleaseAge` from pnpm settings
@@ -269,24 +269,26 @@ Floating selectors such as `"*"`, npm dist-tags like `"latest"`, and Gradle dyna
 depup respects upper-bound range constraints (both exclusive and inclusive):
 
 ```
-">=3.5.0,<4.0.0"   → preserved as-is, updates only below 4.0.0
-">=1.0,<=2.0"      → preserved as-is, updates up to and including 2.0
-"4.0.0..<5.0.0"    → preserved as-is, updates only below 5.0.0
-"4.0.0...4.9.9"    → preserved as-is, updates up to and including 4.9.9
-"1.2.0 - 2.0.0"    → preserved as-is, updates up to and including 2.0.0 (npm hyphen)
-"[1.0,2.0)"        → preserved as-is, updates only below 2.0 (Maven-style)
-"[1.0,2.0]"        → preserved as-is, updates up to and including 2.0 (Maven-style)
-"[1.0,2.0.Final)"  → preserved as-is, updates only below 2.0.Final (Maven qualifier)
-"]1.0,2.0["        → preserved as-is, updates only below 2.0 (Maven alt brackets)
-"]1.0,2.0]"        → preserved as-is, updates up to and including 2.0 (Maven alt inclusive)
-"[1.0,2.0["        → preserved as-is, updates only below 2.0 (Maven alt upper bracket)
+">=3.5.0,<4.0.0"   → ">=3.9.1,<4.0.0"
+">=1.0,<=2.0"      → ">=2.0,<=2.0"
+"4.0.0..<5.0.0"    → "4.99.0..<5.0.0"
+"4.0.0...4.9.9"    → "4.9.9...4.9.9"
+"1.2.0 - 2.0.0"    → "1.9.3 - 2.0.0" (npm hyphen)
+"[1.0,2.0)"        → "[1.9.3,2.0)" (Maven-style)
+"[1.0,2.0]"        → "[2.0,2.0]" (Maven-style)
+"[1.0,2.0.Final)"  → "[1.9.3,2.0.Final)" (Maven qualifier)
+"]1.0,2.0["        → "]1.9.3,2.0[" (Maven alt brackets)
+"]1.0,2.0]"        → "]2.0,2.0]" (Maven alt inclusive)
+"[1.0,2.0["        → "[1.9.3,2.0[" (Maven alt upper bracket)
 ```
 
 When a dependency has an upper bound constraint (e.g., `<4.0.0`, `<=2.0`, `...4.9.9`), depup will:
 - **Not propose** versions that exceed the upper bound
 - Keep inclusive boundaries (`<=`, `...`) eligible
-- **Preserve** the original constraint format in the manifest file
-- **Only update** within the specified range if a newer compatible version exists
+- **Preserve** the original constraint shape in the manifest file
+- **Update only the lower-bound side** to the newest compatible version within the range
+
+Constraints that cannot be rewritten safely are skipped instead of being rewritten partially. This includes examples such as npm/Composer OR constraints (`^1 || ^2`), exclusion-only constraints (`!=1.2.3`), and Maven-style ranges without a lower bound (`(,2.0]`).
 
 For Swift GitHub dependencies, depup recognizes both `v1.2.3` and `V1.2.3` tag prefixes.
 

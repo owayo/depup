@@ -1,10 +1,10 @@
-//! composer.json parser for PHP projects
+//! PHP プロジェクト向けの `composer.json` パーサ。
 //!
-//! Handles:
-//! - require (production dependencies)
-//! - require-dev (development dependencies)
-//! - PHP platform package filtering (php, ext-*)
-//! - Version constraint preservation during updates
+//! 対応対象:
+//! - `require`（本番依存）
+//! - `require-dev`（開発依存）
+//! - PHP プラットフォームパッケージ（`php`, `ext-*` など）の除外
+//! - 更新時のバージョン制約保持
 
 use crate::domain::{Dependency, Language};
 use crate::error::ManifestError;
@@ -14,7 +14,7 @@ use regex::Regex;
 use serde_json::{Map, Value};
 use std::path::PathBuf;
 
-/// Parser for composer.json files
+/// `composer.json` 用パーサ
 pub struct ComposerJsonParser;
 
 impl ManifestParser for ComposerJsonParser {
@@ -28,12 +28,12 @@ impl ManifestParser for ComposerJsonParser {
         let mut dependencies = Vec::new();
         let parser = get_parser(Language::Php);
 
-        // Parse require (production dependencies)
+        // `require`（本番依存）を読む
         if let Some(deps) = json.get("require").and_then(|v| v.as_object()) {
             parse_dependency_object(deps, parser.as_ref(), false, &mut dependencies);
         }
 
-        // Parse require-dev (development dependencies)
+        // `require-dev`（開発依存）を読む
         if let Some(deps) = json.get("require-dev").and_then(|v| v.as_object()) {
             parse_dependency_object(deps, parser.as_ref(), true, &mut dependencies);
         }
@@ -53,9 +53,9 @@ impl ManifestParser for ComposerJsonParser {
     ) -> Result<String, ManifestError> {
         let parser = get_parser(Language::Php);
 
-        // Use regex-based text replacement to preserve original formatting
-        // Pattern matches: "vendor/package": "version" with flexible whitespace
-        // Escape special characters in package name
+        // 元の整形を保つため、正規表現ベースのテキスト置換で更新する
+        // `"vendor/package": "version"` を空白ゆらぎ込みで拾う
+        // パッケージ名中の特殊文字は正規表現用にエスケープする
         let escaped_package = regex::escape(package);
         let pattern = format!(r#"("{}"\s*:\s*)"([^"]+)""#, escaped_package);
 
@@ -71,11 +71,13 @@ impl ManifestParser for ComposerJsonParser {
             let old_version = &caps[2];
 
             if let Some(spec) = parser.parse(old_version) {
-                updated = true;
-                let new_ver = spec.format_updated(new_version);
-                format!(r#"{}"{}""#, prefix, new_ver)
+                if let Some(new_ver) = spec.try_format_updated(new_version) {
+                    updated = true;
+                    return format!(r#"{}"{}""#, prefix, new_ver);
+                }
+                caps[0].to_string()
             } else {
-                // If we can't parse the version, keep the original
+                // 解釈できない制約は元の値を維持する
                 caps[0].to_string()
             }
         });
@@ -92,7 +94,7 @@ impl ManifestParser for ComposerJsonParser {
     }
 }
 
-/// Check if a package name is a platform package (php, ext-*, lib-*)
+/// パッケージ名がプラットフォームパッケージかどうかを返す
 fn is_platform_package(name: &str) -> bool {
     name == "php"
         || name.starts_with("php-")
@@ -110,7 +112,7 @@ fn parse_dependency_object(
     output: &mut Vec<Dependency>,
 ) {
     for (name, version_value) in deps {
-        // Skip platform packages
+        // プラットフォームパッケージは更新対象から除外する
         if is_platform_package(name) {
             continue;
         }
@@ -351,6 +353,32 @@ mod tests {
     }
 
     #[test]
+    fn test_update_version_range_keeps_upper_bound() {
+        let content = r#"{
+  "require": {
+    "vendor/package": ">=1.0 <2.0"
+  }
+}"#;
+
+        let result = ComposerJsonParser
+            .update_version(content, "vendor/package", "1.9.3")
+            .unwrap();
+        assert!(result.contains("\">=1.9.3 <2.0\""));
+    }
+
+    #[test]
+    fn test_update_version_or_constraint_returns_err() {
+        let content = r#"{
+  "require": {
+    "vendor/package": "^1.0 || ^2.0"
+  }
+}"#;
+
+        let result = ComposerJsonParser.update_version(content, "vendor/package", "2.5.0");
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_update_version_not_found() {
         let content = r#"{
   "require": {}
@@ -374,7 +402,7 @@ mod tests {
             .update_version(content, "laravel/framework", "10.5.0")
             .unwrap();
 
-        // Verify the original key order is preserved
+        // 元のキー順が維持されることを確認する
         let symfony_pos = result.find("\"symfony/console\"").unwrap();
         let laravel_pos = result.find("\"laravel/framework\"").unwrap();
         let monolog_pos = result.find("\"monolog/monolog\"").unwrap();

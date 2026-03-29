@@ -451,7 +451,7 @@ impl ManifestParser for GradleParser {
         if let Some(var_name) = variable_for_package
             && let Some(var_def) = variables.get(&var_name)
         {
-            return self.update_variable_definition(content, var_def, new_version);
+            return self.update_variable_definition(content, &var_name, var_def, new_version);
         }
 
         // それ以外は依存行の直接バージョンを更新
@@ -464,6 +464,7 @@ impl GradleParser {
     fn update_variable_definition(
         &self,
         content: &str,
+        var_name: &str,
         var_def: &VariableDefinition,
         new_version: &str,
     ) -> Result<String, ManifestError> {
@@ -471,10 +472,16 @@ impl GradleParser {
         let mut result = Vec::new();
         let quote = var_def.quote_char;
         let version_parser = get_parser(Language::Java);
-        let formatted_version = version_parser
+        let Some(formatted_version) = version_parser
             .parse(&var_def.value)
-            .map(|spec| spec.format_updated(new_version))
-            .unwrap_or_else(|| new_version.to_string());
+            .and_then(|spec| spec.try_format_updated(new_version))
+        else {
+            return Err(ManifestError::InvalidVersionSpec {
+                path: PathBuf::from("build.gradle"),
+                spec: var_name.to_string(),
+                message: "version could not be updated safely".to_string(),
+            });
+        };
 
         for (idx, line) in lines.iter().enumerate() {
             let line_number = idx + 1;
@@ -568,11 +575,10 @@ impl GradleParser {
         let escaped_group = regex::escape(group);
         let escaped_artifact = regex::escape(artifact);
         let version_parser = get_parser(Language::Java);
-        let format_updated = |current_version: &str| -> String {
+        let format_updated = |current_version: &str| -> Option<String> {
             version_parser
                 .parse(current_version)
-                .map(|spec| spec.format_updated(new_version))
-                .unwrap_or_else(|| new_version.to_string())
+                .and_then(|spec| spec.try_format_updated(new_version))
         };
 
         // map 記法を更新: group: 'x', name: 'y', version: 'z'
@@ -592,9 +598,12 @@ impl GradleParser {
             let prefix = &caps[1];
             let quote = &caps[2];
             let current_version = caps.get(3).map(|m| m.as_str()).unwrap_or("");
-            let updated_version = format_updated(current_version);
-            updated = true;
-            format!("{}{}{}{}", prefix, quote, updated_version, quote)
+            if let Some(updated_version) = format_updated(current_version) {
+                updated = true;
+                format!("{}{}{}{}", prefix, quote, updated_version, quote)
+            } else {
+                caps[0].to_string()
+            }
         });
 
         if updated {
@@ -617,12 +626,15 @@ impl GradleParser {
         let result = string_re.replace(content, |caps: &regex::Captures| {
             let quote = &caps[1];
             let current_version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-            let updated_version = format_updated(current_version);
-            updated = true;
-            format!(
-                "{}{}:{}:{}{}",
-                quote, group, artifact, updated_version, quote
-            )
+            if let Some(updated_version) = format_updated(current_version) {
+                updated = true;
+                format!(
+                    "{}{}:{}:{}{}",
+                    quote, group, artifact, updated_version, quote
+                )
+            } else {
+                caps[0].to_string()
+            }
         });
 
         if updated {
