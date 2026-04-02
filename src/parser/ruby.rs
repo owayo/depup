@@ -423,4 +423,35 @@ mod tests {
         assert_eq!(spec.kind, VersionSpecKind::Tilde);
         assert_eq!(spec.version, "1.2.3.4");
     }
+
+    #[test]
+    fn test_parse_zero_padded_version() {
+        // ゼロパディングされたバージョン — 正規表現は数字列を許容するためパースされる
+        let spec = parse("01.02.03").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "01.02.03");
+    }
+
+    #[test]
+    fn test_parse_prerelease_hyphen_format() {
+        // ハイフン区切りのプレリリースバージョン
+        let spec = parse("1.2.3-beta1").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "1.2.3-beta1");
+    }
+
+    #[test]
+    fn test_parse_pessimistic_major_only_nonzero() {
+        // ~> 2 のようなメジャーのみペシミスティック制約
+        let spec = parse("~> 2").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Tilde);
+        assert_eq!(spec.version, "2");
+    }
+
+    #[test]
+    fn test_format_updated_four_segments() {
+        // 4セグメントバージョンの更新フォーマット
+        let spec = parse("1.2.3.4").unwrap();
+        assert_eq!(spec.format_updated("1.2.3.5"), "1.2.3.5");
+    }
 }

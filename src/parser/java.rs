@@ -365,4 +365,59 @@ mod tests {
         let spec = parse("5.+").unwrap();
         assert_eq!(spec.format_updated("6.1.0"), "6.+");
     }
+
+    #[test]
+    fn test_parse_release_suffix_format_updated() {
+        // RELEASE サフィックス付きバージョンの更新
+        let spec = parse("5.0.0.RELEASE").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.format_updated("5.1.0"), "5.1.0");
+    }
+
+    #[test]
+    fn test_parse_final_suffix_format_updated() {
+        // Final サフィックス付きバージョンの更新
+        let spec = parse("4.0.0.Final").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.format_updated("4.1.0"), "4.1.0");
+    }
+
+    #[test]
+    fn test_parse_maven_range_alt_lower_exclusive() {
+        // ]A,B] 形式 — 下限排他、上限包含
+        let spec = parse("]1.0,2.0]").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1.0");
+    }
+
+    #[test]
+    fn test_parse_maven_range_upper_only_parenthesis() {
+        // (,2.0) 形式 — 上限排他、下限なし
+        let spec = parse("(,2.0)").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "2.0");
+    }
+
+    #[test]
+    fn test_parse_strict_with_range_not_supported() {
+        // [1.7,1.8[!!1.7.25 — strict 記法とレンジの組み合わせはサポートしない
+        assert!(parse("[1.7,1.8[!!1.7.25").is_none());
+    }
+
+    #[test]
+    fn test_parse_strict_version_with_qualifier() {
+        // qualifier 付き strict 記法
+        let spec = parse("1.2.3.Final!!").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "1.2.3.Final");
+        assert_eq!(spec.format_updated("1.3.0"), "1.3.0!!");
+    }
+
+    #[test]
+    fn test_parse_maven_range_half_open_lower_bracket() {
+        // ]1.0,2.0) 形式 — 下限排他上限排他
+        let spec = parse("]1.0,2.0)").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1.0");
+    }
 }

@@ -117,4 +117,39 @@ mod tests {
         // Swift のバージョン文字列に v 接頭辞は付かない
         assert!(parse("v1.2.3").is_none());
     }
+
+    #[test]
+    fn test_parse_two_segment_version() {
+        // 2セグメントバージョンが正しくパースされる
+        let spec = parse("1.0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "1.0");
+    }
+
+    #[test]
+    fn test_parse_leading_zeros_accepted() {
+        // 先頭ゼロ付きバージョンも数字列として許容される
+        let spec = parse("01.02.03").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "01.02.03");
+    }
+
+    #[test]
+    fn test_parse_prerelease_alpha_rejected() {
+        // alpha プレリリースも拒否される
+        assert!(parse("1.0.0-alpha").is_none());
+    }
+
+    #[test]
+    fn test_parse_prerelease_rc_rejected() {
+        // RC プレリリースも拒否される
+        assert!(parse("2.0.0-rc.1").is_none());
+    }
+
+    #[test]
+    fn test_format_updated_two_segment() {
+        // 2セグメントバージョンの更新フォーマット
+        let spec = parse("1.0").unwrap();
+        assert_eq!(spec.format_updated("2.1"), "2.1");
+    }
 }

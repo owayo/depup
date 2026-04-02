@@ -523,4 +523,59 @@ mod tests {
         let spec = parse("1.x").unwrap();
         assert_eq!(spec.format_updated("2.3.4"), "2.x");
     }
+
+    #[test]
+    fn test_parse_v_prefix_with_caret() {
+        // v接頭辞付きの caret 指定でもバージョンが正規化される
+        let spec = parse("^v1.2.3").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Caret);
+        assert_eq!(spec.version, "1.2.3");
+    }
+
+    #[test]
+    fn test_parse_stability_flag_dev_bare() {
+        // 裸のバージョンに @dev が付いた場合もフラグが除去される
+        let spec = parse("1.0@dev").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "1.0");
+    }
+
+    #[test]
+    fn test_parse_wildcard_x_minor() {
+        // 1.2.x 形式のワイルドカード
+        let spec = parse("1.2.x").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Wildcard);
+    }
+
+    #[test]
+    fn test_parse_hyphen_range_with_patch() {
+        // パッチバージョン付きのハイフンレンジ
+        let spec = parse("1.0.0 - 2.0.0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1.0.0");
+    }
+
+    #[test]
+    fn test_parse_single_pipe_or() {
+        // シングルパイプの OR 制約
+        let spec = parse("^1 | ^2").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1");
+    }
+
+    #[test]
+    fn test_parse_double_pipe_or_with_tilde() {
+        // ダブルパイプの OR 制約 (tilde)
+        let spec = parse("~1.0 || ~2.0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1.0");
+    }
+
+    #[test]
+    fn test_parse_stability_flag_stable() {
+        // @stable フラグも除去される
+        let spec = parse("^2.0@stable").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Caret);
+        assert_eq!(spec.version, "2.0");
+    }
 }

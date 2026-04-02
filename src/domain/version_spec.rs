@@ -552,6 +552,72 @@ mod tests {
     }
 
     #[test]
+    fn test_format_wildcard_like_v_prefix_upper() {
+        // 大文字 V プレフィックス付きワイルドカードの更新
+        let spec = VersionSpec::new(VersionSpecKind::Wildcard, "V1.*", "1");
+        assert_eq!(spec.format_updated("2.3.4"), "V2.*");
+    }
+
+    #[test]
+    fn test_format_range_like_maven_alt_brackets() {
+        // Maven の反転ブラケット記法 ]...[ で下限のみ更新される
+        let spec = VersionSpec::new(VersionSpecKind::Range, "]1.0,2.0[", "1.0");
+        assert_eq!(
+            spec.try_format_updated("1.5.0").as_deref(),
+            Some("]1.5.0,2.0[")
+        );
+    }
+
+    #[test]
+    fn test_format_range_like_swift_half_open() {
+        // Swift の半開区間 ..< はバージョントークンに .. が含まれるため
+        // 下限置換後に区切りが残り "1.5.0<2.0.0" となる
+        let spec = VersionSpec::new(VersionSpecKind::Range, "1.0.0..<2.0.0", "1.0.0");
+        assert_eq!(
+            spec.try_format_updated("1.5.0").as_deref(),
+            Some("1.5.0<2.0.0")
+        );
+    }
+
+    #[test]
+    fn test_format_range_like_swift_closed() {
+        // Swift の閉区間 ... はバージョントークンが全体を包含するため
+        // 下限のみの置換となる
+        let spec = VersionSpec::new(VersionSpecKind::Range, "1.0.0...2.0.0", "1.0.0");
+        assert_eq!(spec.try_format_updated("1.5.0").as_deref(), Some("1.5.0"));
+    }
+
+    #[test]
+    fn test_format_range_like_comma_not_equal_rejected() {
+        // カンマ区切りの不等号制約は安全に書き換えられないため None を返す
+        let spec = VersionSpec::new(VersionSpecKind::Range, ",!=1.2.3", "1.2.3");
+        assert!(spec.try_format_updated("2.0.0").is_none());
+    }
+
+    #[test]
+    fn test_try_format_updated_any_empty_prefix_suffix() {
+        // Any 種別で prefix/suffix が空の場合、新バージョンをそのまま返す
+        let spec = VersionSpec {
+            kind: VersionSpecKind::Any,
+            raw: String::new(),
+            version: String::new(),
+            prefix: None,
+            suffix: None,
+        };
+        assert_eq!(spec.try_format_updated("1.2.3").as_deref(), Some("1.2.3"));
+    }
+
+    #[test]
+    fn test_format_range_like_v_prefix_in_range() {
+        // レンジ内の v プレフィックスが保持されて下限のみ更新される
+        let spec = VersionSpec::new(VersionSpecKind::Range, ">=v1.0,<v2.0", "1.0");
+        assert_eq!(
+            spec.try_format_updated("1.5.0").as_deref(),
+            Some(">=v1.5.0,<v2.0")
+        );
+    }
+
+    #[test]
     fn test_serde_version_spec_kind() {
         let kind = VersionSpecKind::GreaterOrEqual;
         let json = serde_json::to_string(&kind).unwrap();

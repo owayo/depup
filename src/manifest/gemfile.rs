@@ -660,4 +660,74 @@ gem 'nokogiri'
         let result = GemfileParser.update_version(content, "pg", "1.5.0");
         assert!(result.is_err());
     }
+
+    // --- 追加エッジケーステスト ---
+
+    #[test]
+    fn test_parse_four_segment_version() {
+        // 4セグメントバージョン（例: loofah のパッチリリース）
+        let content = r#"gem 'loofah', '2.22.0.1'"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "loofah");
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Exact);
+        assert_eq!(deps[0].version_spec.version, "2.22.0.1");
+    }
+
+    #[test]
+    fn test_parse_prerelease_gem() {
+        // プレリリースバージョンの gem をパースできること
+        let content = r#"gem 'rails', '7.0.0.alpha'"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "rails");
+        assert_eq!(deps[0].version_spec.version, "7.0.0.alpha");
+    }
+
+    #[test]
+    fn test_parse_double_quoted_pessimistic() {
+        // ダブルクォート + ペシミスティック制約の組み合わせ
+        let content = r#"gem "nokogiri", "~> 1.15""#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "nokogiri");
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Tilde);
+        assert_eq!(deps[0].version_spec.version, "1.15");
+    }
+
+    #[test]
+    fn test_parse_gem_with_require_false_option() {
+        // require: false オプション付きの gem がバージョン制約だけ解釈されること
+        let content = r#"gem 'webpacker', '~> 5.0', require: false"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "webpacker");
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Tilde);
+        assert_eq!(deps[0].version_spec.version, "5.0");
+    }
+
+    #[test]
+    fn test_parse_multiple_groups_on_one_line() {
+        // 1行に複数グループを指定した group ブロック
+        let content = r#"
+group :development, :test do
+  gem 'pry', '~> 0.14'
+  gem 'faker', '~> 3.0'
+end
+
+gem 'pg', '~> 1.5'
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 3);
+
+        let pry = deps.iter().find(|d| d.name == "pry").unwrap();
+        let faker = deps.iter().find(|d| d.name == "faker").unwrap();
+        let pg = deps.iter().find(|d| d.name == "pg").unwrap();
+
+        // development, test グループ内の gem は開発依存
+        assert!(pry.is_dev);
+        assert!(faker.is_dev);
+        // グループ外の gem は本番依存
+        assert!(!pg.is_dev);
+    }
 }

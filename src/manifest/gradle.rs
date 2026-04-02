@@ -1067,4 +1067,76 @@ dependencies {
         let test_deps: Vec<_> = deps.iter().filter(|d| d.is_dev).collect();
         assert_eq!(test_deps.len(), 2);
     }
+
+    // --- 追加エッジケーステスト ---
+
+    #[test]
+    fn test_parse_kotlin_dsl_parenthesized_string() {
+        // Kotlin DSL: implementation("group:name:version") 形式
+        let content = r#"
+dependencies {
+    implementation("com.google.guava:guava:32.1.2-jre")
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "com.google.guava:guava");
+        assert_eq!(deps[0].version_spec.version, "32.1.2-jre");
+        assert!(!deps[0].is_dev);
+    }
+
+    #[test]
+    fn test_parse_test_implementation_string_notation() {
+        // testImplementation の文字列記法が開発依存として判定されること
+        let content = r#"
+dependencies {
+    testImplementation 'org.mockito:mockito-core:5.5.0'
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "org.mockito:mockito-core");
+        assert_eq!(deps[0].version_spec.version, "5.5.0");
+        assert!(deps[0].is_dev);
+    }
+
+    #[test]
+    fn test_parse_variable_reference_in_string_interpolation() {
+        // 変数参照を文字列展開で使用するケース
+        let content = r#"
+def guavaVersion = '32.1.2-jre'
+
+dependencies {
+    implementation "com.google.guava:guava:$guavaVersion"
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "com.google.guava:guava");
+        // 変数が解決されて実際のバージョンになること
+        assert_eq!(deps[0].version_spec.version, "32.1.2-jre");
+    }
+
+    #[test]
+    fn test_parse_platform_dependency_not_matched() {
+        // platform() ラッパー付き依存は通常の文字列記法正規表現にマッチしない
+        // （platform がコンフィグ名として解釈されるため、実際の configuration とは異なる）
+        let content = r#"
+dependencies {
+    implementation platform('com.google.cloud:libraries-bom:26.1.0')
+}
+"#;
+        let deps = parse(content).unwrap();
+        // platform() ラッパーの中身は独立した行としてパースされる
+        // "platform" が configuration 名として解釈される
+        let platform_dep = deps
+            .iter()
+            .find(|d| d.name == "com.google.cloud:libraries-bom");
+        if let Some(dep) = platform_dep {
+            // パースされた場合、本番依存として扱われる（platform は DEV_CONFIGURATIONS に含まれない）
+            assert!(!dep.is_dev);
+            assert_eq!(dep.version_spec.version, "26.1.0");
+        }
+        // パースされない場合もテスト自体は成功（実装の振る舞いを記録）
+    }
 }

@@ -734,4 +734,72 @@ let package = Package(
         assert_eq!(deps[2].version_spec.kind, VersionSpecKind::Exact);
         assert_eq!(deps[2].version_spec.version, "2.40.0");
     }
+
+    // --- 追加エッジケーステスト ---
+
+    #[test]
+    fn test_parse_url_without_dot_git_from() {
+        // .git 拡張子なしの URL でも正しくパースされること
+        let content = r#".package(url: "https://github.com/owner/repo", from: "1.0.0")"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "owner/repo");
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Caret);
+        assert_eq!(deps[0].version_spec.version, "1.0.0");
+    }
+
+    #[test]
+    fn test_parse_v_prefix_in_version() {
+        // v プレフィックス付きバージョン。from: に指定された文字列がそのまま保持される
+        let content = r#".package(url: "https://github.com/owner/repo.git", from: "v1.0.0")"#;
+        let deps = parse(content).unwrap();
+        // v プレフィックスはバージョン正規表現 (\d+...) にマッチしないため、
+        // パースはされるがバージョン文字列は "v1.0.0" として保持される
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "owner/repo");
+        assert_eq!(deps[0].version_spec.version, "v1.0.0");
+    }
+
+    #[test]
+    fn test_parse_multiple_mixed_constraint_types() {
+        // 複数の依存関係が異なる制約タイプを使用する Package.swift
+        let content = r#"
+// swift-tools-version: 5.9
+import PackageDescription
+
+let package = Package(
+    name: "MixedDeps",
+    dependencies: [
+        .package(url: "https://github.com/apple/swift-log", from: "1.5.0"),
+        .package(url: "https://github.com/vapor/vapor.git", .upToNextMinor(from: "4.89.0")),
+        .package(url: "https://github.com/apple/swift-nio.git", exact: "2.40.0"),
+        .package(url: "https://github.com/swift-server/async-http-client.git", "1.0.0"..<"2.0.0"),
+    ]
+)
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 4);
+
+        // from: → Caret
+        let swift_log = deps.iter().find(|d| d.name == "apple/swift-log").unwrap();
+        assert_eq!(swift_log.version_spec.kind, VersionSpecKind::Caret);
+        assert_eq!(swift_log.version_spec.version, "1.5.0");
+
+        // upToNextMinor → Tilde
+        let vapor = deps.iter().find(|d| d.name == "vapor/vapor").unwrap();
+        assert_eq!(vapor.version_spec.kind, VersionSpecKind::Tilde);
+        assert_eq!(vapor.version_spec.version, "4.89.0");
+
+        // exact: → Exact
+        let nio = deps.iter().find(|d| d.name == "apple/swift-nio").unwrap();
+        assert_eq!(nio.version_spec.kind, VersionSpecKind::Exact);
+
+        // ..<  → Range
+        let http_client = deps
+            .iter()
+            .find(|d| d.name == "swift-server/async-http-client")
+            .unwrap();
+        assert_eq!(http_client.version_spec.kind, VersionSpecKind::Range);
+        assert_eq!(http_client.version_spec.version, "1.0.0");
+    }
 }
