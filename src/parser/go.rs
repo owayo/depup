@@ -27,7 +27,7 @@ static SEMVER_RE: LazyLock<Regex> = LazyLock::new(|| {
 // - v1.2.3-0.20210101120000-abcdef123456 (リリースタグ後のコミット)
 // - v1.2.4-beta.0.20210101120000-abcdef123456 (プレリリースタグ後のコミット)
 static PSEUDO_VERSION_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^v(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+\.)?\d{14}-[a-f0-9]{12})(\+incompatible)?$")
+    Regex::new(r"^v(\d+\.\d+\.\d+-(?:[0-9A-Za-z.-]+\.)?\d{14}-[a-f0-9]{12})(\+incompatible)?$")
         .unwrap()
 });
 
@@ -213,9 +213,11 @@ mod tests {
     #[test]
     fn test_parse_pseudo_version_incompatible() {
         // pseudo-version + incompatible の組み合わせ
-        let spec = parse("v2.0.0-20210101120000-abcdef123456+incompatible");
-        // pseudo-version は +incompatible を許容する
-        assert!(spec.is_some() || spec.is_none()); // 形式次第
+        let spec = parse("v2.0.0-20210101120000-abcdef123456+incompatible").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "2.0.0-20210101120000-abcdef123456");
+        assert_eq!(spec.prefix, Some("v".to_string()));
+        assert_eq!(spec.suffix, Some("+incompatible".to_string()));
     }
 
     #[test]
