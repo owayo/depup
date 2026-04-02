@@ -93,16 +93,19 @@ impl PartialOrd for VersionInfo {
     }
 }
 
-/// Compare two version strings using semver-like rules
-/// Missing parts are treated as 0 (e.g., "1.0" == "1.0.0")
-/// Build metadata after '+' is ignored per semver spec
+/// semver 風ルールでバージョン文字列を比較する
+/// 不足パートは 0 として扱う (例: "1.0" == "1.0.0")
+/// ビルドメタデータ ('+' 以降) は semver 仕様に従い無視する
 pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
     let parse_parts = |s: &str| -> Vec<u64> {
-        // Remove leading 'v' if present
-        let s = s.strip_prefix('v').unwrap_or(s);
-        // Strip build metadata (+...) per semver spec
+        // 先頭の 'v' または 'V' を除去
+        let s = s
+            .strip_prefix('v')
+            .or_else(|| s.strip_prefix('V'))
+            .unwrap_or(s);
+        // ビルドメタデータ (+...) を除去
         let s = s.split('+').next().unwrap_or(s);
-        // Split by . and - and take only the numeric parts
+        // '.' と '-' で分割し、数値部分のみ取得
         s.split(['.', '-']).filter_map(|p| p.parse().ok()).collect()
     };
 
@@ -111,7 +114,7 @@ pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
 
     let max_len = parts_a.len().max(parts_b.len());
 
-    // Compare each part, treating missing parts as 0
+    // 各パートを比較 (不足パートは 0 として扱う)
     for i in 0..max_len {
         let pa = parts_a.get(i).copied().unwrap_or(0);
         let pb = parts_b.get(i).copied().unwrap_or(0);
