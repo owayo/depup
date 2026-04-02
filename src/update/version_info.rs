@@ -509,4 +509,40 @@ mod tests {
         assert!(!is_prerelease_version("5.0.0.RELEASE"));
         assert!(!is_prerelease_version("4.0.0.Final"));
     }
+
+    #[test]
+    fn test_is_prerelease_case_insensitive() {
+        // 大文字小文字混在でもプレリリースとして検出される
+        assert!(is_prerelease_version("1.0.0-ALPHA"));
+        assert!(is_prerelease_version("1.0.0-Beta.1"));
+        assert!(is_prerelease_version("1.0.0-RC1"));
+        assert!(is_prerelease_version("1.0.0-CANARY"));
+    }
+
+    #[test]
+    fn test_is_prerelease_non_version_strings() {
+        // バージョン表記ではない文字列の処理
+        assert!(!is_prerelease_version("hello"));
+        assert!(!is_prerelease_version(""));
+        assert!(!is_prerelease_version("abc"));
+        // "dev" を含む文字列はプレリリースとして検出される
+        assert!(is_prerelease_version("development"));
+    }
+
+    #[test]
+    fn test_compare_versions_v_prefix_mixed() {
+        // v/V 接頭辞が混在していても正しく比較できる
+        assert_eq!(
+            compare_versions("v1.0.0", "V1.0.0"),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            compare_versions("v2.0.0", "1.0.0"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_versions("1.0.0", "V2.0.0"),
+            std::cmp::Ordering::Less
+        );
+    }
 }

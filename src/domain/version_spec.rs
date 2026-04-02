@@ -511,6 +511,27 @@ mod tests {
     }
 
     #[test]
+    fn test_try_format_updated_range_maven_lower_open_returns_none() {
+        // Maven 下限なし `(,2.0]` は安全に書き換えられないため None を返す
+        let spec = VersionSpec::new(VersionSpecKind::Range, "(,2.0]", "0.0");
+        assert!(spec.try_format_updated("1.5.0").is_none());
+    }
+
+    #[test]
+    fn test_try_format_updated_range_maven_lower_open_exclusive_returns_none() {
+        // Maven 下限なし `(,2.0)` も同様に None を返す
+        let spec = VersionSpec::new(VersionSpecKind::Range, "(,2.0)", "0.0");
+        assert!(spec.try_format_updated("1.5.0").is_none());
+    }
+
+    #[test]
+    fn test_try_format_updated_range_arbitrary_equality_returns_none() {
+        // `===` 付きレンジは安全に書き換えられない
+        let spec = VersionSpec::new(VersionSpecKind::Range, "===v1.2-custom", "1.2");
+        assert!(spec.try_format_updated("2.0.0").is_none());
+    }
+
+    #[test]
     fn test_display_trait() {
         let spec = VersionSpec::new(VersionSpecKind::Caret, "^1.2.3", "1.2.3");
         assert_eq!(format!("{}", spec), "^1.2.3");

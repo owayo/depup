@@ -1,27 +1,27 @@
-//! HTTP client shared foundation
+//! HTTP クライアント共通基盤
 //!
-//! This module provides a shared HTTP client with:
-//! - Configurable timeout and User-Agent
-//! - Exponential backoff retry logic (max 3 retries)
-//! - Rate limit error handling
+//! 共有 HTTP クライアントを提供する:
+//! - タイムアウトと User-Agent の設定
+//! - 指数バックオフによるリトライ (最大3回)
+//! - レート制限のエラーハンドリング
 
 use crate::error::RegistryError;
 use reqwest::Client;
 use std::time::Duration;
 
-/// Default timeout for HTTP requests (30 seconds)
+/// HTTP リクエストのデフォルトタイムアウト (30秒)
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Default User-Agent header
+/// デフォルトの User-Agent ヘッダ
 const DEFAULT_USER_AGENT: &str = concat!("depup/", env!("CARGO_PKG_VERSION"));
 
-/// Maximum number of retry attempts
+/// 最大リトライ回数
 const MAX_RETRIES: u32 = 3;
 
-/// Base delay for exponential backoff (in milliseconds)
+/// 指数バックオフの基本遅延 (ミリ秒)
 const BASE_DELAY_MS: u64 = 100;
 
-/// HTTP client wrapper with retry logic
+/// リトライロジック付き HTTP クライアントラッパー
 #[derive(Clone)]
 pub struct HttpClient {
     client: Client,
@@ -29,12 +29,12 @@ pub struct HttpClient {
 }
 
 impl HttpClient {
-    /// Create a new HTTP client with default settings
+    /// デフォルト設定で HTTP クライアントを作成
     pub fn new() -> Result<Self, RegistryError> {
         Self::with_config(DEFAULT_TIMEOUT, DEFAULT_USER_AGENT)
     }
 
-    /// Create a new HTTP client with custom configuration
+    /// カスタム設定で HTTP クライアントを作成
     pub fn with_config(timeout: Duration, user_agent: &str) -> Result<Self, RegistryError> {
         let client = Client::builder()
             .timeout(timeout)
@@ -52,23 +52,23 @@ impl HttpClient {
         })
     }
 
-    /// Set the maximum number of retries
+    /// 最大リトライ回数を設定
     pub fn with_max_retries(mut self, max_retries: u32) -> Self {
         self.max_retries = max_retries;
         self
     }
 
-    /// Get the underlying reqwest client
+    /// 内部の reqwest クライアントを取得
     pub fn inner(&self) -> &Client {
         &self.client
     }
 
-    /// Perform a GET request with retry logic
+    /// リトライ付き GET リクエストを実行
     pub async fn get(&self, url: &str) -> Result<reqwest::Response, RegistryError> {
         self.get_with_context(url, "", "").await
     }
 
-    /// Perform a GET request with retry logic and error context
+    /// エラーコンテキスト付きリトライ GET リクエストを実行
     pub async fn get_with_context(
         &self,
         url: &str,
@@ -81,21 +81,23 @@ impl HttpClient {
         for attempt in 0..=self.max_retries {
             match self.client.get(url).send().await {
                 Ok(response) => {
-                    // Check for rate limiting
+                    // レート制限チェック
                     if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
                         last_error = Some(RegistryError::RateLimitExceeded {
                             registry: registry.to_string(),
                         });
 
                         if attempt < self.max_retries {
-                            // Wait before retrying with exponential backoff
+                            // 指数バックオフでリトライ
                             tokio::time::sleep(Duration::from_millis(delay)).await;
                             delay *= 2;
                             continue;
                         }
+                        // 最終リトライでも 429 の場合は RateLimitExceeded を返す
+                        return Err(last_error.unwrap());
                     }
 
-                    // Check for 404 Not Found
+                    // 404 Not Found チェック
                     if response.status() == reqwest::StatusCode::NOT_FOUND {
                         return Err(RegistryError::PackageNotFound {
                             package: package.to_string(),
@@ -103,7 +105,7 @@ impl HttpClient {
                         });
                     }
 
-                    // Check for other errors
+                    // その他のエラーチェック
                     if !response.status().is_success() {
                         let status = response.status();
                         return Err(RegistryError::NetworkError {
@@ -116,7 +118,7 @@ impl HttpClient {
                     return Ok(response);
                 }
                 Err(e) => {
-                    // Check for timeout
+                    // タイムアウトチェック
                     if e.is_timeout() {
                         last_error = Some(RegistryError::Timeout {
                             package: package.to_string(),
@@ -131,7 +133,7 @@ impl HttpClient {
                     }
 
                     if attempt < self.max_retries {
-                        // Wait before retrying with exponential backoff
+                        // 指数バックオフでリトライ
                         tokio::time::sleep(Duration::from_millis(delay)).await;
                         delay *= 2;
                     }
@@ -146,7 +148,7 @@ impl HttpClient {
         }))
     }
 
-    /// Perform a GET request and parse JSON response with retry on parse errors
+    /// GET リクエストを実行し JSON レスポンスをパース (パースエラー時リトライ)
     pub async fn get_json<T: serde::de::DeserializeOwned>(
         &self,
         url: &str,
@@ -157,13 +159,13 @@ impl HttpClient {
         let mut delay = BASE_DELAY_MS;
 
         for attempt in 0..=self.max_retries {
-            // First, get the response (this already has its own retry logic)
+            // レスポンスを取得 (get_with_context 内でリトライ済み)
             let response = match self.get_with_context(url, package, registry).await {
                 Ok(resp) => resp,
-                Err(e) => return Err(e), // Network errors are already retried in get_with_context
+                Err(e) => return Err(e), // ネットワークエラーは get_with_context 内でリトライ済み
             };
 
-            // Try to parse JSON
+            // JSON パースを試行
             match response.json::<T>().await {
                 Ok(parsed) => return Ok(parsed),
                 Err(e) => {
@@ -174,7 +176,7 @@ impl HttpClient {
                     });
 
                     if attempt < self.max_retries {
-                        // Wait before retrying with exponential backoff
+                        // 指数バックオフでリトライ
                         tokio::time::sleep(Duration::from_millis(delay)).await;
                         delay *= 2;
                         continue;
@@ -192,7 +194,7 @@ impl HttpClient {
         )
     }
 
-    /// Perform a GET request and get text response with retry on parse errors
+    /// GET リクエストを実行しテキストレスポンスを取得 (エラー時リトライ)
     pub async fn get_text(
         &self,
         url: &str,
@@ -203,13 +205,13 @@ impl HttpClient {
         let mut delay = BASE_DELAY_MS;
 
         for attempt in 0..=self.max_retries {
-            // First, get the response (this already has its own retry logic)
+            // レスポンスを取得 (get_with_context 内でリトライ済み)
             let response = match self.get_with_context(url, package, registry).await {
                 Ok(resp) => resp,
-                Err(e) => return Err(e), // Network errors are already retried in get_with_context
+                Err(e) => return Err(e), // ネットワークエラーは get_with_context 内でリトライ済み
             };
 
-            // Try to get text
+            // テキスト取得を試行
             match response.text().await {
                 Ok(text) => return Ok(text),
                 Err(e) => {
@@ -220,7 +222,7 @@ impl HttpClient {
                     });
 
                     if attempt < self.max_retries {
-                        // Wait before retrying with exponential backoff
+                        // 指数バックオフでリトライ
                         tokio::time::sleep(Duration::from_millis(delay)).await;
                         delay *= 2;
                         continue;

@@ -1357,4 +1357,52 @@ mod tests {
             assert_eq!(new_version, "1.49.0");
         }
     }
+
+    #[test]
+    fn test_extract_upper_bound_maven_lower_open_exclusive() {
+        // Maven 下限なし排他的上限 `(,2.0)` は上限 2.0 で排他
+        let result = extract_upper_bound("(,2.0)");
+        assert_eq!(result, Some(("2.0".to_string(), false)));
+    }
+
+    #[test]
+    fn test_extract_upper_bound_maven_lower_open_inclusive() {
+        // Maven 下限なし包含上限 `(,2.0]` は上限 2.0 で包含
+        let result = extract_upper_bound("(,2.0]");
+        assert_eq!(result, Some(("2.0".to_string(), true)));
+    }
+
+    #[test]
+    fn test_extract_upper_bound_maven_upper_open() {
+        // Maven 上限なし `[1.0,)` は上限なし → None
+        let result = extract_upper_bound("[1.0,)");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_extract_upper_bound_maven_single_exact() {
+        // Maven 単一指定 `[1.5]` はカンマなしなので正規表現にマッチしない → None
+        let result = extract_upper_bound("[1.5]");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_judge_maven_lower_open_range() {
+        // Maven 下限なし `(,2.0]` はフォーマット更新不可で ParseError スキップになる
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_range_dependency("org.example:lib", "(,2.0]", "0.0", Language::Java);
+        let versions = vec![make_version_info("1.0", 100), make_version_info("1.9", 50)];
+
+        let result = judge.judge(&dep, &versions);
+        // 下限なし Maven 形式は安全に書き換えられないため ParseError でスキップ
+        assert!(result.is_skip());
+        if let UpdateResult::Skip { reason, .. } = result {
+            assert_eq!(
+                reason,
+                SkipReason::ParseError("constraint cannot be updated safely".to_string())
+            );
+        }
+    }
 }

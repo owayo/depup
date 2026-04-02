@@ -487,13 +487,7 @@ impl Orchestrator {
             return;
         }
 
-        // Get the crate's target version (either from update or current)
-        let _crate_target = crate_info.as_ref().map(|(_, _, r, current)| match r {
-            UpdateResult::Update { new_version, .. } => new_version.clone(),
-            _ => current.clone(),
-        });
-
-        // Get first npm package's current version for reference
+        // 最初の npm パッケージの現在バージョンを参照用に取得
         let npm_current = npm_packages.first().map(|(_, _, _, v)| v.as_str());
 
         // Determine effective versions (after any pending updates)
