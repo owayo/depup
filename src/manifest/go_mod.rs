@@ -648,4 +648,96 @@ require github.com/critical/lib v1.0.0 // pinned
         let deps = parse(content).unwrap();
         assert_eq!(deps.len(), 2);
     }
+
+    #[test]
+    fn test_parse_indirect_dependency() {
+        // 単一 require 文の // indirect コメント付き依存が dev=true として分類されること
+        let content = r#"
+module example.com/myproject
+
+go 1.21
+
+require golang.org/x/sys v0.15.0 // indirect
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "golang.org/x/sys");
+        assert_eq!(deps[0].version_spec.version, "0.15.0");
+        assert!(
+            deps[0].is_dev,
+            "// indirect 付き依存は開発依存として扱われるべき"
+        );
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Exact);
+    }
+
+    #[test]
+    fn test_parse_incompatible_suffix() {
+        // +incompatible サフィックスがパース後も suffix フィールドに保持されること
+        let content = r#"
+module example.com/myproject
+
+go 1.21
+
+require github.com/old/module v2.0.0+incompatible
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "github.com/old/module");
+        assert_eq!(deps[0].version_spec.version, "2.0.0");
+        assert_eq!(
+            deps[0].version_spec.suffix,
+            Some("+incompatible".to_string()),
+            "+incompatible サフィックスが suffix フィールドに保持されるべき"
+        );
+        assert_eq!(deps[0].version_spec.prefix, Some("v".to_string()));
+    }
+
+    #[test]
+    fn test_parse_pseudo_version() {
+        // pseudo-version (v0.0.0-YYYYMMDDHHmmss-hash) が正しくパースされること
+        let content = r#"
+module example.com/myproject
+
+go 1.21
+
+require golang.org/x/tools v0.0.0-20210101120000-abcdef123456
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "golang.org/x/tools");
+        assert_eq!(
+            deps[0].version_spec.version,
+            "0.0.0-20210101120000-abcdef123456"
+        );
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Exact);
+        assert_eq!(deps[0].version_spec.prefix, Some("v".to_string()));
+    }
+
+    #[test]
+    fn test_update_preserves_pinned_comment_in_block() {
+        // require ブロック内の // pinned コメントが更新後も保持されること
+        let content = r#"module example.com/myproject
+
+go 1.21
+
+require (
+	github.com/gin-gonic/gin v1.9.1
+	github.com/critical/lib v1.0.0 // pinned
+)
+"#;
+
+        let result = GoModParser
+            .update_version(content, "github.com/critical/lib", "v2.0.0")
+            .unwrap();
+        assert!(result.contains("v2.0.0"), "バージョンが更新されるべき");
+        assert!(
+            result.contains("// pinned"),
+            "// pinned コメントが保持されるべき"
+        );
+        // 他の依存は変更されないこと
+        assert!(result.contains("v1.9.1"));
+    }
 }
