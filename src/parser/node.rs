@@ -489,4 +489,44 @@ mod tests {
     fn test_language() {
         assert_eq!(NodeVersionParser.language(), Language::Node);
     }
+
+    /// v接頭辞付き完全バージョンが Exact として分類される
+    #[test]
+    fn test_parse_v_prefix_exact() {
+        let spec = parse("v1.2.3").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "1.2.3");
+        assert_eq!(spec.raw, "v1.2.3");
+    }
+
+    /// v接頭辞付き部分指定が Range として分類される（npm の部分指定扱い）
+    #[test]
+    fn test_parse_v_prefix_partial() {
+        let spec = parse("v1.2").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1.2.0");
+        assert_eq!(spec.raw, "v1.2");
+    }
+
+    /// npm エイリアス形式 ("npm:@scope/pkg@^1.0") はパース対象外で None を返す
+    #[test]
+    fn test_parse_npm_alias() {
+        assert!(parse("npm:@scope/pkg@^1.0").is_none());
+    }
+
+    /// プロトコル参照 (git://, file:, workspace:*) はパース対象外で None を返す
+    #[test]
+    fn test_parse_protocol_refs_skipped() {
+        assert!(parse("git://github.com/user/repo.git").is_none());
+        assert!(parse("file:../local-pkg").is_none());
+        assert!(parse("workspace:*").is_none());
+    }
+
+    /// v接頭辞付き Exact バージョンの更新フォーマット（v は正規化時に除去される）
+    #[test]
+    fn test_format_updated_v_prefix_exact() {
+        let spec = parse("v1.2.3").unwrap();
+        // v接頭辞は normalize_version で除去されるため、更新後は v なしになる
+        assert_eq!(spec.format_updated("2.0.0"), "2.0.0");
+    }
 }

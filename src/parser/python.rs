@@ -351,4 +351,30 @@ mod tests {
         let spec = parse("1.2.*").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Wildcard);
     }
+
+    #[test]
+    fn test_parse_local_version() {
+        // PEP 440 ローカルバージョン指定: '+' 以降はローカルセグメントとして扱われる
+        let spec = parse("==1.0+local1").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "1.0");
+        assert_eq!(spec.prefix, Some("==".to_string()));
+    }
+
+    #[test]
+    fn test_parse_post_release() {
+        // PEP 440 ポストリリースバージョン: '.post1' は数値部分のみ抽出される
+        let spec = parse("==1.0.post1").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "1.0");
+        assert_eq!(spec.prefix, Some("==".to_string()));
+    }
+
+    #[test]
+    fn test_parse_not_equal_wildcard() {
+        // ワイルドカード除外制約: '!=1.2.*' はレンジとして扱われる
+        let spec = parse("!=1.2.*").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1.2");
+    }
 }
