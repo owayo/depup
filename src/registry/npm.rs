@@ -75,11 +75,11 @@ impl RegistryAdapter for NpmAdapter {
             if let Some(latest) = latest_version
                 && compare_versions(&version, latest) == std::cmp::Ordering::Greater
             {
-                // This version is newer than the official latest - skip it
+                // 公式の latest より新しいバージョン — スキップ
                 continue;
             }
 
-            // Get the publish time for this version
+            // このバージョンの公開時刻を取得
             if let Some(time_str) = response.time.get(&version)
                 && let Ok(released_at) = time_str.parse::<DateTime<Utc>>()
             {
@@ -87,7 +87,7 @@ impl RegistryAdapter for NpmAdapter {
             }
         }
 
-        // Sort by version
+        // バージョンでソート
         versions.sort();
 
         Ok(versions)

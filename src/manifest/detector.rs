@@ -77,7 +77,7 @@ pub fn detect_manifests(dir: &Path) -> Vec<ManifestInfo> {
         if manifest_path.exists() {
             let mut info = ManifestInfo::new(&manifest_path, *language);
 
-            // Mark as workspace root if pnpm-workspace.yaml exists and this is package.json
+            // pnpm-workspace.yaml が存在し package.json であればワークスペースルートとしてマークする
             if *language == Language::Node && is_pnpm_workspace {
                 info = info.with_workspace_root(true);
             }
@@ -85,11 +85,11 @@ pub fn detect_manifests(dir: &Path) -> Vec<ManifestInfo> {
             manifests.push(info);
         }
 
-        // Check for Kotlin DSL variant for Java (build.gradle.kts)
+        // Java 向け Kotlin DSL バリアント (build.gradle.kts) を確認する
         if *language == Language::Java {
             let kts_path = dir.join("build.gradle.kts");
             if kts_path.exists() && !manifest_path.exists() {
-                // Only add .kts if no build.gradle exists (prefer Groovy over Kotlin DSL)
+                // build.gradle が存在しない場合のみ .kts を追加する (Groovy を Kotlin DSL より優先)
                 manifests.push(ManifestInfo::new(&kts_path, Language::Java));
             }
         }
