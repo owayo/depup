@@ -56,20 +56,20 @@ pub struct ManifestFile {
     pub info: ManifestInfo,
 }
 
-/// Detect all manifest files in the given directory
+/// 指定ディレクトリ内の全マニフェストファイルを検出する
 ///
-/// This function:
-/// 1. Looks for standard manifest files (package.json, pyproject.toml, Cargo.toml, go.mod, build.gradle)
-/// 2. Checks for pnpm-workspace.yaml to detect monorepo
-/// 3. Checks for src-tauri/Cargo.toml for Tauri projects
-/// 4. Checks for build.gradle.kts (Kotlin DSL) for Gradle projects
+/// この関数の処理:
+/// 1. 標準的なマニフェストファイル (package.json, pyproject.toml, Cargo.toml, go.mod, build.gradle) を探す
+/// 2. pnpm-workspace.yaml の存在をチェックしてモノレポを検出する
+/// 3. src-tauri/Cargo.toml の存在をチェックして Tauri プロジェクトを検出する
+/// 4. build.gradle.kts (Kotlin DSL) の存在をチェックして Gradle プロジェクトを検出する
 pub fn detect_manifests(dir: &Path) -> Vec<ManifestInfo> {
     let mut manifests = Vec::new();
 
-    // Check if this is a pnpm workspace
+    // pnpm ワークスペースかどうかを確認する
     let is_pnpm_workspace = dir.join("pnpm-workspace.yaml").exists();
 
-    // Detect each manifest type
+    // 各マニフェストタイプを検出する
     for language in Language::all() {
         let manifest_name = language.manifest_filename();
         let manifest_path = dir.join(manifest_name);

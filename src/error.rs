@@ -1,44 +1,44 @@
-//! Application error types using thiserror
+//! thiserror を使用したアプリケーションエラー型
 //!
-//! Error hierarchy:
-//! - ManifestError: Issues with manifest file parsing
-//! - RegistryError: Issues with package registry communication
-//! - ConfigError: Issues with CLI configuration
-//! - IoError: File system operation failures
+//! エラー階層:
+//! - ManifestError: マニフェストファイルの解析に関する問題
+//! - RegistryError: パッケージレジストリとの通信に関する問題
+//! - ConfigError: CLI 設定に関する問題
+//! - IoError: ファイルシステム操作の失敗
 
 use std::path::PathBuf;
 use thiserror::Error;
 
 use crate::domain::Language;
 
-/// Application-level error type
+/// アプリケーションレベルのエラー型
 #[derive(Error, Debug)]
 pub enum AppError {
-    /// Manifest file related errors
+    /// マニフェストファイル関連のエラー
     #[error(transparent)]
     Manifest(#[from] ManifestError),
 
-    /// Package registry related errors
+    /// パッケージレジストリ関連のエラー
     #[error(transparent)]
     Registry(#[from] RegistryError),
 
-    /// Configuration related errors
+    /// 設定関連のエラー
     #[error(transparent)]
     Config(#[from] ConfigError),
 
-    /// IO related errors
+    /// IO 関連のエラー
     #[error(transparent)]
     Io(#[from] IoError),
 }
 
-/// Errors related to manifest file operations
+/// マニフェストファイル操作に関するエラー
 #[derive(Error, Debug)]
 pub enum ManifestError {
-    /// Manifest file not found
+    /// マニフェストファイルが見つからない
     #[error("manifest file not found: {path}")]
     NotFound { path: PathBuf },
 
-    /// Failed to read manifest file
+    /// マニフェストファイルの読み取りに失敗
     #[error("failed to read manifest file {path}: {source}")]
     ReadError {
         path: PathBuf,
@@ -46,7 +46,7 @@ pub enum ManifestError {
         source: std::io::Error,
     },
 
-    /// Failed to write manifest file
+    /// マニフェストファイルの書き込みに失敗
     #[error("failed to write manifest file {path}: {source}")]
     WriteError {
         path: PathBuf,
@@ -54,19 +54,19 @@ pub enum ManifestError {
         source: std::io::Error,
     },
 
-    /// JSON parsing error (for package.json)
+    /// JSON パースエラー (package.json 用)
     #[error("failed to parse JSON in {path}: {message}")]
     JsonParseError { path: PathBuf, message: String },
 
-    /// TOML parsing error (for pyproject.toml, Cargo.toml)
+    /// TOML パースエラー (pyproject.toml, Cargo.toml 用)
     #[error("failed to parse TOML in {path}: {message}")]
     TomlParseError { path: PathBuf, message: String },
 
-    /// go.mod parsing error
+    /// go.mod パースエラー
     #[error("failed to parse go.mod in {path}: {message}")]
     GoModParseError { path: PathBuf, message: String },
 
-    /// Invalid version specification
+    /// 無効なバージョン指定
     #[error("invalid version specification '{spec}' in {path}: {message}")]
     InvalidVersionSpec {
         path: PathBuf,
@@ -74,19 +74,19 @@ pub enum ManifestError {
         message: String,
     },
 
-    /// Unsupported manifest format
+    /// サポートされていないマニフェスト形式
     #[error("unsupported manifest format: {path}")]
     UnsupportedFormat { path: PathBuf },
 }
 
-/// Errors related to package registry communication
+/// パッケージレジストリ通信に関するエラー
 #[derive(Error, Debug)]
 pub enum RegistryError {
-    /// Package not found in registry
+    /// レジストリにパッケージが見つからない
     #[error("package '{package}' not found in {registry} registry")]
     PackageNotFound { package: String, registry: String },
 
-    /// Network request failed
+    /// ネットワークリクエストの失敗
     #[error("failed to fetch package '{package}' from {registry}: {message}")]
     NetworkError {
         package: String,
@@ -94,11 +94,11 @@ pub enum RegistryError {
         message: String,
     },
 
-    /// Rate limit exceeded
+    /// レートリミット超過
     #[error("rate limit exceeded for {registry} registry")]
     RateLimitExceeded { registry: String },
 
-    /// Invalid response from registry
+    /// レジストリからの無効なレスポンス
     #[error("invalid response from {registry} for '{package}': {message}")]
     InvalidResponse {
         package: String,
@@ -106,15 +106,15 @@ pub enum RegistryError {
         message: String,
     },
 
-    /// Timeout
+    /// タイムアウト
     #[error("timeout while fetching '{package}' from {registry}")]
     Timeout { package: String, registry: String },
 
-    /// Authentication error
+    /// 認証エラー
     #[error("authentication failed for {registry}: {message}")]
     AuthenticationError { registry: String, message: String },
 
-    /// Invalid package name format
+    /// 無効なパッケージ名形式
     #[error("invalid package name '{name}' for {registry}: {reason}")]
     InvalidPackageName {
         name: String,
@@ -123,38 +123,38 @@ pub enum RegistryError {
     },
 }
 
-/// Errors related to configuration
+/// 設定に関するエラー
 #[derive(Error, Debug)]
 pub enum ConfigError {
-    /// Invalid duration format
+    /// 無効な期間形式
     #[error("invalid duration format '{value}': expected format like '2w', '10d', '1m'")]
     InvalidDuration { value: String },
 
-    /// Invalid language filter
+    /// 無効な言語フィルタ
     #[error("invalid language filter '{value}': expected 'node', 'python', 'rust', or 'go'")]
     InvalidLanguageFilter { value: String },
 
-    /// Invalid path
+    /// 無効なパス
     #[error("invalid path '{path}': {message}")]
     InvalidPath { path: PathBuf, message: String },
 
-    /// Conflicting options
+    /// 競合するオプション
     #[error("conflicting options: {message}")]
     ConflictingOptions { message: String },
 }
 
-/// Errors related to IO operations
+/// IO 操作に関するエラー
 #[derive(Error, Debug)]
 pub enum IoError {
-    /// Directory not found
+    /// ディレクトリが見つからない
     #[error("directory not found: {path}")]
     DirectoryNotFound { path: PathBuf },
 
-    /// Permission denied
+    /// パーミッション拒否
     #[error("permission denied: {path}")]
     PermissionDenied { path: PathBuf },
 
-    /// Generic IO error
+    /// 汎用 IO エラー
     #[error("IO error at {path}: {source}")]
     Generic {
         path: PathBuf,
@@ -164,12 +164,12 @@ pub enum IoError {
 }
 
 impl ManifestError {
-    /// Creates a new NotFound error
+    /// NotFound エラーを作成する
     pub fn not_found(path: impl Into<PathBuf>) -> Self {
         ManifestError::NotFound { path: path.into() }
     }
 
-    /// Creates a new ReadError
+    /// ReadError を作成する
     pub fn read_error(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
         ManifestError::ReadError {
             path: path.into(),
@@ -177,7 +177,7 @@ impl ManifestError {
         }
     }
 
-    /// Creates a new WriteError
+    /// WriteError を作成する
     pub fn write_error(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
         ManifestError::WriteError {
             path: path.into(),
@@ -185,7 +185,7 @@ impl ManifestError {
         }
     }
 
-    /// Creates a new JsonParseError
+    /// JsonParseError を作成する
     pub fn json_parse_error(path: impl Into<PathBuf>, message: impl Into<String>) -> Self {
         ManifestError::JsonParseError {
             path: path.into(),
@@ -193,7 +193,7 @@ impl ManifestError {
         }
     }
 
-    /// Creates a new TomlParseError
+    /// TomlParseError を作成する
     pub fn toml_parse_error(path: impl Into<PathBuf>, message: impl Into<String>) -> Self {
         ManifestError::TomlParseError {
             path: path.into(),
@@ -201,7 +201,7 @@ impl ManifestError {
         }
     }
 
-    /// Creates a new InvalidVersionSpec error
+    /// InvalidVersionSpec エラーを作成する
     pub fn invalid_version_spec(
         path: impl Into<PathBuf>,
         spec: impl Into<String>,
@@ -216,7 +216,7 @@ impl ManifestError {
 }
 
 impl RegistryError {
-    /// Creates a new PackageNotFound error
+    /// PackageNotFound エラーを作成する
     pub fn package_not_found(package: impl Into<String>, registry: impl Into<String>) -> Self {
         RegistryError::PackageNotFound {
             package: package.into(),
@@ -224,7 +224,7 @@ impl RegistryError {
         }
     }
 
-    /// Creates a new NetworkError
+    /// NetworkError を作成する
     pub fn network_error(
         package: impl Into<String>,
         registry: impl Into<String>,
@@ -237,14 +237,14 @@ impl RegistryError {
         }
     }
 
-    /// Creates a new RateLimitExceeded error
+    /// RateLimitExceeded エラーを作成する
     pub fn rate_limit_exceeded(registry: impl Into<String>) -> Self {
         RegistryError::RateLimitExceeded {
             registry: registry.into(),
         }
     }
 
-    /// Creates a new Timeout error
+    /// Timeout エラーを作成する
     pub fn timeout(package: impl Into<String>, registry: impl Into<String>) -> Self {
         RegistryError::Timeout {
             package: package.into(),
@@ -252,7 +252,7 @@ impl RegistryError {
         }
     }
 
-    /// Returns the registry name for this language
+    /// 指定された言語のレジストリ名を返す
     pub fn registry_name(language: Language) -> &'static str {
         match language {
             Language::Node => "npm",
@@ -268,17 +268,17 @@ impl RegistryError {
 }
 
 impl IoError {
-    /// Creates a new DirectoryNotFound error
+    /// DirectoryNotFound エラーを作成する
     pub fn directory_not_found(path: impl Into<PathBuf>) -> Self {
         IoError::DirectoryNotFound { path: path.into() }
     }
 
-    /// Creates a new PermissionDenied error
+    /// PermissionDenied エラーを作成する
     pub fn permission_denied(path: impl Into<PathBuf>) -> Self {
         IoError::PermissionDenied { path: path.into() }
     }
 
-    /// Creates a new Generic IO error
+    /// 汎用 IO エラーを作成する
     pub fn generic(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
         IoError::Generic {
             path: path.into(),

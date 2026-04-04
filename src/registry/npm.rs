@@ -38,7 +38,7 @@ impl NpmAdapter {
         Self { client }
     }
 
-    /// Build the URL for a package
+    /// パッケージ用の URL を構築
     fn build_url(&self, package: &str) -> String {
         format!("{}/{}", NPM_REGISTRY_URL, package)
     }
@@ -61,17 +61,17 @@ impl RegistryAdapter for NpmAdapter {
             .get_json(&url, package, self.registry_name())
             .await?;
 
-        // Get the official "latest" version from dist-tags
-        // This is the version npm considers stable
+        // dist-tags から公式の "latest" バージョンを取得
+        // npm が安定版とみなすバージョン
         let latest_version = response.dist_tags.get("latest");
 
         let mut versions = Vec::new();
 
         for (version, _) in response.versions {
-            // Skip versions newer than dist-tags.latest
-            // This handles cases where npm has published pre-release versions
-            // (e.g., 7.3.0-integration-...) with version numbers higher than
-            // the current stable release (e.g., 7.2.0)
+            // dist-tags.latest より新しいバージョンをスキップ
+            // npm がプレリリースバージョン (例: 7.3.0-integration-...) を
+            // 現在の安定リリース (例: 7.2.0) より高いバージョン番号で
+            // 公開しているケースに対応
             if let Some(latest) = latest_version
                 && compare_versions(&version, latest) == std::cmp::Ordering::Greater
             {
