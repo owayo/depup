@@ -1,9 +1,9 @@
-//! Output formatting for update results
+//! 更新結果の出力フォーマット
 //!
-//! This module provides:
-//! - Text output for human-readable display
-//! - JSON output for machine processing
-//! - Diff output for showing changes
+//! このモジュールが提供するもの:
+//! - 人間が読みやすいテキスト出力
+//! - 機械処理用 JSON 出力
+//! - 変更内容を表示する diff 出力
 
 mod diff;
 mod json;
@@ -17,40 +17,40 @@ use crate::domain::{ManifestUpdateResult, UpdateSummary};
 use crate::orchestrator::OrchestratorResult;
 use std::io::Write;
 
-/// Output format options
+/// 出力フォーマットオプション
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OutputFormat {
-    /// Human-readable text output
+    /// 人間が読みやすいテキスト出力
     #[default]
     Text,
-    /// JSON output for machine processing
+    /// 機械処理用 JSON 出力
     Json,
-    /// Unified diff format
+    /// unified diff 形式
     Diff,
 }
 
-/// Output verbosity level
+/// 出力の詳細度レベル
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Verbosity {
-    /// Minimal output
+    /// 最小限の出力
     Quiet,
-    /// Normal output
+    /// 通常の出力
     #[default]
     Normal,
-    /// Detailed output with additional information
+    /// 追加情報付きの詳細出力
     Verbose,
 }
 
-/// Configuration for output formatting
+/// 出力フォーマットの設定
 #[derive(Debug, Clone)]
 pub struct OutputConfig {
-    /// Output format (text, json, diff)
+    /// 出力フォーマット (text, json, diff)
     pub format: OutputFormat,
-    /// Verbosity level
+    /// 詳細度レベル
     pub verbosity: Verbosity,
-    /// Whether this is a dry-run
+    /// dry-run かどうか
     pub dry_run: bool,
-    /// Whether to use colors (when supported)
+    /// カラー表示を使用するか (対応時)
     pub color: bool,
 }
 
@@ -66,7 +66,7 @@ impl Default for OutputConfig {
 }
 
 impl OutputConfig {
-    /// Create a new output configuration
+    /// 新しい出力設定を作成
     pub fn new(format: OutputFormat, verbosity: Verbosity, dry_run: bool) -> Self {
         Self {
             format,
@@ -76,7 +76,7 @@ impl OutputConfig {
         }
     }
 
-    /// Create configuration from CLI arguments
+    /// CLI 引数から設定を作成
     pub fn from_cli(json: bool, diff: bool, verbose: bool, quiet: bool, dry_run: bool) -> Self {
         let format = if json {
             OutputFormat::Json
@@ -103,19 +103,19 @@ impl OutputConfig {
     }
 }
 
-/// Trait for output formatters
+/// 出力フォーマッタのトレイト
 pub trait OutputFormatter {
-    /// Format and write the orchestrator result
+    /// オーケストレータの結果をフォーマットして書き出す
     fn format(&self, result: &OrchestratorResult, writer: &mut dyn Write) -> std::io::Result<()>;
 
-    /// Format and write just the summary
+    /// サマリのみをフォーマットして書き出す
     fn format_summary(
         &self,
         summary: &UpdateSummary,
         writer: &mut dyn Write,
     ) -> std::io::Result<()>;
 
-    /// Format and write a single manifest result
+    /// 単一マニフェストの結果をフォーマットして書き出す
     fn format_manifest(
         &self,
         manifest: &ManifestUpdateResult,
@@ -123,7 +123,7 @@ pub trait OutputFormatter {
     ) -> std::io::Result<()>;
 }
 
-/// Create an output formatter based on configuration
+/// 設定に基づいて出力フォーマッタを作成
 pub fn create_formatter(config: OutputConfig) -> Box<dyn OutputFormatter> {
     match config.format {
         OutputFormat::Text => Box::new(TextFormatter::new(config.verbosity, config.dry_run)),

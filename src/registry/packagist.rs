@@ -1,7 +1,7 @@
-//! Packagist Registry adapter
+//! Packagist レジストリアダプタ
 //!
-//! Fetches package version information from the Packagist registry.
-//! API endpoint: https://repo.packagist.org/p2/{vendor}/{package}.json
+//! Packagist レジストリからパッケージバージョン情報を取得する。
+//! API エンドポイント: https://repo.packagist.org/p2/{vendor}/{package}.json
 
 use crate::domain::Language;
 use crate::error::RegistryError;
@@ -12,51 +12,51 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::collections::HashMap;
 
-/// Packagist registry base URL
+/// Packagist レジストリのベース URL
 const PACKAGIST_API_URL: &str = "https://repo.packagist.org/p2";
 
-/// Packagist Registry adapter
+/// Packagist レジストリアダプタ
 pub struct PackagistAdapter {
     client: HttpClient,
 }
 
-/// Packagist API response format (p2 metadata API)
+/// Packagist API レスポンス形式 (p2 メタデータ API)
 #[derive(Debug, Deserialize)]
 struct PackagistResponse {
-    /// Map of package name to version list
+    /// パッケージ名からバージョンリストへのマップ
     packages: HashMap<String, Vec<PackagistVersionInfo>>,
 }
 
-/// Version info from Packagist API response
+/// Packagist API レスポンスのバージョン情報
 #[derive(Debug, Deserialize)]
 struct PackagistVersionInfo {
-    /// Version string (e.g., "v1.0.0" or "1.0.0")
+    /// バージョン文字列 (例: "v1.0.0" または "1.0.0")
     version: String,
-    /// Normalized version for comparison
+    /// 比較用の正規化バージョン
     #[allow(dead_code)]
     version_normalized: Option<String>,
-    /// Release timestamp in ISO 8601 format
+    /// ISO 8601 形式のリリースタイムスタンプ
     time: Option<String>,
 }
 
 impl PackagistAdapter {
-    /// Create a new Packagist adapter
+    /// 新しい Packagist アダプタを作成
     pub fn new(client: HttpClient) -> Self {
         Self { client }
     }
 
-    /// Build the URL for a package
-    /// Package names are in the format vendor/package
+    /// パッケージ用の URL を構築
+    /// パッケージ名は vendor/package 形式
     fn build_url(&self, package: &str) -> String {
         format!("{}/{}.json", PACKAGIST_API_URL, package)
     }
 
-    /// Normalize version string by removing 'v' prefix if present
+    /// 'v' プレフィックスがあれば除去してバージョン文字列を正規化
     fn normalize_version(version: &str) -> String {
         version.strip_prefix('v').unwrap_or(version).to_string()
     }
 
-    /// Check if version is a dev or unstable version
+    /// dev または不安定バージョンかどうかを判定
     fn is_dev_version(version: &str) -> bool {
         let lower = version.to_lowercase();
         lower.contains("dev") || lower.contains("-dev")
@@ -82,16 +82,16 @@ impl RegistryAdapter for PackagistAdapter {
 
         let mut versions = Vec::new();
 
-        // Find the package in the response
-        // The key is the full package name (vendor/package)
+        // レスポンス内からパッケージを検索
+        // キーは完全なパッケージ名 (vendor/package)
         if let Some(version_list) = response.packages.get(package) {
             for version_info in version_list {
-                // Skip dev versions
+                // dev バージョンをスキップ
                 if Self::is_dev_version(&version_info.version) {
                     continue;
                 }
 
-                // Parse the release timestamp
+                // リリースタイムスタンプをパース
                 if let Some(ref time_str) = version_info.time
                     && let Ok(released_at) = time_str.parse::<DateTime<Utc>>()
                 {
@@ -101,7 +101,7 @@ impl RegistryAdapter for PackagistAdapter {
             }
         }
 
-        // Sort by version
+        // バージョンでソート
         versions.sort();
 
         Ok(versions)

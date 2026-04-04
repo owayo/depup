@@ -1,9 +1,9 @@
-//! Maven Central Search API adapter
+//! Maven Central Search API アダプタ
 //!
-//! Fetches Java package version information from Maven Central.
-//! API endpoint: https://search.maven.org/solrsearch/select
+//! Maven Central から Java パッケージのバージョン情報を取得する。
+//! API エンドポイント: https://search.maven.org/solrsearch/select
 //!
-//! Query format: q=g:{groupId}+AND+a:{artifactId}&core=gav&rows=100&wt=json
+//! クエリ形式: q=g:{groupId}+AND+a:{artifactId}&core=gav&rows=100&wt=json
 
 use crate::domain::Language;
 use crate::error::RegistryError;
@@ -13,47 +13,47 @@ use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use serde::Deserialize;
 
-/// Maven Central Search API base URL
+/// Maven Central Search API のベース URL
 const MAVEN_CENTRAL_API_URL: &str = "https://search.maven.org/solrsearch/select";
 
-/// Maximum number of versions to fetch
+/// 取得するバージョンの最大数
 const MAX_VERSIONS: u32 = 100;
 
-/// Maven Central adapter
+/// Maven Central アダプタ
 pub struct MavenCentralAdapter {
     client: HttpClient,
 }
 
-/// Maven Central search response
+/// Maven Central 検索レスポンス
 #[derive(Debug, Deserialize)]
 struct MavenSearchResponse {
     response: MavenResponseBody,
 }
 
-/// Maven Central response body
+/// Maven Central レスポンスボディ
 #[derive(Debug, Deserialize)]
 struct MavenResponseBody {
     docs: Vec<MavenVersionDoc>,
 }
 
-/// Maven Central version document
+/// Maven Central バージョンドキュメント
 #[derive(Debug, Deserialize)]
 struct MavenVersionDoc {
-    /// Version string
+    /// バージョン文字列
     v: String,
-    /// Timestamp in milliseconds since epoch
+    /// エポックからのミリ秒タイムスタンプ
     timestamp: i64,
 }
 
 impl MavenCentralAdapter {
-    /// Create a new Maven Central adapter
+    /// 新しい Maven Central アダプタを作成
     pub fn new(client: HttpClient) -> Self {
         Self { client }
     }
 
-    /// Build search URL for group:artifact
+    /// group:artifact 形式の検索 URL を構築
     fn build_url(&self, package: &str) -> Result<String, RegistryError> {
-        // package format: "group:artifact" (e.g., "org.apache.wicket:wicket-core")
+        // パッケージ形式: "group:artifact" (例: "org.apache.wicket:wicket-core")
         let parts: Vec<&str> = package.split(':').collect();
         if parts.len() != 2 {
             return Err(RegistryError::InvalidPackageName {
@@ -69,7 +69,7 @@ impl MavenCentralAdapter {
         ))
     }
 
-    /// Convert timestamp in milliseconds to DateTime<Utc>
+    /// ミリ秒タイムスタンプを DateTime<Utc> に変換
     fn timestamp_to_datetime(timestamp_ms: i64) -> Option<DateTime<Utc>> {
         Utc.timestamp_millis_opt(timestamp_ms).single()
     }
@@ -100,7 +100,7 @@ impl RegistryAdapter for MavenCentralAdapter {
             }
         }
 
-        // Sort by version
+        // バージョンでソート
         versions.sort();
 
         Ok(versions)
@@ -142,11 +142,11 @@ mod tests {
         let client = HttpClient::new().unwrap();
         let adapter = MavenCentralAdapter::new(client);
 
-        // Missing artifact
+        // アーティファクトなし
         let result = adapter.build_url("org.apache.wicket");
         assert!(result.is_err());
 
-        // Too many parts
+        // パーツが多すぎる
         let result = adapter.build_url("a:b:c");
         assert!(result.is_err());
     }

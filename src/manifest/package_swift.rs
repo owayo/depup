@@ -1,16 +1,16 @@
-//! Package.swift parser for Swift Package Manager projects
+//! Swift Package Manager プロジェクト向けの `Package.swift` パーサ。
 //!
-//! Handles:
+//! 対応対象:
 //! - `.package(url:, from:)` / `.package(name:, url:, from:)` → Caret
 //! - `.package(url:, .upToNextMajor(from:))` → Caret
 //! - `.package(url:, .upToNextMinor(from:))` → Tilde
-//! - `.package(url:, exact:)` / `.package(url:, .exact())` → Exact (pinned)
+//! - `.package(url:, exact:)` / `.package(url:, .exact())` → Exact (固定)
 //! - `.package(url:, "V1"..<"V2")` → Range
 //! - `.package(url:, "V1"..."V2")` → Range
-//! - `.package(path:)` → Skipped (local dependency)
-//! - `branch:` / `revision:` / `.branch()` / `.revision()` → Skipped (no version)
-//! - Comment lines (`//`) are skipped
-//! - Multi-line `.package()` declarations are supported
+//! - `.package(path:)` → スキップ (ローカル依存)
+//! - `branch:` / `revision:` / `.branch()` / `.revision()` → スキップ (バージョンなし)
+//! - コメント行 (`//`) はスキップ
+//! - 複数行の `.package()` 宣言に対応
 
 use crate::domain::{Dependency, Language, VersionSpec, VersionSpecKind};
 use crate::error::ManifestError;
@@ -19,13 +19,13 @@ use regex::Regex;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
-/// Parser for Package.swift files
+/// `Package.swift` 用パーサ
 pub struct PackageSwiftParser;
 
-/// Optional `name:` parameter prefix (Swift 5.2+, deprecated in 5.5+)
+/// オプションの `name:` パラメータ接頭辞 (Swift 5.2+ で追加、5.5+ で非推奨)
 const NAME_OPT: &str = r#"(?:name:\s*"[^"]+"\s*,\s*)?"#;
 
-// Match .package([name:,] url: "...", from: "VERSION")
+// .package([name:,] url: "...", from: "VERSION") にマッチする
 static FROM_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
         r#"\.package\(\s*{}url:\s*"([^"]+)"\s*,\s*from:\s*"([^"]+)"\s*\)"#,
@@ -34,7 +34,7 @@ static FROM_RE: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
-// Match .package([name:,] url: "...", .upToNextMajor(from: "VERSION"))
+// .package([name:,] url: "...", .upToNextMajor(from: "VERSION")) にマッチする
 static UP_TO_NEXT_MAJOR_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
         r#"\.package\(\s*{}url:\s*"([^"]+)"\s*,\s*\.upToNextMajor\(\s*from:\s*"([^"]+)"\s*\)\s*\)"#,
@@ -43,7 +43,7 @@ static UP_TO_NEXT_MAJOR_RE: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
-// Match .package([name:,] url: "...", .upToNextMinor(from: "VERSION"))
+// .package([name:,] url: "...", .upToNextMinor(from: "VERSION")) にマッチする
 static UP_TO_NEXT_MINOR_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
         r#"\.package\(\s*{}url:\s*"([^"]+)"\s*,\s*\.upToNextMinor\(\s*from:\s*"([^"]+)"\s*\)\s*\)"#,
@@ -52,7 +52,7 @@ static UP_TO_NEXT_MINOR_RE: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
-// Match .package([name:,] url: "...", exact: "VERSION")
+// .package([name:,] url: "...", exact: "VERSION") にマッチする
 static EXACT_KEYWORD_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
         r#"\.package\(\s*{}url:\s*"([^"]+)"\s*,\s*exact:\s*"([^"]+)"\s*\)"#,
@@ -61,7 +61,7 @@ static EXACT_KEYWORD_RE: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
-// Match .package([name:,] url: "...", .exact("VERSION"))
+// .package([name:,] url: "...", .exact("VERSION")) にマッチする
 static EXACT_METHOD_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
         r#"\.package\(\s*{}url:\s*"([^"]+)"\s*,\s*\.exact\(\s*"([^"]+)"\s*\)\s*\)"#,
@@ -70,7 +70,7 @@ static EXACT_METHOD_RE: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
-// Match .package([name:,] url: "...", "V1"..<"V2") — half-open range
+// .package([name:,] url: "...", "V1"..<"V2") にマッチする — 半開区間
 static RANGE_HALF_OPEN_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
         r#"\.package\(\s*{}url:\s*"([^"]+)"\s*,\s*"([^"]+)"\s*\.\.<\s*"([^"]+)"\s*\)"#,
@@ -79,7 +79,7 @@ static RANGE_HALF_OPEN_RE: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
-// Match .package([name:,] url: "...", "V1"..."V2") — closed range
+// .package([name:,] url: "...", "V1"..."V2") にマッチする — 閉区間
 static RANGE_CLOSED_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
         r#"\.package\(\s*{}url:\s*"([^"]+)"\s*,\s*"([^"]+)"\s*\.\.\.\s*"([^"]+)"\s*\)"#,
@@ -88,14 +88,14 @@ static RANGE_CLOSED_RE: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
-/// Extract owner/repo from a GitHub URL
+/// GitHub URL から owner/repo を抽出する
 ///
-/// Supports:
+/// 対応形式:
 /// - https://github.com/owner/repo.git
 /// - https://github.com/owner/repo
 /// - git@github.com:owner/repo.git
 fn extract_github_owner_repo(url: &str) -> Option<String> {
-    // HTTPS URL pattern
+    // HTTPS URL パターン
     if let Some(rest) = url.strip_prefix("https://github.com/") {
         let path = rest.trim_end_matches(".git");
         let parts: Vec<&str> = path.splitn(3, '/').collect();
@@ -104,7 +104,7 @@ fn extract_github_owner_repo(url: &str) -> Option<String> {
         }
     }
 
-    // SSH URL pattern
+    // SSH URL パターン
     if let Some(rest) = url.strip_prefix("git@github.com:") {
         let path = rest.trim_end_matches(".git");
         let parts: Vec<&str> = path.splitn(3, '/').collect();
@@ -116,7 +116,7 @@ fn extract_github_owner_repo(url: &str) -> Option<String> {
     None
 }
 
-/// Remove full-line comments from content for parsing
+/// パース用にコンテンツからコメント行を除去する
 fn strip_comment_lines(content: &str) -> String {
     content
         .lines()
@@ -127,11 +127,11 @@ fn strip_comment_lines(content: &str) -> String {
 
 impl ManifestParser for PackageSwiftParser {
     fn parse(&self, content: &str) -> Result<Vec<Dependency>, ManifestError> {
-        // Strip comment lines, then match against full content for multi-line support
+        // コメント行を除去し、複数行対応のため全体に対してマッチする
         let clean = strip_comment_lines(content);
         let mut found: Vec<(usize, Dependency)> = Vec::new();
 
-        // More specific patterns first, then general FROM_RE last
+        // より具体的なパターンを先に、汎用の FROM_RE を最後に試す
         for caps in UP_TO_NEXT_MAJOR_RE.captures_iter(&clean) {
             let pos = caps.get(0).unwrap().start();
             let url = caps.get(1).map(|m| m.as_str()).unwrap_or("");
@@ -196,7 +196,7 @@ impl ManifestParser for PackageSwiftParser {
             }
         }
 
-        // FROM_RE last (most general pattern)
+        // FROM_RE を最後に (最も汎用的なパターン)
         for caps in FROM_RE.captures_iter(&clean) {
             let pos = caps.get(0).unwrap().start();
             let url = caps.get(1).map(|m| m.as_str()).unwrap_or("");
@@ -207,10 +207,10 @@ impl ManifestParser for PackageSwiftParser {
             }
         }
 
-        // Sort by position to preserve original order
+        // 元の順序を保つため位置でソートする
         found.sort_by_key(|(pos, _)| *pos);
 
-        // Deduplicate by package name
+        // パッケージ名で重複を除去する
         let mut seen = std::collections::HashSet::new();
         let dependencies = found
             .into_iter()
@@ -247,7 +247,7 @@ impl ManifestParser for PackageSwiftParser {
                 message: format!("invalid regex pattern: {}", e),
             })?;
 
-        // Find the URL in the full content (supports multi-line declarations)
+        // 全体から URL を検索する (複数行宣言に対応)
         let url_match = url_re
             .find(content)
             .ok_or_else(|| ManifestError::InvalidVersionSpec {
@@ -256,7 +256,7 @@ impl ManifestParser for PackageSwiftParser {
                 message: "package not found or version could not be updated".to_string(),
             })?;
 
-        // Check if the URL is on a comment line
+        // URL がコメント行にあるかどうかを確認する
         let line_start = content[..url_match.start()]
             .rfind('\n')
             .map(|i| i + 1)
@@ -270,7 +270,7 @@ impl ManifestParser for PackageSwiftParser {
             });
         }
 
-        // Find the enclosing .package() declaration
+        // 囲む .package() 宣言を見つける
         let prefix = &content[..url_match.start()];
         let pkg_start =
             prefix
@@ -281,7 +281,7 @@ impl ManifestParser for PackageSwiftParser {
                     message: "package not found or version could not be updated".to_string(),
                 })?;
 
-        // Count paren depth from .package( to url end
+        // .package( から URL 末尾までの括弧深度を数える
         let mut depth: i32 = 0;
         for c in content[pkg_start..url_match.end()].chars() {
             match c {
@@ -299,7 +299,7 @@ impl ManifestParser for PackageSwiftParser {
             });
         }
 
-        // Find matching closing paren
+        // 対応する閉じ括弧を見つける
         let mut end_pos = content.len();
         for (i, c) in content[url_match.end()..].char_indices() {
             match c {
@@ -315,7 +315,7 @@ impl ManifestParser for PackageSwiftParser {
             }
         }
 
-        // Replace version strings between url end and package declaration end
+        // URL 末尾からパッケージ宣言末尾までのバージョン文字列を置換する
         let before = &content[..url_match.end()];
         let version_section = &content[url_match.end()..end_pos];
         let after = &content[end_pos..];
@@ -525,7 +525,7 @@ let package = Package(
             .update_version(content, "apple/swift-argument-parser", "1.3.0")
             .unwrap();
         assert!(result.contains(r#"from: "1.3.0""#));
-        // Other packages unchanged
+        // 他のパッケージは変更されない
         assert!(result.contains(r#"from: "4.0.0""#));
     }
 
@@ -558,7 +558,7 @@ let package = Package(
         assert_eq!(deps[0].name, "apple/swift-log");
     }
 
-    // --- name: parameter support ---
+    // --- name: パラメータのサポート ---
 
     #[test]
     fn test_parse_with_name_parameter_from() {
@@ -587,7 +587,7 @@ let package = Package(
         assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Exact);
     }
 
-    // --- path: dependencies (should be skipped) ---
+    // --- path: 依存 (スキップされるべき) ---
 
     #[test]
     fn test_skip_path_dependency() {
@@ -603,7 +603,7 @@ let package = Package(
         assert!(deps.is_empty());
     }
 
-    // --- .branch() / .revision() method syntax ---
+    // --- .branch() / .revision() メソッド構文 ---
 
     #[test]
     fn test_skip_branch_method_syntax() {
@@ -619,7 +619,7 @@ let package = Package(
         assert!(deps.is_empty());
     }
 
-    // --- Multi-line declarations ---
+    // --- 複数行宣言 ---
 
     #[test]
     fn test_parse_multiline_from() {
@@ -669,7 +669,7 @@ let package = Package(
         assert!(result.contains(r#"name: "ArgumentParser""#));
     }
 
-    // --- Realistic Package.swift ---
+    // --- 実運用に近い Package.swift ---
 
     #[test]
     fn test_update_version_range_preserves_upper_bound() {
@@ -739,7 +739,7 @@ let package = Package(
 
     #[test]
     fn test_parse_url_without_dot_git_from() {
-        // .git 拡張子なしの URL でも正しくパースされること
+        // .git 拡張なしの URL でも正しくパースされること
         let content = r#".package(url: "https://github.com/owner/repo", from: "1.0.0")"#;
         let deps = parse(content).unwrap();
         assert_eq!(deps.len(), 1);

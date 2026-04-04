@@ -1,7 +1,7 @@
-//! RubyGems Registry adapter
+//! RubyGems レジストリアダプタ
 //!
-//! Fetches package version information from the RubyGems registry.
-//! API endpoint: https://rubygems.org/api/v1/versions/{gem}.json
+//! RubyGems レジストリからパッケージバージョン情報を取得する。
+//! API エンドポイント: https://rubygems.org/api/v1/versions/{gem}.json
 
 use crate::domain::Language;
 use crate::error::RegistryError;
@@ -11,36 +11,36 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
-/// RubyGems registry base URL
+/// RubyGems レジストリのベース URL
 const RUBYGEMS_API_URL: &str = "https://rubygems.org/api/v1/versions";
 
-/// RubyGems Registry adapter
+/// RubyGems レジストリアダプタ
 pub struct RubyGemsAdapter {
     client: HttpClient,
 }
 
-/// RubyGems version info from API response
+/// RubyGems API レスポンスのバージョン情報
 #[derive(Debug, Deserialize)]
 struct RubyGemsVersionInfo {
-    /// Version number (e.g., "7.1.0")
+    /// バージョン番号 (例: "7.1.0")
     number: String,
-    /// Creation timestamp
+    /// 作成日時タイムスタンプ
     created_at: String,
-    /// Platform (usually "ruby")
+    /// プラットフォーム (通常 "ruby")
     #[allow(dead_code)]
     platform: Option<String>,
-    /// Whether this version is yanked
+    /// このバージョンが yank されているか
     #[serde(default)]
     yanked: bool,
 }
 
 impl RubyGemsAdapter {
-    /// Create a new RubyGems adapter
+    /// 新しい RubyGems アダプタを作成
     pub fn new(client: HttpClient) -> Self {
         Self { client }
     }
 
-    /// Build the URL for a gem
+    /// gem 用の URL を構築
     fn build_url(&self, gem: &str) -> String {
         format!("{}/{}.json", RUBYGEMS_API_URL, gem)
     }
@@ -66,18 +66,18 @@ impl RegistryAdapter for RubyGemsAdapter {
         let mut versions = Vec::new();
 
         for version_info in response {
-            // Skip yanked versions
+            // yank されたバージョンをスキップ
             if version_info.yanked {
                 continue;
             }
 
-            // Parse the creation timestamp
+            // 作成日時タイムスタンプをパース
             if let Ok(released_at) = version_info.created_at.parse::<DateTime<Utc>>() {
                 versions.push(VersionInfo::new(&version_info.number, released_at));
             }
         }
 
-        // Sort by version
+        // バージョンでソート
         versions.sort();
 
         Ok(versions)
@@ -142,6 +142,6 @@ mod tests {
         let json = r#"{"number": "1.0.0", "created_at": "2023-01-01T00:00:00Z"}"#;
         let info: RubyGemsVersionInfo = serde_json::from_str(json).unwrap();
         assert_eq!(info.number, "1.0.0");
-        assert!(!info.yanked); // defaults to false
+        assert!(!info.yanked); // デフォルトは false
     }
 }

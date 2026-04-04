@@ -53,7 +53,7 @@ impl GoProxyAdapter {
 
     /// Go Proxy URL 用にモジュールパスをエンコード
     fn encode_module_path(module: &str) -> String {
-        // Go Proxy uses case-encoded paths where uppercase letters become !lowercase
+        // Go Proxy は大文字を !小文字 にエンコードするケースエンコードパスを使用
         let mut encoded = String::with_capacity(module.len() + GO_PROXY_URL.len() + 1);
         encoded.push_str(GO_PROXY_URL);
         encoded.push('/');
@@ -84,7 +84,7 @@ impl RegistryAdapter for GoProxyAdapter {
     }
 
     async fn fetch_versions(&self, module: &str) -> Result<Vec<VersionInfo>, RegistryError> {
-        // First, get the list of versions
+        // まずバージョン一覧を取得
         let list_url = self.build_list_url(module);
         let version_list = self
             .client
@@ -97,7 +97,7 @@ impl RegistryAdapter for GoProxyAdapter {
             return Ok(Vec::new());
         }
 
-        // For each version, fetch the info to get the release time
+        // 各バージョンについて、リリース時刻を取得するために情報をフェッチ
         let mut versions = Vec::new();
 
         for version_str in version_strings {
@@ -118,13 +118,13 @@ impl RegistryAdapter for GoProxyAdapter {
                     }
                 }
                 Err(_) => {
-                    // If we can't get info for a specific version, skip it
+                    // 特定バージョンの情報が取得できない場合はスキップ
                     continue;
                 }
             }
         }
 
-        // Sort by version
+        // バージョンでソート
         versions.sort();
 
         Ok(versions)
@@ -159,7 +159,7 @@ mod tests {
 
     #[test]
     fn test_encode_module_path_with_uppercase() {
-        // Uppercase letters should be encoded as !lowercase
+        // 大文字は !小文字 にエンコードされるべき
         assert_eq!(
             GoProxyAdapter::encode_module_path("github.com/Azure/azure-sdk-for-go"),
             "https://proxy.golang.org/github.com/!azure/azure-sdk-for-go"

@@ -1,11 +1,11 @@
-//! Text output formatter for human-readable display
+//! 人間が読みやすいテキスト出力フォーマッタ
 //!
-//! This module provides:
-//! - Human-readable update result display with colors
-//! - Semantic version change type indication (major/minor/patch)
-//! - Production vs development dependency grouping
-//! - Skipped package display with reasons
-//! - Summary with detailed breakdown
+//! このモジュールが提供するもの:
+//! - カラー付き更新結果の表示
+//! - セマンティックバージョン変更種別の表示 (major/minor/patch)
+//! - 本番/開発依存関係のグループ分け
+//! - スキップされたパッケージの理由表示
+//! - 詳細な内訳付きサマリ
 
 use crate::domain::{Language, ManifestUpdateResult, SkipReason, UpdateResult, UpdateSummary};
 use crate::orchestrator::OrchestratorResult;
@@ -14,32 +14,32 @@ use chrono::{DateTime, Utc};
 use colored::Colorize;
 use std::io::Write;
 
-/// Semantic version change type
+/// セマンティックバージョン変更種別
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VersionChangeType {
-    /// Major version change (breaking)
+    /// メジャーバージョン変更 (破壊的)
     Major,
-    /// Minor version change (features)
+    /// マイナーバージョン変更 (機能追加)
     Minor,
-    /// Patch version change (fixes)
+    /// パッチバージョン変更 (修正)
     Patch,
-    /// New version being added (no previous version)
+    /// 新規バージョン追加 (以前のバージョンなし)
     New,
-    /// Unknown or unparseable
+    /// 不明またはパース不可
     Unknown,
 }
 
 impl VersionChangeType {
-    /// Determine the change type between two versions
+    /// 2つのバージョン間の変更種別を判定
     pub fn from_versions(old: &str, new: &str) -> Self {
-        // If old version is empty or "-", this is a new version being added
+        // 旧バージョンが空か "-" なら新規追加
         if old.is_empty() || old == "-" {
             return VersionChangeType::New;
         }
 
         let parse = |v: &str| -> Option<(u64, u64, u64)> {
             let v = v.strip_prefix('v').unwrap_or(v);
-            // Split by . and - to handle prerelease suffixes
+            // . と - で分割してプレリリースサフィックスに対応
             let parts: Vec<&str> = v.split(['.', '-']).collect();
             if parts.len() >= 3 {
                 Some((
@@ -70,7 +70,7 @@ impl VersionChangeType {
         }
     }
 
-    /// Get the display label with color
+    /// カラー付き表示ラベルを取得
     pub fn colored_label(&self) -> String {
         match self {
             VersionChangeType::Major => "major".red().bold().to_string(),
@@ -81,7 +81,7 @@ impl VersionChangeType {
         }
     }
 
-    /// Get the plain label
+    /// プレーンラベルを取得
     pub fn label(&self) -> &'static str {
         match self {
             VersionChangeType::Major => "major",
@@ -93,14 +93,14 @@ impl VersionChangeType {
     }
 }
 
-/// Package info for skip display in verbose mode
+/// verbose モードでのスキップ表示用パッケージ情報
 struct SkipPackageInfo {
     name: String,
     version: String,
     released_at: Option<DateTime<Utc>>,
 }
 
-/// Named color for conditional styling
+/// 条件付きスタイリング用の名前付きカラー
 #[derive(Clone, Copy)]
 enum Color {
     Red,
@@ -110,18 +110,18 @@ enum Color {
     Dimmed,
 }
 
-/// Text formatter for human-readable output
+/// 人間が読みやすい出力用テキストフォーマッタ
 pub struct TextFormatter {
-    /// Verbosity level
+    /// 詳細度レベル
     verbosity: Verbosity,
-    /// Whether this is a dry-run
+    /// dry-run かどうか
     dry_run: bool,
-    /// Whether to use colors
+    /// カラー表示を使用するか
     color: bool,
 }
 
 impl TextFormatter {
-    /// Create a new text formatter
+    /// 新しいテキストフォーマッタを作成
     pub fn new(verbosity: Verbosity, dry_run: bool) -> Self {
         Self {
             verbosity,
@@ -130,7 +130,7 @@ impl TextFormatter {
         }
     }
 
-    /// Create a new text formatter with color option
+    /// カラーオプション付きで新しいテキストフォーマッタを作成
     pub fn with_color(verbosity: Verbosity, dry_run: bool, color: bool) -> Self {
         Self {
             verbosity,
@@ -139,7 +139,7 @@ impl TextFormatter {
         }
     }
 
-    /// Get the dry-run prefix if applicable
+    /// 該当する場合 dry-run プレフィックスを取得
     fn dry_run_prefix(&self) -> String {
         if self.dry_run {
             if self.color {
@@ -152,7 +152,7 @@ impl TextFormatter {
         }
     }
 
-    /// Format a skip reason for display
+    /// スキップ理由を表示用にフォーマット
     fn format_skip_reason(&self, reason: &SkipReason) -> String {
         match reason {
             SkipReason::Pinned => "pinned".to_string(),
@@ -166,7 +166,7 @@ impl TextFormatter {
         }
     }
 
-    /// Calculate the maximum package name length for alignment
+    /// 整列のためにパッケージ名の最大長を計算
     fn max_name_length(&self, results: &[&UpdateResult]) -> usize {
         results
             .iter()
@@ -178,7 +178,7 @@ impl TextFormatter {
             .unwrap_or(0)
     }
 
-    /// Format a single update line
+    /// 単一の更新行をフォーマット
     #[allow(clippy::too_many_arguments)]
     fn format_update_line(
         &self,

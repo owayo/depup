@@ -1,10 +1,10 @@
-//! GitHub Tags API adapter for Swift Package Manager
+//! Swift Package Manager 用 GitHub Tags API アダプタ
 //!
-//! Fetches package version information from the GitHub Tags API.
-//! API endpoint: https://api.github.com/repos/{owner}/{repo}/tags
+//! GitHub Tags API からパッケージバージョン情報を取得する。
+//! API エンドポイント: https://api.github.com/repos/{owner}/{repo}/tags
 //!
-//! Authentication: Optional via GITHUB_TOKEN or GH_TOKEN environment variable.
-//! Non-GitHub URLs are skipped at the manifest parser level.
+//! 認証: GITHUB_TOKEN または GH_TOKEN 環境変数による任意認証。
+//! 非 GitHub URL はマニフェストパーサレベルでスキップされる。
 
 use crate::domain::Language;
 use crate::error::RegistryError;
@@ -16,29 +16,29 @@ use regex::Regex;
 use serde::Deserialize;
 use std::sync::LazyLock;
 
-/// GitHub API base URL
+/// GitHub API のベース URL
 const GITHUB_API_URL: &str = "https://api.github.com";
 
-/// Semver tag pattern (with optional 'v' prefix)
+/// semver タグパターン ('v' プレフィックスは任意)
 static SEMVER_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[vV]?(\d+\.\d+\.\d+)$").unwrap());
 
-/// GitHub Tags API adapter
+/// GitHub Tags API アダプタ
 pub struct GitHubTagsAdapter {
     client: HttpClient,
     token: Option<String>,
 }
 
-/// GitHub tag info from API response
+/// GitHub API レスポンスのタグ情報
 #[derive(Debug, Deserialize)]
 struct GitHubTag {
     name: String,
 }
 
 impl GitHubTagsAdapter {
-    /// Create a new GitHub Tags adapter
+    /// 新しい GitHub Tags アダプタを作成
     pub fn new(client: HttpClient) -> Self {
-        // Try GITHUB_TOKEN first, then GH_TOKEN
+        // まず GITHUB_TOKEN を試し、次に GH_TOKEN を試す
         let token = std::env::var("GITHUB_TOKEN")
             .or_else(|_| std::env::var("GH_TOKEN"))
             .ok();
@@ -46,12 +46,12 @@ impl GitHubTagsAdapter {
         Self { client, token }
     }
 
-    /// Build the tags URL for a repository
+    /// リポジトリ用のタグ URL を構築
     fn build_url(&self, owner_repo: &str) -> String {
         format!("{}/repos/{}/tags?per_page=100", GITHUB_API_URL, owner_repo)
     }
 
-    /// Validate that the package name is in "owner/repo" format
+    /// パッケージ名が "owner/repo" 形式であることを検証
     fn validate_package_name(&self, package: &str) -> Result<(), RegistryError> {
         let parts: Vec<&str> = package.split('/').collect();
         if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
@@ -80,7 +80,7 @@ impl RegistryAdapter for GitHubTagsAdapter {
 
         let url = self.build_url(package);
 
-        // Build the request with appropriate headers
+        // 適切なヘッダ付きでリクエストを構築
         let mut request = self.client.inner().get(&url);
         request = request.header("Accept", "application/vnd.github+json");
 
@@ -103,7 +103,7 @@ impl RegistryAdapter for GitHubTagsAdapter {
             }
         })?;
 
-        // Handle HTTP status codes
+        // HTTP ステータスコードを処理
         match response.status() {
             status if status == reqwest::StatusCode::NOT_FOUND => {
                 return Err(RegistryError::PackageNotFound {
@@ -149,15 +149,15 @@ impl RegistryAdapter for GitHubTagsAdapter {
         let now = Utc::now();
 
         for tag in tags {
-            // Try to extract semver from tag name
+            // タグ名から semver を抽出
             if let Some(caps) = SEMVER_RE.captures(&tag.name) {
                 let version = caps.get(1).unwrap().as_str();
-                // Use current time as fallback for release date
+                // リリース日のフォールバックとして現在時刻を使用
                 versions.push(VersionInfo::new(version, now));
             }
         }
 
-        // Sort by version
+        // バージョンでソート
         versions.sort();
 
         Ok(versions)

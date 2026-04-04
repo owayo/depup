@@ -13,20 +13,20 @@ use regex::Regex;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
-/// Parser for go.mod files
+/// `go.mod` 用パーサ
 pub struct GoModParser;
 
-// Regex for single require: require module/path v1.2.3
+// 単一 require 文の正規表現: require module/path v1.2.3
 static SINGLE_REQUIRE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^\s*require\s+(\S+)\s+(v[\d]+\.[\d]+\.[\d]+[^\s]*)\s*(//.*)?\s*$").unwrap()
 });
 
-// Regex for require block entry: module/path v1.2.3
+// require ブロック内エントリの正規表現: module/path v1.2.3
 static BLOCK_ENTRY_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^\s*(\S+)\s+(v[\d]+\.[\d]+\.[\d]+[^\s]*)\s*(//.*)?\s*$").unwrap()
 });
 
-// Regex for pinned comment
+// pinned コメントの正規表現
 static PINNED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"//\s*pinned").unwrap());
 
 impl ManifestParser for GoModParser {
@@ -40,12 +40,12 @@ impl ManifestParser for GoModParser {
         for line in content.lines() {
             let trimmed = line.trim();
 
-            // Skip empty lines and comments
+            // 空行とコメントをスキップする
             if trimmed.is_empty() || trimmed.starts_with("//") {
                 continue;
             }
 
-            // Check for block start/end
+            // ブロックの開始/終了を確認する
             if trimmed.starts_with("require (") || trimmed == "require (" {
                 in_require_block = true;
                 continue;
@@ -62,15 +62,15 @@ impl ManifestParser for GoModParser {
                 continue;
             }
 
-            // Skip replace blocks - these are local overrides
+            // replace ブロックはローカルオーバーライドなのでスキップする
             if in_replace_block || trimmed.starts_with("replace ") {
                 continue;
             }
 
-            // Check for pinned comment
+            // pinned コメントを確認する
             let is_pinned = PINNED_RE.is_match(line);
 
-            // Parse single require statement
+            // 単一 require 文をパースする
             if let Some(caps) = SINGLE_REQUIRE_RE.captures(trimmed) {
                 if let Some(dep) = parse_go_dependency(&caps, parser.as_ref(), is_pinned) {
                     dependencies.push(dep);
@@ -78,7 +78,7 @@ impl ManifestParser for GoModParser {
                 continue;
             }
 
-            // Parse require block entry
+            // require ブロック内エントリをパースする
             if in_require_block
                 && let Some(caps) = BLOCK_ENTRY_RE.captures(trimmed)
                 && let Some(dep) = parse_go_dependency(&caps, parser.as_ref(), is_pinned)
@@ -103,7 +103,7 @@ impl ManifestParser for GoModParser {
         let mut result = String::new();
         let mut updated = false;
 
-        // Ensure version has v prefix
+        // バージョンに v プレフィックスを付ける
         let new_ver = if new_version.starts_with('v') {
             new_version.to_string()
         } else {
@@ -113,9 +113,9 @@ impl ManifestParser for GoModParser {
         for line in content.lines() {
             let trimmed = line.trim();
 
-            // Check if this line contains our package
+            // この行に対象パッケージが含まれているか確認する
             let updated_line = if trimmed.contains(package) {
-                // Try to match single require
+                // 単一 require 文とのマッチを試みる
                 if let Some(caps) = SINGLE_REQUIRE_RE.captures(trimmed) {
                     let module = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                     if module == package {
@@ -131,11 +131,11 @@ impl ManifestParser for GoModParser {
                         None
                     }
                 } else if let Some(caps) = BLOCK_ENTRY_RE.captures(trimmed) {
-                    // Try to match block entry
+                    // ブロックエントリとのマッチを試みる
                     let module = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                     if module == package {
                         let comment = caps.get(3).map(|m| m.as_str()).unwrap_or("");
-                        // Preserve leading whitespace
+                        // 先頭の空白を保持する
                         let leading_ws = line.len() - line.trim_start().len();
                         let indent = &line[..leading_ws];
                         let new_line = if comment.is_empty() {
@@ -163,7 +163,7 @@ impl ManifestParser for GoModParser {
             result.push('\n');
         }
 
-        // Remove trailing newline if original didn't have one
+        // 元のファイルに末尾改行がなければ除去する
         if !content.ends_with('\n') && result.ends_with('\n') {
             result.pop();
         }
@@ -188,7 +188,7 @@ fn parse_go_dependency(
     let module = caps.get(1)?.as_str();
     let version = caps.get(2)?.as_str();
 
-    // Skip indirect dependencies (usually have // indirect comment)
+    // 間接依存をスキップする (通常 // indirect コメントが付いている)
     let comment = caps.get(3).map(|m| m.as_str()).unwrap_or("");
     let is_indirect = comment.contains("indirect");
 
@@ -298,7 +298,7 @@ require (
         assert!(!gin.is_dev);
 
         let text = deps.iter().find(|d| d.name == "golang.org/x/text").unwrap();
-        assert!(text.is_dev); // indirect marked as dev
+        assert!(text.is_dev); // indirect は開発依存として扱う
     }
 
     #[test]
@@ -428,7 +428,7 @@ require (
             .update_version(content, "github.com/gin-gonic/gin", "v1.10.0")
             .unwrap();
         assert!(result.contains("v1.10.0"));
-        assert!(result.contains("v1.8.4")); // Other deps unchanged
+        assert!(result.contains("v1.8.4")); // 他の依存は変更されない
     }
 
     #[test]
@@ -482,7 +482,7 @@ require github.com/gin-gonic/gin v1.9.1
 
     #[test]
     fn test_parse_ignores_exclude() {
-        // exclude directives should not be parsed as dependencies
+        // exclude ディレクティブは依存関係としてパースされないこと
         let content = r#"
 module example.com/myproject
 
@@ -500,7 +500,7 @@ exclude github.com/bad/pkg v1.2.3
 
     #[test]
     fn test_parse_ignores_exclude_block() {
-        // exclude blocks should not be parsed as dependencies
+        // exclude ブロックは依存関係としてパースされないこと
         let content = r#"
 module example.com/myproject
 
@@ -521,7 +521,7 @@ exclude (
 
     #[test]
     fn test_parse_ignores_retract() {
-        // retract directives should not be parsed as dependencies
+        // retract ディレクティブは依存関係としてパースされないこと
         let content = r#"
 module example.com/myproject
 
@@ -539,7 +539,7 @@ retract v1.0.0
 
     #[test]
     fn test_parse_mixed_directives() {
-        // All non-require directives should be ignored
+        // require 以外のディレクティブはすべて無視されるべき
         let content = r#"
 module example.com/myproject
 
@@ -642,7 +642,7 @@ require github.com/critical/lib v1.0.0 // pinned
 
     #[test]
     fn test_parse_require_with_tabs_and_spaces() {
-        // Mixed whitespace should be handled
+        // タブとスペースが混在しても処理できること
         let content = "module example.com/myproject\n\ngo 1.21\n\nrequire (\n\tgithub.com/gin-gonic/gin v1.9.1\n    github.com/pkg/errors v0.9.1\n)";
 
         let deps = parse(content).unwrap();

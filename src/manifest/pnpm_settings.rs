@@ -1,43 +1,43 @@
-//! pnpm workspace settings reader
+//! pnpm ワークスペース設定の読み取り
 //!
-//! Reads pnpm configuration from (in priority order):
+//! 以下の優先順で pnpm 設定を読み取る:
 //! - .npmrc (minimum-release-age=10d)
-//! - pnpm-workspace.yaml (minimumReleaseAge: 14400) - value in minutes
+//! - pnpm-workspace.yaml (minimumReleaseAge: 14400) - 値は分単位
 //! - package.json (pnpm.settings.minimumReleaseAge)
 
 use std::path::Path;
 use std::time::Duration;
 
-/// pnpm workspace settings
+/// pnpm ワークスペース設定
 #[derive(Debug, Clone, Default)]
 pub struct PnpmSettings {
-    /// Minimum release age for packages
+    /// パッケージの最低リリース経過時間
     pub minimum_release_age: Option<Duration>,
 }
 
 impl PnpmSettings {
-    /// Read pnpm settings from a directory
+    /// ディレクトリから pnpm 設定を読み取る
     ///
-    /// Checks in order of priority:
-    /// 1. .npmrc (minimum-release-age setting)
-    /// 2. pnpm-workspace.yaml (minimumReleaseAge in minutes)
+    /// 優先順に確認する:
+    /// 1. .npmrc (minimum-release-age 設定)
+    /// 2. pnpm-workspace.yaml (minimumReleaseAge、分単位)
     /// 3. package.json (pnpm.settings.minimumReleaseAge)
     pub fn from_dir(dir: &Path) -> Self {
         let mut settings = PnpmSettings::default();
 
-        // Try reading from .npmrc first (highest priority)
+        // まず .npmrc から読み取る (最高優先)
         if let Some(age) = read_npmrc_minimum_release_age(dir) {
             settings.minimum_release_age = Some(age);
             return settings;
         }
 
-        // Try reading from pnpm-workspace.yaml
+        // pnpm-workspace.yaml から読み取りを試みる
         if let Some(age) = read_workspace_yaml_minimum_release_age(dir) {
             settings.minimum_release_age = Some(age);
             return settings;
         }
 
-        // Try reading from package.json
+        // package.json から読み取りを試みる
         if let Some(age) = read_package_json_minimum_release_age(dir) {
             settings.minimum_release_age = Some(age);
         }
@@ -46,7 +46,7 @@ impl PnpmSettings {
     }
 }
 
-/// Parse duration string in format: Nd (days), Nw (weeks), Nm (months)
+/// 期間文字列をパースする。形式: Nd (日), Nw (週), Nm (月)
 fn parse_duration(s: &str) -> Option<Duration> {
     let s = s.trim();
     if s.is_empty() {
@@ -76,21 +76,21 @@ fn parse_duration(s: &str) -> Option<Duration> {
     Some(Duration::from_secs(seconds))
 }
 
-/// Read minimum-release-age from .npmrc file
+/// .npmrc ファイルから minimum-release-age を読み取る
 fn read_npmrc_minimum_release_age(dir: &Path) -> Option<Duration> {
     let npmrc_path = dir.join(".npmrc");
     let content = std::fs::read_to_string(npmrc_path).ok()?;
 
     for line in content.lines() {
         let line = line.trim();
-        // Skip comments
+        // コメントをスキップする
         if line.starts_with('#') || line.starts_with(';') {
             continue;
         }
 
-        // Look for minimum-release-age setting
+        // minimum-release-age 設定を探す
         if let Some(value) = line.strip_prefix("minimum-release-age=") {
-            // Handle quoted values like "10d" or '2w'
+            // "10d" や '2w' のようなクォート付き値を処理する
             let value = value.trim();
             let value = value.trim_matches('"').trim_matches('\'');
             return parse_duration(value);
@@ -100,23 +100,23 @@ fn read_npmrc_minimum_release_age(dir: &Path) -> Option<Duration> {
     None
 }
 
-/// Read minimumReleaseAge from pnpm-workspace.yaml
+/// pnpm-workspace.yaml から minimumReleaseAge を読み取る
 ///
-/// The value in pnpm-workspace.yaml is in minutes (e.g., 14400 = 10 days)
+/// pnpm-workspace.yaml の値は分単位 (例: 14400 = 10日)
 fn read_workspace_yaml_minimum_release_age(dir: &Path) -> Option<Duration> {
     let workspace_path = dir.join("pnpm-workspace.yaml");
     let content = std::fs::read_to_string(workspace_path).ok()?;
 
-    // Simple YAML parsing for minimumReleaseAge
+    // minimumReleaseAge の簡易 YAML パース
     for line in content.lines() {
         let line = line.trim();
         if let Some(value) = line.strip_prefix("minimumReleaseAge:") {
             let value = value.trim();
-            // Value is in minutes
+            // 値は分単位
             if let Ok(minutes) = value.parse::<u64>() {
                 return Some(Duration::from_secs(minutes * 60));
             }
-            // Also support quoted string format like "10d"
+            // "10d" のようなクォート付き文字列形式もサポートする
             let value = value.trim_matches('"').trim_matches('\'');
             return parse_duration(value);
         }
@@ -125,13 +125,13 @@ fn read_workspace_yaml_minimum_release_age(dir: &Path) -> Option<Duration> {
     None
 }
 
-/// Read minimumReleaseAge from package.json pnpm.settings
+/// package.json の pnpm.settings から minimumReleaseAge を読み取る
 fn read_package_json_minimum_release_age(dir: &Path) -> Option<Duration> {
     let package_json_path = dir.join("package.json");
     let content = std::fs::read_to_string(package_json_path).ok()?;
     let json: serde_json::Value = serde_json::from_str(&content).ok()?;
 
-    // Look for pnpm.settings.minimumReleaseAge
+    // pnpm.settings.minimumReleaseAge を探す
     let age_str = json
         .get("pnpm")?
         .get("settings")?
@@ -141,7 +141,7 @@ fn read_package_json_minimum_release_age(dir: &Path) -> Option<Duration> {
     parse_duration(age_str)
 }
 
-/// Check if a directory has pnpm workspace configuration
+/// ディレクトリに pnpm ワークスペース設定があるかどうかを判定する
 pub fn has_pnpm_workspace(dir: &Path) -> bool {
     dir.join("pnpm-workspace.yaml").exists() || dir.join("pnpm-lock.yaml").exists()
 }
@@ -282,7 +282,7 @@ mod tests {
     #[test]
     fn test_read_workspace_yaml_minimum_release_age_minutes() {
         let dir = create_temp_dir();
-        // 14400 minutes = 10 days
+        // 14400 分 = 10 日
         fs::write(
             dir.path().join("pnpm-workspace.yaml"),
             "packages: []\nminimumReleaseAge: 14400\n",
@@ -325,7 +325,7 @@ mod tests {
     #[test]
     fn test_pnpm_settings_workspace_yaml_priority_over_package_json() {
         let dir = create_temp_dir();
-        // Both pnpm-workspace.yaml and package.json have settings
+        // pnpm-workspace.yaml と package.json の両方に設定がある
         fs::write(
             dir.path().join("pnpm-workspace.yaml"),
             "packages: []\nminimumReleaseAge: 14400\n",
@@ -344,7 +344,7 @@ mod tests {
         .unwrap();
 
         let settings = PnpmSettings::from_dir(dir.path());
-        // pnpm-workspace.yaml takes priority over package.json
+        // pnpm-workspace.yaml が package.json より優先される
         assert_eq!(
             settings.minimum_release_age,
             Some(Duration::from_secs(14400 * 60))
@@ -354,7 +354,7 @@ mod tests {
     #[test]
     fn test_pnpm_settings_npmrc_takes_priority() {
         let dir = create_temp_dir();
-        // Both .npmrc and package.json have settings
+        // .npmrc と package.json の両方に設定がある
         fs::write(dir.path().join(".npmrc"), "minimum-release-age=10d\n").unwrap();
         fs::write(
             dir.path().join("package.json"),
@@ -369,7 +369,7 @@ mod tests {
         .unwrap();
 
         let settings = PnpmSettings::from_dir(dir.path());
-        // .npmrc takes priority
+        // .npmrc が優先される
         assert_eq!(
             settings.minimum_release_age,
             Some(Duration::from_secs(10 * 86400))
