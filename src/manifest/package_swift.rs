@@ -802,4 +802,109 @@ let package = Package(
         assert_eq!(http_client.version_spec.kind, VersionSpecKind::Range);
         assert_eq!(http_client.version_spec.version, "1.0.0");
     }
+
+    #[test]
+    fn test_parse_name_parameter() {
+        // name: パラメータ付きの各種制約タイプが正しくパースされること
+        let content = r#"
+// swift-tools-version: 5.9
+import PackageDescription
+
+let package = Package(
+    name: "MyApp",
+    dependencies: [
+        .package(name: "ArgumentParser", url: "https://github.com/apple/swift-argument-parser.git", from: "1.2.0"),
+        .package(name: "Vapor", url: "https://github.com/vapor/vapor.git", .upToNextMajor(from: "4.0.0")),
+        .package(name: "SwiftNIO", url: "https://github.com/apple/swift-nio.git", .upToNextMinor(from: "2.40.0")),
+        .package(name: "GRPC", url: "https://github.com/grpc/grpc-swift.git", exact: "1.0.0"),
+        .package(name: "GRPCMethod", url: "https://github.com/grpc/grpc-swift-nio.git", .exact("2.0.0")),
+    ]
+)
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 5);
+
+        // name: パラメータは無視され、URL からパッケージ名が抽出される
+        let parser_dep = deps
+            .iter()
+            .find(|d| d.name == "apple/swift-argument-parser")
+            .unwrap();
+        assert_eq!(parser_dep.version_spec.kind, VersionSpecKind::Caret);
+        assert_eq!(parser_dep.version_spec.version, "1.2.0");
+
+        let vapor = deps.iter().find(|d| d.name == "vapor/vapor").unwrap();
+        assert_eq!(vapor.version_spec.kind, VersionSpecKind::Caret);
+        assert_eq!(vapor.version_spec.version, "4.0.0");
+
+        let nio = deps.iter().find(|d| d.name == "apple/swift-nio").unwrap();
+        assert_eq!(nio.version_spec.kind, VersionSpecKind::Tilde);
+        assert_eq!(nio.version_spec.version, "2.40.0");
+
+        let grpc = deps.iter().find(|d| d.name == "grpc/grpc-swift").unwrap();
+        assert_eq!(grpc.version_spec.kind, VersionSpecKind::Exact);
+        assert_eq!(grpc.version_spec.version, "1.0.0");
+
+        let grpc_method = deps
+            .iter()
+            .find(|d| d.name == "grpc/grpc-swift-nio")
+            .unwrap();
+        assert_eq!(grpc_method.version_spec.kind, VersionSpecKind::Exact);
+        assert_eq!(grpc_method.version_spec.version, "2.0.0");
+    }
+
+    #[test]
+    fn test_parse_multiline_dependency() {
+        // 複数行にまたがる依存宣言が正しくパースされること
+        let content = r#"
+// swift-tools-version: 5.9
+import PackageDescription
+
+let package = Package(
+    name: "MyApp",
+    dependencies: [
+        .package(
+            name: "ArgumentParser",
+            url: "https://github.com/apple/swift-argument-parser.git",
+            from: "1.2.0"
+        ),
+        .package(
+            url: "https://github.com/vapor/vapor.git",
+            .upToNextMajor(
+                from: "4.89.0"
+            )
+        ),
+        .package(
+            url: "https://github.com/apple/swift-nio.git",
+            .upToNextMinor(from: "2.40.0")
+        ),
+        .package(
+            name: "GRPC",
+            url: "https://github.com/grpc/grpc-swift.git",
+            .exact("1.5.0")
+        ),
+    ]
+)
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 4, "マルチライン宣言が全てパースされるべき");
+
+        let parser_dep = deps
+            .iter()
+            .find(|d| d.name == "apple/swift-argument-parser")
+            .unwrap();
+        assert_eq!(parser_dep.version_spec.kind, VersionSpecKind::Caret);
+        assert_eq!(parser_dep.version_spec.version, "1.2.0");
+
+        let vapor = deps.iter().find(|d| d.name == "vapor/vapor").unwrap();
+        assert_eq!(vapor.version_spec.kind, VersionSpecKind::Caret);
+        assert_eq!(vapor.version_spec.version, "4.89.0");
+
+        let nio = deps.iter().find(|d| d.name == "apple/swift-nio").unwrap();
+        assert_eq!(nio.version_spec.kind, VersionSpecKind::Tilde);
+        assert_eq!(nio.version_spec.version, "2.40.0");
+
+        let grpc = deps.iter().find(|d| d.name == "grpc/grpc-swift").unwrap();
+        assert_eq!(grpc.version_spec.kind, VersionSpecKind::Exact);
+        assert_eq!(grpc.version_spec.version, "1.5.0");
+    }
 }

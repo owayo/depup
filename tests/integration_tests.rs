@@ -277,6 +277,34 @@ dependencies {
         );
     }
 
+    /// Package.swift ファイルの検出テスト
+    #[test]
+    fn test_detect_swift_manifest() {
+        let temp_dir = create_test_dir();
+
+        // Package.swift (Swift)
+        let package_swift = r#"// swift-tools-version:5.9
+import PackageDescription
+let package = Package(
+    name: "MyApp",
+    dependencies: [
+        .package(url: "https://github.com/apple/swift-nio.git", from: "2.0.0"),
+    ],
+    targets: [.target(name: "MyApp")]
+)
+"#;
+        fs::write(temp_dir.path().join("Package.swift"), package_swift).unwrap();
+
+        let manifests = depup::manifest::detect_manifests(temp_dir.path());
+
+        assert_eq!(manifests.len(), 1, "Package.swift を検出すべき");
+        assert_eq!(
+            manifests[0].language,
+            depup::domain::Language::Swift,
+            "Swift 言語として検出されるべき"
+        );
+    }
+
     /// Test detection of all 7 languages including Java
     #[test]
     fn test_detect_all_seven_languages() {
