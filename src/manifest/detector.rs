@@ -8,21 +8,21 @@
 use crate::domain::Language;
 use std::path::{Path, PathBuf};
 
-/// Information about a detected manifest file
+/// 検出されたマニフェストファイルの情報
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestInfo {
-    /// Path to the manifest file
+    /// マニフェストファイルのパス
     pub path: PathBuf,
-    /// Language/ecosystem of the manifest
+    /// マニフェストの言語/エコシステム
     pub language: Language,
-    /// Whether this is a workspace root manifest
+    /// ワークスペースルートのマニフェストかどうか
     pub is_workspace_root: bool,
-    /// Whether this manifest is from a Tauri project's src-tauri directory
+    /// Tauri プロジェクトの src-tauri ディレクトリのマニフェストかどうか
     pub is_tauri_rust: bool,
 }
 
 impl ManifestInfo {
-    /// Create a new ManifestInfo
+    /// 新しい ManifestInfo を作成する
     pub fn new(path: impl Into<PathBuf>, language: Language) -> Self {
         Self {
             path: path.into(),

@@ -227,7 +227,7 @@ mod tests {
         assert_eq!(spec.version, "1.2.3");
     }
 
-    // Comparison operator tests
+    // 比較演算子のテスト
     #[test]
     fn test_parse_greater_or_equal() {
         let spec = parse(">= 1.0").unwrap();
@@ -268,7 +268,7 @@ mod tests {
         assert_eq!(spec.prefix, Some("< ".to_string()));
     }
 
-    // Compound constraint tests
+    // 複合制約のテスト
     #[test]
     fn test_parse_compound() {
         let spec = parse(">= 1.0, < 2.0").unwrap();
@@ -299,7 +299,7 @@ mod tests {
         assert_eq!(spec.version, "1.5.0");
     }
 
-    // Edge case tests
+    // 境界ケースのテスト
     #[test]
     fn test_parse_empty() {
         assert!(parse("").is_none());

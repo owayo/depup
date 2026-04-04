@@ -1,7 +1,6 @@
-//! depup - Multi-language dependency updater library
+//! depup - 多言語対応の依存関係アップデーターライブラリ
 //!
-//! This library provides the core functionality for updating dependencies
-//! across multiple programming languages:
+//! 複数のプログラミング言語の依存関係更新に必要なコア機能を提供する:
 //! - Node.js (package.json)
 //! - Python (pyproject.toml)
 //! - Rust (Cargo.toml)

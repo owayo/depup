@@ -1,6 +1,6 @@
-//! depup - Multi-language dependency updater CLI tool
+//! depup - 多言語対応の依存関係アップデーター CLI ツール
 //!
-//! This tool updates dependencies across multiple programming languages:
+//! 複数のプログラミング言語の依存関係を更新するツール:
 //! - Node.js (package.json)
 //! - Python (pyproject.toml)
 //! - Rust (Cargo.toml)
@@ -25,13 +25,13 @@ use std::process::ExitCode;
 async fn main() -> ExitCode {
     let args = CliArgs::parse();
 
-    // Handle version flag
+    // バージョンフラグの処理
     if args.print_version {
         println!("depup {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
 
-    // Change directory if --cd is specified
+    // --cd が指定されている場合はディレクトリを変更
     if let Some(ref dir) = args.directory
         && let Err(e) = std::env::set_current_dir(dir)
     {
@@ -43,7 +43,7 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // Run the main logic and handle errors
+    // メインロジックを実行してエラーを処理
     match run(args).await {
         Ok(exit_code) => exit_code,
         Err(e) => {
@@ -53,9 +53,9 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Main application logic
+/// アプリケーションのメインロジック
 async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
-    // Print version info in verbose mode
+    // verbose モードではバージョン情報を表示
     if args.verbose {
         eprintln!("depup v{}", env!("CARGO_PKG_VERSION"));
         eprintln!("Target: {}", args.path.display());
@@ -64,10 +64,10 @@ async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
         }
     }
 
-    // Check for .depup monorepo config
+    // .depup モノレポ設定を確認
     let monorepo_config = DepupConfig::from_dir(&args.path);
 
-    // Create and run the orchestrator
+    // オーケストレーターを作成して実行
     let orchestrator = Orchestrator::new(args.clone())?;
 
     let (result, monorepo_dirs) = if let Some(config) = monorepo_config {
@@ -85,17 +85,17 @@ async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
         (r, None)
     };
 
-    // Create output formatter based on CLI options
+    // CLI オプションに基づいて出力フォーマッターを作成
     let output_config =
         OutputConfig::from_cli(args.json, args.diff, args.verbose, args.quiet, args.dry_run);
     let formatter = create_formatter(output_config);
 
-    // Output results
+    // 結果を出力
     let mut stdout = io::stdout().lock();
     formatter.format(&result, &mut stdout)?;
     stdout.flush()?;
 
-    // Print errors in verbose mode
+    // verbose モードではエラーを表示
     if args.verbose && !result.errors.is_empty() {
         eprintln!();
         eprintln!("Errors encountered:");
@@ -104,34 +104,34 @@ async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
         }
     }
 
-    // Run package manager install if requested and not dry-run
+    // dry-run でない場合、要求があればパッケージマネージャの install を実行
     if args.install && !args.dry_run {
         run_package_installs(&args, &result, &monorepo_dirs)?;
     }
 
-    // Return appropriate exit code
+    // 適切な終了コードを返す
     let has_errors = !result.errors.is_empty();
     let has_updates = result.summary.total_updates() > 0;
 
     if has_errors {
-        // Partial success - some errors occurred
+        // 部分的な成功 - 一部エラーが発生
         Ok(ExitCode::from(2))
     } else if has_updates || args.dry_run {
-        // Success - updates were made (or would be in dry-run)
+        // 成功 - 更新が行われた (dry-run では更新予定)
         Ok(ExitCode::SUCCESS)
     } else {
-        // No updates needed
+        // 更新不要
         Ok(ExitCode::SUCCESS)
     }
 }
 
-/// Run package manager installs, handling both single-dir and monorepo modes
+/// パッケージマネージャの install を実行する (単一ディレクトリとモノレポの両方に対応)
 fn run_package_installs(
     args: &CliArgs,
     result: &OrchestratorResult,
     monorepo_dirs: &Option<Vec<PathBuf>>,
 ) -> anyhow::Result<()> {
-    // Build a map of directory -> languages that need install
+    // ディレクトリ -> install が必要な言語のマップを構築
     let install_map = build_install_map(result, monorepo_dirs, &args.path);
 
     if install_map.is_empty() {
@@ -185,7 +185,7 @@ fn run_package_installs(
     Ok(())
 }
 
-/// Build a map of directory -> languages needing install from the result
+/// 結果からディレクトリ -> install が必要な言語のマップを構築する
 fn build_install_map(
     result: &OrchestratorResult,
     monorepo_dirs: &Option<Vec<PathBuf>>,
@@ -198,7 +198,7 @@ fn build_install_map(
             continue;
         }
 
-        // Determine which directory this manifest belongs to
+        // このマニフェストが属するディレクトリを特定
         let working_dir = if let Some(dirs) = monorepo_dirs {
             let manifest_path = &manifest.path;
             dirs.iter()

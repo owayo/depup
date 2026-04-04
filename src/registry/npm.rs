@@ -1,7 +1,7 @@
-//! npm Registry adapter
+//! npm レジストリアダプタ
 //!
-//! Fetches package version information from the npm registry.
-//! API endpoint: https://registry.npmjs.org/{package}
+//! npm レジストリからパッケージバージョン情報を取得する。
+//! API エンドポイント: https://registry.npmjs.org/{package}
 
 use crate::domain::Language;
 use crate::error::RegistryError;
@@ -12,10 +12,10 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::collections::HashMap;
 
-/// npm registry base URL
+/// npm レジストリのベース URL
 const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org";
 
-/// npm Registry adapter
+/// npm レジストリアダプタ
 pub struct NpmAdapter {
     client: HttpClient,
 }
