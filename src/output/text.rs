@@ -194,12 +194,12 @@ impl TextFormatter {
         let change_type = VersionChangeType::from_versions(old_version, new_version);
         let dev_marker = if is_dev { " 🔧" } else { "" };
 
-        // Format release date
+        // リリース日をフォーマット
         let date_display = released_at
             .map(|d| format!(" ({})", d.format("%Y/%m/%d %H:%M")))
             .unwrap_or_default();
 
-        // Format variable indicator
+        // 変数インジケータをフォーマット
         let var_display = variable_name
             .map(|v| format!(" via ${}", v))
             .unwrap_or_default();
@@ -252,7 +252,7 @@ impl TextFormatter {
         }
     }
 
-    /// Format manifest with grouped updates
+    /// グループ化した更新でマニフェストをフォーマット
     fn format_manifest_grouped(
         &self,
         manifest: &ManifestUpdateResult,
@@ -260,20 +260,20 @@ impl TextFormatter {
     ) -> std::io::Result<()> {
         let prefix = self.dry_run_prefix();
 
-        // Collect updates and skips
+        // 更新とスキップを収集
         let updates: Vec<_> = manifest.updates().collect();
         let skips: Vec<_> = manifest.skips().collect();
 
-        // Skip truly empty manifests (no updates and no skips)
+        // 更新もスキップもない完全に空のマニフェストを除外
         if updates.is_empty() && skips.is_empty() {
             return Ok(());
         }
 
-        // Count updates and skips
+        // 更新数とスキップ数をカウント
         let update_count = updates.len();
         let skip_count = skips.len();
 
-        // If no updates but have skips, show skip summary (even in non-verbose mode)
+        // 更新なしでスキップありの場合、スキップサマリを表示 (非 verbose モードでも)
         if updates.is_empty() && !skips.is_empty() {
             let path_display = manifest.path.display().to_string();
             let lang_display = format!("({})", manifest.language);
@@ -287,14 +287,14 @@ impl TextFormatter {
                 if skip_count == 1 { "skip" } else { "skips" }
             )?;
 
-            // Show skip reasons summary
+            // スキップ理由のサマリを表示
             let skip_reasons = self.summarize_skip_reasons(&skips);
             self.write_skip_reasons(&skip_reasons, self.verbosity == Verbosity::Verbose, writer)?;
             writeln!(writer)?;
             return Ok(());
         }
 
-        // Separate production and dev dependencies
+        // 本番依存と開発依存を分離
         let (prod_updates, dev_updates): (Vec<&UpdateResult>, Vec<&UpdateResult>) =
             updates.into_iter().partition(|r| {
                 if let UpdateResult::Update { dependency, .. } = r {
@@ -304,7 +304,7 @@ impl TextFormatter {
                 }
             });
 
-        // Write manifest header with counts
+        // カウント付きマニフェストヘッダを書き出す
         let path_display = manifest.path.display().to_string();
         let lang_display = format!("({})", manifest.language);
         writeln!(
@@ -323,7 +323,7 @@ impl TextFormatter {
             if skip_count == 1 { "skip" } else { "skips" }
         )?;
 
-        // Get max name length for alignment (use partitioned vectors)
+        // 整列のために名前の最大長を取得 (分割済みベクタを使用)
         let all_results: Vec<&UpdateResult> = prod_updates
             .iter()
             .chain(dev_updates.iter())
@@ -331,7 +331,7 @@ impl TextFormatter {
             .collect();
         let max_name_len = self.max_name_length(&all_results).max(20);
 
-        // Write production dependencies
+        // 本番依存を書き出す
         if !prod_updates.is_empty() {
             for result in &prod_updates {
                 if let UpdateResult::Update {
@@ -341,7 +341,7 @@ impl TextFormatter {
                     ..
                 } = result
                 {
-                    // Show "-" for unversioned dependencies
+                    // バージョンなしの依存には "-" を表示
                     let old_version = if dependency.version_spec.version.is_empty() {
                         "-"
                     } else {
@@ -361,7 +361,7 @@ impl TextFormatter {
             }
         }
 
-        // Write dev dependencies
+        // 開発依存を書き出す
         if !dev_updates.is_empty() {
             for result in &dev_updates {
                 if let UpdateResult::Update {
@@ -371,7 +371,7 @@ impl TextFormatter {
                     ..
                 } = result
                 {
-                    // Show "-" for unversioned dependencies
+                    // バージョンなしの依存には "-" を表示
                     let old_version = if dependency.version_spec.version.is_empty() {
                         "-"
                     } else {
@@ -391,7 +391,7 @@ impl TextFormatter {
             }
         }
 
-        // Write skips in verbose mode
+        // verbose モードでスキップを書き出す
         if self.verbosity == Verbosity::Verbose && !skips.is_empty() {
             writeln!(writer)?;
             let skip_reasons = self.summarize_skip_reasons(&skips);
@@ -402,7 +402,7 @@ impl TextFormatter {
         Ok(())
     }
 
-    /// Count updates by change type
+    /// 変更種別ごとに更新数をカウント
     fn count_by_change_type(&self, summary: &UpdateSummary) -> (usize, usize, usize, usize, usize) {
         let mut major = 0;
         let mut minor = 0;
@@ -435,7 +435,7 @@ impl TextFormatter {
         (major, minor, patch, new, unknown)
     }
 
-    /// Count skips by reason
+    /// 理由ごとにスキップ数をカウント
     fn count_by_skip_reason(&self, summary: &UpdateSummary) -> Vec<(String, usize)> {
         use std::collections::HashMap;
         let mut counts: HashMap<String, usize> = HashMap::new();
@@ -450,11 +450,11 @@ impl TextFormatter {
         }
 
         let mut result: Vec<_> = counts.into_iter().collect();
-        result.sort_by(|a, b| b.1.cmp(&a.1)); // Sort by count descending
+        result.sort_by(|a, b| b.1.cmp(&a.1)); // カウント降順でソート
         result
     }
 
-    /// Apply bold styling if color is enabled
+    /// カラー有効時にボールドスタイルを適用
     fn maybe_bold(&self, text: &str) -> String {
         if self.color {
             text.bold().to_string()
@@ -463,7 +463,7 @@ impl TextFormatter {
         }
     }
 
-    /// Apply dimmed styling if color is enabled
+    /// カラー有効時に暗いスタイルを適用
     fn maybe_dimmed(&self, text: &str) -> String {
         if self.color {
             text.dimmed().to_string()
@@ -472,7 +472,7 @@ impl TextFormatter {
         }
     }
 
-    /// Apply a named color to text if color is enabled
+    /// カラー有効時にテキストに名前付きカラーを適用
     fn apply_color(&self, text: &str, color: Color) -> String {
         if self.color {
             match color {
@@ -487,7 +487,7 @@ impl TextFormatter {
         }
     }
 
-    /// Write skip reason lines (verbose: with package details, normal: count only)
+    /// スキップ理由行を書き出す (verbose: パッケージ詳細付き、normal: カウントのみ)
     fn write_skip_reasons(
         &self,
         skip_reasons: &[(String, usize, Vec<SkipPackageInfo>)],
@@ -534,8 +534,8 @@ impl TextFormatter {
         Ok(())
     }
 
-    /// Summarize skip reasons from a list of skip results
-    /// Returns: Vec<(reason_string, count, package_infos)>
+    /// スキップ結果のリストからスキップ理由をサマリ化
+    /// 戻り値: Vec<(理由文字列, カウント, パッケージ情報)>
     fn summarize_skip_reasons(
         &self,
         skips: &[&UpdateResult],
@@ -566,24 +566,24 @@ impl TextFormatter {
                 (reason, count, packages)
             })
             .collect();
-        result.sort_by(|a, b| b.1.cmp(&a.1)); // Sort by count descending
+        result.sort_by(|a, b| b.1.cmp(&a.1)); // カウント降順でソート
         result
     }
 }
 
 impl OutputFormatter for TextFormatter {
     fn format(&self, result: &OrchestratorResult, writer: &mut dyn Write) -> std::io::Result<()> {
-        // In quiet mode, only show summary
+        // quiet モードではサマリのみ表示
         if self.verbosity == Verbosity::Quiet {
             return self.format_summary(&result.summary, writer);
         }
 
-        // Format each manifest
+        // 各マニフェストをフォーマット
         for manifest in &result.summary.manifests {
             self.format_manifest_grouped(manifest, writer)?;
         }
 
-        // Format errors if any
+        // エラーがあればフォーマット
         if !result.errors.is_empty() && self.verbosity != Verbosity::Quiet {
             if self.color {
                 writeln!(writer, "{}:", "Errors".red().bold())?;
@@ -599,7 +599,7 @@ impl OutputFormatter for TextFormatter {
             writeln!(writer)?;
         }
 
-        // Format summary
+        // サマリをフォーマット
         self.format_summary(&result.summary, writer)?;
 
         Ok(())
@@ -615,7 +615,7 @@ impl OutputFormatter for TextFormatter {
         let skips = summary.total_skips();
 
         if self.verbosity == Verbosity::Quiet {
-            // Minimal output
+            // 最小限の出力
             if updates > 0 {
                 writeln!(
                     writer,
@@ -629,13 +629,13 @@ impl OutputFormatter for TextFormatter {
             return Ok(());
         }
 
-        // Count by change type
+        // 変更種別ごとにカウント
         let (major, minor, patch, new, unknown) = self.count_by_change_type(summary);
 
-        // Normal/verbose output
+        // Normal/Verbose 出力
         writeln!(writer, "{}{}:", prefix, self.maybe_bold("Summary"))?;
 
-        // Update breakdown
+        // 更新の内訳
         if updates > 0 {
             let mut parts = Vec::new();
             let color_pairs: &[(usize, Color, &str)] = &[
@@ -664,7 +664,7 @@ impl OutputFormatter for TextFormatter {
             writeln!(writer, "  {}", self.maybe_dimmed("No packages updated"))?;
         }
 
-        // Skip summary
+        // スキップサマリ
         if skips > 0 {
             write!(
                 writer,
@@ -684,7 +684,7 @@ impl OutputFormatter for TextFormatter {
             writeln!(writer)?;
         }
 
-        // Verbose: show breakdown by language
+        // Verbose: 言語別の内訳を表示
         if self.verbosity == Verbosity::Verbose {
             writeln!(writer)?;
             writeln!(writer, "{}:", self.maybe_dimmed("By language"))?;
@@ -737,15 +737,15 @@ mod tests {
         let mut summary = UpdateSummary::new(false);
         let mut manifest = ManifestUpdateResult::new(PathBuf::from("package.json"), Language::Node);
 
-        // Production dependency - minor update
+        // 本番依存 - マイナー更新
         let dep1 = sample_dependency("lodash", "4.17.21", false);
         manifest.add_result(UpdateResult::update(dep1, "4.18.0"));
 
-        // Dev dependency - patch update
+        // 開発依存 - パッチ更新
         let dep2 = sample_dependency("typescript", "5.0.0", true);
         manifest.add_result(UpdateResult::update(dep2, "5.0.1"));
 
-        // Skipped
+        // スキップ
         let dep3 = sample_dependency("express", "4.18.0", false);
         manifest.add_result(UpdateResult::skip(dep3, SkipReason::AlreadyLatest));
 
@@ -885,7 +885,7 @@ mod tests {
         formatter.format(&result, &mut output).unwrap();
         let output_str = String::from_utf8(output).unwrap();
 
-        // Quiet mode should be minimal
+        // quiet モードは最小限であるべき
         assert!(output_str.contains("2 updated"));
         assert!(!output_str.contains("Summary:"));
     }
@@ -899,9 +899,9 @@ mod tests {
         formatter.format(&result, &mut output).unwrap();
         let output_str = String::from_utf8(output).unwrap();
 
-        // Verbose mode should show skipped packages with version and language breakdown
+        // verbose モードではスキップされたパッケージのバージョンと言語別内訳を表示するべき
         assert!(output_str.contains("express"));
-        assert!(output_str.contains("4.18.0")); // version shown
+        assert!(output_str.contains("4.18.0")); // バージョンが表示される
         assert!(output_str.contains("latest"));
         assert!(output_str.contains("By language:"));
     }
@@ -948,15 +948,15 @@ mod tests {
         let mut summary = UpdateSummary::new(false);
         let mut manifest = ManifestUpdateResult::new(PathBuf::from("package.json"), Language::Node);
 
-        // Major
+        // メジャー
         let dep1 = sample_dependency("pkg1", "1.0.0", false);
         manifest.add_result(UpdateResult::update(dep1, "2.0.0"));
 
-        // Minor
+        // マイナー
         let dep2 = sample_dependency("pkg2", "1.0.0", false);
         manifest.add_result(UpdateResult::update(dep2, "1.1.0"));
 
-        // Patch
+        // パッチ
         let dep3 = sample_dependency("pkg3", "1.0.0", false);
         manifest.add_result(UpdateResult::update(dep3, "1.0.1"));
 
@@ -976,7 +976,7 @@ mod tests {
         let mut summary = UpdateSummary::new(false);
         let mut manifest = ManifestUpdateResult::new(PathBuf::from("package.json"), Language::Node);
 
-        // Unknown (non-semver version)
+        // 不明 (非 semver バージョン)
         let dep1 = sample_dependency("pkg1", "latest", false);
         manifest.add_result(UpdateResult::update(dep1, "2.0.0"));
 
@@ -996,7 +996,7 @@ mod tests {
         let mut summary = UpdateSummary::new(false);
         let mut manifest = ManifestUpdateResult::new(PathBuf::from("Gemfile"), Language::Ruby);
 
-        // New (no previous version - empty string)
+        // 新規 (以前のバージョンなし - 空文字列)
         let spec = VersionSpec::new(VersionSpecKind::Any, "", "");
         let dep1 = Dependency::new("rmagick", spec, false, Language::Ruby);
         manifest.add_result(UpdateResult::update(dep1, "6.1.5"));

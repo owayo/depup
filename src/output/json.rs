@@ -1,8 +1,8 @@
-//! JSON output formatter for machine processing
+//! 機械処理用 JSON 出力フォーマッタ
 //!
-//! This module provides:
-//! - JSON serialization of update results
-//! - Structured file-by-file update/skip information
+//! このモジュールが提供するもの:
+//! - 更新結果の JSON シリアライズ
+//! - ファイルごとの構造化された更新/スキップ情報
 
 use crate::domain::{Language, ManifestUpdateResult, SkipReason, UpdateResult, UpdateSummary};
 use crate::orchestrator::OrchestratorResult;
@@ -10,99 +10,99 @@ use crate::output::{OutputFormatter, Verbosity};
 use serde::Serialize;
 use std::io::Write;
 
-/// JSON formatter for machine-readable output
+/// 機械可読出力用 JSON フォーマッタ
 pub struct JsonFormatter {
-    /// Verbosity level affects detail in output
+    /// 詳細度レベルが出力の詳細さに影響
     verbosity: Verbosity,
 }
 
 impl JsonFormatter {
-    /// Create a new JSON formatter
+    /// 新しい JSON フォーマッタを作成
     pub fn new(verbosity: Verbosity) -> Self {
         Self { verbosity }
     }
 }
 
-/// JSON representation of the full result
+/// 全結果の JSON 表現
 #[derive(Serialize)]
 struct JsonOutput {
-    /// Whether this was a dry-run
+    /// dry-run だったかどうか
     dry_run: bool,
-    /// Summary statistics
+    /// サマリ統計
     summary: JsonSummary,
-    /// Per-manifest results
+    /// マニフェストごとの結果
     manifests: Vec<JsonManifest>,
-    /// Errors encountered
+    /// 発生したエラー
     #[serde(skip_serializing_if = "Vec::is_empty")]
     errors: Vec<String>,
 }
 
-/// JSON representation of summary statistics
+/// サマリ統計の JSON 表現
 #[derive(Serialize)]
 struct JsonSummary {
-    /// Total number of updates
+    /// 更新の総数
     updates: usize,
-    /// Total number of skips
+    /// スキップの総数
     skips: usize,
-    /// Breakdown by language
+    /// 言語別の内訳
     #[serde(skip_serializing_if = "Vec::is_empty")]
     by_language: Vec<JsonLanguageSummary>,
 }
 
-/// JSON representation of per-language summary
+/// 言語別サマリの JSON 表現
 #[derive(Serialize)]
 struct JsonLanguageSummary {
-    /// Language name
+    /// 言語名
     language: String,
-    /// Number of updates
+    /// 更新数
     updates: usize,
-    /// Number of skips
+    /// スキップ数
     skips: usize,
 }
 
-/// JSON representation of a manifest result
+/// マニフェスト結果の JSON 表現
 #[derive(Serialize)]
 struct JsonManifest {
-    /// Path to the manifest file
+    /// マニフェストファイルのパス
     path: String,
-    /// Language of the manifest
+    /// マニフェストの言語
     language: String,
-    /// List of updates
+    /// 更新のリスト
     updates: Vec<JsonUpdate>,
-    /// List of skips (only in verbose mode)
+    /// スキップのリスト (verbose モードのみ)
     #[serde(skip_serializing_if = "Vec::is_empty")]
     skips: Vec<JsonSkip>,
 }
 
-/// JSON representation of an update
+/// 更新の JSON 表現
 #[derive(Serialize)]
 struct JsonUpdate {
-    /// Package name
+    /// パッケージ名
     name: String,
-    /// Old version
+    /// 旧バージョン
     from: String,
-    /// New version
+    /// 新バージョン
     to: String,
-    /// Whether it's a dev dependency
+    /// 開発依存かどうか
     dev: bool,
 }
 
-/// JSON representation of a skip
+/// スキップの JSON 表現
 #[derive(Serialize)]
 struct JsonSkip {
-    /// Package name
+    /// パッケージ名
     name: String,
-    /// Current version
+    /// 現在のバージョン
     version: String,
-    /// Skip reason
+    /// スキップ理由
     reason: String,
-    /// When the current version was released (ISO 8601)
+    /// 現在のバージョンがリリースされた日時 (ISO 8601)
     #[serde(skip_serializing_if = "Option::is_none")]
     released_at: Option<String>,
 }
 
 impl JsonFormatter {
-    /// Convert skip reason to string
+    /// スキップ理由を文字列に変換
     fn skip_reason_to_string(reason: &SkipReason) -> String {
         match reason {
             SkipReason::Pinned => "pinned".to_string(),
@@ -116,7 +116,7 @@ impl JsonFormatter {
         }
     }
 
-    /// Convert manifest result to JSON representation
+    /// マニフェスト結果を JSON 表現に変換
     fn manifest_to_json(&self, manifest: &ManifestUpdateResult) -> JsonManifest {
         let updates: Vec<JsonUpdate> = manifest
             .updates()
@@ -321,7 +321,7 @@ mod tests {
         formatter.format(&result, &mut output).unwrap();
         let output_str = String::from_utf8(output).unwrap();
 
-        // Verify it's valid JSON
+        // 有効な JSON であることを検証
         let parsed: serde_json::Value = serde_json::from_str(&output_str).unwrap();
 
         assert_eq!(parsed["dry_run"], false);
@@ -344,7 +344,7 @@ mod tests {
 
         let parsed: serde_json::Value = serde_json::from_str(&output_str).unwrap();
 
-        // Verbose mode should include skips
+        // verbose モードではスキップが含まれるべき
         assert!(
             !parsed["manifests"][0]["skips"]
                 .as_array()
@@ -357,7 +357,7 @@ mod tests {
             "already_latest"
         );
 
-        // Should include by_language breakdown
+        // 言語別内訳が含まれるべき
         assert!(
             !parsed["summary"]["by_language"]
                 .as_array()
@@ -377,7 +377,7 @@ mod tests {
 
         let parsed: serde_json::Value = serde_json::from_str(&output_str).unwrap();
 
-        // Quiet mode should not include skips (field is omitted or empty)
+        // quiet モードではスキップが含まれないべき (フィールドが省略または空)
         let skips = &parsed["manifests"][0]["skips"];
         assert!(skips.is_null() || skips.as_array().map(|a| a.is_empty()).unwrap_or(true));
     }
