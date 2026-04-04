@@ -1,26 +1,26 @@
-//! Update result summary types
+//! 更新結果サマリの型定義
 //!
-//! Provides structures for tracking update results at file and overall levels.
+//! ファイル単位および全体レベルの更新結果を追跡する構造体を提供する。
 
 use super::{Language, UpdateResult};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Update result for a single manifest file
+/// 単一マニフェストファイルの更新結果
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ManifestUpdateResult {
-    /// Path to the manifest file
+    /// マニフェストファイルのパス
     pub path: PathBuf,
-    /// Language of this manifest
+    /// このマニフェストの言語
     pub language: Language,
-    /// Individual dependency update results
+    /// 個別の依存関係更新結果
     pub results: Vec<UpdateResult>,
-    /// Whether the file was actually modified
+    /// ファイルが実際に変更されたかどうか
     pub modified: bool,
 }
 
 impl ManifestUpdateResult {
-    /// Creates a new ManifestUpdateResult
+    /// 新しいManifestUpdateResultを作成する
     pub fn new(path: impl Into<PathBuf>, language: Language) -> Self {
         Self {
             path: path.into(),
@@ -30,7 +30,7 @@ impl ManifestUpdateResult {
         }
     }
 
-    /// Adds an update result
+    /// 更新結果を追加する
     pub fn add_result(&mut self, result: UpdateResult) {
         if result.is_update() {
             self.modified = true;
@@ -38,43 +38,43 @@ impl ManifestUpdateResult {
         self.results.push(result);
     }
 
-    /// Returns the number of updates
+    /// 更新件数を返す
     pub fn update_count(&self) -> usize {
         self.results.iter().filter(|r| r.is_update()).count()
     }
 
-    /// Returns the number of skips
+    /// スキップ件数を返す
     pub fn skip_count(&self) -> usize {
         self.results.iter().filter(|r| r.is_skip()).count()
     }
 
-    /// Returns all updates
+    /// 全更新を返す
     pub fn updates(&self) -> impl Iterator<Item = &UpdateResult> {
         self.results.iter().filter(|r| r.is_update())
     }
 
-    /// Returns all skips
+    /// 全スキップを返す
     pub fn skips(&self) -> impl Iterator<Item = &UpdateResult> {
         self.results.iter().filter(|r| r.is_skip())
     }
 
-    /// Returns true if any dependencies were updated
+    /// 依存関係が更新されたかどうかを返す
     pub fn has_updates(&self) -> bool {
         self.update_count() > 0
     }
 }
 
-/// Overall summary of all update operations
+/// 全更新操作の総合サマリ
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UpdateSummary {
-    /// Results for each manifest file processed
+    /// 処理された各マニフェストファイルの結果
     pub manifests: Vec<ManifestUpdateResult>,
-    /// Whether this was a dry run
+    /// ドライランかどうか
     pub dry_run: bool,
 }
 
 impl UpdateSummary {
-    /// Creates a new UpdateSummary
+    /// 新しいUpdateSummaryを作成する
     pub fn new(dry_run: bool) -> Self {
         Self {
             manifests: Vec::new(),
@@ -82,54 +82,54 @@ impl UpdateSummary {
         }
     }
 
-    /// Adds a manifest result
+    /// マニフェスト結果を追加する
     pub fn add_manifest(&mut self, manifest: ManifestUpdateResult) {
         self.manifests.push(manifest);
     }
 
-    /// Returns the total number of files processed
+    /// 処理されたファイルの合計数を返す
     pub fn files_processed(&self) -> usize {
         self.manifests.len()
     }
 
-    /// Returns the total number of files modified
+    /// 変更されたファイルの合計数を返す
     pub fn files_modified(&self) -> usize {
         self.manifests.iter().filter(|m| m.modified).count()
     }
 
-    /// Returns the total number of dependencies updated
+    /// 更新された依存関係の合計数を返す
     pub fn total_updates(&self) -> usize {
         self.manifests.iter().map(|m| m.update_count()).sum()
     }
 
-    /// Returns the total number of dependencies skipped
+    /// スキップされた依存関係の合計数を返す
     pub fn total_skips(&self) -> usize {
         self.manifests.iter().map(|m| m.skip_count()).sum()
     }
 
-    /// Returns the total number of dependencies processed
+    /// 処理された依存関係の合計数を返す
     pub fn total_dependencies(&self) -> usize {
         self.manifests.iter().map(|m| m.results.len()).sum()
     }
 
-    /// Returns true if any files were modified
+    /// ファイルが変更されたかどうかを返す
     pub fn has_changes(&self) -> bool {
         self.files_modified() > 0
     }
 
-    /// Returns manifests for a specific language
+    /// 特定言語のマニフェストを返す
     pub fn by_language(&self, language: Language) -> impl Iterator<Item = &ManifestUpdateResult> {
         self.manifests
             .iter()
             .filter(move |m| m.language == language)
     }
 
-    /// Returns all updates across all manifests
+    /// 全マニフェストの全更新を返す
     pub fn all_updates(&self) -> impl Iterator<Item = &UpdateResult> {
         self.manifests.iter().flat_map(|m| m.updates())
     }
 
-    /// Returns all skips across all manifests
+    /// 全マニフェストの全スキップを返す
     pub fn all_skips(&self) -> impl Iterator<Item = &UpdateResult> {
         self.manifests.iter().flat_map(|m| m.skips())
     }

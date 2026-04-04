@@ -21,37 +21,37 @@ pub struct GoProxyAdapter {
     client: HttpClient,
 }
 
-/// Version info response
+/// バージョン情報レスポンス
 #[derive(Debug, Deserialize)]
 struct VersionInfoResponse {
-    /// Version string
+    /// バージョン文字列
     #[serde(rename = "Version")]
     version: String,
-    /// Time when the version was created
+    /// バージョンが作成された時刻
     #[serde(rename = "Time")]
     time: String,
 }
 
 impl GoProxyAdapter {
-    /// Create a new Go Proxy adapter
+    /// 新しい Go Proxy アダプタを作成
     pub fn new(client: HttpClient) -> Self {
         Self { client }
     }
 
-    /// Build the URL for listing versions
+    /// バージョン一覧用の URL を構築
     fn build_list_url(&self, module: &str) -> String {
-        // URL encode the module path (replace / with %2F for case-insensitive lookup)
+        // モジュールパスを URL エンコード (大文字小文字を区別しない検索のため)
         let encoded_module = Self::encode_module_path(module);
         format!("{}/@v/list", encoded_module)
     }
 
-    /// Build the URL for version info
+    /// バージョン情報用の URL を構築
     fn build_info_url(&self, module: &str, version: &str) -> String {
         let encoded_module = Self::encode_module_path(module);
         format!("{}/@v/{}.info", encoded_module, version)
     }
 
-    /// Encode module path for the Go Proxy URL
+    /// Go Proxy URL 用にモジュールパスをエンコード
     fn encode_module_path(module: &str) -> String {
         // Go Proxy uses case-encoded paths where uppercase letters become !lowercase
         let mut encoded = String::with_capacity(module.len() + GO_PROXY_URL.len() + 1);

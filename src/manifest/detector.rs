@@ -506,7 +506,7 @@ clap = "4"
     fn test_detect_cargo_workspace_no_duplicate_with_tauri() {
         let dir = create_temp_dir();
 
-        // Create workspace root with src-tauri as member
+        // src-tauri をメンバーとするワークスペースルートを作成する
         fs::write(
             dir.path().join("Cargo.toml"),
             r#"[workspace]
@@ -531,7 +531,7 @@ version = "0.1.0"
             .filter(|m| m.language == Language::Rust)
             .collect();
 
-        // src-tauri should appear only once (as tauri, not duplicated by workspace member)
+        // src-tauri は 1 回だけ出現するはず (Tauri として追加、ワークスペースメンバーとの重複なし)
         let tauri_paths: Vec<_> = rust_manifests
             .iter()
             .filter(|m| m.path.ends_with("src-tauri/Cargo.toml"))
@@ -544,7 +544,7 @@ version = "0.1.0"
     fn test_detect_cargo_workspace_member_missing_dir() {
         let dir = create_temp_dir();
 
-        // Create workspace root with member that doesn't exist
+        // 存在しないメンバーを指定したワークスペースルートを作成する
         fs::write(
             dir.path().join("Cargo.toml"),
             r#"[workspace]
@@ -559,7 +559,7 @@ members = ["crates/nonexistent"]
             .filter(|m| m.language == Language::Rust)
             .collect();
 
-        // Only root Cargo.toml, nonexistent member ignored
+        // ルート Cargo.toml のみ、存在しないメンバーは無視される
         assert_eq!(rust_manifests.len(), 1);
     }
 
@@ -588,7 +588,7 @@ members = ["crates/nonexistent"]
     #[test]
     fn test_detect_build_gradle_prefers_groovy_over_kts() {
         let dir = create_temp_dir();
-        // Both Groovy and Kotlin DSL exist - prefer Groovy
+        // Groovy と Kotlin DSL が両方存在する場合、Groovy を優先する
         fs::write(dir.path().join("build.gradle"), "").unwrap();
         fs::write(dir.path().join("build.gradle.kts"), "").unwrap();
 
@@ -597,7 +597,7 @@ members = ["crates/nonexistent"]
             .iter()
             .filter(|m| m.language == Language::Java)
             .collect();
-        // Should only detect one (Groovy)
+        // 1 件だけ検出されるはず (Groovy)
         assert_eq!(java_manifests.len(), 1);
         assert!(java_manifests[0].path.ends_with("build.gradle"));
     }

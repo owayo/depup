@@ -1,11 +1,11 @@
-//! Core domain models for depup
+//! depup のコアドメインモデル
 //!
-//! This module contains the fundamental types used throughout the application:
-//! - Language types for supported ecosystems
-//! - Version specification types for parsing and maintaining version constraints
-//! - Dependency information structures
-//! - Update decision results
-//! - Summary and result structures
+//! このモジュールはアプリケーション全体で使用される基本型を含む:
+//! - 対応エコシステムの言語型
+//! - バージョン制約のパースと保持のためのバージョン指定型
+//! - 依存関係情報の構造体
+//! - 更新判定結果
+//! - サマリと結果の構造体
 
 mod dependency;
 mod language;

@@ -1,9 +1,9 @@
-//! go.mod parser for Go projects
+//! Go プロジェクト向けの `go.mod` パーサ。
 //!
-//! Handles:
-//! - require statements (single and block)
-//! - // pinned comments for version pinning
-//! - replace directives (skipped from updates)
+//! 対応対象:
+//! - require 文 (単一行およびブロック)
+//! - `// pinned` コメントによるバージョン固定
+//! - replace ディレクティブ (更新対象から除外)
 
 use crate::domain::{Dependency, Language};
 use crate::error::ManifestError;
