@@ -184,7 +184,17 @@ fn find_first_version_token(raw: &str) -> Option<(usize, usize)> {
         }
 
         let mut end = raw.len();
-        for &(candidate_end, candidate) in chars.iter().skip(index + 1) {
+        for (scan_idx, &(candidate_end, candidate)) in chars.iter().enumerate().skip(index + 1) {
+            // 連続するドット (..) はレンジ演算子 (..< / ...) なのでトークンを終端する
+            if candidate == '.'
+                && chars
+                    .get(scan_idx + 1)
+                    .map(|(_, next)| *next == '.')
+                    .unwrap_or(false)
+            {
+                end = candidate_end;
+                break;
+            }
             if !(candidate.is_ascii_alphanumeric()
                 || matches!(candidate, '.' | '*' | '+' | '-' | '_'))
             {
@@ -570,21 +580,22 @@ mod tests {
 
     #[test]
     fn test_format_range_like_swift_half_open() {
-        // Swift の半開区間 ..< はバージョントークンに .. が含まれるため
-        // 下限置換後に区切りが残り "1.5.0<2.0.0" となる
+        // Swift の半開区間 ..< は下限のみ更新し、上限と演算子を保持する
         let spec = VersionSpec::new(VersionSpecKind::Range, "1.0.0..<2.0.0", "1.0.0");
         assert_eq!(
             spec.try_format_updated("1.5.0").as_deref(),
-            Some("1.5.0<2.0.0")
+            Some("1.5.0..<2.0.0")
         );
     }
 
     #[test]
     fn test_format_range_like_swift_closed() {
-        // Swift の閉区間 ... はバージョントークンが全体を包含するため
-        // 下限のみの置換となる
+        // Swift の閉区間 ... は下限のみ更新し、上限と演算子を保持する
         let spec = VersionSpec::new(VersionSpecKind::Range, "1.0.0...2.0.0", "1.0.0");
-        assert_eq!(spec.try_format_updated("1.5.0").as_deref(), Some("1.5.0"));
+        assert_eq!(
+            spec.try_format_updated("1.5.0").as_deref(),
+            Some("1.5.0...2.0.0")
+        );
     }
 
     #[test]
@@ -633,5 +644,61 @@ mod tests {
         let json = serde_json::to_string(&spec).unwrap();
         let parsed: VersionSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, spec);
+    }
+
+    // --- Swift レンジ演算子の追加テスト ---
+
+    #[test]
+    fn test_format_range_like_swift_half_open_two_segment() {
+        // 2セグメントバージョンの半開区間
+        let spec = VersionSpec::new(VersionSpecKind::Range, "1.0..<2.0", "1.0");
+        assert_eq!(spec.try_format_updated("1.5").as_deref(), Some("1.5..<2.0"));
+    }
+
+    #[test]
+    fn test_format_range_like_swift_closed_different_major() {
+        // メジャーバージョンが異なる閉区間
+        let spec = VersionSpec::new(VersionSpecKind::Range, "2.0.0...3.0.0", "2.0.0");
+        assert_eq!(
+            spec.try_format_updated("2.5.0").as_deref(),
+            Some("2.5.0...3.0.0")
+        );
+    }
+
+    #[test]
+    fn test_format_range_like_ruby_compound_comma() {
+        // Ruby スタイルのカンマ区切り複合制約
+        let spec = VersionSpec::new(VersionSpecKind::Range, ">= 1.0, < 2.0", "1.0");
+        assert_eq!(
+            spec.try_format_updated("1.8.0").as_deref(),
+            Some(">= 1.8.0, < 2.0")
+        );
+    }
+
+    #[test]
+    fn test_format_range_like_maven_closed_brackets() {
+        // Maven 閉区間 [A,B] の下限のみ更新
+        let spec = VersionSpec::new(VersionSpecKind::Range, "[1.0,2.0]", "1.0");
+        assert_eq!(
+            spec.try_format_updated("1.5.0").as_deref(),
+            Some("[1.5.0,2.0]")
+        );
+    }
+
+    #[test]
+    fn test_format_range_like_hyphen_range_preserves_spacing() {
+        // ハイフンレンジのスペーシングが保持される
+        let spec = VersionSpec::new(VersionSpecKind::Range, "1.0.0 - 3.0.0", "1.0.0");
+        assert_eq!(
+            spec.try_format_updated("2.0.0").as_deref(),
+            Some("2.0.0 - 3.0.0")
+        );
+    }
+
+    #[test]
+    fn test_format_wildcard_like_gradle_two_segment() {
+        // Gradle の 2セグメント + ワイルドカード
+        let spec = VersionSpec::new(VersionSpecKind::Wildcard, "5.3.+", "5.3");
+        assert_eq!(spec.format_updated("6.1.0"), "6.1.+");
     }
 }

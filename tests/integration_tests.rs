@@ -765,6 +765,119 @@ dependencies {
         let laravel = deps.iter().find(|d| d.name == "laravel/framework").unwrap();
         assert!(!laravel.is_dev, "Should mark require as non-dev dependency");
     }
+
+    /// Test Package.swift half-open range (..<) の下限更新と上限保持
+    #[test]
+    fn test_package_swift_half_open_range_preservation() {
+        let content = r#"// swift-tools-version:5.9
+import PackageDescription
+let package = Package(
+    name: "Test",
+    dependencies: [
+        .package(url: "https://github.com/apple/swift-nio.git", "1.0.0"..<"2.0.0"),
+    ],
+    targets: [.target(name: "Test")]
+)
+"#;
+
+        let parser = get_parser(Language::Swift);
+        let deps = parser.parse(content).unwrap();
+
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "apple/swift-nio");
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Range);
+
+        let updated = parser
+            .update_version(content, "apple/swift-nio", "1.5.0")
+            .unwrap();
+        assert!(
+            updated.contains(r#""1.5.0"..<"2.0.0""#),
+            "半開区間の上限が保持されるべき: {}",
+            updated
+        );
+    }
+
+    /// Test Package.swift closed range (...) の下限更新と上限保持
+    #[test]
+    fn test_package_swift_closed_range_preservation() {
+        let content = r#"// swift-tools-version:5.9
+import PackageDescription
+let package = Package(
+    name: "Test",
+    dependencies: [
+        .package(url: "https://github.com/apple/swift-log.git", "1.0.0"..."2.0.0"),
+    ],
+    targets: [.target(name: "Test")]
+)
+"#;
+
+        let parser = get_parser(Language::Swift);
+        let deps = parser.parse(content).unwrap();
+
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "apple/swift-log");
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Range);
+
+        let updated = parser
+            .update_version(content, "apple/swift-log", "1.5.0")
+            .unwrap();
+        assert!(
+            updated.contains(r#""1.5.0"..."2.0.0""#),
+            "閉区間の上限が保持されるべき: {}",
+            updated
+        );
+    }
+
+    /// Test npm alias (npm:@scope/pkg@^1.0) のパースと更新
+    #[test]
+    fn test_package_json_npm_alias_preservation() {
+        let content = r#"{
+  "name": "test",
+  "dependencies": {
+    "my-lodash": "npm:lodash@^4.17.21"
+  }
+}"#;
+
+        let parser = get_parser(Language::Node);
+        let deps = parser.parse(content).unwrap();
+
+        assert_eq!(deps.len(), 1);
+        // npm alias の場合、パッケージ名はキー名
+        assert_eq!(deps[0].name, "my-lodash");
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Caret);
+
+        let updated = parser
+            .update_version(content, "my-lodash", "4.18.0")
+            .unwrap();
+        assert!(
+            updated.contains("npm:lodash@^4.18.0"),
+            "npm alias プレフィックスが保持されるべき: {}",
+            updated
+        );
+    }
+
+    /// Test Maven 半開区間の下限更新
+    #[test]
+    fn test_gradle_maven_range_lower_bound_update() {
+        let content = r#"dependencies {
+    implementation("org.example:mylib:[1.0,2.0)")
+}"#;
+
+        let parser = get_parser(Language::Java);
+        let deps = parser.parse(content).unwrap();
+
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Range);
+
+        let updated = parser
+            .update_version(content, "org.example:mylib", "1.5.0")
+            .unwrap();
+        assert!(
+            updated.contains("[1.5.0,2.0)"),
+            "Maven レンジの下限が更新されるべき: {}",
+            updated
+        );
+    }
 }
 
 mod registry_response_parsing {
