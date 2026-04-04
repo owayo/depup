@@ -1,6 +1,6 @@
-//! Version specification parsers for different package ecosystems
+//! 各パッケージエコシステムのバージョン指定パーサ
 //!
-//! This module provides parsers for version specifications in:
+//! 以下の言語のバージョン指定をパースする:
 //! - Node.js (npm/yarn/pnpm)
 //! - Python (pip/poetry)
 //! - Rust (cargo)
@@ -8,6 +8,7 @@
 //! - Ruby (bundler)
 //! - PHP (composer)
 //! - Java (gradle)
+//! - Swift (SPM)
 
 mod go;
 mod java;
