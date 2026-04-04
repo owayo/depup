@@ -20,20 +20,20 @@ pub struct NpmAdapter {
     client: HttpClient,
 }
 
-/// npm package metadata response
+/// npm パッケージメタデータレスポンス
 #[derive(Debug, Deserialize)]
 struct NpmPackageResponse {
-    /// Distribution tags (latest, next, etc.)
+    /// ディストリビューションタグ (latest, next 等)
     #[serde(rename = "dist-tags")]
     dist_tags: HashMap<String, String>,
-    /// Version time information
+    /// バージョンごとの公開時刻情報
     time: HashMap<String, String>,
-    /// Available versions
+    /// 利用可能なバージョン
     versions: HashMap<String, serde_json::Value>,
 }
 
 impl NpmAdapter {
-    /// Create a new npm adapter
+    /// 新しい npm アダプタを作成
     pub fn new(client: HttpClient) -> Self {
         Self { client }
     }

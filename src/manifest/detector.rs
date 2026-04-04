@@ -32,27 +32,27 @@ impl ManifestInfo {
         }
     }
 
-    /// Mark this manifest as a workspace root
+    /// ワークスペースルートとしてマークする
     pub fn with_workspace_root(mut self, is_root: bool) -> Self {
         self.is_workspace_root = is_root;
         self
     }
 
-    /// Mark this manifest as Tauri Rust project
+    /// Tauri Rust プロジェクトとしてマークする
     pub fn with_tauri_rust(mut self, is_tauri: bool) -> Self {
         self.is_tauri_rust = is_tauri;
         self
     }
 }
 
-/// Represents a detected manifest file
+/// 検出されたマニフェストファイルを表す構造体
 #[derive(Debug, Clone)]
 pub struct ManifestFile {
-    /// Path to the manifest file
+    /// マニフェストファイルのパス
     pub path: PathBuf,
-    /// Content of the manifest file
+    /// マニフェストファイルの内容
     pub content: String,
-    /// Information about the manifest
+    /// マニフェストの情報
     pub info: ManifestInfo,
 }
 

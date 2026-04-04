@@ -322,7 +322,7 @@ mod tests {
         assert_eq!(spec.version, "1.2.3");
     }
 
-    // Format updated tests
+    // 更新書式のテスト
     #[test]
     fn test_format_updated_pessimistic() {
         let spec = parse("~> 1.2.3").unwrap();
@@ -347,14 +347,14 @@ mod tests {
         assert_eq!(spec.format_updated("2.0"), ">= 2.0");
     }
 
-    // Language test
+    // language のテスト
     #[test]
     fn test_ruby_parser_language() {
         let parser = RubyVersionParser;
         assert_eq!(parser.language(), Language::Ruby);
     }
 
-    // Version with multiple segments
+    // 複数セグメントバージョンのテスト
     #[test]
     fn test_parse_major_only() {
         let spec = parse("1").unwrap();
