@@ -171,7 +171,7 @@ mod tests {
 
     #[test]
     fn test_parse_bare_version() {
-        // Bare versions in Cargo are treated as caret (^1.2.3)
+        // Cargo では裸のバージョンは caret (^1.2.3) 扱い
         let spec = parse("1.2.3").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Caret);
         assert_eq!(spec.version, "1.2.3");

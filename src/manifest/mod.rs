@@ -1,10 +1,10 @@
-//! Manifest file detection and parsing
+//! マニフェストファイルの検出とパース
 //!
-//! This module provides functionality to:
-//! - Detect manifest files in a directory
-//! - Parse dependencies from different manifest formats
-//! - Support monorepo structures (pnpm-workspace.yaml)
-//! - Support Tauri projects (src-tauri/Cargo.toml)
+//! このモジュールが提供する機能:
+//! - ディレクトリ内のマニフェストファイルを検出
+//! - 各種マニフェスト形式から依存関係をパース
+//! - モノレポ構造のサポート (pnpm-workspace.yaml)
+//! - Tauri プロジェクトのサポート (src-tauri/Cargo.toml)
 
 mod cargo_toml;
 mod composer_json;
@@ -34,15 +34,15 @@ use crate::domain::{Dependency, Language};
 use crate::error::ManifestError;
 use std::path::Path;
 
-/// Trait for parsing manifest files
+/// マニフェストファイルをパースするためのトレイト
 pub trait ManifestParser {
-    /// Parse dependencies from a manifest file
+    /// マニフェストファイルから依存関係をパースする
     fn parse(&self, content: &str) -> Result<Vec<Dependency>, ManifestError>;
 
-    /// Returns the language this parser handles
+    /// このパーサが対応する言語を返す
     fn language(&self) -> Language;
 
-    /// Update a dependency version in the manifest content
+    /// マニフェスト内容の依存バージョンを更新する
     fn update_version(
         &self,
         content: &str,

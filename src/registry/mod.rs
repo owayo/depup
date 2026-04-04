@@ -1,12 +1,12 @@
-//! Registry adapters for fetching package version information
+//! パッケージバージョン情報を取得するレジストリアダプタ
 //!
-//! This module provides:
-//! - HTTP client shared foundation with retry logic
-//! - npm Registry adapter
-//! - PyPI JSON API adapter
-//! - crates.io API adapter
-//! - Go Module Proxy adapter
-//! - Maven Central adapter
+//! このモジュールが提供するもの:
+//! - リトライロジック付き HTTP クライアント共通基盤
+//! - npm レジストリアダプタ
+//! - PyPI JSON API アダプタ
+//! - crates.io API アダプタ
+//! - Go Module Proxy アダプタ
+//! - Maven Central アダプタ
 
 mod client;
 mod crates_io;
@@ -33,13 +33,13 @@ use crate::error::RegistryError;
 use crate::update::VersionInfo;
 use async_trait::async_trait;
 
-/// Trait for registry adapters
+/// レジストリアダプタのトレイト
 #[async_trait]
 pub trait RegistryAdapter: Send + Sync {
-    /// Get the language this adapter handles
+    /// このアダプタが扱う言語を取得
     fn language(&self) -> Language;
 
-    /// Get the registry name
+    /// レジストリ名を取得
     fn registry_name(&self) -> &'static str;
 
     /// Fetch available versions for a package

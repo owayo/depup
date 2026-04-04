@@ -109,7 +109,7 @@ mod tests {
         assert_eq!(spec.kind, VersionSpecKind::Exact);
         assert_eq!(spec.version, "0.0.0-20210101120000-abcdef123456");
         assert_eq!(spec.prefix, Some("v".to_string()));
-        // Pseudo-versions should be treated as pinned
+        // pseudo-version は固定バージョン扱い
         assert!(spec.is_pinned());
     }
 
@@ -155,7 +155,7 @@ mod tests {
 
     #[test]
     fn test_parse_invalid_no_v_prefix() {
-        // Go versions must have v prefix
+        // Go のバージョンは v 接頭辞が必須
         assert!(parse("1.2.3").is_none());
     }
 

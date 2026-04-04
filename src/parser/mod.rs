@@ -30,16 +30,16 @@ pub use swift::SwiftVersionParser;
 
 use crate::domain::{Language, VersionSpec};
 
-/// Trait for parsing version specifications
+/// バージョン指定のパースを行うトレイト
 pub trait VersionParser {
-    /// Parse a version specification string
+    /// バージョン指定文字列をパースする
     fn parse(&self, version_str: &str) -> Option<VersionSpec>;
 
-    /// Returns the language this parser handles
+    /// このパーサが対応する言語を返す
     fn language(&self) -> Language;
 }
 
-/// Get a version parser for the specified language
+/// 指定された言語に対応するバージョンパーサを取得する
 pub fn get_parser(language: Language) -> Box<dyn VersionParser> {
     match language {
         Language::Node => Box::new(NodeVersionParser),

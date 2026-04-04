@@ -1,10 +1,10 @@
-//! CLI argument parsing module for depup
+//! depup の CLI 引数解析モジュール
 
 use clap::{ArgAction, Parser};
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Parse duration string in format: Nd (days), Nw (weeks), Nm (months)
+/// 期間文字列をパースする (形式: Nd (日), Nw (週), Nm (月))
 fn parse_duration(s: &str) -> Result<Duration, String> {
     let s = s.trim();
     if s.is_empty() {
@@ -26,16 +26,16 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
         .map_err(|_| format!("invalid number in duration: {}", num_str))?;
 
     let seconds = match unit {
-        'd' => num * 24 * 60 * 60,      // days
-        'w' => num * 7 * 24 * 60 * 60,  // weeks
-        'm' => num * 30 * 24 * 60 * 60, // months (30 days)
+        'd' => num * 24 * 60 * 60,      // 日
+        'w' => num * 7 * 24 * 60 * 60,  // 週
+        'm' => num * 30 * 24 * 60 * 60, // 月 (30日)
         _ => unreachable!(),
     };
 
     Ok(Duration::from_secs(seconds))
 }
 
-/// Multi-language dependency updater
+/// 多言語対応の依存関係アップデーター
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "depup",
@@ -55,7 +55,7 @@ pub struct CliArgs {
     #[arg(short = 'C', long = "cd", value_name = "DIR")]
     pub directory: Option<PathBuf>,
 
-    // General options
+    // 一般オプション
     /// Dry run mode - show what would be updated without making changes
     #[arg(short = 'n', long)]
     pub dry_run: bool,
@@ -68,7 +68,7 @@ pub struct CliArgs {
     #[arg(short, long)]
     pub quiet: bool,
 
-    // Language filters
+    // 言語フィルタ
     /// Update only Node.js (package.json) dependencies
     #[arg(long)]
     pub node: bool,
@@ -101,7 +101,7 @@ pub struct CliArgs {
     #[arg(long)]
     pub swift: bool,
 
-    // Package filters
+    // パッケージフィルタ
     /// Exclude specific packages from update (can be specified multiple times)
     #[arg(long, action = ArgAction::Append)]
     pub exclude: Vec<String>,
@@ -114,12 +114,12 @@ pub struct CliArgs {
     #[arg(long)]
     pub include_pinned: bool,
 
-    // Age filter
+    // 経過時間フィルタ
     /// Only update to versions released at least this long ago (e.g., 2w, 10d, 1m)
     #[arg(long, value_parser = parse_duration)]
     pub age: Option<Duration>,
 
-    // Output options
+    // 出力オプション
     /// Output results in JSON format
     #[arg(long)]
     pub json: bool,
@@ -128,14 +128,14 @@ pub struct CliArgs {
     #[arg(long)]
     pub diff: bool,
 
-    // Install option
+    // インストールオプション
     /// Run package manager install after update
     #[arg(long)]
     pub install: bool,
 }
 
 impl CliArgs {
-    /// Check if any language filter is specified
+    /// 言語フィルタが指定されているかを確認する
     pub fn has_language_filter(&self) -> bool {
         self.node
             || self.python
@@ -147,10 +147,10 @@ impl CliArgs {
             || self.swift
     }
 
-    /// Check if a specific language should be processed
+    /// 指定された言語を処理すべきかを確認する
     pub fn should_process_language(&self, lang: &str) -> bool {
         if !self.has_language_filter() {
-            return true; // No filter means process all
+            return true; // フィルタなしの場合は全言語を処理
         }
         match lang {
             "node" | "nodejs" | "javascript" => self.node,
@@ -165,13 +165,13 @@ impl CliArgs {
         }
     }
 
-    /// Check if a package should be processed based on filters
+    /// フィルタ条件に基づいてパッケージを処理すべきかを確認する
     pub fn should_process_package(&self, name: &str) -> bool {
-        // If --only is specified, only process those packages
+        // --only が指定されている場合、そのパッケージのみ処理
         if !self.only.is_empty() {
             return self.only.iter().any(|p| p == name);
         }
-        // If --exclude is specified, skip those packages
+        // --exclude が指定されている場合、そのパッケージをスキップ
         if self.exclude.iter().any(|p| p == name) {
             return false;
         }
@@ -288,7 +288,7 @@ mod tests {
         assert!(!args.go);
         assert!(!args.java);
 
-        // Test Java with other languages
+        // Java と他の言語の組み合わせテスト
         let args = CliArgs::parse_from(["depup", "--java", "--node"]);
         assert!(args.java);
         assert!(args.node);
@@ -378,7 +378,7 @@ mod tests {
         assert!(!args.should_process_language("go"));
         assert!(!args.should_process_language("java"));
 
-        // Test Java-only filter
+        // Javaのみのフィルタテスト
         let args = CliArgs::parse_from(["depup", "--java"]);
         assert!(args.should_process_language("java"));
         assert!(!args.should_process_language("node"));
