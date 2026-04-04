@@ -42,11 +42,11 @@ pub trait RegistryAdapter: Send + Sync {
     /// レジストリ名を取得
     fn registry_name(&self) -> &'static str;
 
-    /// Fetch available versions for a package
+    /// パッケージの利用可能なバージョンを取得
     async fn fetch_versions(&self, package: &str) -> Result<Vec<VersionInfo>, RegistryError>;
 }
 
-/// Create a registry adapter for the given language
+/// 指定された言語に対応するレジストリアダプタを作成
 pub fn create_adapter(language: Language, client: HttpClient) -> Box<dyn RegistryAdapter> {
     match language {
         Language::Node => Box::new(NpmAdapter::new(client)),

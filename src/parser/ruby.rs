@@ -176,7 +176,7 @@ mod tests {
         RubyVersionParser.parse(version)
     }
 
-    // Pessimistic constraint tests
+    // ペシミスティック制約のテスト
     #[test]
     fn test_parse_pessimistic_minor() {
         let spec = parse("~> 1.2").unwrap();
@@ -201,7 +201,7 @@ mod tests {
         assert_eq!(spec.version, "1.2.3");
     }
 
-    // Exact version tests
+    // 固定バージョンのテスト
     #[test]
     fn test_parse_exact_with_equals() {
         let spec = parse("= 1.2.3").unwrap();

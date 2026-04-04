@@ -51,7 +51,7 @@ pub trait ManifestParser {
     ) -> Result<String, ManifestError>;
 }
 
-/// Get a manifest parser for the specified language
+/// 指定された言語に対応するマニフェストパーサを取得する
 pub fn get_parser(language: Language) -> Box<dyn ManifestParser> {
     match language {
         Language::Node => Box::new(PackageJsonParser),
@@ -65,7 +65,7 @@ pub fn get_parser(language: Language) -> Box<dyn ManifestParser> {
     }
 }
 
-/// Parse dependencies from a manifest file path
+/// ファイルパスからマニフェストの依存関係をパースする
 pub fn parse_manifest(path: &Path) -> Result<Vec<Dependency>, ManifestError> {
     let content = std::fs::read_to_string(path).map_err(|e| ManifestError::ReadError {
         path: path.to_path_buf(),

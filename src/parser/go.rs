@@ -178,7 +178,7 @@ mod tests {
 
     #[test]
     fn test_is_pinned() {
-        // All Go versions are effectively pinned in go.mod
+        // go.mod のすべてのバージョンは実質的に固定
         let spec = parse("v1.2.3").unwrap();
         assert!(spec.is_pinned());
     }

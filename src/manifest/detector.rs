@@ -1,9 +1,9 @@
-//! Manifest file detection with monorepo and Tauri support
+//! モノレポおよび Tauri 対応のマニフェストファイル検出
 //!
-//! Features:
-//! - Detects package.json, pyproject.toml, Cargo.toml, go.mod
-//! - Supports pnpm-workspace.yaml for monorepo detection
-//! - Supports Tauri projects (src-tauri/Cargo.toml)
+//! 機能:
+//! - package.json, pyproject.toml, Cargo.toml, go.mod の検出
+//! - pnpm-workspace.yaml によるモノレポ検出のサポート
+//! - Tauri プロジェクト (src-tauri/Cargo.toml) のサポート
 
 use crate::domain::Language;
 use std::path::{Path, PathBuf};
