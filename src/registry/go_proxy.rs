@@ -1,9 +1,9 @@
-//! Go Module Proxy adapter
+//! Go Module Proxy アダプタ
 //!
-//! Fetches module version information from the Go Module Proxy.
-//! API endpoints:
-//! - List versions: https://proxy.golang.org/{module}/@v/list
-//! - Version info: https://proxy.golang.org/{module}/@v/{version}.info
+//! Go Module Proxy からモジュールバージョン情報を取得する。
+//! API エンドポイント:
+//! - バージョン一覧: https://proxy.golang.org/{module}/@v/list
+//! - バージョン情報: https://proxy.golang.org/{module}/@v/{version}.info
 
 use crate::domain::Language;
 use crate::error::RegistryError;
@@ -13,10 +13,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
-/// Go Module Proxy base URL
+/// Go Module Proxy のベース URL
 const GO_PROXY_URL: &str = "https://proxy.golang.org";
 
-/// Go Module Proxy adapter
+/// Go Module Proxy アダプタ
 pub struct GoProxyAdapter {
     client: HttpClient,
 }

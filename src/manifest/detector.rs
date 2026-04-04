@@ -95,7 +95,7 @@ pub fn detect_manifests(dir: &Path) -> Vec<ManifestInfo> {
         }
     }
 
-    // Check for Cargo workspace members
+    // Cargo ワークスペースメンバーを確認する
     let cargo_toml_path = dir.join("Cargo.toml");
     if cargo_toml_path.exists()
         && let Ok(content) = std::fs::read_to_string(&cargo_toml_path)
@@ -108,10 +108,10 @@ pub fn detect_manifests(dir: &Path) -> Vec<ManifestInfo> {
         }
     }
 
-    // Check for Tauri project (src-tauri/Cargo.toml)
+    // Tauri プロジェクト (src-tauri/Cargo.toml) を確認する
     let tauri_cargo_path = dir.join("src-tauri").join("Cargo.toml");
     if tauri_cargo_path.exists() {
-        // If already added by workspace member detection, just mark as Tauri
+        // ワークスペースメンバー検出で既に追加済みなら、Tauri フラグだけ設定する
         if let Some(existing) = manifests
             .iter_mut()
             .find(|m| m.language == Language::Rust && m.path == tauri_cargo_path)
@@ -124,12 +124,12 @@ pub fn detect_manifests(dir: &Path) -> Vec<ManifestInfo> {
         }
     }
 
-    // Check for pnpm workspace packages if pnpm-workspace.yaml exists
+    // pnpm-workspace.yaml が存在する場合、pnpm ワークスペースパッケージを確認する
     if is_pnpm_workspace && let Ok(workspace_packages) = detect_pnpm_workspace_packages(dir) {
         for package_path in workspace_packages {
             let package_json_path = package_path.join("package.json");
             if package_json_path.exists() {
-                // Don't add if it's the root package.json
+                // ルートの package.json は重複追加しない
                 if package_json_path != dir.join("package.json") {
                     manifests.push(ManifestInfo::new(&package_json_path, Language::Node));
                 }
@@ -140,17 +140,17 @@ pub fn detect_manifests(dir: &Path) -> Vec<ManifestInfo> {
     manifests
 }
 
-/// Parse pnpm-workspace.yaml and return package directories
+/// pnpm-workspace.yaml をパースしてパッケージディレクトリを返す
 fn detect_pnpm_workspace_packages(dir: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
     let workspace_file = dir.join("pnpm-workspace.yaml");
     let content = std::fs::read_to_string(&workspace_file)?;
 
     let mut packages = Vec::new();
 
-    // Simple YAML parsing for packages array
-    // Format: packages:
-    //           - 'packages/*'
-    //           - 'apps/*'
+    // packages 配列の簡易 YAML パース
+    // 形式: packages:
+    //          - 'packages/*'
+    //          - 'apps/*'
     let mut in_packages = false;
     for line in content.lines() {
         let trimmed = line.trim();
@@ -161,18 +161,18 @@ fn detect_pnpm_workspace_packages(dir: &Path) -> Result<Vec<PathBuf>, std::io::E
         }
 
         if in_packages {
-            // Check if we've moved to a new section
+            // 新しいセクションに移ったかどうかを確認する
             if !trimmed.is_empty() && !trimmed.starts_with('-') && !trimmed.starts_with('#') {
                 break;
             }
 
-            // Parse package glob pattern
+            // パッケージの glob パターンをパースする
             if let Some(pattern) = trimmed.strip_prefix('-') {
                 let pattern = pattern.trim().trim_matches('\'').trim_matches('"');
 
-                // Handle glob patterns like 'packages/*' or 'apps/**'
+                // 'packages/*' や 'apps/**' のような glob パターンを処理する
                 if let Some(base) = pattern.strip_suffix("/*") {
-                    // List directories in the base path
+                    // ベースパス内のディレクトリを列挙する
                     let base_path = dir.join(base);
                     if let Ok(entries) = std::fs::read_dir(&base_path) {
                         for entry in entries.flatten() {
@@ -182,7 +182,7 @@ fn detect_pnpm_workspace_packages(dir: &Path) -> Result<Vec<PathBuf>, std::io::E
                         }
                     }
                 } else if let Some(base) = pattern.strip_suffix("/**") {
-                    // For ** patterns, we just use the first level for now
+                    // ** パターンは現時点では第 1 階層のみを対象にする
                     let base_path = dir.join(base);
                     if let Ok(entries) = std::fs::read_dir(&base_path) {
                         for entry in entries.flatten() {
@@ -192,7 +192,7 @@ fn detect_pnpm_workspace_packages(dir: &Path) -> Result<Vec<PathBuf>, std::io::E
                         }
                     }
                 } else if !pattern.contains('*') {
-                    // Direct path without glob
+                    // glob なしの直接パス
                     let pkg_path = dir.join(pattern);
                     if pkg_path.exists() {
                         packages.push(pkg_path);
@@ -205,7 +205,7 @@ fn detect_pnpm_workspace_packages(dir: &Path) -> Result<Vec<PathBuf>, std::io::E
     Ok(packages)
 }
 
-/// Parse Cargo.toml workspace members and return their directories
+/// Cargo.toml のワークスペースメンバーをパースしてディレクトリを返す
 fn detect_cargo_workspace_members(dir: &Path, content: &str) -> Vec<PathBuf> {
     let toml: toml::Value = match toml::from_str(content) {
         Ok(v) => v,
@@ -228,13 +228,13 @@ fn detect_cargo_workspace_members(dir: &Path, content: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Check if a directory is a Tauri project
+/// ディレクトリが Tauri プロジェクトかどうかを判定する
 #[allow(dead_code)]
 pub fn is_tauri_project(dir: &Path) -> bool {
     dir.join("src-tauri").exists() && dir.join("src-tauri").join("Cargo.toml").exists()
 }
 
-/// Check if a directory is a pnpm workspace
+/// ディレクトリが pnpm ワークスペースかどうかを判定する
 #[allow(dead_code)]
 pub fn is_pnpm_workspace(dir: &Path) -> bool {
     dir.join("pnpm-workspace.yaml").exists()
@@ -320,14 +320,14 @@ mod tests {
         fs::write(dir.path().join("src-tauri").join("Cargo.toml"), "").unwrap();
 
         let manifests = detect_manifests(dir.path());
-        // Should have both root Cargo.toml and src-tauri/Cargo.toml
+        // ルート Cargo.toml と src-tauri/Cargo.toml の両方があるはず
         let rust_manifests: Vec<_> = manifests
             .iter()
             .filter(|m| m.language == Language::Rust)
             .collect();
         assert_eq!(rust_manifests.len(), 2);
 
-        // One should be tauri, one should not
+        // 一方は Tauri、もう一方は非 Tauri であるべき
         assert!(rust_manifests.iter().any(|m| m.is_tauri_rust));
         assert!(rust_manifests.iter().any(|m| !m.is_tauri_rust));
     }
@@ -376,17 +376,17 @@ mod tests {
     fn test_pnpm_workspace_packages_detection() {
         let dir = create_temp_dir();
 
-        // Create pnpm-workspace.yaml
+        // pnpm-workspace.yaml を作成する
         fs::write(
             dir.path().join("pnpm-workspace.yaml"),
             "packages:\n  - 'packages/*'\n  - 'apps/*'\n",
         )
         .unwrap();
 
-        // Create root package.json
+        // ルート package.json を作成する
         fs::write(dir.path().join("package.json"), "{}").unwrap();
 
-        // Create packages directory with sub-packages
+        // サブパッケージを含む packages ディレクトリを作成する
         fs::create_dir(dir.path().join("packages")).unwrap();
         fs::create_dir(dir.path().join("packages").join("pkg-a")).unwrap();
         fs::write(
@@ -407,7 +407,7 @@ mod tests {
         )
         .unwrap();
 
-        // Create apps directory
+        // apps ディレクトリを作成する
         fs::create_dir(dir.path().join("apps")).unwrap();
         fs::create_dir(dir.path().join("apps").join("web")).unwrap();
         fs::write(
@@ -418,14 +418,14 @@ mod tests {
 
         let manifests = detect_manifests(dir.path());
 
-        // Should find: root package.json + pkg-a + pkg-b + apps/web
+        // ルート package.json + pkg-a + pkg-b + apps/web の 4 件が見つかるはず
         let node_manifests: Vec<_> = manifests
             .iter()
             .filter(|m| m.language == Language::Node)
             .collect();
         assert_eq!(node_manifests.len(), 4);
 
-        // Root should be marked as workspace root
+        // ルートがワークスペースルートとしてマークされているはず
         let root = node_manifests
             .iter()
             .find(|m| m.path == dir.path().join("package.json"))
@@ -437,7 +437,7 @@ mod tests {
     fn test_detect_cargo_workspace_members() {
         let dir = create_temp_dir();
 
-        // Create workspace root Cargo.toml
+        // ワークスペースルートの Cargo.toml を作成する
         fs::write(
             dir.path().join("Cargo.toml"),
             r#"[workspace]
@@ -450,7 +450,7 @@ serde = "1"
         )
         .unwrap();
 
-        // Create member crate directories with Cargo.toml
+        // メンバークレートのディレクトリと Cargo.toml を作成する
         fs::create_dir_all(dir.path().join("crates").join("core")).unwrap();
         fs::write(
             dir.path().join("crates").join("core").join("Cargo.toml"),
@@ -483,7 +483,7 @@ clap = "4"
             .filter(|m| m.language == Language::Rust)
             .collect();
 
-        // Should find: root Cargo.toml + crates/core + crates/cli
+        // ルート Cargo.toml + crates/core + crates/cli の 3 件が見つかるはず
         assert_eq!(rust_manifests.len(), 3);
         assert!(
             rust_manifests

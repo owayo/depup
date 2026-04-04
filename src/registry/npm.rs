@@ -134,12 +134,12 @@ mod tests {
 
     #[test]
     fn test_prerelease_version_greater_than_latest() {
-        // Prisma-style integration versions should be filtered out
-        // because they are greater than the official "latest" tag
+        // Prisma スタイルの integration バージョンはフィルタされるべき
+        // 公式の "latest" タグより大きいため
         let latest = "7.2.0";
         let prerelease = "7.3.0-integration-fix-6-19-0-cloudflare-accelerate-engine.1";
 
-        // The prerelease version should be considered greater than latest
+        // プレリリースバージョンは latest より大きいとみなされるべき
         assert_eq!(
             compare_versions(prerelease, latest),
             std::cmp::Ordering::Greater
@@ -148,13 +148,13 @@ mod tests {
 
     #[test]
     fn test_stable_version_not_filtered() {
-        // Stable versions older than or equal to latest should not be filtered
+        // latest 以前の安定バージョンはフィルタされないべき
         let latest = "7.2.0";
 
-        // Same version
+        // 同じバージョン
         assert_eq!(compare_versions("7.2.0", latest), std::cmp::Ordering::Equal);
 
-        // Older versions
+        // 古いバージョン
         assert_eq!(compare_versions("7.1.0", latest), std::cmp::Ordering::Less);
         assert_eq!(compare_versions("6.0.0", latest), std::cmp::Ordering::Less);
     }

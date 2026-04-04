@@ -1,7 +1,7 @@
-//! PyPI JSON API adapter
+//! PyPI JSON API アダプタ
 //!
-//! Fetches package version information from PyPI.
-//! API endpoint: https://pypi.org/pypi/{package}/json
+//! PyPI からパッケージバージョン情報を取得する。
+//! API エンドポイント: https://pypi.org/pypi/{package}/json
 
 use crate::domain::Language;
 use crate::error::RegistryError;
@@ -12,35 +12,35 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::collections::HashMap;
 
-/// PyPI API base URL
+/// PyPI API のベース URL
 const PYPI_API_URL: &str = "https://pypi.org/pypi";
 
-/// PyPI adapter
+/// PyPI アダプタ
 pub struct PyPIAdapter {
     client: HttpClient,
 }
 
-/// PyPI package metadata response
+/// PyPI パッケージメタデータレスポンス
 #[derive(Debug, Deserialize)]
 struct PyPIResponse {
-    /// Release information keyed by version
+    /// バージョンごとのリリース情報
     releases: HashMap<String, Vec<ReleaseInfo>>,
 }
 
-/// Release file information
+/// リリースファイル情報
 #[derive(Debug, Deserialize)]
 struct ReleaseInfo {
-    /// Upload time for the release file
+    /// リリースファイルのアップロード時刻
     upload_time_iso_8601: Option<String>,
 }
 
 impl PyPIAdapter {
-    /// Create a new PyPI adapter
+    /// 新しい PyPI アダプタを作成
     pub fn new(client: HttpClient) -> Self {
         Self { client }
     }
 
-    /// Build the URL for a package
+    /// パッケージ用の URL を構築
     fn build_url(&self, package: &str) -> String {
         format!("{}/{}/json", PYPI_API_URL, package)
     }
@@ -66,7 +66,7 @@ impl RegistryAdapter for PyPIAdapter {
         let mut versions = Vec::new();
 
         for (version, release_files) in response.releases {
-            // Get the earliest upload time from release files
+            // リリースファイルの中から最も早いアップロード時刻を取得
             let mut earliest_time: Option<DateTime<Utc>> = None;
 
             for file_info in release_files {
@@ -86,7 +86,7 @@ impl RegistryAdapter for PyPIAdapter {
             }
         }
 
-        // Sort by version
+        // バージョンでソート
         versions.sort();
 
         Ok(versions)

@@ -1,20 +1,20 @@
-//! `.depup` configuration file parser
+//! `.depup` 設定ファイルパーサ
 //!
-//! Parses `.depup` files that list subdirectories for monorepo support.
-//! Each line is a relative path to a subdirectory containing manifest files.
-//! Lines starting with `#` are comments, and inline `#` comments are supported.
+//! モノレポ対応のための `.depup` ファイルを解析する。
+//! 各行はマニフェストファイルを含むサブディレクトリへの相対パス。
+//! `#` で始まる行はコメントとして扱い、インラインの `#` コメントもサポートする。
 
 use std::path::{Path, PathBuf};
 
-/// Configuration parsed from a `.depup` file
+/// `.depup` ファイルから解析された設定
 #[derive(Debug, Clone)]
 pub struct DepupConfig {
-    /// List of subdirectories to process
+    /// 処理対象のサブディレクトリ一覧
     pub directories: Vec<PathBuf>,
 }
 
 impl DepupConfig {
-    /// Look for a `.depup` file in the given directory and parse it
+    /// 指定されたディレクトリ内の `.depup` ファイルを探して解析する
     pub fn from_dir(dir: &Path) -> Option<Self> {
         let config_path = dir.join(".depup");
         if !config_path.is_file() {
@@ -31,10 +31,10 @@ impl DepupConfig {
         }
     }
 
-    /// Build the list of directories to scan, always including the root directory.
+    /// スキャン対象のディレクトリ一覧を構築する (ルートディレクトリを常に含む)
     ///
-    /// The root directory is placed first, followed by any `.depup`-listed directories
-    /// that are not the root itself (to avoid duplicates).
+    /// ルートディレクトリが先頭に配置され、その後に `.depup` に記載されたディレクトリが
+    /// ルート自身でない場合のみ追加される (重複を防ぐため)。
     pub fn directories_with_root(&self, root: &Path) -> Vec<PathBuf> {
         let mut dirs = vec![root.to_path_buf()];
         for dir in &self.directories {
@@ -45,16 +45,16 @@ impl DepupConfig {
         dirs
     }
 
-    /// Parse the content of a `.depup` file
+    /// `.depup` ファイルの内容を解析する
     ///
-    /// Each line is treated as a relative path. `#` starts a comment (line or inline).
-    /// Empty lines and comment-only lines are ignored.
-    /// Non-existent directories are warned and skipped.
+    /// 各行は相対パスとして扱われる。`#` はコメント開始文字 (行頭・インライン)。
+    /// 空行やコメントのみの行は無視される。
+    /// 存在しないディレクトリは警告を出してスキップする。
     pub fn parse(content: &str, base_dir: &Path) -> Result<Self, String> {
         let mut directories = Vec::new();
 
         for line in content.lines() {
-            // Strip inline comments
+            // インラインコメントを除去
             let stripped = match line.find('#') {
                 Some(pos) => &line[..pos],
                 None => line,
@@ -147,7 +147,7 @@ mod tests {
         let dir = create_test_dir();
         fs::create_dir(dir.path().join("gui")).unwrap();
 
-        // Trailing slash should work since Path::join handles it
+        // 末尾スラッシュは Path::join が処理するため動作する
         let content = "gui/\n";
         let config = DepupConfig::parse(content, dir.path()).unwrap();
         assert_eq!(config.directories.len(), 1);
@@ -222,7 +222,7 @@ missing
         let dirs = config.directories_with_root(dir.path());
 
         assert_eq!(dirs.len(), 3);
-        assert_eq!(dirs[0], dir.path().to_path_buf(), "root should be first");
+        assert_eq!(dirs[0], dir.path().to_path_buf(), "ルートが先頭であること");
         assert_eq!(dirs[1], dir.path().join("gui"));
         assert_eq!(dirs[2], dir.path().join("api"));
     }
@@ -251,7 +251,7 @@ missing
         let dirs = config.directories_with_root(dir.path());
 
         assert_eq!(dirs.len(), 1);
-        assert_eq!(dirs[0], dir.path().to_path_buf(), "root only");
+        assert_eq!(dirs[0], dir.path().to_path_buf(), "ルートのみ");
     }
 
     #[test]

@@ -1,30 +1,30 @@
-//! Progress display for dependency updates
+//! 依存関係更新のプログレス表示
 //!
-//! Provides visual feedback during the update workflow using indicatif.
+//! indicatif を使用して更新ワークフロー中の視覚的フィードバックを提供する。
 
 use indicatif::{ProgressBar, ProgressStyle};
 use std::time::Duration;
 
-/// Progress reporter for the update workflow
+/// 更新ワークフローのプログレスレポーター
 pub struct Progress {
-    /// Whether progress display is enabled (disabled in quiet mode)
+    /// プログレス表示が有効か (quiet モードでは無効)
     enabled: bool,
-    /// Current progress bar
+    /// 現在のプログレスバー
     bar: Option<ProgressBar>,
 }
 
 impl Progress {
-    /// Create a new progress reporter
+    /// 新しいプログレスレポーターを作成する
     pub fn new(enabled: bool) -> Self {
         Self { enabled, bar: None }
     }
 
-    /// Create a disabled progress reporter
+    /// 無効なプログレスレポーターを作成する
     pub fn disabled() -> Self {
         Self::new(false)
     }
 
-    /// Show a spinner with a message for an indeterminate operation
+    /// 不定操作用のスピナーをメッセージ付きで表示する
     pub fn spinner(&mut self, message: &str) {
         if !self.enabled {
             return;
@@ -42,7 +42,7 @@ impl Progress {
         self.bar = Some(spinner);
     }
 
-    /// Start a progress bar for a known number of items
+    /// 既知の件数に対するプログレスバーを開始する
     pub fn start(&mut self, total: u64, message: &str) {
         if !self.enabled {
             return;
@@ -60,21 +60,21 @@ impl Progress {
         self.bar = Some(bar);
     }
 
-    /// Increment progress by one
+    /// プログレスを1つ進める
     pub fn inc(&self) {
         if let Some(ref bar) = self.bar {
             bar.inc(1);
         }
     }
 
-    /// Update the message
+    /// メッセージを更新する
     pub fn set_message(&self, message: &str) {
         if let Some(ref bar) = self.bar {
             bar.set_message(message.to_string());
         }
     }
 
-    /// Finish the current progress bar with a message
+    /// メッセージ付きで現在のプログレスバーを完了する
     pub fn finish(&mut self, message: &str) {
         if let Some(ref bar) = self.bar {
             bar.finish_with_message(message.to_string());
@@ -82,7 +82,7 @@ impl Progress {
         self.bar = None;
     }
 
-    /// Finish and clear the current progress bar
+    /// 現在のプログレスバーを完了してクリアする
     pub fn finish_and_clear(&mut self) {
         if let Some(ref bar) = self.bar {
             bar.finish_and_clear();
@@ -124,7 +124,7 @@ mod tests {
     #[test]
     fn test_progress_default_is_enabled() {
         let mut progress = Progress::default();
-        // Default should be enabled; spinner should create a bar
+        // デフォルトは有効; スピナーでバーが作成されるはず
         progress.spinner("loading");
         progress.finish("done");
     }
@@ -135,7 +135,7 @@ mod tests {
         progress.spinner("scanning");
         progress.set_message("updated message");
         progress.finish_and_clear();
-        // After finish_and_clear, inc/set_message should be no-ops
+        // finish_and_clear 後は inc/set_message はノーオペになる
         progress.inc();
         progress.set_message("no-op");
     }
@@ -143,7 +143,7 @@ mod tests {
     #[test]
     fn test_progress_disabled_operations_are_noop() {
         let mut progress = Progress::disabled();
-        // All operations should be safe no-ops when disabled
+        // 無効時は全操作が安全なノーオペであること
         progress.spinner("test");
         progress.inc();
         progress.set_message("msg");

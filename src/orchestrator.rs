@@ -1,11 +1,11 @@
-//! Update orchestrator for coordinating the entire update workflow
+//! 更新オーケストレータ - 更新ワークフロー全体の調整
 //!
-//! This module provides:
-//! - Workflow coordination: detect → parse → fetch → judge → write
-//! - Parallel registry queries with rate limiting
-//! - Dry-run mode support
-//! - Language and package filter application
-//! - Error handling with partial continuation
+//! このモジュールは以下を提供する:
+//! - ワークフロー調整: 検出 → パース → フェッチ → 判定 → 書き込み
+//! - レート制限付き並列レジストリクエリ
+//! - ドライランモード対応
+//! - 言語・パッケージフィルタの適用
+//! - 部分的な継続を伴うエラーハンドリング
 
 use crate::cli::CliArgs;
 use crate::domain::{Language, ManifestUpdateResult, SkipReason, UpdateResult, UpdateSummary};
@@ -25,51 +25,51 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
 
-/// Default concurrency limit for registry requests
+/// レジストリリクエストのデフォルト同時実行数
 const DEFAULT_CONCURRENCY: usize = 10;
 
-/// Concurrency limit for crates.io (rate limited)
+/// crates.io 用の同時実行数 (レート制限あり)
 const CRATES_IO_CONCURRENCY: usize = 1;
 
-/// Cache for version information keyed by (language, package_name)
+/// バージョン情報のキャッシュ (言語, パッケージ名) をキーとする
 pub type VersionCache = Arc<Mutex<HashMap<(Language, String), Vec<VersionInfo>>>>;
 
-/// Orchestrator for coordinating the update workflow
+/// 更新ワークフローを調整するオーケストレータ
 pub struct Orchestrator {
-    /// CLI arguments for configuration
+    /// 設定用CLI引数
     args: CliArgs,
-    /// HTTP client for registry requests
+    /// レジストリリクエスト用HTTPクライアント
     client: HttpClient,
-    /// Semaphore for general concurrency control
+    /// 汎用同時実行制御用セマフォ
     general_semaphore: Arc<Semaphore>,
-    /// Semaphore for crates.io specific rate limiting
+    /// crates.io 専用レート制限セマフォ
     crates_io_semaphore: Arc<Semaphore>,
-    /// Version cache shared across directories
+    /// ディレクトリ間で共有されるバージョンキャッシュ
     version_cache: VersionCache,
 }
 
-/// Result of running the orchestrator
+/// オーケストレータの実行結果
 pub struct OrchestratorResult {
-    /// Update summary with all results
+    /// 全結果を含む更新サマリ
     pub summary: UpdateSummary,
-    /// Write results for each manifest
+    /// 各マニフェストの書き込み結果
     pub write_results: Vec<WriteResult>,
-    /// Errors encountered during processing
+    /// 処理中に発生したエラー
     pub errors: Vec<OrchestratorError>,
 }
 
-/// Errors that can occur during orchestration
+/// オーケストレーション中に発生しうるエラー
 #[derive(Debug)]
 pub enum OrchestratorError {
-    /// Failed to create HTTP client
+    /// HTTPクライアントの作成に失敗
     HttpClientError(String),
-    /// Failed to detect manifests
+    /// マニフェストの検出に失敗
     ManifestDetectionError(String),
-    /// Failed to parse manifest
+    /// マニフェストのパースに失敗
     ManifestParseError { path: String, message: String },
-    /// Failed to fetch versions from registry
+    /// レジストリからのバージョン取得に失敗
     RegistryError { package: String, message: String },
-    /// Failed to write manifest
+    /// マニフェストの書き込みに失敗
     WriteError { path: String, message: String },
 }
 
@@ -96,7 +96,7 @@ impl std::fmt::Display for OrchestratorError {
 impl std::error::Error for OrchestratorError {}
 
 impl Orchestrator {
-    /// Create a new orchestrator with the given CLI arguments
+    /// 指定されたCLI引数で新しいオーケストレータを作成する
     pub fn new(args: CliArgs) -> Result<Self, OrchestratorError> {
         let client =
             HttpClient::new().map_err(|e| OrchestratorError::HttpClientError(e.to_string()))?;
@@ -110,7 +110,7 @@ impl Orchestrator {
         })
     }
 
-    /// Create an orchestrator with a custom HTTP client (for testing)
+    /// カスタムHTTPクライアントでオーケストレータを作成する (テスト用)
     pub fn with_client(args: CliArgs, client: HttpClient) -> Self {
         Self {
             args,
@@ -121,22 +121,22 @@ impl Orchestrator {
         }
     }
 
-    /// Set a shared version cache (for monorepo multi-directory runs)
+    /// 共有バージョンキャッシュを設定する (モノレポの複数ディレクトリ実行用)
     pub fn with_cache(mut self, cache: VersionCache) -> Self {
         self.version_cache = cache;
         self
     }
 
-    /// Run the update workflow
+    /// 更新ワークフローを実行する
     pub async fn run(&self) -> OrchestratorResult {
         self.run_with_progress(!self.args.quiet).await
     }
 
-    /// Run the update workflow with optional progress display
+    /// プログレス表示オプション付きで更新ワークフローを実行する
     pub async fn run_with_progress(&self, show_progress: bool) -> OrchestratorResult {
         let mut progress = Progress::new(show_progress);
 
-        // Step 1: Detect manifest files
+        // ステップ1: マニフェストファイルを検出
         progress.spinner("Detecting manifest files...");
         let manifests = detect_manifests(&self.args.path);
         progress.finish_and_clear();
@@ -144,14 +144,14 @@ impl Orchestrator {
         self.process_manifests(&manifests, &mut progress).await
     }
 
-    /// Run the update workflow across multiple directories (monorepo mode)
+    /// 複数ディレクトリにまたがって更新ワークフローを実行する (モノレポモード)
     ///
-    /// Detects manifests in each directory, shares the version cache,
-    /// and produces a combined result.
+    /// 各ディレクトリのマニフェストを検出し、バージョンキャッシュを共有して
+    /// 統合された結果を生成する。
     pub async fn run_directories(&self, directories: &[PathBuf]) -> OrchestratorResult {
         let mut progress = Progress::new(!self.args.quiet);
 
-        // Step 1: Detect manifest files across all directories
+        // ステップ1: 全ディレクトリのマニフェストファイルを検出
         progress.spinner("Detecting manifest files...");
         let mut all_manifests = Vec::new();
         for dir in directories {
@@ -163,7 +163,7 @@ impl Orchestrator {
         self.process_manifests(&all_manifests, &mut progress).await
     }
 
-    /// Process detected manifests: parse, fetch versions, judge updates, and write results
+    /// 検出されたマニフェストを処理: パース、バージョン取得、更新判定、結果書き込み
     async fn process_manifests(
         &self,
         manifests: &[ManifestInfo],
@@ -180,21 +180,21 @@ impl Orchestrator {
             };
         }
 
-        // Build update filter from CLI args
+        // CLI引数から更新フィルタを構築
         let filter = self.build_filter();
         let judge = UpdateJudge::new(filter);
 
-        // Step 2: Parse manifests and collect all dependencies
+        // ステップ2: マニフェストをパースし、全依存関係を収集
         progress.spinner("Parsing manifests...");
         let mut parsed_manifests = Vec::new();
 
         for manifest_info in manifests {
-            // Check language filter
+            // 言語フィルタをチェック
             if !self.should_process_language(manifest_info.language) {
                 continue;
             }
 
-            // Parse the manifest
+            // マニフェストをパース
             let parser = get_parser(manifest_info.language);
             let content = match std::fs::read_to_string(&manifest_info.path) {
                 Ok(c) => c,
@@ -222,10 +222,10 @@ impl Orchestrator {
         }
         progress.finish_and_clear();
 
-        // Count total dependencies for progress bar
+        // プログレスバー用に依存関係の合計数をカウント
         let total_deps: usize = parsed_manifests.iter().map(|(_, deps)| deps.len()).sum();
 
-        // Step 3: Fetch versions and judge updates for each dependency
+        // ステップ3: 各依存関係のバージョンを取得し、更新を判定
         progress.start(total_deps as u64, "Checking dependencies");
 
         for (manifest_info, dependencies) in parsed_manifests {
@@ -236,14 +236,14 @@ impl Orchestrator {
             for dep in dependencies {
                 progress.set_message(&format!("Checking {}", &dep.name));
 
-                // Check if we should skip this dependency early
+                // この依存関係を早期スキップすべきかチェック
                 if let Some(reason) = judge.should_skip(&dep) {
                     manifest_result.add_result(UpdateResult::skip(dep, reason));
                     progress.inc();
                     continue;
                 }
 
-                // Fetch versions from registry
+                // レジストリからバージョンを取得
                 let versions = match self.fetch_versions(&*adapter, &dep.name).await {
                     Ok(v) => v,
                     Err(e) => {
@@ -258,7 +258,7 @@ impl Orchestrator {
                     }
                 };
 
-                // Judge whether to update
+                // 更新すべきか判定
                 let result = judge.judge(&dep, &versions);
                 manifest_result.add_result(result);
                 progress.inc();
@@ -268,7 +268,7 @@ impl Orchestrator {
         }
         progress.finish_and_clear();
 
-        // Step 3.5: Synchronize Tauri versions if this is a Tauri project
+        // ステップ3.5: Tauriプロジェクトの場合、バージョンを同期
         let is_tauri = manifests.iter().any(|m| m.is_tauri_rust);
         if is_tauri {
             progress.spinner("Synchronizing Tauri versions...");
@@ -277,7 +277,7 @@ impl Orchestrator {
             progress.finish_and_clear();
         }
 
-        // Step 4: Apply updates (unless dry-run)
+        // ステップ4: 更新を適用 (ドライランでなければ)
         if !self.args.dry_run {
             progress.spinner("Writing updates...");
         }
@@ -285,7 +285,7 @@ impl Orchestrator {
         let write_results = writer.apply_all_updates(&summary.manifests, get_parser);
         progress.finish_and_clear();
 
-        // Collect write errors
+        // 書き込みエラーを収集
         for result in &write_results {
             for error in &result.errors {
                 errors.push(OrchestratorError::WriteError {
@@ -302,11 +302,11 @@ impl Orchestrator {
         }
     }
 
-    /// Build an UpdateFilter from CLI arguments
+    /// CLI引数からUpdateFilterを構築する
     fn build_filter(&self) -> UpdateFilter {
         let mut filter = UpdateFilter::new();
 
-        // Language filter
+        // 言語フィルタ
         if self.args.has_language_filter() {
             let mut languages = Vec::new();
             if self.args.node {
@@ -336,7 +336,7 @@ impl Orchestrator {
             filter = filter.with_languages(languages);
         }
 
-        // Package filters
+        // パッケージフィルタ
         if !self.args.exclude.is_empty() {
             filter = filter.with_exclude(self.args.exclude.clone());
         }
@@ -344,17 +344,17 @@ impl Orchestrator {
             filter = filter.with_only(self.args.only.clone());
         }
 
-        // Include pinned
+        // ピン留めバージョンを含める
         if self.args.include_pinned {
             filter = filter.with_include_pinned(true);
         }
 
-        // Age filter
-        // Priority: CLI --age > pnpm settings (for Node.js projects)
+        // 経過日数フィルタ
+        // 優先順位: CLI --age > pnpm設定 (Node.jsプロジェクトの場合)
         if let Some(age) = self.args.age {
             filter = filter.with_min_age(age);
         } else if has_pnpm_workspace(&self.args.path) {
-            // Read pnpm settings for minimum release age
+            // pnpm設定から最小リリース経過日数を読み取る
             let pnpm_settings = PnpmSettings::from_dir(&self.args.path);
             if let Some(age) = pnpm_settings.minimum_release_age {
                 filter = filter.with_min_age(age);
@@ -364,7 +364,7 @@ impl Orchestrator {
         filter
     }
 
-    /// Check if a language should be processed based on CLI args
+    /// CLI引数に基づいて言語を処理すべきかチェックする
     fn should_process_language(&self, language: Language) -> bool {
         if !self.args.has_language_filter() {
             return true;
@@ -381,7 +381,7 @@ impl Orchestrator {
         }
     }
 
-    /// Get the appropriate registry adapter for a language
+    /// 言語に対応するレジストリアダプタを取得する
     fn get_adapter(&self, language: Language) -> Box<dyn RegistryAdapter + Send + Sync> {
         match language {
             Language::Node => Box::new(NpmAdapter::new(self.client.clone())),
@@ -395,7 +395,7 @@ impl Orchestrator {
         }
     }
 
-    /// Fetch versions from registry with concurrency control and caching
+    /// 同時実行制御とキャッシュ付きでレジストリからバージョンを取得する
     async fn fetch_versions(
         &self,
         adapter: &(dyn RegistryAdapter + Send + Sync),
@@ -403,7 +403,7 @@ impl Orchestrator {
     ) -> Result<Vec<VersionInfo>, String> {
         let cache_key = (adapter.language(), package.to_string());
 
-        // Check cache first
+        // まずキャッシュを確認
         {
             let cache = self.version_cache.lock().await;
             if let Some(cached) = cache.get(&cache_key) {
@@ -411,7 +411,7 @@ impl Orchestrator {
             }
         }
 
-        // Use appropriate semaphore based on registry
+        // レジストリに応じて適切なセマフォを使用
         let semaphore = if adapter.language() == Language::Rust {
             &self.crates_io_semaphore
         } else {
@@ -425,7 +425,7 @@ impl Orchestrator {
             .await
             .map_err(|e| e.to_string())?;
 
-        // Store in cache
+        // キャッシュに保存
         {
             let mut cache = self.version_cache.lock().await;
             cache.insert(cache_key, result.clone());
@@ -434,10 +434,10 @@ impl Orchestrator {
         Ok(result)
     }
 
-    /// Synchronize Tauri package versions (@tauri-apps/api, @tauri-apps/cli, and tauri crate)
+    /// Tauriパッケージバージョンを同期する (@tauri-apps/api, @tauri-apps/cli, tauri crate)
     ///
-    /// Ensures all packages have matching major.minor versions to prevent
-    /// Tauri build errors.
+    /// Tauriビルドエラーを防ぐため、全パッケージのメジャー.マイナーバージョンを
+    /// 一致させる。
     async fn synchronize_tauri_versions(
         &self,
         summary: &mut UpdateSummary,
@@ -445,8 +445,8 @@ impl Orchestrator {
     ) {
         use crate::tauri_sync::extract_major_minor;
 
-        // Find all Tauri npm packages in Node manifests
-        // Returns: Vec<(manifest_idx, result_idx, result, current_version)>
+        // Nodeマニフェスト内の全Tauri npmパッケージを検索
+        // 戻り値: Vec<(manifest_idx, result_idx, result, current_version)>
         let npm_packages: Vec<(usize, usize, UpdateResult, String)> = summary
             .manifests
             .iter()
@@ -464,7 +464,7 @@ impl Orchestrator {
             })
             .collect();
 
-        // Find tauri crate in Rust manifests
+        // Rustマニフェスト内のtauri crateを検索
         let crate_info: Option<(usize, usize, UpdateResult, String)> = summary
             .manifests
             .iter()
@@ -482,7 +482,7 @@ impl Orchestrator {
             })
             .next();
 
-        // If no tauri packages found at all, nothing to sync
+        // tauriパッケージが一つも見つからなければ、同期不要
         if npm_packages.is_empty() && crate_info.is_none() {
             return;
         }
@@ -490,7 +490,7 @@ impl Orchestrator {
         // 最初の npm パッケージの現在バージョンを参照用に取得
         let npm_current = npm_packages.first().map(|(_, _, _, v)| v.as_str());
 
-        // Determine effective versions (after any pending updates)
+        // 保留中の更新後の実効バージョンを決定
         let npm_effective = npm_packages.first().map(|(_, _, r, current)| match r {
             UpdateResult::Update { new_version, .. } => new_version.as_str(),
             _ => current.as_str(),
@@ -501,7 +501,7 @@ impl Orchestrator {
             _ => current.as_str(),
         });
 
-        // Check if versions already match - if so, no sync needed
+        // バージョンが既に一致しているか確認 - 一致していれば同期不要
         if let (Some(npm_v), Some(crate_v)) = (npm_effective, crate_effective)
             && let (Some(npm_mm), Some(crate_mm)) =
                 (extract_major_minor(npm_v), extract_major_minor(crate_v))
@@ -510,13 +510,13 @@ impl Orchestrator {
             return;
         }
 
-        // Versions don't match - need to sync
+        // バージョンが不一致 - 同期が必要
 
-        // Fetch versions from both registries
+        // 両方のレジストリからバージョンを取得
         let npm_adapter = self.get_adapter(Language::Node);
         let crate_adapter = self.get_adapter(Language::Rust);
 
-        // Use first npm package name for version fetch (they all share versions)
+        // バージョン取得には最初のnpmパッケージ名を使用 (全パッケージでバージョンは共通)
         let npm_pkg_name = TAURI_NPM_PACKAGES[0];
         let npm_versions = match self.fetch_versions(&*npm_adapter, npm_pkg_name).await {
             Ok(v) => v,
@@ -540,7 +540,7 @@ impl Orchestrator {
             }
         };
 
-        // Create sync helper and get synchronized versions
+        // 同期ヘルパーを作成し、同期後のバージョンを取得
         let sync = TauriVersionSync::new(npm_versions, crate_versions);
 
         let npm_update_result = npm_packages.first().map(|(_, _, r, _)| r);
@@ -553,17 +553,17 @@ impl Orchestrator {
             crate_update_result,
         );
 
-        // Apply npm version adjustments to all Tauri npm packages
+        // 全Tauri npmパッケージにnpmバージョンの調整を適用
         if let Some(ref target) = npm_target_version {
             for (manifest_idx, result_idx, original, _current) in &npm_packages {
                 match original {
                     UpdateResult::Update { dependency, .. } => {
-                        // Adjust existing update
+                        // 既存の更新を調整
                         let adjusted = UpdateResult::update(dependency.clone(), target);
                         summary.manifests[*manifest_idx].results[*result_idx] = adjusted;
                     }
                     UpdateResult::Skip { dependency, .. } => {
-                        // Create new update from skip
+                        // スキップから新しい更新を作成
                         let adjusted = UpdateResult::update(dependency.clone(), target);
                         summary.manifests[*manifest_idx].results[*result_idx] = adjusted;
                         summary.manifests[*manifest_idx].modified = true;
@@ -572,7 +572,7 @@ impl Orchestrator {
             }
         }
 
-        // Apply crate version adjustment
+        // crateバージョンの調整を適用
         if let Some(ref target) = crate_target_version
             && let Some((manifest_idx, result_idx, original, _)) = crate_info
         {
@@ -591,12 +591,12 @@ impl Orchestrator {
     }
 }
 
-/// Configuration for the orchestrator
+/// オーケストレータの設定
 #[derive(Debug, Clone)]
 pub struct OrchestratorConfig {
-    /// Maximum concurrent requests for general registries
+    /// 汎用レジストリの最大同時リクエスト数
     pub general_concurrency: usize,
-    /// Maximum concurrent requests for crates.io
+    /// crates.io の最大同時リクエスト数
     pub crates_io_concurrency: usize,
 }
 
@@ -640,7 +640,7 @@ mod tests {
         let orchestrator = Orchestrator::new(args).unwrap();
         let filter = orchestrator.build_filter();
 
-        // No language filter
+        // 言語フィルタなし
         assert!(filter.should_process_language(Language::Node));
         assert!(filter.should_process_language(Language::Python));
         assert!(filter.should_process_language(Language::Rust));
@@ -725,7 +725,7 @@ mod tests {
         assert!(!orchestrator.should_process_language(Language::Go));
         assert!(!orchestrator.should_process_language(Language::Java));
 
-        // Test Java-only filter
+        // Javaのみのフィルタをテスト
         let args = make_args(&["depup", "--java"]);
         let orchestrator = Orchestrator::new(args).unwrap();
 
@@ -805,7 +805,7 @@ mod tests {
     fn test_build_filter_with_pnpm_workspace_yaml() {
         let dir = TempDir::new().unwrap();
 
-        // Create pnpm-workspace.yaml with minimumReleaseAge in minutes (14400 = 10 days)
+        // minimumReleaseAge を分単位で指定した pnpm-workspace.yaml を作成 (14400 = 10日)
         fs::write(
             dir.path().join("pnpm-workspace.yaml"),
             "packages: []\nminimumReleaseAge: 14400\n",
@@ -816,7 +816,7 @@ mod tests {
         let orchestrator = Orchestrator::new(args).unwrap();
         let filter = orchestrator.build_filter();
 
-        // Should have min_age from pnpm settings (14400 minutes = 864000 seconds)
+        // pnpm設定からmin_ageが設定されるべき (14400分 = 864000秒)
         assert!(filter.min_age.is_some());
         assert_eq!(
             filter.min_age.unwrap(),
@@ -828,23 +828,23 @@ mod tests {
     fn test_build_filter_cli_age_overrides_pnpm() {
         let dir = TempDir::new().unwrap();
 
-        // Create pnpm-workspace.yaml with minimumReleaseAge
+        // minimumReleaseAge 付きの pnpm-workspace.yaml を作成
         fs::write(
             dir.path().join("pnpm-workspace.yaml"),
             "packages: []\nminimumReleaseAge: 14400\n",
         )
         .unwrap();
 
-        // CLI --age should override pnpm settings
+        // CLI --age が pnpm 設定を上書きすべき
         let args = make_args_with_path(dir.path(), &["--age", "2w"]);
         let orchestrator = Orchestrator::new(args).unwrap();
         let filter = orchestrator.build_filter();
 
-        // Should have CLI age (2 weeks), not pnpm age (10 days)
+        // CLI の age (2週間) であるべきで、pnpm の age (10日) ではない
         assert!(filter.min_age.is_some());
         assert_eq!(
             filter.min_age.unwrap(),
-            std::time::Duration::from_secs(14 * 24 * 60 * 60) // 2 weeks
+            std::time::Duration::from_secs(14 * 24 * 60 * 60) // 2週間
         );
     }
 
@@ -852,17 +852,17 @@ mod tests {
     fn test_build_filter_with_npmrc() {
         let dir = TempDir::new().unwrap();
 
-        // Create pnpm-lock.yaml to indicate pnpm project
+        // pnpmプロジェクトであることを示す pnpm-lock.yaml を作成
         fs::write(dir.path().join("pnpm-lock.yaml"), "").unwrap();
 
-        // Create .npmrc with minimum-release-age
+        // minimum-release-age 付きの .npmrc を作成
         fs::write(dir.path().join(".npmrc"), "minimum-release-age=10d\n").unwrap();
 
         let args = make_args_with_path(dir.path(), &[]);
         let orchestrator = Orchestrator::new(args).unwrap();
         let filter = orchestrator.build_filter();
 
-        // Should have min_age from .npmrc (10 days)
+        // .npmrc からmin_ageが設定されるべき (10日)
         assert!(filter.min_age.is_some());
         assert_eq!(
             filter.min_age.unwrap(),
@@ -874,12 +874,12 @@ mod tests {
     fn test_build_filter_no_pnpm_no_age() {
         let dir = TempDir::new().unwrap();
 
-        // No pnpm files, no --age flag
+        // pnpmファイルなし、--ageフラグなし
         let args = make_args_with_path(dir.path(), &[]);
         let orchestrator = Orchestrator::new(args).unwrap();
         let filter = orchestrator.build_filter();
 
-        // Should have no min_age
+        // min_ageは設定されないべき
         assert!(filter.min_age.is_none());
     }
 
@@ -888,7 +888,7 @@ mod tests {
         let args = make_args(&["depup"]);
         let orchestrator = Orchestrator::new(args).unwrap();
 
-        // Pre-populate cache with a known package
+        // 既知のパッケージでキャッシュを事前に設定
         let cache_key = (Language::Node, "lodash".to_string());
         {
             let mut cache = orchestrator.version_cache.lock().await;
@@ -901,7 +901,7 @@ mod tests {
             );
         }
 
-        // Fetch the same package — should return cached result without network access
+        // 同じパッケージをフェッチ — ネットワークアクセスなしでキャッシュ結果を返すべき
         let adapter = orchestrator.get_adapter(Language::Node);
         let result = orchestrator.fetch_versions(&*adapter, "lodash").await;
 
@@ -915,14 +915,14 @@ mod tests {
     async fn test_run_directories_with_root_included() {
         let dir = TempDir::new().unwrap();
 
-        // Create root manifest
+        // ルートマニフェストを作成
         fs::write(
             dir.path().join("Cargo.toml"),
             "[package]\nname = \"root\"\nversion = \"0.1.0\"\n",
         )
         .unwrap();
 
-        // Create subdirectory with manifest
+        // マニフェスト付きのサブディレクトリを作成
         fs::create_dir(dir.path().join("sub")).unwrap();
         fs::write(
             dir.path().join("sub").join("Cargo.toml"),
@@ -930,7 +930,7 @@ mod tests {
         )
         .unwrap();
 
-        // Build directories list using DepupConfig::directories_with_root
+        // DepupConfig::directories_with_root を使ってディレクトリリストを構築
         let config = crate::config::DepupConfig {
             directories: vec![dir.path().join("sub")],
         };
@@ -938,13 +938,13 @@ mod tests {
 
         assert_eq!(dirs.len(), 2);
 
-        // Run orchestrator with these directories (dry-run, no network)
+        // これらのディレクトリでオーケストレータを実行 (ドライラン、ネットワークなし)
         let args = make_args_with_path(dir.path(), &["--dry-run"]);
         let orchestrator = Orchestrator::new(args).unwrap();
         let result = orchestrator.run_directories(&dirs).await;
 
-        // Both directories' manifests should be detected
-        // (they have no dependencies so 0 updates, but no errors either)
+        // 両ディレクトリのマニフェストが検出されるべき
+        // (依存関係がないので更新は0件だが、エラーもないはず)
         assert!(result.errors.is_empty());
     }
 }

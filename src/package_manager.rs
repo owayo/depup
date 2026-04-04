@@ -1,30 +1,30 @@
-//! Package manager integration for installing dependencies after updates
+//! 更新後の依存関係インストールのためのパッケージマネージャ連携
 //!
-//! This module provides:
-//! - Detection of installed package managers
-//! - Execution of install commands for each language
+//! このモジュールが提供する機能:
+//! - インストール済みパッケージマネージャの検出
+//! - 各言語のインストールコマンドの実行
 
 use crate::domain::Language;
 use std::path::Path;
 use std::process::{Command, Output};
 
-/// Result of a package manager installation
+/// パッケージマネージャのインストール結果
 #[derive(Debug, Clone)]
 pub struct InstallResult {
-    /// The language/package manager used
+    /// 使用された言語/パッケージマネージャ
     pub language: Language,
-    /// The command that was executed
+    /// 実行されたコマンド
     pub command: String,
-    /// Whether the command succeeded
+    /// コマンドが成功したかどうか
     pub success: bool,
-    /// Standard output from the command
+    /// コマンドの標準出力
     pub stdout: String,
-    /// Standard error from the command
+    /// コマンドの標準エラー出力
     pub stderr: String,
 }
 
 impl InstallResult {
-    /// Create a successful install result
+    /// 成功したインストール結果を作成する
     pub fn success(language: Language, command: String, stdout: String, stderr: String) -> Self {
         Self {
             language,
@@ -35,7 +35,7 @@ impl InstallResult {
         }
     }
 
-    /// Create a failed install result
+    /// 失敗したインストール結果を作成する
     pub fn failure(language: Language, command: String, stdout: String, stderr: String) -> Self {
         Self {
             language,
@@ -46,7 +46,7 @@ impl InstallResult {
         }
     }
 
-    /// Create a skipped result (no package manager found)
+    /// スキップされた結果を作成する (パッケージマネージャが見つからない場合)
     pub fn skipped(language: Language) -> Self {
         Self {
             language,
@@ -58,25 +58,25 @@ impl InstallResult {
     }
 }
 
-/// Trait for running package manager install commands
+/// パッケージマネージャのインストールコマンドを実行するトレイト
 pub trait PackageManagerRunner {
-    /// Run the install command for a language in the specified directory
+    /// 指定されたディレクトリで言語のインストールコマンドを実行する
     fn run_install(&self, language: Language, working_dir: &Path) -> InstallResult;
 }
 
-/// Default package manager runner that executes real commands
+/// 実際のコマンドを実行するデフォルトのパッケージマネージャランナー
 #[derive(Debug, Default)]
 pub struct SystemPackageManager;
 
 impl SystemPackageManager {
-    /// Create a new system package manager
+    /// 新しいシステムパッケージマネージャを作成する
     pub fn new() -> Self {
         Self
     }
 
-    /// Detect the Node.js package manager to use
+    /// 使用する Node.js パッケージマネージャを検出する
     fn detect_node_pm(&self, working_dir: &Path) -> Option<&'static str> {
-        // Check for lockfiles in order of preference
+        // ロックファイルを優先順位に従ってチェック
         if working_dir.join("pnpm-lock.yaml").exists() {
             return Some("pnpm");
         }
@@ -89,16 +89,16 @@ impl SystemPackageManager {
         if working_dir.join("package-lock.json").exists() {
             return Some("npm");
         }
-        // Default to npm if package.json exists but no lockfile
+        // package.json があるがロックファイルがない場合は npm をデフォルトにする
         if working_dir.join("package.json").exists() {
             return Some("npm");
         }
         None
     }
 
-    /// Detect the Python package manager to use
+    /// 使用する Python パッケージマネージャを検出する
     fn detect_python_pm(&self, working_dir: &Path) -> Option<&'static str> {
-        // Check for lockfiles/configs in order of preference
+        // ロックファイル/設定を優先順位に従ってチェック
         if working_dir.join("uv.lock").exists() {
             return Some("uv");
         }
@@ -111,9 +111,9 @@ impl SystemPackageManager {
         if working_dir.join("Pipfile.lock").exists() {
             return Some("pipenv");
         }
-        // Check for pyproject.toml with specific tool configurations
+        // 特定のツール設定を持つ pyproject.toml をチェック
         if working_dir.join("pyproject.toml").exists() {
-            // Default to pip if pyproject.toml exists
+            // pyproject.toml がある場合は pip をデフォルトにする
             return Some("pip");
         }
         if working_dir.join("requirements.txt").exists() {
@@ -122,20 +122,20 @@ impl SystemPackageManager {
         None
     }
 
-    /// Detect if this is a Tauri project (has src-tauri/Cargo.toml)
+    /// Tauri プロジェクトかどうかを検出する (src-tauri/Cargo.toml が存在するか)
     fn detect_tauri_project(&self, working_dir: &Path) -> bool {
         working_dir.join("src-tauri/Cargo.toml").exists()
     }
 
-    /// Get the install command for a package manager
+    /// パッケージマネージャのインストールコマンドを取得する
     fn get_install_command(&self, pm: &str) -> Vec<&'static str> {
         match pm {
-            // Node.js package managers
+            // Node.js パッケージマネージャ
             "npm" => vec!["npm", "install"],
             "yarn" => vec!["yarn", "install"],
             "pnpm" => vec!["pnpm", "install"],
             "bun" => vec!["bun", "install"],
-            // Python package managers
+            // Python パッケージマネージャ
             "pip" => vec!["pip", "install", "-e", "."],
             "uv" => vec!["uv", "sync"],
             "poetry" => vec!["poetry", "install"],
@@ -158,7 +158,7 @@ impl SystemPackageManager {
         }
     }
 
-    /// Run a command and capture output
+    /// コマンドを実行して出力をキャプチャする
     fn run_command(&self, command: &[&str], working_dir: &Path) -> std::io::Result<Output> {
         if command.is_empty() {
             return Err(std::io::Error::new(
@@ -176,7 +176,7 @@ impl SystemPackageManager {
 
 impl PackageManagerRunner for SystemPackageManager {
     fn run_install(&self, language: Language, working_dir: &Path) -> InstallResult {
-        // For Rust in Tauri projects, use src-tauri directory
+        // Tauri プロジェクトの Rust では src-tauri ディレクトリを使用
         let (effective_dir, pm) = match language {
             Language::Node => (working_dir.to_path_buf(), self.detect_node_pm(working_dir)),
             Language::Python => (
@@ -184,7 +184,7 @@ impl PackageManagerRunner for SystemPackageManager {
                 self.detect_python_pm(working_dir),
             ),
             Language::Rust => {
-                // Check for Tauri project first
+                // まず Tauri プロジェクトかチェック
                 if self.detect_tauri_project(working_dir) {
                     (working_dir.join("src-tauri"), Some("cargo"))
                 } else if working_dir.join("Cargo.toml").exists() {
@@ -218,7 +218,7 @@ impl PackageManagerRunner for SystemPackageManager {
                 (working_dir.to_path_buf(), pm)
             }
             Language::Java => {
-                // Prefer gradlew if available, fallback to gradle
+                // gradlew が利用可能ならそちらを優先し、なければ gradle にフォールバック
                 let pm = if working_dir.join("gradlew").exists() {
                     Some("./gradlew")
                 } else if working_dir.join("build.gradle").exists()
@@ -272,7 +272,7 @@ impl PackageManagerRunner for SystemPackageManager {
     }
 }
 
-/// Run install commands for all specified languages
+/// 指定された全言語のインストールコマンドを実行する
 pub fn run_installs<R: PackageManagerRunner>(
     runner: &R,
     languages: &[Language],
@@ -288,7 +288,7 @@ pub fn run_installs<R: PackageManagerRunner>(
 mod tests {
     use super::*;
 
-    /// Mock package manager runner for testing
+    /// テスト用のモックパッケージマネージャランナー
     struct MockPackageManager {
         should_succeed: bool,
     }
@@ -379,7 +379,7 @@ mod tests {
     #[test]
     fn test_system_package_manager_new() {
         let _pm = SystemPackageManager::new();
-        // Just verify it can be created without panic
+        // パニックせずに作成できることを確認
     }
 
     #[test]
@@ -454,7 +454,7 @@ mod tests {
 
     #[test]
     fn test_detect_node_pm_npm() {
-        // Create a temp directory with package-lock.json
+        // package-lock.json がある一時ディレクトリを作成
         let temp_dir = tempfile::tempdir().unwrap();
         std::fs::write(temp_dir.path().join("package-lock.json"), "{}").unwrap();
 
@@ -654,7 +654,7 @@ mod tests {
 
         let result = pm.run_install(Language::Ruby, temp_dir.path());
         assert!(result.success);
-        assert!(result.command.is_empty()); // skipped
+        assert!(result.command.is_empty()); // スキップ
     }
 
     #[test]
@@ -664,7 +664,7 @@ mod tests {
 
         let result = pm.run_install(Language::Php, temp_dir.path());
         assert!(result.success);
-        assert!(result.command.is_empty()); // skipped
+        assert!(result.command.is_empty()); // スキップ
     }
 
     #[test]
@@ -674,7 +674,7 @@ mod tests {
 
         let result = pm.run_install(Language::Java, temp_dir.path());
         assert!(result.success);
-        assert!(result.command.is_empty()); // skipped
+        assert!(result.command.is_empty()); // スキップ
     }
 
     #[test]
@@ -684,6 +684,6 @@ mod tests {
 
         let result = pm.run_install(Language::Go, temp_dir.path());
         assert!(result.success);
-        assert!(result.command.is_empty()); // skipped
+        assert!(result.command.is_empty()); // スキップ
     }
 }

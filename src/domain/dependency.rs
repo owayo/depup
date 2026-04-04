@@ -1,27 +1,27 @@
-//! Dependency information structures
+//! 依存関係情報の構造体
 
 use super::{Language, VersionSpec};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-/// Represents a package dependency
+/// パッケージ依存関係を表す
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Dependency {
-    /// Package name
+    /// パッケージ名
     pub name: String,
-    /// Version specification
+    /// バージョン指定
     pub version_spec: VersionSpec,
-    /// Whether this is a development dependency
+    /// 開発依存かどうか
     pub is_dev: bool,
-    /// The language/ecosystem this dependency belongs to
+    /// この依存関係が属する言語/エコシステム
     pub language: Language,
-    /// Optional variable name if version is defined via variable (e.g., Gradle def/val)
+    /// バージョンが変数で定義されている場合のオプション変数名 (例: Gradle の def/val)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub variable_name: Option<String>,
 }
 
 impl Dependency {
-    /// Creates a new dependency
+    /// 新しい依存関係を作成する
     pub fn new(
         name: impl Into<String>,
         version_spec: VersionSpec,
@@ -37,13 +37,13 @@ impl Dependency {
         }
     }
 
-    /// Sets the variable name for this dependency (builder pattern)
+    /// この依存関係の変数名を設定する (ビルダーパターン)
     pub fn with_variable(mut self, var_name: impl Into<String>) -> Self {
         self.variable_name = Some(var_name.into());
         self
     }
 
-    /// Creates a new production dependency
+    /// 新しい本番依存関係を作成する
     pub fn production(
         name: impl Into<String>,
         version_spec: VersionSpec,
@@ -52,7 +52,7 @@ impl Dependency {
         Self::new(name, version_spec, false, language)
     }
 
-    /// Creates a new development dependency
+    /// 新しい開発依存関係を作成する
     pub fn development(
         name: impl Into<String>,
         version_spec: VersionSpec,
@@ -61,12 +61,12 @@ impl Dependency {
         Self::new(name, version_spec, true, language)
     }
 
-    /// Returns true if this dependency is pinned
+    /// この依存関係がピン留めされているかどうかを返す
     pub fn is_pinned(&self) -> bool {
         self.version_spec.is_pinned()
     }
 
-    /// Returns the current version string
+    /// 現在のバージョン文字列を返す
     pub fn version(&self) -> &str {
         &self.version_spec.version
     }
@@ -206,12 +206,12 @@ mod tests {
 
     #[test]
     fn test_dependency_with_variable_serde_skip() {
-        // variable_name is None -> should not appear in JSON
+        // variable_name が None -> JSON に出現しないべき
         let dep = Dependency::new("lodash", sample_version_spec(), false, Language::Node);
         let json = serde_json::to_string(&dep).unwrap();
         assert!(!json.contains("variable_name"));
 
-        // variable_name is Some -> should appear in JSON
+        // variable_name が Some -> JSON に出現するべき
         let dep_with_var = dep.with_variable("ver");
         let json_with_var = serde_json::to_string(&dep_with_var).unwrap();
         assert!(json_with_var.contains("variable_name"));

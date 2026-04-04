@@ -1,29 +1,29 @@
-//! Update decision result types
+//! 更新判定結果の型定義
 
 use super::Dependency;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-/// Reason why a dependency update was skipped
+/// 依存関係の更新がスキップされた理由
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkipReason {
-    /// Version is pinned (exact version specified)
+    /// バージョンがピン留めされている (完全一致バージョン指定)
     Pinned,
-    /// Already at the latest version
+    /// 既に最新バージョン
     AlreadyLatest,
-    /// Package was excluded via --exclude flag
+    /// --exclude フラグで除外された
     Excluded,
-    /// Package not in --only list
+    /// --only リストに含まれていない
     NotInOnlyList,
-    /// Failed to fetch version info from registry
+    /// レジストリからのバージョン情報取得に失敗
     FetchFailed(String),
-    /// No suitable version found (e.g., age filter excluded all versions)
+    /// 適切なバージョンが見つからない (例: 経過日数フィルタで全バージョンが除外)
     NoSuitableVersion,
-    /// Version parsing failed
+    /// バージョンのパースに失敗
     ParseError(String),
-    /// Language filter excluded this package
+    /// 言語フィルタで除外された
     LanguageFiltered,
 }
 
@@ -42,34 +42,34 @@ impl fmt::Display for SkipReason {
     }
 }
 
-/// Result of an update decision for a single dependency
+/// 単一依存関係の更新判定結果
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum UpdateResult {
-    /// Dependency will be updated
+    /// 依存関係が更新される
     Update {
-        /// The dependency being updated
+        /// 更新対象の依存関係
         dependency: Dependency,
-        /// The new version to update to
+        /// 更新先の新バージョン
         new_version: String,
-        /// When the new version was released
+        /// 新バージョンのリリース日時
         #[serde(skip_serializing_if = "Option::is_none")]
         released_at: Option<DateTime<Utc>>,
     },
-    /// Dependency update was skipped
+    /// 依存関係の更新がスキップされた
     Skip {
-        /// The dependency that was skipped
+        /// スキップされた依存関係
         dependency: Dependency,
-        /// The reason for skipping
+        /// スキップの理由
         reason: SkipReason,
-        /// When the current version was released (for AlreadyLatest)
+        /// 現在のバージョンのリリース日時 (AlreadyLatest の場合)
         #[serde(skip_serializing_if = "Option::is_none")]
         released_at: Option<DateTime<Utc>>,
     },
 }
 
 impl UpdateResult {
-    /// Creates an Update result without release date (for backward compatibility)
+    /// リリース日なしのUpdate結果を作成する (後方互換性のため)
     pub fn update(dependency: Dependency, new_version: impl Into<String>) -> Self {
         UpdateResult::Update {
             dependency,
@@ -78,7 +78,7 @@ impl UpdateResult {
         }
     }
 
-    /// Creates an Update result with release date
+    /// リリース日付きのUpdate結果を作成する
     pub fn update_with_date(
         dependency: Dependency,
         new_version: impl Into<String>,
@@ -91,7 +91,7 @@ impl UpdateResult {
         }
     }
 
-    /// Creates a Skip result
+    /// Skip結果を作成する
     pub fn skip(dependency: Dependency, reason: SkipReason) -> Self {
         UpdateResult::Skip {
             dependency,
@@ -100,17 +100,17 @@ impl UpdateResult {
         }
     }
 
-    /// Creates a Skip result for pinned version
+    /// ピン留めバージョンのSkip結果を作成する
     pub fn skip_pinned(dependency: Dependency) -> Self {
         Self::skip(dependency, SkipReason::Pinned)
     }
 
-    /// Creates a Skip result for already at latest
+    /// 既に最新のSkip結果を作成する
     pub fn skip_already_latest(dependency: Dependency) -> Self {
         Self::skip(dependency, SkipReason::AlreadyLatest)
     }
 
-    /// Creates a Skip result for already at latest with release date
+    /// リリース日付きの既に最新のSkip結果を作成する
     pub fn skip_already_latest_with_date(
         dependency: Dependency,
         released_at: DateTime<Utc>,
@@ -122,32 +122,32 @@ impl UpdateResult {
         }
     }
 
-    /// Creates a Skip result for excluded package
+    /// 除外パッケージのSkip結果を作成する
     pub fn skip_excluded(dependency: Dependency) -> Self {
         Self::skip(dependency, SkipReason::Excluded)
     }
 
-    /// Creates a Skip result for not in only list
+    /// onlyリスト外のSkip結果を作成する
     pub fn skip_not_in_only_list(dependency: Dependency) -> Self {
         Self::skip(dependency, SkipReason::NotInOnlyList)
     }
 
-    /// Creates a Skip result for fetch failure
+    /// フェッチ失敗のSkip結果を作成する
     pub fn skip_fetch_failed(dependency: Dependency, message: impl Into<String>) -> Self {
         Self::skip(dependency, SkipReason::FetchFailed(message.into()))
     }
 
-    /// Returns true if this is an update result
+    /// Update結果かどうかを返す
     pub fn is_update(&self) -> bool {
         matches!(self, UpdateResult::Update { .. })
     }
 
-    /// Returns true if this is a skip result
+    /// Skip結果かどうかを返す
     pub fn is_skip(&self) -> bool {
         matches!(self, UpdateResult::Skip { .. })
     }
 
-    /// Returns the dependency reference
+    /// 依存関係の参照を返す
     pub fn dependency(&self) -> &Dependency {
         match self {
             UpdateResult::Update { dependency, .. } => dependency,
@@ -155,7 +155,7 @@ impl UpdateResult {
         }
     }
 
-    /// Returns the package name
+    /// パッケージ名を返す
     pub fn package_name(&self) -> &str {
         &self.dependency().name
     }
@@ -260,7 +260,7 @@ mod tests {
         {
             assert_eq!(dependency, dep);
             assert_eq!(new_version, "2.0.0");
-            assert!(released_at.is_none()); // No release date when using update()
+            assert!(released_at.is_none()); // update() 使用時はリリース日なし
         } else {
             panic!("Expected Update variant");
         }

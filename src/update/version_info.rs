@@ -1,22 +1,22 @@
-//! Version information from registry
+//! レジストリからのバージョン情報
 //!
-//! This module provides the VersionInfo struct that represents
-//! a package version with its release date.
+//! このモジュールはリリース日付を伴うパッケージバージョンを表す
+//! VersionInfo 構造体を提供する。
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// Information about a package version from the registry
+/// レジストリから取得したパッケージバージョンの情報
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VersionInfo {
-    /// The version string (e.g., "1.2.3")
+    /// バージョン文字列 (例: "1.2.3")
     pub version: String,
-    /// When this version was released
+    /// このバージョンがリリースされた日時
     pub released_at: DateTime<Utc>,
 }
 
 impl VersionInfo {
-    /// Create a new VersionInfo
+    /// 新しいVersionInfoを作成する
     pub fn new(version: impl Into<String>, released_at: DateTime<Utc>) -> Self {
         Self {
             version: version.into(),
@@ -24,7 +24,7 @@ impl VersionInfo {
         }
     }
 
-    /// Create a VersionInfo with current time as release date
+    /// リリース日として現在時刻を使用してVersionInfoを作成する
     pub fn now(version: impl Into<String>) -> Self {
         Self {
             version: version.into(),
@@ -32,13 +32,13 @@ impl VersionInfo {
         }
     }
 
-    /// Check if this version is a pre-release (alpha, beta, rc, canary, dev, etc.)
+    /// このバージョンがプレリリース (alpha, beta, rc, canary, dev 等) かチェックする
     pub fn is_prerelease(&self) -> bool {
         is_prerelease_version(&self.version)
     }
 }
 
-/// Pre-release identifiers to check for
+/// チェック対象のプレリリース識別子
 const PRERELEASE_IDENTIFIERS: &[&str] = &[
     "alpha",
     "beta",
@@ -54,23 +54,23 @@ const PRERELEASE_IDENTIFIERS: &[&str] = &[
     "experimental",
 ];
 
-/// Check if a version string represents a pre-release version
+/// バージョン文字列がプレリリースバージョンを表すかチェックする
 pub fn is_prerelease_version(version: &str) -> bool {
     let lower = version.to_lowercase();
 
-    // Check for word-based identifiers (alpha, beta, canary, etc.)
+    // 単語ベースの識別子をチェック (alpha, beta, canary 等)
     if PRERELEASE_IDENTIFIERS.iter().any(|id| lower.contains(id)) {
         return true;
     }
 
-    // Check for Python/PEP 440 style short identifiers:
+    // Python/PEP 440 形式の短縮識別子をチェック:
     // - 26.1a1 (alpha), 21.12b0 (beta), 1.0c1 or 1.0rc1 (release candidate)
-    // Pattern: digit followed by 'a', 'b', or 'c' followed by digit
+    // パターン: 数字の後に 'a', 'b', 'c' が続き、さらに数字が続く
     let chars: Vec<char> = lower.chars().collect();
     for i in 0..chars.len().saturating_sub(2) {
         if chars[i].is_ascii_digit() {
             let next = chars[i + 1];
-            // 'a' for alpha, 'b' for beta, 'c' for release candidate
+            // 'a' は alpha, 'b' は beta, 'c' は release candidate
             if (next == 'a' || next == 'b' || next == 'c') && chars[i + 2].is_ascii_digit() {
                 return true;
             }
@@ -82,7 +82,7 @@ pub fn is_prerelease_version(version: &str) -> bool {
 
 impl Ord for VersionInfo {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Compare by version using semver-like comparison
+        // semver 風の比較でバージョンを比較
         compare_versions(&self.version, &other.version)
     }
 }
@@ -190,7 +190,7 @@ mod tests {
     fn test_version_comparison_mixed_prefix() {
         let v1 = VersionInfo::now("1.0.0");
         let v2 = VersionInfo::now("v1.0.0");
-        // Should be equal (v prefix is stripped)
+        // 等しいはず (v接頭辞は除去される)
         assert_eq!(v1.cmp(&v2), std::cmp::Ordering::Equal);
     }
 
@@ -198,13 +198,13 @@ mod tests {
     fn test_version_comparison_different_lengths() {
         let v1 = VersionInfo::now("1.0");
         let v2 = VersionInfo::now("1.0.0");
-        // 1.0 is equivalent to 1.0.0 (missing parts are treated as 0)
+        // 1.0 は 1.0.0 と等価 (不足パートは0として扱う)
         assert_eq!(v1.cmp(&v2), std::cmp::Ordering::Equal);
     }
 
     #[test]
     fn test_version_comparison_semver_equivalence() {
-        // Test various semver-equivalent versions
+        // 様々なsemver等価バージョンのテスト
         assert_eq!(
             compare_versions("0.15", "0.15.0"),
             std::cmp::Ordering::Equal
@@ -216,7 +216,7 @@ mod tests {
             std::cmp::Ordering::Equal
         );
 
-        // But different versions should still be different
+        // 異なるバージョンは異なるままであるべき
         assert_eq!(compare_versions("0.15", "0.15.1"), std::cmp::Ordering::Less);
         assert_eq!(
             compare_versions("0.16", "0.15.1"),
@@ -228,12 +228,12 @@ mod tests {
 
     #[test]
     fn test_version_comparison_prerelease() {
-        // This is a simplified comparison - it treats pre-release parts as numbers
+        // 簡略化された比較 - プレリリースパートを数値として扱う
         let v1 = VersionInfo::now("1.0.0-alpha");
         let v2 = VersionInfo::now("1.0.0-beta");
-        // Since alpha/beta aren't numeric, they're ignored
-        // This means 1.0.0-alpha == 1.0.0-beta in our simple comparison
-        // For production use, we'd want full semver parsing
+        // alpha/beta は数値でないため無視される
+        // つまり簡略比較では 1.0.0-alpha == 1.0.0-beta
+        // 本番用途では完全なsemverパースが必要
         assert_eq!(v1.cmp(&v2), std::cmp::Ordering::Equal);
     }
 
@@ -309,7 +309,7 @@ mod tests {
 
     #[test]
     fn test_is_prerelease_stable_versions() {
-        // Stable versions should NOT be detected as prerelease
+        // 安定版バージョンはプレリリースとして検出されてはいけない
         assert!(!is_prerelease_version("1.0.0"));
         assert!(!is_prerelease_version("2.5.3"));
         assert!(!is_prerelease_version("v1.0.0"));
@@ -328,13 +328,13 @@ mod tests {
 
     #[test]
     fn test_is_prerelease_canary_dev() {
-        // React-style canary versions
+        // React風のcanaryバージョン
         assert!(is_prerelease_version("19.3.0-canary-52684925-20251110"));
-        // TypeScript-style dev versions
+        // TypeScript風のdevバージョン
         assert!(is_prerelease_version("6.0.0-dev.20260103"));
-        // Vite-style beta versions
+        // Vite風のbetaバージョン
         assert!(is_prerelease_version("8.0.0-beta.5"));
-        // Prettier-style alpha
+        // Prettier風のalpha
         assert!(is_prerelease_version("4.0.0-alpha.13"));
     }
 
@@ -351,19 +351,19 @@ mod tests {
 
     #[test]
     fn test_is_prerelease_python_pep440_style() {
-        // Python/PEP 440 style: number + a/b/c + number
-        // Alpha releases
+        // Python/PEP 440 形式: 数字 + a/b/c + 数字
+        // アルファリリース
         assert!(is_prerelease_version("26.1a1"));
         assert!(is_prerelease_version("18.3a0"));
         assert!(is_prerelease_version("1.0a1"));
-        // Beta releases
+        // ベータリリース
         assert!(is_prerelease_version("21.12b0"));
         assert!(is_prerelease_version("21.11b1"));
         assert!(is_prerelease_version("1.0b2"));
-        // Release candidates (using 'c')
+        // リリース候補 ('c' 使用)
         assert!(is_prerelease_version("1.0c1"));
         assert!(is_prerelease_version("2.5c0"));
-        // Stable versions should not match
+        // 安定版バージョンはマッチしないべき
         assert!(!is_prerelease_version("25.12.0"));
         assert!(!is_prerelease_version("1.2.3"));
         assert!(!is_prerelease_version("2024.1.1"));
@@ -383,7 +383,7 @@ mod tests {
 
     #[test]
     fn test_compare_versions_ignores_build_metadata() {
-        // semver build metadata (+...) should not affect version precedence
+        // semver ビルドメタデータ (+...) はバージョン優先度に影響しないべき
         assert_eq!(
             compare_versions("1.0.0", "1.0.0+spec-1.1.0"),
             std::cmp::Ordering::Equal
@@ -396,7 +396,7 @@ mod tests {
             compare_versions("1.0.0+build.1", "1.0.0+build.2"),
             std::cmp::Ordering::Equal
         );
-        // But actual version differences should still work
+        // 実際のバージョン差は引き続き機能するべき
         assert_eq!(
             compare_versions("1.0.0+build", "1.0.1"),
             std::cmp::Ordering::Less
@@ -405,7 +405,7 @@ mod tests {
 
     #[test]
     fn test_compare_versions_four_part_versions() {
-        // Some ecosystems use 4-part versions (e.g., Java SNAPSHOT, .NET)
+        // 一部のエコシステムは4パートバージョンを使用 (例: Java SNAPSHOT, .NET)
         assert_eq!(
             compare_versions("1.0.0.0", "1.0.0.1"),
             std::cmp::Ordering::Less
@@ -422,7 +422,7 @@ mod tests {
 
     #[test]
     fn test_compare_versions_large_numbers() {
-        // CalVer-style large version numbers
+        // CalVer形式の大きなバージョン番号
         assert_eq!(
             compare_versions("2024.1.1", "2025.1.1"),
             std::cmp::Ordering::Less
@@ -439,31 +439,31 @@ mod tests {
 
     #[test]
     fn test_is_prerelease_false_positives_avoided() {
-        // Versions that contain prerelease-like substrings but are NOT prerelease
-        // "1.0.0" contains no prerelease identifiers
+        // プレリリースに似た部分文字列を含むがプレリリースではないバージョン
+        // "1.0.0" にはプレリリース識別子が含まれない
         assert!(!is_prerelease_version("1.0.0"));
-        // Versions with only numeric parts after hyphen
+        // ハイフン後が数値のみのバージョン
         assert!(!is_prerelease_version("1.0.0-1"));
-        // CalVer dates should not trigger prerelease
+        // CalVer日付はプレリリースをトリガーしないべき
         assert!(!is_prerelease_version("2024.1.15"));
         assert!(!is_prerelease_version("25.12.0"));
     }
 
     #[test]
     fn test_is_prerelease_pep440_edge_cases() {
-        // Post-release (PEP 440) - NOT prerelease
-        // Note: our current implementation treats post-release specially via the
-        // digit+letter+digit pattern; these should NOT match since 'p' is not a/b/c
+        // ポストリリース (PEP 440) - プレリリースではない
+        // 注: 現在の実装はポストリリースを数字+文字+数字パターンで特別処理する;
+        // 'p' は a/b/c ではないためマッチしないべき
         assert!(!is_prerelease_version("1.0.0.post1"));
-        // dev0 IS prerelease (contains "dev")
+        // dev0 はプレリリース ("dev" を含む)
         assert!(is_prerelease_version("1.0.0.dev0"));
-        // Combined: dev + rc
+        // 複合: dev + rc
         assert!(is_prerelease_version("1.0.0.dev1rc1"));
     }
 
     #[test]
     fn test_compare_versions_single_component() {
-        // Single component versions (e.g., Rust crate "1")
+        // 単一コンポーネントバージョン (例: Rust crate "1")
         assert_eq!(compare_versions("1", "2"), std::cmp::Ordering::Less);
         assert_eq!(compare_versions("10", "9"), std::cmp::Ordering::Greater);
         assert_eq!(compare_versions("1", "1"), std::cmp::Ordering::Equal);

@@ -1,32 +1,32 @@
-//! Language type definitions for supported package ecosystems
+//! 対応パッケージエコシステムの言語型定義
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-/// Supported programming languages/ecosystems
+/// 対応するプログラミング言語/エコシステム
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Language {
-    /// Node.js ecosystem (package.json)
+    /// Node.js エコシステム (package.json)
     Node,
-    /// Python ecosystem (pyproject.toml)
+    /// Python エコシステム (pyproject.toml)
     Python,
-    /// Rust ecosystem (Cargo.toml)
+    /// Rust エコシステム (Cargo.toml)
     Rust,
-    /// Go ecosystem (go.mod)
+    /// Go エコシステム (go.mod)
     Go,
-    /// Ruby ecosystem (Gemfile)
+    /// Ruby エコシステム (Gemfile)
     Ruby,
-    /// PHP ecosystem (composer.json)
+    /// PHP エコシステム (composer.json)
     Php,
-    /// Java ecosystem (build.gradle, build.gradle.kts)
+    /// Java エコシステム (build.gradle, build.gradle.kts)
     Java,
-    /// Swift ecosystem (Package.swift)
+    /// Swift エコシステム (Package.swift)
     Swift,
 }
 
 impl Language {
-    /// Returns the manifest filename for this language
+    /// この言語のマニフェストファイル名を返す
     pub fn manifest_filename(&self) -> &'static str {
         match self {
             Language::Node => "package.json",
@@ -40,7 +40,7 @@ impl Language {
         }
     }
 
-    /// Returns the lock filenames for this language
+    /// この言語のロックファイル名を返す
     pub fn lock_filenames(&self) -> &'static [&'static str] {
         match self {
             Language::Node => &["package-lock.json", "pnpm-lock.yaml", "yarn.lock"],
@@ -54,7 +54,7 @@ impl Language {
         }
     }
 
-    /// Returns the display name for this language
+    /// この言語の表示名を返す
     pub fn display_name(&self) -> &'static str {
         match self {
             Language::Node => "Node.js",
@@ -68,7 +68,7 @@ impl Language {
         }
     }
 
-    /// Returns all supported languages
+    /// 対応する全言語を返す
     pub fn all() -> &'static [Language] {
         &[
             Language::Node,
@@ -82,20 +82,19 @@ impl Language {
         ]
     }
 
-    /// Returns true if this language only supports pinned/exact versions
+    /// この言語がピン留め/完全一致バージョンのみ対応するかどうかを返す
     ///
-    /// Go doesn't have range specifiers in go.mod - all versions are
-    /// effectively pinned. For this language, `--include-pinned` should
-    /// be implicitly enabled.
+    /// Goはgo.modにレンジ指定子がないため、全バージョンが実質的にピン留めされる。
+    /// この言語では `--include-pinned` が暗黙的に有効になるべき。
     ///
-    /// Note: Java/Gradle does support version ranges (Maven-style ranges,
-    /// prefix versions like `1.+`, dynamic versions like `latest.release`),
-    /// so it is NOT included here.
+    /// 注: Java/Gradle はバージョンレンジに対応 (Maven形式レンジ、
+    /// `1.+` のようなプレフィックスバージョン、`latest.release` のような動的バージョン)
+    /// するため、ここには含まれない。
     pub fn always_pinned(&self) -> bool {
         matches!(self, Language::Go)
     }
 
-    /// Returns true if this language uses GitHub Tags API as registry
+    /// この言語がレジストリとしてGitHub Tags APIを使用するかどうかを返す
     pub fn uses_github_tags(&self) -> bool {
         matches!(self, Language::Swift)
     }
@@ -241,13 +240,13 @@ mod tests {
 
     #[test]
     fn test_always_pinned() {
-        // Go only supports exact/pinned versions (no range syntax in go.mod)
+        // Goはピン留め/完全一致バージョンのみ対応 (go.modにレンジ構文なし)
         assert!(Language::Go.always_pinned());
 
-        // Java/Gradle supports version ranges (Maven-style, prefix versions, dynamic versions)
+        // Java/Gradle はバージョンレンジに対応 (Maven形式、プレフィックスバージョン、動的バージョン)
         assert!(!Language::Java.always_pinned());
 
-        // Other languages also support range specifiers
+        // 他の言語もレンジ指定子に対応
         assert!(!Language::Node.always_pinned());
         assert!(!Language::Python.always_pinned());
         assert!(!Language::Rust.always_pinned());

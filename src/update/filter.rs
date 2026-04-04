@@ -1,77 +1,77 @@
-//! Update filter configuration
+//! 更新フィルタ設定
 //!
-//! This module provides the UpdateFilter struct that encapsulates
-//! all filter options for update judgment.
+//! このモジュールは更新判定のためのフィルタオプションを
+//! カプセル化する UpdateFilter 構造体を提供する。
 
 use crate::domain::Language;
 use std::time::Duration;
 
-/// Filter configuration for update judgment
+/// 更新判定用のフィルタ設定
 #[derive(Debug, Clone, Default)]
 pub struct UpdateFilter {
-    /// Languages to process (empty means all)
+    /// 処理対象の言語 (空の場合は全言語)
     pub languages: Vec<Language>,
-    /// Packages to exclude from updates
+    /// 更新から除外するパッケージ
     pub exclude: Vec<String>,
-    /// If non-empty, only update these packages
+    /// 空でない場合、これらのパッケージのみ更新
     pub only: Vec<String>,
-    /// Include pinned versions in updates
+    /// ピン留めバージョンも更新に含める
     pub include_pinned: bool,
-    /// Minimum age for versions to be considered
+    /// バージョンが考慮されるための最小経過日数
     pub min_age: Option<Duration>,
 }
 
 impl UpdateFilter {
-    /// Create a new UpdateFilter with default settings (process all)
+    /// デフォルト設定 (全処理) で新しいUpdateFilterを作成する
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Set languages to process
+    /// 処理対象の言語を設定する
     pub fn with_languages(mut self, languages: Vec<Language>) -> Self {
         self.languages = languages;
         self
     }
 
-    /// Set packages to exclude
+    /// 除外するパッケージを設定する
     pub fn with_exclude(mut self, exclude: Vec<String>) -> Self {
         self.exclude = exclude;
         self
     }
 
-    /// Set packages to include (only list)
+    /// 対象パッケージ (onlyリスト) を設定する
     pub fn with_only(mut self, only: Vec<String>) -> Self {
         self.only = only;
         self
     }
 
-    /// Set whether to include pinned versions
+    /// ピン留めバージョンを含めるかどうかを設定する
     pub fn with_include_pinned(mut self, include: bool) -> Self {
         self.include_pinned = include;
         self
     }
 
-    /// Set minimum age for versions
+    /// バージョンの最小経過日数を設定する
     pub fn with_min_age(mut self, age: Duration) -> Self {
         self.min_age = Some(age);
         self
     }
 
-    /// Check if a language should be processed
+    /// 言語を処理すべきかチェックする
     pub fn should_process_language(&self, language: Language) -> bool {
         if self.languages.is_empty() {
-            return true; // No filter means process all
+            return true; // フィルタなしは全言語処理を意味する
         }
         self.languages.contains(&language)
     }
 
-    /// Check if a package should be processed based on filters
+    /// フィルタに基づいてパッケージを処理すべきかチェックする
     pub fn should_process_package(&self, name: &str) -> bool {
-        // If --only is specified, only process those packages
+        // --only が指定されている場合、それらのパッケージのみ処理
         if !self.only.is_empty() {
             return self.only.iter().any(|p| p == name);
         }
-        // If --exclude is specified, skip those packages
+        // --exclude が指定されている場合、それらのパッケージをスキップ
         if self.exclude.iter().any(|p| p == name) {
             return false;
         }
@@ -166,11 +166,11 @@ mod tests {
 
     #[test]
     fn test_should_process_package_only_takes_precedence() {
-        // When both only and exclude are set, only takes precedence
+        // onlyとexcludeの両方が設定されている場合、onlyが優先される
         let filter = UpdateFilter::new()
             .with_only(vec!["foo".to_string()])
             .with_exclude(vec!["foo".to_string()]);
-        // "foo" is in only list, so it should be processed despite being in exclude
+        // "foo"はonlyリストにあるため、excludeリストにあっても処理されるべき
         assert!(filter.should_process_package("foo"));
     }
 

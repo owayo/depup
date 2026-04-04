@@ -1,10 +1,10 @@
-//! crates.io API adapter
+//! crates.io API アダプタ
 //!
-//! Fetches crate version information from crates.io.
-//! API endpoint: https://crates.io/api/v1/crates/{crate}
+//! crates.io からクレートのバージョン情報を取得する。
+//! API エンドポイント: https://crates.io/api/v1/crates/{crate}
 //!
-//! Note: crates.io requires a User-Agent header (handled by HttpClient)
-//! and has rate limiting (1 request/second).
+//! 注意: crates.io は User-Agent ヘッダが必要 (HttpClient で処理済み)
+//! かつレート制限あり (1リクエスト/秒)。
 
 use crate::domain::Language;
 use crate::error::RegistryError;
@@ -17,39 +17,39 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::time::{Duration, Instant};
 
-/// crates.io API base URL
+/// crates.io API のベース URL
 const CRATES_IO_API_URL: &str = "https://crates.io/api/v1/crates";
 
-/// Rate limit: 1 request per second
+/// レート制限: 1リクエスト/秒
 const RATE_LIMIT_INTERVAL: Duration = Duration::from_secs(1);
 
-/// crates.io adapter with rate limiting
+/// レート制限付き crates.io アダプタ
 pub struct CratesIoAdapter {
     client: HttpClient,
     rate_limiter: Arc<Semaphore>,
     last_request: std::sync::Mutex<Option<Instant>>,
 }
 
-/// crates.io crate response
+/// crates.io クレートレスポンス
 #[derive(Debug, Deserialize)]
 struct CratesIoResponse {
-    /// Crate information
+    /// クレート情報
     versions: Vec<CrateVersion>,
 }
 
-/// Crate version information
+/// クレートバージョン情報
 #[derive(Debug, Deserialize)]
 struct CrateVersion {
-    /// Version number
+    /// バージョン番号
     num: String,
-    /// Created at timestamp
+    /// 作成日時タイムスタンプ
     created_at: String,
-    /// Whether this version is yanked
+    /// このバージョンが yank されているか
     yanked: bool,
 }
 
 impl CratesIoAdapter {
-    /// Create a new crates.io adapter
+    /// 新しい crates.io アダプタを作成
     pub fn new(client: HttpClient) -> Self {
         Self {
             client,
@@ -58,16 +58,16 @@ impl CratesIoAdapter {
         }
     }
 
-    /// Build the URL for a crate
+    /// クレート用の URL を構築
     fn build_url(&self, crate_name: &str) -> String {
         format!("{}/{}", CRATES_IO_API_URL, crate_name)
     }
 
-    /// Apply rate limiting before making a request
+    /// リクエスト前にレート制限を適用
     async fn apply_rate_limit(&self) {
         let _permit = self.rate_limiter.acquire().await.unwrap();
 
-        // Check if we need to wait
+        // 待機が必要か確認
         let elapsed = {
             let last_request = self.last_request.lock().unwrap();
             last_request.map(|t| t.elapsed())
@@ -79,7 +79,7 @@ impl CratesIoAdapter {
             tokio::time::sleep(RATE_LIMIT_INTERVAL - elapsed).await;
         }
 
-        // Update last request time
+        // 最終リクエスト時刻を更新
         *self.last_request.lock().unwrap() = Some(Instant::now());
     }
 }
@@ -95,7 +95,7 @@ impl RegistryAdapter for CratesIoAdapter {
     }
 
     async fn fetch_versions(&self, crate_name: &str) -> Result<Vec<VersionInfo>, RegistryError> {
-        // Apply rate limiting
+        // レート制限を適用
         self.apply_rate_limit().await;
 
         let url = self.build_url(crate_name);
@@ -107,7 +107,7 @@ impl RegistryAdapter for CratesIoAdapter {
         let mut versions = Vec::new();
 
         for version in response.versions {
-            // Skip yanked versions
+            // yank されたバージョンをスキップ
             if version.yanked {
                 continue;
             }
@@ -117,7 +117,7 @@ impl RegistryAdapter for CratesIoAdapter {
             }
         }
 
-        // Sort by version
+        // バージョンでソート
         versions.sort();
 
         Ok(versions)
