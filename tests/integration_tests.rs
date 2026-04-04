@@ -1450,3 +1450,191 @@ serde = "1.0.0"
         assert_eq!(after, original_content);
     }
 }
+
+mod dependency_parser_edge_cases {
+    use depup::domain::{Language, VersionSpecKind};
+    use depup::manifest::get_parser;
+
+    /// npm エイリアス依存 (npm:パッケージ名@バージョン) が正しくパースされることを確認
+    #[test]
+    fn test_node_npm_alias_parsing() {
+        let content = r#"{
+  "dependencies": {
+    "custom-lodash": "npm:lodash@^4.17.21",
+    "my-react": "npm:react@~18.2.0"
+  }
+}"#;
+
+        let parser = get_parser(Language::Node);
+        let deps = parser.parse(content).unwrap();
+
+        assert_eq!(deps.len(), 2, "npm エイリアス依存が2つパースされるべき");
+
+        // エイリアス名がパッケージ名として使われる
+        let lodash = deps.iter().find(|d| d.name == "custom-lodash").unwrap();
+        assert_eq!(
+            lodash.version_spec.kind,
+            VersionSpecKind::Caret,
+            "キャレットプレフィックスが検出されるべき"
+        );
+        assert_eq!(lodash.version_spec.version, "4.17.21");
+
+        let react = deps.iter().find(|d| d.name == "my-react").unwrap();
+        assert_eq!(
+            react.version_spec.kind,
+            VersionSpecKind::Tilde,
+            "チルダプレフィックスが検出されるべき"
+        );
+        assert_eq!(react.version_spec.version, "18.2.0");
+    }
+
+    /// pyproject.toml の extras 付き依存 (例: httpx[http2]>=0.24.0) がパースされることを確認
+    #[test]
+    fn test_python_extras_in_dependency() {
+        let content = r#"[project]
+name = "my-project"
+dependencies = [
+    "httpx[http2]>=0.24.0",
+    "boto3[crt]>=1.28.0",
+]
+"#;
+
+        let parser = get_parser(Language::Python);
+        let deps = parser.parse(content).unwrap();
+
+        assert_eq!(deps.len(), 2, "extras 付き依存が2つパースされるべき");
+
+        // extras 部分はパッケージ名から除去される
+        let httpx = deps.iter().find(|d| d.name == "httpx").unwrap();
+        assert_eq!(
+            httpx.version_spec.kind,
+            VersionSpecKind::GreaterOrEqual,
+            ">= 制約が検出されるべき"
+        );
+        assert_eq!(httpx.version_spec.version, "0.24.0");
+
+        let boto3 = deps.iter().find(|d| d.name == "boto3").unwrap();
+        assert_eq!(boto3.version_spec.version, "1.28.0");
+    }
+
+    /// Gemfile の group ブロック内依存が正しく開発依存として認識されることを確認
+    #[test]
+    fn test_ruby_group_block_parsing() {
+        let content = r#"source 'https://rubygems.org'
+
+gem 'rails', '~> 7.0'
+
+group :development do
+  gem 'web-console', '>= 4.1.0'
+  gem 'debug', '~> 1.0'
+end
+
+group :test do
+  gem 'rspec-rails', '~> 6.0'
+end
+
+gem 'pg', '~> 1.5'
+"#;
+
+        let parser = get_parser(Language::Ruby);
+        let deps = parser.parse(content).unwrap();
+
+        // group 外の gem は本番依存
+        let rails = deps.iter().find(|d| d.name == "rails").unwrap();
+        assert!(!rails.is_dev, "rails は本番依存であるべき");
+
+        let pg = deps.iter().find(|d| d.name == "pg").unwrap();
+        assert!(!pg.is_dev, "pg は group ブロック外なので本番依存であるべき");
+
+        // group :development 内の gem は開発依存
+        let web_console = deps.iter().find(|d| d.name == "web-console").unwrap();
+        assert!(web_console.is_dev, "web-console は開発依存であるべき");
+
+        let debug = deps.iter().find(|d| d.name == "debug").unwrap();
+        assert!(debug.is_dev, "debug は開発依存であるべき");
+
+        // group :test 内の gem も開発依存
+        let rspec = deps.iter().find(|d| d.name == "rspec-rails").unwrap();
+        assert!(
+            rspec.is_dev,
+            "rspec-rails はテスト依存（開発依存）であるべき"
+        );
+    }
+
+    /// build.gradle の変数展開 ($variable) によるバージョン定義がパースされることを確認
+    #[test]
+    fn test_java_variable_expansion() {
+        let content = r#"
+def guavaVersion = '33.0.0-jre'
+def junitVersion = '4.13.2'
+
+dependencies {
+    implementation "com.google.guava:guava:$guavaVersion"
+    testImplementation "junit:junit:$junitVersion"
+}
+"#;
+
+        let parser = get_parser(Language::Java);
+        let deps = parser.parse(content).unwrap();
+
+        // 変数が展開された状態でバージョンが取得される
+        let guava = deps
+            .iter()
+            .find(|d| d.name == "com.google.guava:guava")
+            .expect("guava が検出されるべき");
+        assert_eq!(
+            guava.version_spec.version, "33.0.0-jre",
+            "変数 $guavaVersion が展開されるべき"
+        );
+
+        let junit = deps
+            .iter()
+            .find(|d| d.name == "junit:junit")
+            .expect("junit が検出されるべき");
+        assert_eq!(
+            junit.version_spec.version, "4.13.2",
+            "変数 $junitVersion が展開されるべき"
+        );
+        assert!(junit.is_dev, "testImplementation は開発依存であるべき");
+    }
+
+    /// composer.json の安定性フラグ付き依存 (@dev, @stable 等) がパースされることを確認
+    #[test]
+    fn test_composer_stability_flag() {
+        let content = r#"{
+  "require": {
+    "vendor/package-a": "^1.0@dev",
+    "vendor/package-b": "^2.0@stable",
+    "vendor/package-c": "~3.0@beta"
+  }
+}"#;
+
+        let parser = get_parser(Language::Php);
+        let deps = parser.parse(content).unwrap();
+
+        assert_eq!(deps.len(), 3, "安定性フラグ付き依存が3つパースされるべき");
+
+        // @dev フラグは除去されてバージョン制約のみが解釈される
+        let pkg_a = deps.iter().find(|d| d.name == "vendor/package-a").unwrap();
+        assert_eq!(
+            pkg_a.version_spec.kind,
+            VersionSpecKind::Caret,
+            "@dev フラグ除去後にキャレット制約が検出されるべき"
+        );
+        assert_eq!(pkg_a.version_spec.version, "1.0");
+
+        // @stable フラグも同様に除去される
+        let pkg_b = deps.iter().find(|d| d.name == "vendor/package-b").unwrap();
+        assert_eq!(pkg_b.version_spec.kind, VersionSpecKind::Caret);
+        assert_eq!(pkg_b.version_spec.version, "2.0");
+
+        // @beta フラグも除去され、チルダ制約として解釈される
+        let pkg_c = deps.iter().find(|d| d.name == "vendor/package-c").unwrap();
+        assert_eq!(
+            pkg_c.version_spec.kind,
+            VersionSpecKind::Tilde,
+            "@beta フラグ除去後にチルダ制約が検出されるべき"
+        );
+        assert_eq!(pkg_c.version_spec.version, "3.0");
+    }
+}
