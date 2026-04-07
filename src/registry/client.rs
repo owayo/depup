@@ -148,96 +148,48 @@ impl HttpClient {
         }))
     }
 
-    /// GET リクエストを実行し JSON レスポンスをパース (パースエラー時リトライ)
+    /// GET リクエストを実行し JSON レスポンスをパース
+    ///
+    /// ネットワークリトライは `get_with_context` 内で完結するため、
+    /// ここでは追加のリトライは行わない。
     pub async fn get_json<T: serde::de::DeserializeOwned>(
         &self,
         url: &str,
         package: &str,
         registry: &str,
     ) -> Result<T, RegistryError> {
-        let mut last_error = None;
-        let mut delay = BASE_DELAY_MS;
+        let response = self.get_with_context(url, package, registry).await?;
 
-        for attempt in 0..=self.max_retries {
-            // レスポンスを取得 (get_with_context 内でリトライ済み)
-            let response = match self.get_with_context(url, package, registry).await {
-                Ok(resp) => resp,
-                Err(e) => return Err(e), // ネットワークエラーは get_with_context 内でリトライ済み
-            };
-
-            // JSON パースを試行
-            match response.json::<T>().await {
-                Ok(parsed) => return Ok(parsed),
-                Err(e) => {
-                    last_error = Some(RegistryError::InvalidResponse {
-                        package: package.to_string(),
-                        registry: registry.to_string(),
-                        message: format!("failed to parse JSON: {}", e),
-                    });
-
-                    if attempt < self.max_retries {
-                        // 指数バックオフでリトライ
-                        tokio::time::sleep(Duration::from_millis(delay)).await;
-                        delay *= 2;
-                        continue;
-                    }
-                }
-            }
-        }
-
-        Err(
-            last_error.unwrap_or_else(|| RegistryError::InvalidResponse {
+        response
+            .json::<T>()
+            .await
+            .map_err(|e| RegistryError::InvalidResponse {
                 package: package.to_string(),
                 registry: registry.to_string(),
-                message: "unknown JSON parse error".to_string(),
-            }),
-        )
+                message: format!("JSON パース失敗: {}", e),
+            })
     }
 
-    /// GET リクエストを実行しテキストレスポンスを取得 (エラー時リトライ)
+    /// GET リクエストを実行しテキストレスポンスを取得
+    ///
+    /// ネットワークリトライは `get_with_context` 内で完結するため、
+    /// ここでは追加のリトライは行わない。
     pub async fn get_text(
         &self,
         url: &str,
         package: &str,
         registry: &str,
     ) -> Result<String, RegistryError> {
-        let mut last_error = None;
-        let mut delay = BASE_DELAY_MS;
+        let response = self.get_with_context(url, package, registry).await?;
 
-        for attempt in 0..=self.max_retries {
-            // レスポンスを取得 (get_with_context 内でリトライ済み)
-            let response = match self.get_with_context(url, package, registry).await {
-                Ok(resp) => resp,
-                Err(e) => return Err(e), // ネットワークエラーは get_with_context 内でリトライ済み
-            };
-
-            // テキスト取得を試行
-            match response.text().await {
-                Ok(text) => return Ok(text),
-                Err(e) => {
-                    last_error = Some(RegistryError::InvalidResponse {
-                        package: package.to_string(),
-                        registry: registry.to_string(),
-                        message: format!("failed to get text response: {}", e),
-                    });
-
-                    if attempt < self.max_retries {
-                        // 指数バックオフでリトライ
-                        tokio::time::sleep(Duration::from_millis(delay)).await;
-                        delay *= 2;
-                        continue;
-                    }
-                }
-            }
-        }
-
-        Err(
-            last_error.unwrap_or_else(|| RegistryError::InvalidResponse {
+        response
+            .text()
+            .await
+            .map_err(|e| RegistryError::InvalidResponse {
                 package: package.to_string(),
                 registry: registry.to_string(),
-                message: "unknown text parse error".to_string(),
-            }),
-        )
+                message: format!("テキストレスポンス取得失敗: {}", e),
+            })
     }
 }
 

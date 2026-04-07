@@ -192,11 +192,17 @@ impl UpdateJudge {
 
         // age 制約があれば候補を絞る
         let age_filtered: Vec<&VersionInfo> = if let Some(min_age) = self.filter.min_age {
-            let min_release_time = self.now - chrono::Duration::from_std(min_age).unwrap();
-            stable_versions
-                .into_iter()
-                .filter(|v| v.released_at <= min_release_time)
-                .collect()
+            // chrono::Duration は i64 ナノ秒 (約292年) が上限。
+            // 変換失敗時は age 制約を無視して全候補を通す。
+            if let Ok(chrono_duration) = chrono::Duration::from_std(min_age) {
+                let min_release_time = self.now - chrono_duration;
+                stable_versions
+                    .into_iter()
+                    .filter(|v| v.released_at <= min_release_time)
+                    .collect()
+            } else {
+                stable_versions
+            }
         } else {
             stable_versions
         };

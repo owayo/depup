@@ -54,12 +54,42 @@ const PRERELEASE_IDENTIFIERS: &[&str] = &[
     "experimental",
 ];
 
+/// セパレータ (`-`, `.`, `+`, 文字列境界) で区切られた単語としてマッチするかチェックする。
+/// 部分文字列マッチによる誤検出 ("enterprise" に "pre" がマッチ等) を防止する。
+fn contains_identifier_word(haystack: &str, needle: &str) -> bool {
+    let bytes = haystack.as_bytes();
+    let needle_len = needle.len();
+    let mut start = 0;
+    while let Some(pos) = haystack[start..].find(needle) {
+        let abs = start + pos;
+        // 前方境界: 文字列先頭、またはセパレータ文字
+        let before_ok = abs == 0 || matches!(bytes[abs - 1], b'-' | b'.' | b'+' | b'_' | b' ');
+        // 後方境界: 文字列末尾、セパレータ文字、または数字 (例: "alpha1" の "alpha" + "1")
+        let end = abs + needle_len;
+        let after_ok = end >= haystack.len()
+            || matches!(bytes[end], b'-' | b'.' | b'+' | b'_' | b' ')
+            || bytes[end].is_ascii_digit();
+        if before_ok && after_ok {
+            return true;
+        }
+        start = abs + 1;
+        if start >= haystack.len() {
+            break;
+        }
+    }
+    false
+}
+
 /// バージョン文字列がプレリリースバージョンを表すかチェックする
 pub fn is_prerelease_version(version: &str) -> bool {
     let lower = version.to_lowercase();
 
-    // 単語ベースの識別子をチェック (alpha, beta, canary 等)
-    if PRERELEASE_IDENTIFIERS.iter().any(|id| lower.contains(id)) {
+    // 単語境界ベースの識別子をチェック (alpha, beta, canary 等)
+    // セパレータ (-._+ またはバージョン境界) で区切られた単語としてマッチする
+    if PRERELEASE_IDENTIFIERS
+        .iter()
+        .any(|id| contains_identifier_word(&lower, id))
+    {
         return true;
     }
 
@@ -528,8 +558,9 @@ mod tests {
         assert!(!is_prerelease_version("hello"));
         assert!(!is_prerelease_version(""));
         assert!(!is_prerelease_version("abc"));
-        // "dev" を含む文字列はプレリリースとして検出される
-        assert!(is_prerelease_version("development"));
+        // "development" は "dev" を部分文字列として含むが、
+        // 単語境界チェックにより誤検出されない
+        assert!(!is_prerelease_version("development"));
     }
 
     #[test]
@@ -547,5 +578,71 @@ mod tests {
             compare_versions("1.0.0", "V2.0.0"),
             std::cmp::Ordering::Less
         );
+    }
+
+    #[test]
+    fn test_contains_identifier_word_basic() {
+        // 基本的な単語境界マッチ
+        assert!(contains_identifier_word("1.0.0-alpha", "alpha"));
+        assert!(contains_identifier_word("1.0.0-dev.1", "dev"));
+        assert!(contains_identifier_word("1.0.0+pre.1", "pre"));
+        assert!(contains_identifier_word("alpha-1.0.0", "alpha"));
+    }
+
+    #[test]
+    fn test_contains_identifier_word_false_positives_prevented() {
+        // 部分文字列マッチによる誤検出が防止される
+        assert!(!contains_identifier_word("1.0.0-enterprise", "pre"));
+        assert!(!contains_identifier_word("1.0.0-deprecated", "pre"));
+        assert!(!contains_identifier_word("1.0.0-spread", "pre"));
+        assert!(!contains_identifier_word("development", "dev"));
+        assert!(!contains_identifier_word("1.0.0-nextcloud", "next"));
+        assert!(!contains_identifier_word("salpha", "alpha"));
+        assert!(!contains_identifier_word("preemptive", "pre"));
+    }
+
+    #[test]
+    fn test_contains_identifier_word_separators() {
+        // 各種セパレータで区切られた場合にマッチする
+        assert!(contains_identifier_word("1.0.0-dev", "dev")); // ハイフン
+        assert!(contains_identifier_word("1.0.0.dev", "dev")); // ドット
+        assert!(contains_identifier_word("1.0.0+dev", "dev")); // プラス
+        assert!(contains_identifier_word("1.0.0_dev", "dev")); // アンダースコア
+        assert!(contains_identifier_word("dev", "dev")); // 文字列全体
+    }
+
+    #[test]
+    fn test_contains_identifier_word_digit_boundary() {
+        // 識別子の後に数字が続く場合もマッチする (例: alpha1)
+        assert!(contains_identifier_word("1.0.0-alpha1", "alpha"));
+        assert!(contains_identifier_word("1.0.0-beta2", "beta"));
+        assert!(contains_identifier_word("1.0.0-rc1", "rc"));
+        assert!(contains_identifier_word("1.0.0-dev0", "dev"));
+    }
+
+    #[test]
+    fn test_contains_identifier_word_edge_cases() {
+        // 空文字列や境界ケース
+        assert!(!contains_identifier_word("", "dev"));
+        assert!(!contains_identifier_word("abc", "development"));
+        assert!(contains_identifier_word("dev", "dev"));
+        assert!(!contains_identifier_word("d", "dev"));
+    }
+
+    #[test]
+    fn test_is_prerelease_word_boundary_regression() {
+        // Bug回帰テスト: 部分文字列マッチによる誤検出が修正されている
+        // これらは "pre" を部分文字列として含むが、プレリリースではない
+        assert!(!is_prerelease_version("1.0.0-enterprise"));
+        assert!(!is_prerelease_version("1.0.0-deprecated"));
+        // これらは正しくプレリリースと判定される
+        assert!(is_prerelease_version("1.0.0-pre"));
+        assert!(is_prerelease_version("1.0.0-pre.1"));
+        assert!(is_prerelease_version("1.0.0-pre1"));
+        // "dev" の境界チェック
+        assert!(!is_prerelease_version("1.0.0-devtools"));
+        assert!(is_prerelease_version("1.0.0-dev"));
+        assert!(is_prerelease_version("1.0.0-dev.1"));
+        assert!(is_prerelease_version("1.0.0-dev0"));
     }
 }

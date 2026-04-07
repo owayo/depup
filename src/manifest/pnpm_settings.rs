@@ -114,7 +114,8 @@ fn read_workspace_yaml_minimum_release_age(dir: &Path) -> Option<Duration> {
             let value = value.trim();
             // 値は分単位
             if let Ok(minutes) = value.parse::<u64>() {
-                return Some(Duration::from_secs(minutes * 60));
+                // オーバーフロー防止: checked_mul で安全に変換する
+                return minutes.checked_mul(60).map(Duration::from_secs);
             }
             // "10d" のようなクォート付き文字列形式もサポートする
             let value = value.trim_matches('"').trim_matches('\'');
