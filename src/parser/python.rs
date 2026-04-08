@@ -32,7 +32,7 @@ static RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 static WILDCARD_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\*$|^\d+(?:\.\d+)*\.\*$").unwrap());
-static VERSION_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d+(?:\.\d+)+").unwrap());
+static VERSION_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d+(?:\.\d+)*").unwrap());
 
 fn normalize_for_compare(version: &str) -> String {
     let mut s = version.trim();
@@ -376,5 +376,21 @@ mod tests {
         let spec = parse("!=1.2.*").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Range);
         assert_eq!(spec.version, "1.2");
+    }
+
+    #[test]
+    fn test_parse_range_single_segment_version() {
+        // 単一セグメントバージョンのレンジ指定: `>=3,<4`
+        let spec = parse(">=3,<4").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "3");
+    }
+
+    #[test]
+    fn test_parse_single_segment_gte() {
+        // 単一セグメントの以上制約: `>=3`
+        let spec = parse(">=3").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::GreaterOrEqual);
+        assert_eq!(spec.version, "3");
     }
 }

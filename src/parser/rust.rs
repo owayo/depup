@@ -17,20 +17,21 @@ use std::sync::LazyLock;
 pub struct RustVersionParser;
 
 // Rust のバージョン指定用正規表現
+// 演算子後の空白を許容する（Cargo は `>= 1.2.3` のようなスペース付き指定を受け入れる）
 static EXACT_PINNED_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^=([\d]+(?:\.[\d]+)*(?:-[\w.]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^=\s*([\d]+(?:\.[\d]+)*(?:-[\w.]+)?)$").unwrap());
 static CARET_EXPLICIT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\^([\d]+(?:\.[\d]+)*(?:-[\w.]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^\^\s*([\d]+(?:\.[\d]+)*(?:-[\w.]+)?)$").unwrap());
 static TILDE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^~([\d]+(?:\.[\d]+)*(?:-[\w.]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^~\s*([\d]+(?:\.[\d]+)*(?:-[\w.]+)?)$").unwrap());
 static GTE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^>=([\d]+(?:\.[\d]+)*(?:-[\w.]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^>=\s*([\d]+(?:\.[\d]+)*(?:-[\w.]+)?)$").unwrap());
 static GT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^>([\d]+(?:\.[\d]+)*(?:-[\w.]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^>\s*([\d]+(?:\.[\d]+)*(?:-[\w.]+)?)$").unwrap());
 static LTE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^<=([\d]+(?:\.[\d]+)*(?:-[\w.]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^<=\s*([\d]+(?:\.[\d]+)*(?:-[\w.]+)?)$").unwrap());
 static LT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^<([\d]+(?:\.[\d]+)*(?:-[\w.]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^<\s*([\d]+(?:\.[\d]+)*(?:-[\w.]+)?)$").unwrap());
 static BARE_VERSION_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^([\d]+(?:\.[\d]+)*(?:-[\w.]+)?)$").unwrap());
 static RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -350,5 +351,42 @@ mod tests {
     #[test]
     fn test_language() {
         assert_eq!(RustVersionParser.language(), Language::Rust);
+    }
+
+    #[test]
+    fn test_parse_gte_with_space() {
+        // Cargo は演算子後のスペースを許容する
+        let spec = parse(">= 1.2.3").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::GreaterOrEqual);
+        assert_eq!(spec.version, "1.2.3");
+        assert_eq!(spec.prefix, Some(">=".to_string()));
+    }
+
+    #[test]
+    fn test_parse_lt_with_space() {
+        let spec = parse("< 2.0.0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Less);
+        assert_eq!(spec.version, "2.0.0");
+    }
+
+    #[test]
+    fn test_parse_exact_pinned_with_space() {
+        let spec = parse("= 1.2.3").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "1.2.3");
+    }
+
+    #[test]
+    fn test_parse_tilde_with_space() {
+        let spec = parse("~ 1.2.3").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Tilde);
+        assert_eq!(spec.version, "1.2.3");
+    }
+
+    #[test]
+    fn test_parse_caret_with_space() {
+        let spec = parse("^ 1.2.3").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Caret);
+        assert_eq!(spec.version, "1.2.3");
     }
 }
