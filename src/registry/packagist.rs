@@ -91,13 +91,14 @@ impl RegistryAdapter for PackagistAdapter {
                     continue;
                 }
 
-                // リリースタイムスタンプをパース
-                if let Some(ref time_str) = version_info.time
-                    && let Ok(released_at) = time_str.parse::<DateTime<Utc>>()
-                {
-                    let normalized = Self::normalize_version(&version_info.version);
-                    versions.push(VersionInfo::new(&normalized, released_at));
-                }
+                // リリースタイムスタンプをパース（time が欠落している場合は現在時刻をフォールバックとして使用）
+                let released_at = version_info
+                    .time
+                    .as_ref()
+                    .and_then(|t| t.parse::<DateTime<Utc>>().ok())
+                    .unwrap_or_else(Utc::now);
+                let normalized = Self::normalize_version(&version_info.version);
+                versions.push(VersionInfo::new(&normalized, released_at));
             }
         }
 

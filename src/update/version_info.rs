@@ -7,7 +7,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// レジストリから取得したパッケージバージョンの情報
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Eq`/`Ord` はバージョン文字列のみで比較する（`released_at` は無視）。
+/// これにより BTreeSet 等でも一貫した振る舞いになる。
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VersionInfo {
     /// バージョン文字列 (例: "1.2.3")
     pub version: String,
@@ -110,6 +113,14 @@ pub fn is_prerelease_version(version: &str) -> bool {
     false
 }
 
+impl PartialEq for VersionInfo {
+    fn eq(&self, other: &Self) -> bool {
+        compare_versions(&self.version, &other.version) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for VersionInfo {}
+
 impl Ord for VersionInfo {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // semver 風の比較でバージョンを比較
@@ -179,6 +190,19 @@ mod tests {
         assert_eq!(info.version, "1.0.0");
         assert!(info.released_at >= before);
         assert!(info.released_at <= after);
+    }
+
+    #[test]
+    fn test_version_info_eq_consistent_with_ord() {
+        // Eq と Ord がバージョン文字列のみで比較されること
+        let date1 = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let date2 = Utc.with_ymd_and_hms(2025, 6, 15, 0, 0, 0).unwrap();
+        let a = VersionInfo::new("1.0.0", date1);
+        let b = VersionInfo::new("1.0.0", date2);
+
+        // 同じバージョン文字列は released_at が異なっても等しい
+        assert_eq!(a, b);
+        assert_eq!(a.cmp(&b), std::cmp::Ordering::Equal);
     }
 
     #[test]

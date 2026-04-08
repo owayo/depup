@@ -63,9 +63,10 @@ impl CratesIoAdapter {
         format!("{}/{}", CRATES_IO_API_URL, crate_name)
     }
 
-    /// リクエスト前にレート制限を適用
-    async fn apply_rate_limit(&self) {
-        let _permit = self.rate_limiter.acquire().await.unwrap();
+    /// レート制限を適用し、セマフォ許可を返す。
+    /// 呼び出し元は HTTP リクエスト完了までこの許可を保持すること。
+    async fn apply_rate_limit(&self) -> tokio::sync::SemaphorePermit<'_> {
+        let permit = self.rate_limiter.acquire().await.unwrap();
 
         // 待機が必要か確認
         let elapsed = {
@@ -81,6 +82,8 @@ impl CratesIoAdapter {
 
         // 最終リクエスト時刻を更新
         *self.last_request.lock().unwrap() = Some(Instant::now());
+
+        permit
     }
 }
 
@@ -95,8 +98,8 @@ impl RegistryAdapter for CratesIoAdapter {
     }
 
     async fn fetch_versions(&self, crate_name: &str) -> Result<Vec<VersionInfo>, RegistryError> {
-        // レート制限を適用
-        self.apply_rate_limit().await;
+        // レート制限を適用（HTTP リクエスト完了まで許可を保持する）
+        let _permit = self.apply_rate_limit().await;
 
         let url = self.build_url(crate_name);
         let response: CratesIoResponse = self

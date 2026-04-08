@@ -240,12 +240,13 @@ impl ManifestParser for PackageSwiftParser {
             message: format!("invalid regex pattern: {}", e),
         })?;
 
-        let version_re =
-            Regex::new(r#""(\d+(?:\.\d+)*)""#).map_err(|e| ManifestError::InvalidVersionSpec {
+        let version_re = Regex::new(r#""([vV]?\d+(?:\.\d+)*)""#).map_err(|e| {
+            ManifestError::InvalidVersionSpec {
                 path: PathBuf::from("Package.swift"),
                 spec: package.to_string(),
                 message: format!("invalid regex pattern: {}", e),
-            })?;
+            }
+        })?;
 
         // 全体から URL を検索する (複数行宣言に対応)
         let url_match = url_re
@@ -906,5 +907,26 @@ let package = Package(
         let grpc = deps.iter().find(|d| d.name == "grpc/grpc-swift").unwrap();
         assert_eq!(grpc.version_spec.kind, VersionSpecKind::Exact);
         assert_eq!(grpc.version_spec.version, "1.5.0");
+    }
+
+    #[test]
+    fn test_update_version_v_prefix() {
+        // v プレフィックス付きバージョンが update_version で正しく更新されること
+        let content = r#"
+// swift-tools-version: 5.9
+import PackageDescription
+
+let package = Package(
+    name: "MyApp",
+    dependencies: [
+        .package(url: "https://github.com/owner/repo.git", from: "v1.0.0"),
+    ]
+)
+"#;
+        let result = PackageSwiftParser
+            .update_version(content, "owner/repo", "1.2.0")
+            .unwrap();
+        assert!(result.contains("\"1.2.0\""));
+        assert!(!result.contains("\"v1.0.0\""));
     }
 }

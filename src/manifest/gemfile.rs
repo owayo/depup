@@ -42,6 +42,9 @@ static GROUP_START_RE: LazyLock<Regex> = LazyLock::new(|| {
 static GROUP_END_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*end\s*(?:#.*)?$").unwrap());
 
+// `do` で終わるブロック開始行（group 以外）
+static DO_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bdo\s*(?:#.*)?$").unwrap());
+
 // 開発用グループかどうかを判定する
 fn is_dev_group(group_line: &str) -> bool {
     let lowered = group_line.to_lowercase();
@@ -54,6 +57,8 @@ impl ManifestParser for GemfileParser {
         let mut dependencies = Vec::new();
         let parser = get_parser(Language::Ruby);
         let mut group_stack = Vec::new();
+        // group 以外の do...end ブロックのネスト深度
+        let mut non_group_nesting: usize = 0;
 
         for line in content.lines() {
             let trimmed = line.trim();
@@ -70,9 +75,19 @@ impl ManifestParser for GemfileParser {
                 continue;
             }
 
-            // 対応する `end` で 1 段だけ戻す
-            if GROUP_END_RE.is_match(trimmed) && !group_stack.is_empty() {
-                group_stack.pop();
+            // group 以外の `do` ブロック（platforms, source 等）を追跡する
+            if DO_BLOCK_RE.is_match(trimmed) {
+                non_group_nesting += 1;
+                continue;
+            }
+
+            // 対応する `end` で適切なスタック/カウンタを戻す
+            if GROUP_END_RE.is_match(trimmed) {
+                if non_group_nesting > 0 {
+                    non_group_nesting -= 1;
+                } else if !group_stack.is_empty() {
+                    group_stack.pop();
+                }
                 continue;
             }
 
@@ -729,5 +744,57 @@ gem 'pg', '~> 1.5'
         assert!(faker.is_dev);
         // グループ外の gem は本番依存
         assert!(!pg.is_dev);
+    }
+
+    #[test]
+    fn test_parse_nested_do_end_in_group() {
+        // group 内の platforms do...end がグループスタックを壊さないこと
+        let content = r#"
+group :development do
+  platforms :jruby do
+    gem 'activerecord-jdbc-adapter', '~> 1.3'
+  end
+  gem 'web-console', '>= 4.1.0'
+end
+
+gem 'pg', '~> 1.5'
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 3);
+
+        let jdbc = deps
+            .iter()
+            .find(|d| d.name == "activerecord-jdbc-adapter")
+            .unwrap();
+        let console = deps.iter().find(|d| d.name == "web-console").unwrap();
+        let pg = deps.iter().find(|d| d.name == "pg").unwrap();
+
+        // platforms ブロック内の gem も group :development 内なので開発依存
+        assert!(jdbc.is_dev);
+        // platforms の end でグループが外れてはいけない
+        assert!(console.is_dev);
+        // グループ外は本番依存
+        assert!(!pg.is_dev);
+    }
+
+    #[test]
+    fn test_parse_source_do_end_in_group() {
+        // group 内の source do...end がグループスタックを壊さないこと
+        let content = r#"
+group :development do
+  source 'https://gems.example.com' do
+    gem 'private-gem', '~> 1.0'
+  end
+  gem 'debug', '~> 1.0'
+end
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 2);
+
+        let private = deps.iter().find(|d| d.name == "private-gem").unwrap();
+        let debug = deps.iter().find(|d| d.name == "debug").unwrap();
+
+        assert!(private.is_dev);
+        assert!(debug.is_dev);
     }
 }
