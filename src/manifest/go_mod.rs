@@ -102,6 +102,7 @@ impl ManifestParser for GoModParser {
     ) -> Result<String, ManifestError> {
         let mut result = String::new();
         let mut updated = false;
+        let mut in_replace_block = false;
 
         // バージョンに v プレフィックスを付ける
         let new_ver = if new_version.starts_with('v') {
@@ -113,8 +114,18 @@ impl ManifestParser for GoModParser {
         for line in content.lines() {
             let trimmed = line.trim();
 
+            // replace ブロックの開始/終了を追跡する
+            if trimmed.starts_with("replace (") || trimmed == "replace (" {
+                in_replace_block = true;
+            } else if in_replace_block && trimmed == ")" {
+                in_replace_block = false;
+            }
+
+            // replace ブロック内および単一行 replace は更新対象外
+            let in_replace = in_replace_block || trimmed.starts_with("replace ");
+
             // この行に対象パッケージが含まれているか確認する
-            let updated_line = if trimmed.contains(package) {
+            let updated_line = if !in_replace && trimmed.contains(package) {
                 // 単一 require 文とのマッチを試みる
                 if let Some(caps) = SINGLE_REQUIRE_RE.captures(trimmed) {
                     let module = caps.get(1).map(|m| m.as_str()).unwrap_or("");
@@ -714,6 +725,54 @@ require golang.org/x/tools v0.0.0-20210101120000-abcdef123456
         );
         assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Exact);
         assert_eq!(deps[0].version_spec.prefix, Some("v".to_string()));
+    }
+
+    #[test]
+    fn test_update_skips_replace_block() {
+        // replace ブロック内のパッケージは更新されないこと
+        let content = r#"module example.com/myproject
+
+go 1.21
+
+require (
+	github.com/gin-gonic/gin v1.9.1
+	github.com/other/pkg v1.0.0
+)
+
+replace (
+	github.com/gin-gonic/gin => github.com/fork/gin v1.9.1
+	github.com/other/pkg => ../local-pkg
+)
+"#;
+
+        let result = GoModParser
+            .update_version(content, "github.com/gin-gonic/gin", "v1.10.0")
+            .unwrap();
+        // require 内は更新される
+        assert!(result.contains("github.com/gin-gonic/gin v1.10.0"));
+        // replace 内は変更されない
+        assert!(result.contains("github.com/fork/gin v1.9.1"));
+    }
+
+    #[test]
+    fn test_update_skips_single_replace() {
+        // 単一行 replace は更新されないこと
+        let content = r#"module example.com/myproject
+
+go 1.21
+
+require github.com/gin-gonic/gin v1.9.1
+
+replace github.com/gin-gonic/gin => github.com/fork/gin v1.9.1
+"#;
+
+        let result = GoModParser
+            .update_version(content, "github.com/gin-gonic/gin", "v1.10.0")
+            .unwrap();
+        // require は更新される
+        assert!(result.contains("require github.com/gin-gonic/gin v1.10.0"));
+        // replace は変更されない
+        assert!(result.contains("replace github.com/gin-gonic/gin => github.com/fork/gin v1.9.1"));
     }
 
     #[test]

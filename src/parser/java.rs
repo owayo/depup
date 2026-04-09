@@ -420,4 +420,45 @@ mod tests {
         assert_eq!(spec.kind, VersionSpecKind::Range);
         assert_eq!(spec.version, "1.0");
     }
+
+    // --- エッジケース追加テスト ---
+
+    #[test]
+    fn test_parse_maven_range_with_spaces() {
+        // Maven レンジ内のスペース
+        let spec = parse("[1.0, 2.0)").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1.0");
+    }
+
+    #[test]
+    fn test_parse_strict_with_snapshot() {
+        // SNAPSHOT サフィックス付き strict 記法
+        let spec = parse("1.2.3-SNAPSHOT!!").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "1.2.3-SNAPSHOT");
+        assert_eq!(spec.suffix, Some("!!".to_string()));
+    }
+
+    #[test]
+    fn test_parse_prefix_three_segments() {
+        // 3セグメント+プラスのプレフィックス指定
+        let spec = parse("1.2.3.+").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Wildcard);
+        assert_eq!(spec.version, "1.2.3");
+    }
+
+    #[test]
+    fn test_parse_maven_range_single_version() {
+        // Maven の単一バージョンレンジ [1.0]
+        // 実際には下限と上限が同じ → カンマなしなのでマッチしない
+        assert!(parse("[1.0]").is_none());
+    }
+
+    #[test]
+    fn test_format_updated_strict_preserves_suffix() {
+        // strict 記法の !! が更新後も保持される
+        let spec = parse("5.3.8!!").unwrap();
+        assert_eq!(spec.format_updated("5.4.0"), "5.4.0!!");
+    }
 }

@@ -529,4 +529,85 @@ mod tests {
         // v接頭辞は normalize_version で除去されるため、更新後は v なしになる
         assert_eq!(spec.format_updated("2.0.0"), "2.0.0");
     }
+
+    // --- エッジケース追加テスト ---
+
+    #[test]
+    fn test_parse_equal_with_space() {
+        // = 接頭辞とスペース付き
+        let spec = parse("= 1.2.3").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "1.2.3");
+        assert_eq!(spec.prefix, Some("=".to_string()));
+    }
+
+    #[test]
+    fn test_parse_caret_zero_zero_three() {
+        // ^0.0.3 は >=0.0.3 <0.0.4 と同値（パッチ固定）
+        let spec = parse("^0.0.3").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Caret);
+        assert_eq!(spec.version, "0.0.3");
+    }
+
+    #[test]
+    fn test_parse_caret_zero() {
+        // ^0 は >=0.0.0 <1.0.0 と同値
+        let spec = parse("^0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Caret);
+        assert_eq!(spec.version, "0.0.0");
+    }
+
+    #[test]
+    fn test_parse_tilde_zero() {
+        // ~0.0.3 は >=0.0.3 <0.1.0 と同値
+        let spec = parse("~0.0.3").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Tilde);
+        assert_eq!(spec.version, "0.0.3");
+    }
+
+    #[test]
+    fn test_parse_exact_with_build_metadata() {
+        // ビルドメタデータ付きバージョンは Exact として分類
+        let spec = parse("1.0.0+build").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "1.0.0+build");
+    }
+
+    #[test]
+    fn test_parse_caret_with_build_metadata() {
+        let spec = parse("^1.0.0+build").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Caret);
+        assert_eq!(spec.version, "1.0.0+build");
+    }
+
+    #[test]
+    fn test_parse_partial_major_only_as_range() {
+        // 単一セグメント（例: "2"）は部分指定として Range に分類
+        let spec = parse("2").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "2.0.0");
+    }
+
+    #[test]
+    fn test_parse_gte_with_space() {
+        let spec = parse(">= 1.2.3").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::GreaterOrEqual);
+        assert_eq!(spec.version, "1.2.3");
+    }
+
+    #[test]
+    fn test_parse_tag_next() {
+        // dist-tag は更新対象外
+        assert!(parse("next").is_none());
+    }
+
+    #[test]
+    fn test_parse_tag_beta() {
+        assert!(parse("beta").is_none());
+    }
+
+    #[test]
+    fn test_parse_tag_canary() {
+        assert!(parse("canary").is_none());
+    }
 }

@@ -420,6 +420,14 @@ impl Orchestrator {
 
         let _permit = semaphore.acquire().await.unwrap();
 
+        // セマフォ取得後にキャッシュを再確認（同一パッケージの並行フェッチを防止）
+        {
+            let cache = self.version_cache.lock().await;
+            if let Some(cached) = cache.get(&cache_key) {
+                return Ok(cached.clone());
+            }
+        }
+
         let result = adapter
             .fetch_versions(package)
             .await

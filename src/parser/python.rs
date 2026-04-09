@@ -393,4 +393,61 @@ mod tests {
         assert_eq!(spec.kind, VersionSpecKind::GreaterOrEqual);
         assert_eq!(spec.version, "3");
     }
+
+    // --- エッジケース追加テスト ---
+
+    #[test]
+    fn test_parse_caret_partial() {
+        // Poetry の部分 caret
+        let spec = parse("^1.2").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Caret);
+        assert_eq!(spec.version, "1.2");
+    }
+
+    #[test]
+    fn test_parse_caret_major_only() {
+        // Poetry の caret メジャーのみ
+        let spec = parse("^1").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Caret);
+        assert_eq!(spec.version, "1");
+    }
+
+    #[test]
+    fn test_parse_tilde_partial() {
+        // Poetry の部分 tilde
+        let spec = parse("~1.2").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Tilde);
+        assert_eq!(spec.version, "1.2");
+    }
+
+    #[test]
+    fn test_parse_gte_with_space() {
+        // 演算子後のスペース
+        let spec = parse(">= 1.2.3").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::GreaterOrEqual);
+        assert_eq!(spec.version, "1.2.3");
+    }
+
+    #[test]
+    fn test_parse_dev_release() {
+        // PEP 440 開発リリース
+        let spec = parse("==1.0.dev1").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "1.0");
+    }
+
+    #[test]
+    fn test_parse_range_triple_constraints() {
+        // 3つの制約を含むレンジ
+        let spec = parse(">=1.0,!=1.5.0,<2.0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1.0");
+    }
+
+    #[test]
+    fn test_parse_compatible_release_updates_correctly() {
+        // ~=1.2.3 の更新フォーマット
+        let spec = parse("~=1.2.3").unwrap();
+        assert_eq!(spec.format_updated("1.3.0"), "~=1.3.0");
+    }
 }

@@ -389,4 +389,80 @@ mod tests {
         assert_eq!(spec.kind, VersionSpecKind::Caret);
         assert_eq!(spec.version, "1.2.3");
     }
+
+    // --- 部分バージョン指定のエッジケース ---
+
+    #[test]
+    fn test_parse_caret_partial_major_minor() {
+        // ^1.2 は >=1.2.0, <2.0.0 と同値
+        let spec = parse("^1.2").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Caret);
+        assert_eq!(spec.version, "1.2");
+        assert_eq!(spec.prefix, Some("^".to_string()));
+    }
+
+    #[test]
+    fn test_parse_caret_partial_major_only() {
+        // ^1 は >=1.0.0, <2.0.0 と同値
+        let spec = parse("^1").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Caret);
+        assert_eq!(spec.version, "1");
+        assert_eq!(spec.prefix, Some("^".to_string()));
+    }
+
+    #[test]
+    fn test_parse_caret_zero_zero() {
+        // ^0.0 は >=0.0.0, <0.1.0 と同値
+        let spec = parse("^0.0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Caret);
+        assert_eq!(spec.version, "0.0");
+    }
+
+    #[test]
+    fn test_parse_caret_zero_zero_three() {
+        // ^0.0.3 は >=0.0.3, <0.0.4 と同値（パッチ固定）
+        let spec = parse("^0.0.3").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Caret);
+        assert_eq!(spec.version, "0.0.3");
+    }
+
+    #[test]
+    fn test_parse_tilde_partial_major_minor() {
+        // ~1.2 は >=1.2.0, <1.3.0 と同値
+        let spec = parse("~1.2").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Tilde);
+        assert_eq!(spec.version, "1.2");
+        assert_eq!(spec.prefix, Some("~".to_string()));
+    }
+
+    #[test]
+    fn test_parse_tilde_partial_major_only() {
+        // ~1 は >=1.0.0, <2.0.0 と同値
+        let spec = parse("~1").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Tilde);
+        assert_eq!(spec.version, "1");
+        assert_eq!(spec.prefix, Some("~".to_string()));
+    }
+
+    #[test]
+    fn test_parse_range_single_segment_version() {
+        // 単一セグメントバージョンのレンジ: >=1, <2
+        let spec = parse(">=1, <2").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1");
+    }
+
+    #[test]
+    fn test_parse_gt_with_space() {
+        let spec = parse("> 1.0.0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Greater);
+        assert_eq!(spec.version, "1.0.0");
+    }
+
+    #[test]
+    fn test_parse_lte_with_space() {
+        let spec = parse("<= 2.0.0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::LessOrEqual);
+        assert_eq!(spec.version, "2.0.0");
+    }
 }

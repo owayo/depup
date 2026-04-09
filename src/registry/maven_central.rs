@@ -63,6 +63,22 @@ impl MavenCentralAdapter {
             });
         }
         let (group, artifact) = (parts[0], parts[1]);
+
+        // Maven coordinates に不正な文字が含まれていないか検証する
+        // (URLクエリ文字列へのインジェクション防止)
+        let is_valid_maven_id = |s: &str| {
+            !s.is_empty()
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+        };
+        if !is_valid_maven_id(group) || !is_valid_maven_id(artifact) {
+            return Err(RegistryError::InvalidPackageName {
+                name: package.to_string(),
+                registry: self.registry_name().to_string(),
+                reason: "groupId and artifactId must contain only alphanumeric characters, dots, hyphens, and underscores".to_string(),
+            });
+        }
+
         Ok(format!(
             "{}?q=g:{}+AND+a:{}&core=gav&rows={}&wt=json",
             MAVEN_CENTRAL_API_URL, group, artifact, MAX_VERSIONS
