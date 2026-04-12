@@ -274,6 +274,7 @@ depup respects upper-bound range constraints (both exclusive and inclusive):
 "4.0.0..<5.0.0"    → "4.99.0..<5.0.0"
 "4.0.0...4.9.9"    → "4.9.9...4.9.9"
 "1.2.0 - 2.0.0"    → "1.9.3 - 2.0.0" (npm hyphen)
+"1.0 - 2.0"        → "2.0.9 - 2.0" (npm/Composer partial upper expands to `<2.1`)
 "[1.0,2.0)"        → "[1.9.3,2.0)" (Maven-style)
 "[1.0,2.0]"        → "[2.0,2.0]" (Maven-style)
 "[1.0,2.0.Final)"  → "[1.9.3,2.0.Final)" (Maven qualifier)
@@ -281,6 +282,8 @@ depup respects upper-bound range constraints (both exclusive and inclusive):
 "]1.0,2.0]"        → "]2.0,2.0]" (Maven alt inclusive)
 "[1.0,2.0["        → "[1.9.3,2.0[" (Maven alt upper bracket)
 ```
+
+For npm/Composer hyphen ranges, a partial right-hand side like `1.0 - 2.0` is interpreted as a wildcard-expanded exclusive upper bound, so `2.0.x` updates remain eligible while `2.1.0` is excluded.
 
 When a dependency has an upper bound constraint (e.g., `<4.0.0`, `<=2.0`, `...4.9.9`), depup will:
 - **Not propose** versions that exceed the upper bound

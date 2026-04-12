@@ -52,6 +52,49 @@ fn normalize_bound_version(version: &str) -> String {
         .to_string()
 }
 
+/// npm / Composer のハイフンレンジ右辺を上限制約へ正規化する。
+///
+/// 右辺が部分指定 (`2`, `2.3`) の場合はワイルドカード展開後の排他的上限へ進める。
+/// 例:
+/// - `1 - 2` -> `<3`
+/// - `1.2 - 2.3` -> `<2.4`
+/// - `1.2.3 - 2.3.4` -> `<=2.3.4`
+fn normalize_hyphen_upper_bound(version: &str) -> (String, bool) {
+    let normalized = normalize_bound_version(version);
+
+    // 修飾子付きや 3 セグメント以上の指定はその値自体を包含上限として扱う。
+    if normalized.contains(['-', '+']) {
+        return (normalized, true);
+    }
+
+    let segments: Vec<&str> = normalized.split('.').collect();
+    if !(1..=2).contains(&segments.len()) {
+        return (normalized, true);
+    }
+
+    let mut numeric_segments = Vec::with_capacity(segments.len());
+    for segment in segments {
+        let Ok(value) = segment.parse::<u64>() else {
+            return (normalized, true);
+        };
+        numeric_segments.push(value);
+    }
+
+    if let Some(last) = numeric_segments.last_mut()
+        && let Some(next) = last.checked_add(1)
+    {
+        *last = next;
+        let upper = numeric_segments
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(".");
+        return (upper, false);
+    }
+
+    (normalized, true)
+}
+
 /// Range 制約文字列から上限バージョンと包含可否を取り出す。
 ///
 /// 戻り値は `(upper_bound, inclusive)`:
@@ -87,7 +130,7 @@ fn extract_upper_bound(raw: &str) -> Option<(String, bool)> {
     if let Some(caps) = UPPER_BOUND_HYPHEN_RE.captures(trimmed)
         && let Some(m) = caps.get(1)
     {
-        return Some((normalize_bound_version(m.as_str()), true));
+        return Some(normalize_hyphen_upper_bound(m.as_str()));
     }
 
     if let Some(caps) = MAVEN_RANGE_RE.captures(trimmed) {
@@ -921,6 +964,46 @@ mod tests {
     }
 
     #[test]
+    fn test_judge_hyphen_range_partial_upper_bound_allows_patch_updates() {
+        // npm の `1.2.3 - 2.3` は `>=1.2.3 <2.4` と同義
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_range_dependency("lodash", "1.2.3 - 2.3", "1.2.3", Language::Node);
+        let versions = vec![
+            make_version_info("1.2.3", 100),
+            make_version_info("2.3.5", 50), // `2.3.*` は上限内
+            make_version_info("2.4.0", 10), // `2.4` は排他的上限なので除外
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_update());
+        if let UpdateResult::Update { new_version, .. } = result {
+            assert_eq!(new_version, "2.3.5");
+        }
+    }
+
+    #[test]
+    fn test_judge_composer_hyphen_range_partial_upper_bound_allows_patch_updates() {
+        // Composer の `1.0 - 2.0` は `>=1.0.0 <2.1` と同義
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_range_dependency("vendor/package", "1.0 - 2.0", "1.0", Language::Php);
+        let versions = vec![
+            make_version_info("1.0.0", 100),
+            make_version_info("2.0.9", 50), // `2.0.*` は上限内
+            make_version_info("2.1.0", 10), // `2.1` は排他的上限なので除外
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_update());
+        if let UpdateResult::Update { new_version, .. } = result {
+            assert_eq!(new_version, "2.0.9");
+        }
+    }
+
+    #[test]
     fn test_judge_maven_range_exclusive() {
         // Maven レンジ `[1.0,2.0)` は `>=1.0 && <2.0`
         let filter = UpdateFilter::new();
@@ -1243,6 +1326,18 @@ mod tests {
     fn test_extract_upper_bound_hyphen_range() {
         let result = extract_upper_bound("1.0.0 - 2.0.0");
         assert_eq!(result, Some(("2.0.0".to_string(), true)));
+    }
+
+    #[test]
+    fn test_extract_upper_bound_hyphen_range_partial_upper() {
+        let result = extract_upper_bound("1.2.3 - 2.3");
+        assert_eq!(result, Some(("2.4".to_string(), false)));
+    }
+
+    #[test]
+    fn test_extract_upper_bound_hyphen_range_single_segment_upper() {
+        let result = extract_upper_bound("1 - 2");
+        assert_eq!(result, Some(("3".to_string(), false)));
     }
 
     #[test]
