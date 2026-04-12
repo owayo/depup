@@ -3,7 +3,8 @@
 //! 対応対象:
 //! - require 文 (単一行およびブロック)
 //! - `// pinned` コメントによるバージョン固定
-//! - replace ディレクティブ (更新対象から除外)
+//! - replace ディレクティブ (パースと更新の両方でスキップ)
+//! - exclude ディレクティブ (パースと更新の両方でスキップ)
 
 use crate::domain::{Dependency, Language};
 use crate::error::ManifestError;
@@ -103,6 +104,7 @@ impl ManifestParser for GoModParser {
         let mut result = String::new();
         let mut updated = false;
         let mut in_replace_block = false;
+        let mut in_exclude_block = false;
 
         // バージョンに v プレフィックスを付ける
         let new_ver = if new_version.starts_with('v') {
@@ -117,15 +119,19 @@ impl ManifestParser for GoModParser {
             // replace ブロックの開始/終了を追跡する
             if trimmed.starts_with("replace (") || trimmed == "replace (" {
                 in_replace_block = true;
-            } else if in_replace_block && trimmed == ")" {
+            } else if trimmed.starts_with("exclude (") || trimmed == "exclude (" {
+                in_exclude_block = true;
+            } else if (in_replace_block || in_exclude_block) && trimmed == ")" {
                 in_replace_block = false;
+                in_exclude_block = false;
             }
 
-            // replace ブロック内および単一行 replace は更新対象外
+            // replace/exclude ブロック内および単一行 replace/exclude は更新対象外
             let in_replace = in_replace_block || trimmed.starts_with("replace ");
+            let in_exclude = in_exclude_block || trimmed.starts_with("exclude ");
 
             // この行に対象パッケージが含まれているか確認する
-            let updated_line = if !in_replace && trimmed.contains(package) {
+            let updated_line = if !in_replace && !in_exclude && trimmed.contains(package) {
                 // 単一 require 文とのマッチを試みる
                 if let Some(caps) = SINGLE_REQUIRE_RE.captures(trimmed) {
                     let module = caps.get(1).map(|m| m.as_str()).unwrap_or("");
@@ -773,6 +779,73 @@ replace github.com/gin-gonic/gin => github.com/fork/gin v1.9.1
         assert!(result.contains("require github.com/gin-gonic/gin v1.10.0"));
         // replace は変更されない
         assert!(result.contains("replace github.com/gin-gonic/gin => github.com/fork/gin v1.9.1"));
+    }
+
+    #[test]
+    fn test_update_does_not_modify_exclude_line() {
+        // exclude 行に同じパッケージ名が含まれていても更新されないこと
+        let content = r#"module example.com/myproject
+
+go 1.21
+
+require github.com/gin-gonic/gin v1.9.1
+
+exclude github.com/gin-gonic/gin v1.9.0
+"#;
+
+        let result = GoModParser
+            .update_version(content, "github.com/gin-gonic/gin", "v1.10.0")
+            .unwrap();
+        // require は更新される
+        assert!(result.contains("require github.com/gin-gonic/gin v1.10.0"));
+        // exclude 行は変更されない
+        assert!(result.contains("exclude github.com/gin-gonic/gin v1.9.0"));
+    }
+
+    #[test]
+    fn test_update_does_not_modify_retract_line() {
+        // retract 行がバージョンを含んでいても更新されないこと
+        let content = r#"module example.com/myproject
+
+go 1.21
+
+require github.com/gin-gonic/gin v1.9.1
+
+retract v1.0.0
+"#;
+
+        let result = GoModParser
+            .update_version(content, "github.com/gin-gonic/gin", "v1.10.0")
+            .unwrap();
+        assert!(result.contains("require github.com/gin-gonic/gin v1.10.0"));
+        assert!(result.contains("retract v1.0.0"));
+    }
+
+    #[test]
+    fn test_update_does_not_modify_exclude_block() {
+        // exclude ブロック内の同名パッケージも更新されないこと
+        let content = r#"module example.com/myproject
+
+go 1.21
+
+require (
+	github.com/gin-gonic/gin v1.9.1
+)
+
+exclude (
+	github.com/gin-gonic/gin v1.8.0
+	github.com/gin-gonic/gin v1.8.1
+)
+"#;
+
+        let result = GoModParser
+            .update_version(content, "github.com/gin-gonic/gin", "v1.10.0")
+            .unwrap();
+        // require ブロック内は更新される
+        assert!(result.contains("github.com/gin-gonic/gin v1.10.0"));
+        // exclude ブロック内は変更されない
+        assert!(result.contains("github.com/gin-gonic/gin v1.8.0"));
+        assert!(result.contains("github.com/gin-gonic/gin v1.8.1"));
     }
 
     #[test]
