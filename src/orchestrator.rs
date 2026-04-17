@@ -23,6 +23,7 @@ use crate::registry::{
 };
 use crate::tauri_sync::{TAURI_CRATE, TAURI_NPM_PACKAGES, TauriVersionSync};
 use crate::update::{UpdateFilter, UpdateJudge, VersionInfo, compare_versions};
+use futures::stream::{self, StreamExt};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -35,6 +36,16 @@ const DEFAULT_CONCURRENCY: usize = 10;
 
 /// crates.io 用の同時実行数 (レート制限あり)
 const CRATES_IO_CONCURRENCY: usize = 1;
+
+/// バージョンチェックの並列度上限 (マニフェスト内の依存関係に対して)。
+/// 依存数が少ない場合はそれに合わせて並列度を下げる (`dep_count.clamp(1, 4)`)。
+const MAX_VERSION_CHECK_CONCURRENCY: usize = 4;
+
+/// マニフェスト内の依存数から並列度を計算する。
+/// 最小 1、最大 `MAX_VERSION_CHECK_CONCURRENCY`。
+fn version_check_concurrency(dep_count: usize) -> usize {
+    dep_count.clamp(1, MAX_VERSION_CHECK_CONCURRENCY)
+}
 
 /// `enforce_lock_age_rust` の最大反復回数。
 /// 1 回の `cargo update -p --precise` は依存サブツリーを再解決するため、
@@ -421,44 +432,81 @@ impl Orchestrator {
         for (manifest_info, dependencies) in parsed_manifests {
             let mut manifest_result =
                 ManifestUpdateResult::new(&manifest_info.path, manifest_info.language);
-            let adapter = self.get_adapter(manifest_info.language);
+            // 複数 future から共有するため Arc に変換
+            let adapter: Arc<dyn RegistryAdapter + Send + Sync> =
+                Arc::from(self.get_adapter(manifest_info.language));
 
-            for dep in dependencies {
-                progress.set_message(&format!("Checking {}", &dep.name));
+            // 依存数に応じて並列度を調整 (1〜4)
+            let concurrency = version_check_concurrency(dependencies.len());
 
-                // この依存関係を早期スキップすべきかチェック
-                if let Some(reason) = judge.should_skip(&dep) {
-                    manifest_result.add_result(UpdateResult::skip(dep, reason));
-                    progress.inc();
-                    continue;
-                }
+            // 各依存関係を並列処理する。結果は入力順で返されるため
+            // 出力順は安定する (`buffered`: ordered)。
+            // fetch_versions は内部でレジストリ別の Semaphore を持つため、
+            // crates.io のレート制限などは従来どおり尊重される。
+            let results: Vec<OnePassResult> = stream::iter(dependencies)
+                .map(|dep| {
+                    let adapter = Arc::clone(&adapter);
+                    let judge_ref = &judge;
+                    async move {
+                        // 早期スキップ判定
+                        if let Some(reason) = judge_ref.should_skip(&dep) {
+                            return OnePassResult {
+                                name: dep.name.clone(),
+                                outcome: ResultOutcome::Skip(UpdateResult::skip(dep, reason)),
+                                fetch_error: None,
+                            };
+                        }
 
-                // git 依存は専用ロジックで判定する (レジストリ API を使わない)
-                if dep.is_git() {
-                    let result = self.judge_git_dependency(&dep).await;
-                    manifest_result.add_result(result);
-                    progress.inc();
-                    continue;
-                }
+                        // git 依存は専用ロジック
+                        if dep.is_git() {
+                            let result = self.judge_git_dependency(&dep).await;
+                            return OnePassResult {
+                                name: dep.name.clone(),
+                                outcome: ResultOutcome::Skip(result),
+                                fetch_error: None,
+                            };
+                        }
 
-                // レジストリからバージョンを取得
-                let versions = match self.fetch_versions(&*adapter, &dep.name).await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        errors.push(OrchestratorError::RegistryError {
-                            package: dep.name.clone(),
-                            message: e.to_string(),
-                        });
-                        manifest_result
-                            .add_result(UpdateResult::skip(dep, SkipReason::FetchFailed(e)));
-                        progress.inc();
-                        continue;
+                        // registry 経由のフェッチ
+                        match self.fetch_versions(&*adapter, &dep.name).await {
+                            Ok(versions) => {
+                                let result = judge_ref.judge(&dep, &versions);
+                                OnePassResult {
+                                    name: dep.name.clone(),
+                                    outcome: ResultOutcome::Skip(result),
+                                    fetch_error: None,
+                                }
+                            }
+                            Err(e) => {
+                                let err_msg = e.clone();
+                                OnePassResult {
+                                    name: dep.name.clone(),
+                                    outcome: ResultOutcome::Skip(UpdateResult::skip(
+                                        dep,
+                                        SkipReason::FetchFailed(e),
+                                    )),
+                                    fetch_error: Some(err_msg),
+                                }
+                            }
+                        }
                     }
-                };
+                })
+                .buffered(concurrency)
+                .collect()
+                .await;
 
-                // 更新すべきか判定
-                let result = judge.judge(&dep, &versions);
-                manifest_result.add_result(result);
+            // progress / errors / manifest_result を順序を保って反映する
+            for result in results {
+                progress.set_message(&format!("Checking {}", &result.name));
+                if let Some(err_msg) = result.fetch_error {
+                    errors.push(OrchestratorError::RegistryError {
+                        package: result.name.clone(),
+                        message: err_msg,
+                    });
+                }
+                match result.outcome {
+                    ResultOutcome::Skip(r) => manifest_result.add_result(r),
+                }
                 progress.inc();
             }
 
@@ -797,6 +845,19 @@ impl Orchestrator {
     }
 }
 
+/// バージョンチェック並列処理で 1 件の依存から得られた結果
+/// (内部利用のみ)。
+struct OnePassResult {
+    name: String,
+    outcome: ResultOutcome,
+    /// fetch 失敗時の原因メッセージ (存在する場合のみ `OrchestratorError` として記録される)
+    fetch_error: Option<String>,
+}
+
+enum ResultOutcome {
+    Skip(UpdateResult),
+}
+
 /// `enforce_lock_age_rust` が 1 件の依存に対して実施した調整内容
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockAgeAdjustment {
@@ -1113,6 +1174,19 @@ mod tests {
         let config = OrchestratorConfig::default();
         assert_eq!(config.general_concurrency, 10);
         assert_eq!(config.crates_io_concurrency, 1);
+    }
+
+    #[test]
+    fn test_version_check_concurrency_scaling() {
+        // 依存数に応じて並列度が 1〜4 の範囲で伸縮する
+        assert_eq!(version_check_concurrency(0), 1); // 0 件でも最小 1
+        assert_eq!(version_check_concurrency(1), 1);
+        assert_eq!(version_check_concurrency(2), 2);
+        assert_eq!(version_check_concurrency(3), 3);
+        assert_eq!(version_check_concurrency(4), 4);
+        assert_eq!(version_check_concurrency(10), 4); // 上限に張り付く
+        assert_eq!(version_check_concurrency(100), 4);
+        assert_eq!(version_check_concurrency(usize::MAX), 4);
     }
 
     #[test]
