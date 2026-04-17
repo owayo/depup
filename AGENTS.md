@@ -136,3 +136,4 @@ make help                # Makefileヘルプ
 - Go の `replace` ディレクティブ（単一行・ブロック形式とも）はパースと更新の両方でスキップされる
 - Go の `exclude` ディレクティブ（単一行・ブロック形式とも）はパースと更新の両方でスキップされる
 - Maven Central のクエリはグループID/アーティファクトIDの文字種を検証し、不正な文字によるURLインジェクションを防止する
+- npm/Composer は semver の prerelease (`-...`) と build metadata (`+...`) を同時に含むバージョン（例: `^1.2.3-rc.1+build123`）も正しくパースする

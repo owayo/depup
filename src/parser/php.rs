@@ -17,32 +17,41 @@ use std::sync::LazyLock;
 pub struct PhpVersionParser;
 
 // PHP のバージョン指定用正規表現
+// Composer は semver の prerelease (`-...`) と build metadata (`+...`) の同時指定を許可する
+// (例: `1.2.3-rc.1+build123`)
 
 // Caret: ^1.2.3
-static CARET_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\^\s*(v?\d+(?:\.\d+){0,2}(?:[-+][\w.-]+)?)$").unwrap());
+static CARET_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\^\s*(v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
+});
 
 // Tilde: ~1.2.3
-static TILDE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^~\s*(v?\d+(?:\.\d+){0,2}(?:[-+][\w.-]+)?)$").unwrap());
+static TILDE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^~\s*(v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
+});
 
 // 以上: >=1.2.3
-static GTE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^>=\s*(v?\d+(?:\.\d+){0,2}(?:[-+][\w.-]+)?)$").unwrap());
+static GTE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^>=\s*(v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
+});
 
 // より大きい: >1.2.3
-static GT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^>\s*(v?\d+(?:\.\d+){0,2}(?:[-+][\w.-]+)?)$").unwrap());
+static GT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^>\s*(v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
+});
 
 // 以下: <=1.2.3
-static LTE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^<=\s*(v?\d+(?:\.\d+){0,2}(?:[-+][\w.-]+)?)$").unwrap());
+static LTE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^<=\s*(v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
+});
 
 // より小さい: <1.2.3
-static LT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^<\s*(v?\d+(?:\.\d+){0,2}(?:[-+][\w.-]+)?)$").unwrap());
-static NOT_EQUAL_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^!=\s*(v?\d+(?:\.\d+){0,2}(?:[-+][\w.-]+)?)$").unwrap());
+static LT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^<\s*(v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
+});
+static NOT_EQUAL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^!=\s*(v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
+});
 
 // ワイルドカード: 1.2.*, 1.x, *
 static WILDCARD_RE: LazyLock<Regex> =
@@ -50,7 +59,7 @@ static WILDCARD_RE: LazyLock<Regex> =
 
 // 固定バージョン: 1.2.3
 static BARE_VERSION_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(v?\d+(?:\.\d+){0,2}(?:[-+][\w.-]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^(v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap());
 
 // 複合制約用パターン
 static COMPOUND_OR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\|\|?").unwrap());
@@ -65,7 +74,7 @@ static COMPOUND_SPACE_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 static COMPOUND_COMMA_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r",").unwrap());
 static VERSION_TOKEN_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"v?\d+(?:\.\d+){0,2}(?:[-+][\w.-]+)?").unwrap());
+    LazyLock::new(|| Regex::new(r"v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?").unwrap());
 
 fn normalize_version(version: &str) -> String {
     version.strip_prefix('v').unwrap_or(version).to_string()
@@ -516,6 +525,28 @@ mod tests {
         let spec = parse("^1.2.3-beta.1").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Caret);
         assert_eq!(spec.version, "1.2.3-beta.1");
+    }
+
+    #[test]
+    fn test_parse_caret_with_prerelease_and_build() {
+        // semver の prerelease + build metadata 両方を含むケース
+        let spec = parse("^1.2.3-rc.1+build123").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Caret);
+        assert_eq!(spec.version, "1.2.3-rc.1+build123");
+    }
+
+    #[test]
+    fn test_parse_exact_with_prerelease_and_build() {
+        let spec = parse("1.2.3-beta.1+build").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "1.2.3-beta.1+build");
+    }
+
+    #[test]
+    fn test_parse_gte_with_prerelease_and_build() {
+        let spec = parse(">=1.2.3-alpha.1+meta").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::GreaterOrEqual);
+        assert_eq!(spec.version, "1.2.3-alpha.1+meta");
     }
 
     #[test]

@@ -450,7 +450,7 @@ impl TextFormatter {
         }
 
         let mut result: Vec<_> = counts.into_iter().collect();
-        result.sort_by(|a, b| b.1.cmp(&a.1)); // カウント降順でソート
+        result.sort_by_key(|item| std::cmp::Reverse(item.1)); // カウント降順でソート
         result
     }
 
@@ -566,7 +566,7 @@ impl TextFormatter {
                 (reason, count, packages)
             })
             .collect();
-        result.sort_by(|a, b| b.1.cmp(&a.1)); // カウント降順でソート
+        result.sort_by_key(|item| std::cmp::Reverse(item.1)); // カウント降順でソート
         result
     }
 }

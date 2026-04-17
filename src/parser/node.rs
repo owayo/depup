@@ -42,26 +42,35 @@ fn normalize_version(version: &str) -> String {
 
 // Node.js のバージョン指定用正規表現
 // ^2 や ~2.1 のような部分指定も受け付ける
-static CARET_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\^\s*(v?\d+(?:\.\d+){0,2}(?:[-+][\w.-]+)?)$").unwrap());
-static TILDE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^~\s*(v?\d+(?:\.\d+){0,2}(?:[-+][\w.-]+)?)$").unwrap());
-static GTE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^>=\s*(v?\d+(?:\.\d+){0,2}(?:[-+][\w.-]+)?)$").unwrap());
-static GT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^>\s*(v?\d+(?:\.\d+){0,2}(?:[-+][\w.-]+)?)$").unwrap());
-static LTE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^<=\s*(v?\d+(?:\.\d+){0,2}(?:[-+][\w.-]+)?)$").unwrap());
-static LT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^<\s*(v?\d+(?:\.\d+){0,2}(?:[-+][\w.-]+)?)$").unwrap());
-static EQUAL_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^=\s*(v?\d+(?:\.\d+){0,2}(?:[-+][\w.-]+)?)$").unwrap());
+// node-semver の prerelease (`-...`) と build metadata (`+...`) は同時に出現することがある
+// (例: `1.2.3-rc.1+build123`)
+static CARET_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\^\s*(v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
+});
+static TILDE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^~\s*(v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
+});
+static GTE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^>=\s*(v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
+});
+static GT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^>\s*(v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
+});
+static LTE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^<=\s*(v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
+});
+static LT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^<\s*(v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
+});
+static EQUAL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^=\s*(v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
+});
 static EXACT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(v?\d+(?:\.\d+){0,2}(?:[-+][\w.-]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^(v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap());
 static WILDCARD_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(?:v?(?:\d+|[xX*])(?:\.(?:\d+|[xX*])){0,2}|\*)$").unwrap());
 static RANGE_TOKEN_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"v?\d+(?:\.\d+){0,2}(?:[-+][\w.-]+)?").unwrap());
+    LazyLock::new(|| Regex::new(r"v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?").unwrap());
 static TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^(?:latest|next|canary|beta|alpha|rc|stable|experimental)$").unwrap()
 });
@@ -578,6 +587,43 @@ mod tests {
         let spec = parse("^1.0.0+build").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Caret);
         assert_eq!(spec.version, "1.0.0+build");
+    }
+
+    #[test]
+    fn test_parse_caret_with_prerelease_and_build() {
+        // node-semver では prerelease + build metadata の組み合わせも有効
+        let spec = parse("^1.2.3-rc.1+build123").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Caret);
+        assert_eq!(spec.version, "1.2.3-rc.1+build123");
+    }
+
+    #[test]
+    fn test_parse_exact_with_prerelease_and_build() {
+        // prerelease + build metadata 同時指定の固定バージョン
+        let spec = parse("1.2.3-beta.1+build").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "1.2.3-beta.1+build");
+    }
+
+    #[test]
+    fn test_parse_gte_with_prerelease_and_build() {
+        let spec = parse(">=1.2.3-alpha.1+meta").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::GreaterOrEqual);
+        assert_eq!(spec.version, "1.2.3-alpha.1+meta");
+    }
+
+    #[test]
+    fn test_parse_tilde_with_prerelease_and_build() {
+        let spec = parse("~1.2.3-rc.1+build").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Tilde);
+        assert_eq!(spec.version, "1.2.3-rc.1+build");
+    }
+
+    #[test]
+    fn test_format_updated_caret_prerelease_and_build_to_stable() {
+        // prerelease+build から安定版への更新が正しく書き出される
+        let spec = parse("^1.2.3-rc.1+build123").unwrap();
+        assert_eq!(spec.format_updated("1.2.3"), "^1.2.3");
     }
 
     #[test]
