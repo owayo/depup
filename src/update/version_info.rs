@@ -42,6 +42,10 @@ impl VersionInfo {
 }
 
 /// チェック対象のプレリリース識別子
+///
+/// 安定版として扱わない suffix を列挙する。semver の prerelease マーカーに加え、
+/// `-deprecated` / `-yanked` のように作者が「更新非推奨」を示すためにリリース末尾へ
+/// 付けるマーカーも除外対象に含める (例: `serde_yaml 0.9.34-deprecated`)。
 const PRERELEASE_IDENTIFIERS: &[&str] = &[
     "alpha",
     "beta",
@@ -55,6 +59,12 @@ const PRERELEASE_IDENTIFIERS: &[&str] = &[
     "pre",
     "insiders",
     "experimental",
+    // 非推奨マーカー (crates.io などで作者が自発的に付与)
+    "deprecated",
+    "obsolete",
+    "retired",
+    "yanked",
+    "unmaintained",
 ];
 
 /// セパレータ (`-`, `.`, `+`, 文字列境界) で区切られた単語としてマッチするかチェックする。
@@ -656,9 +666,8 @@ mod tests {
     #[test]
     fn test_is_prerelease_word_boundary_regression() {
         // Bug回帰テスト: 部分文字列マッチによる誤検出が修正されている
-        // これらは "pre" を部分文字列として含むが、プレリリースではない
+        // "enterprise" は "pre" を部分文字列として含むがプレリリースではない
         assert!(!is_prerelease_version("1.0.0-enterprise"));
-        assert!(!is_prerelease_version("1.0.0-deprecated"));
         // これらは正しくプレリリースと判定される
         assert!(is_prerelease_version("1.0.0-pre"));
         assert!(is_prerelease_version("1.0.0-pre.1"));
@@ -668,5 +677,19 @@ mod tests {
         assert!(is_prerelease_version("1.0.0-dev"));
         assert!(is_prerelease_version("1.0.0-dev.1"));
         assert!(is_prerelease_version("1.0.0-dev0"));
+    }
+
+    #[test]
+    fn test_is_prerelease_deprecation_markers() {
+        // 作者が「更新非推奨」を示すために付けたマーカーは prerelease 扱いで
+        // デフォルト更新対象から外す (例: `serde_yaml 0.9.34-deprecated`)
+        assert!(is_prerelease_version("0.9.34-deprecated"));
+        assert!(is_prerelease_version("1.0.0-DEPRECATED"));
+        assert!(is_prerelease_version("1.0.0-obsolete"));
+        assert!(is_prerelease_version("1.0.0-retired"));
+        assert!(is_prerelease_version("1.0.0-yanked"));
+        assert!(is_prerelease_version("1.0.0-unmaintained"));
+        // 単語境界チェック: "deprecated" を部分文字列として含む別の語は除外しない
+        assert!(!is_prerelease_version("1.0.0-undeprecated"));
     }
 }
