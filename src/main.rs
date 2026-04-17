@@ -107,6 +107,12 @@ async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
     // dry-run でない場合、要求があればパッケージマネージャの install を実行
     if args.install && !args.dry_run {
         run_package_installs(&args, &result, &monorepo_dirs)?;
+
+        // --age と --install が同時指定された場合、Rust の transitive 依存も
+        // age 制約を満たすよう Cargo.lock を整える。
+        if let Some(age) = args.age {
+            enforce_rust_lock_age(&args, &orchestrator, &result, &monorepo_dirs, age).await;
+        }
     }
 
     // 適切な終了コードを返す
@@ -183,6 +189,104 @@ fn run_package_installs(
     }
 
     Ok(())
+}
+
+/// Rust プロジェクト (Cargo.toml を含む) ディレクトリに対し、
+/// `--age` を transitive 依存にも適用する。install 済み Cargo.lock を走査し、
+/// age 違反の依存を `cargo update -p --precise` で古いバージョンへ差し戻す。
+async fn enforce_rust_lock_age(
+    args: &CliArgs,
+    orchestrator: &Orchestrator,
+    result: &OrchestratorResult,
+    monorepo_dirs: &Option<Vec<PathBuf>>,
+    age: std::time::Duration,
+) {
+    use depup::orchestrator::LockAgeStatus;
+
+    // 対象となる Rust プロジェクトディレクトリを収集
+    let mut rust_dirs: Vec<PathBuf> = Vec::new();
+    for manifest in &result.summary.manifests {
+        if manifest.language != Language::Rust {
+            continue;
+        }
+        let Some(parent) = manifest.path.parent() else {
+            continue;
+        };
+        let working_dir = if let Some(dirs) = monorepo_dirs {
+            dirs.iter()
+                .find(|d| manifest.path.starts_with(d))
+                .cloned()
+                .unwrap_or_else(|| parent.to_path_buf())
+        } else {
+            parent.to_path_buf()
+        };
+        if !rust_dirs.contains(&working_dir) {
+            rust_dirs.push(working_dir);
+        }
+    }
+
+    if rust_dirs.is_empty() {
+        return;
+    }
+
+    if args.verbose {
+        eprintln!();
+        eprintln!("Enforcing --age on transitive Rust dependencies...");
+    }
+
+    for dir in &rust_dirs {
+        let adjustments = orchestrator.enforce_lock_age_rust(dir, age).await;
+        if adjustments.is_empty() {
+            if args.verbose {
+                eprintln!("  {} — all transitive deps within --age", dir.display());
+            }
+            continue;
+        }
+
+        let downgraded: Vec<_> = adjustments
+            .iter()
+            .filter(|a| matches!(a.status, LockAgeStatus::Downgraded))
+            .collect();
+        let failures: Vec<_> = adjustments
+            .iter()
+            .filter(|a| !matches!(a.status, LockAgeStatus::Downgraded))
+            .collect();
+
+        if !downgraded.is_empty() {
+            eprintln!(
+                "  {} — {} transitive dep(s) rolled back to satisfy --age:",
+                dir.display(),
+                downgraded.len()
+            );
+            for adj in &downgraded {
+                eprintln!(
+                    "    {} {} → {}",
+                    adj.name,
+                    adj.from,
+                    adj.to.as_deref().unwrap_or("?")
+                );
+            }
+        }
+
+        if !failures.is_empty() && args.verbose {
+            eprintln!(
+                "  {} — {} transitive dep(s) could not be rolled back:",
+                dir.display(),
+                failures.len()
+            );
+            for adj in &failures {
+                let detail = match &adj.status {
+                    LockAgeStatus::NoOlderCandidate => "no older candidate".to_string(),
+                    LockAgeStatus::ReleaseDateUnavailable => "release date unavailable".to_string(),
+                    LockAgeStatus::UpdateCommandFailed(msg) => {
+                        format!("cargo update failed: {msg}")
+                    }
+                    LockAgeStatus::Downgraded => unreachable!(),
+                };
+                eprintln!("    {} ({}): {}", adj.name, adj.from, detail);
+            }
+        }
+    }
 }
 
 /// 結果からディレクトリ -> install が必要な言語のマップを構築する

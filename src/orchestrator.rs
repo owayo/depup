@@ -14,7 +14,7 @@ use crate::domain::{
 };
 use crate::manifest::{
     ManifestInfo, ManifestWriter, PnpmSettings, WriteResult, detect_manifests, get_parser,
-    has_pnpm_workspace, read_git_entries,
+    has_pnpm_workspace, read_git_entries, read_registry_entries,
 };
 use crate::progress::Progress;
 use crate::registry::{
@@ -25,7 +25,9 @@ use crate::tauri_sync::{TAURI_CRATE, TAURI_NPM_PACKAGES, TauriVersionSync};
 use crate::update::{UpdateFilter, UpdateJudge, VersionInfo, compare_versions};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore};
 
 /// レジストリリクエストのデフォルト同時実行数
@@ -132,6 +134,90 @@ impl Orchestrator {
     pub fn with_cache(mut self, cache: VersionCache) -> Self {
         self.version_cache = cache;
         self
+    }
+
+    /// Rust プロジェクトの Cargo.lock を走査し、`--age` を満たさない
+    /// transitive 依存を検出して `cargo update -p --precise <older_version>` で差し戻す。
+    ///
+    /// 典型的な用途: `depup --age 2w --install` 実行時、`cargo update` が
+    /// semver 解決で 2 週間以内にリリースされた transitive 依存を引き込んでしまう場合に
+    /// それらを age 境界以前の最新バージョンへ戻す。
+    ///
+    /// 戻り値: 調整が試行された依存のリスト (Downgraded / 候補なし / コマンド失敗)
+    pub async fn enforce_lock_age_rust(
+        &self,
+        project_dir: &Path,
+        min_age: Duration,
+    ) -> Vec<LockAgeAdjustment> {
+        let lock_path = project_dir.join("Cargo.lock");
+        let entries = read_registry_entries(&lock_path);
+        if entries.is_empty() {
+            return Vec::new();
+        }
+
+        let Ok(chrono_duration) = chrono::Duration::from_std(min_age) else {
+            return Vec::new();
+        };
+        let cutoff = chrono::Utc::now() - chrono_duration;
+
+        let adapter = CratesIoAdapter::new(self.client.clone());
+        let mut adjustments: Vec<LockAgeAdjustment> = Vec::new();
+
+        for (name, versions) in &entries {
+            let all_versions = match self.fetch_versions(&adapter, name).await {
+                Ok(v) => v,
+                Err(_) => {
+                    for v in versions {
+                        adjustments.push(LockAgeAdjustment {
+                            name: name.clone(),
+                            from: v.clone(),
+                            to: None,
+                            status: LockAgeStatus::ReleaseDateUnavailable,
+                        });
+                    }
+                    continue;
+                }
+            };
+
+            for current in versions {
+                let Some(current_info) = all_versions
+                    .iter()
+                    .find(|v| compare_versions(&v.version, current) == std::cmp::Ordering::Equal)
+                else {
+                    continue;
+                };
+
+                if current_info.released_at <= cutoff {
+                    // age 内 (十分に古い) なのでそのまま
+                    continue;
+                }
+
+                // age 違反: 現在バージョン未満 (下方) かつ cutoff 以前の最新を探す
+                let Some(target) = pick_older_within_age(&all_versions, current, cutoff) else {
+                    adjustments.push(LockAgeAdjustment {
+                        name: name.clone(),
+                        from: current.clone(),
+                        to: None,
+                        status: LockAgeStatus::NoOlderCandidate,
+                    });
+                    continue;
+                };
+
+                let status = run_cargo_update_precise(project_dir, name, &target);
+                let adjust_to = match &status {
+                    LockAgeStatus::Downgraded => Some(target.clone()),
+                    _ => None,
+                };
+                adjustments.push(LockAgeAdjustment {
+                    name: name.clone(),
+                    from: current.clone(),
+                    to: adjust_to,
+                    status,
+                });
+            }
+        }
+
+        adjustments
     }
 
     /// git 依存の判定を実行する
@@ -676,6 +762,32 @@ impl Orchestrator {
     }
 }
 
+/// `enforce_lock_age_rust` が 1 件の依存に対して実施した調整内容
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockAgeAdjustment {
+    /// 対象パッケージ名
+    pub name: String,
+    /// Cargo.lock 上で解決されていたバージョン
+    pub from: String,
+    /// `cargo update -p --precise` で差し戻したバージョン (Ok のみ)
+    pub to: Option<String>,
+    /// `cargo update -p --precise` の実行結果 (Ok / Err の stderr)
+    pub status: LockAgeStatus,
+}
+
+/// `enforce_lock_age_rust` の 1 件分ステータス
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LockAgeStatus {
+    /// 違反バージョンを `cargo update -p --precise` で差し戻した
+    Downgraded,
+    /// age 内の代替バージョンが見つからずスキップ (全バージョンが新しい等)
+    NoOlderCandidate,
+    /// `cargo update -p --precise` がエラーを返した (resolver 制約違反など)
+    UpdateCommandFailed(String),
+    /// レジストリからの release 日取得に失敗
+    ReleaseDateUnavailable,
+}
+
 /// オーケストレータの設定
 #[derive(Debug, Clone)]
 pub struct OrchestratorConfig {
@@ -691,6 +803,56 @@ impl Default for OrchestratorConfig {
             general_concurrency: DEFAULT_CONCURRENCY,
             crates_io_concurrency: CRATES_IO_CONCURRENCY,
         }
+    }
+}
+
+/// 現在の lock バージョンより古く、かつ cutoff 以前にリリースされた
+/// 候補の中から semver 最新のものを選ぶ。
+/// プレリリースは除外する。
+fn pick_older_within_age(
+    available: &[VersionInfo],
+    current: &str,
+    cutoff: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    let mut best: Option<&VersionInfo> = None;
+    for v in available {
+        if v.is_prerelease() {
+            continue;
+        }
+        if v.released_at > cutoff {
+            continue;
+        }
+        // 現在の lock バージョンと同じもしくはそれより新しいものは対象外
+        if compare_versions(&v.version, current) != std::cmp::Ordering::Less {
+            continue;
+        }
+        best = match best {
+            None => Some(v),
+            Some(b) => {
+                if compare_versions(&v.version, &b.version) == std::cmp::Ordering::Greater {
+                    Some(v)
+                } else {
+                    Some(b)
+                }
+            }
+        };
+    }
+    best.map(|v| v.version.clone())
+}
+
+/// `cargo update -p <name> --precise <version>` を実行する。
+/// resolver 制約違反など失敗ケースでは stderr を保持した `UpdateCommandFailed` を返す。
+fn run_cargo_update_precise(project_dir: &Path, name: &str, version: &str) -> LockAgeStatus {
+    match Command::new("cargo")
+        .args(["update", "-p", name, "--precise", version])
+        .current_dir(project_dir)
+        .output()
+    {
+        Ok(output) if output.status.success() => LockAgeStatus::Downgraded,
+        Ok(output) => LockAgeStatus::UpdateCommandFailed(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ),
+        Err(e) => LockAgeStatus::UpdateCommandFailed(e.to_string()),
     }
 }
 
@@ -815,6 +977,81 @@ mod git_helper_tests {
         // 現在 commit 不明でも更新として扱う (lock 未生成時に lock 生成を誘発)
         let result = compare_and_update_commit(&dep, "newsha", None);
         assert!(result.is_update());
+    }
+
+    fn version_at(version: &str, days_ago: i64) -> VersionInfo {
+        VersionInfo::new(
+            version,
+            chrono::Utc::now() - chrono::Duration::days(days_ago),
+        )
+    }
+
+    #[test]
+    fn test_pick_older_within_age_basic() {
+        // age cutoff = 14 日前。現在 lock = 1.5.0 (3 日前) は age 違反。
+        // 1.4.9 (30 日前) が最新の「古くて age 内」候補。
+        let versions = vec![
+            version_at("1.4.0", 100),
+            version_at("1.4.5", 60),
+            version_at("1.4.9", 30),
+            version_at("1.5.0", 3), // age 違反の現在 lock
+            version_at("1.6.0", 1), // 新しすぎる
+        ];
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(14);
+        assert_eq!(
+            pick_older_within_age(&versions, "1.5.0", cutoff).as_deref(),
+            Some("1.4.9"),
+        );
+    }
+
+    #[test]
+    fn test_pick_older_within_age_returns_none_when_all_newer() {
+        // 全候補が age 違反または現バージョン以上
+        let versions = vec![version_at("1.5.0", 3), version_at("1.6.0", 1)];
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(14);
+        assert!(pick_older_within_age(&versions, "1.5.0", cutoff).is_none());
+    }
+
+    #[test]
+    fn test_pick_older_within_age_skips_prereleases() {
+        // プレリリースは候補から除外
+        let versions = vec![
+            version_at("1.4.9", 30),
+            version_at("1.5.0-beta.1", 60), // プレリリースなので除外
+            version_at("1.5.0", 3),
+        ];
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(14);
+        assert_eq!(
+            pick_older_within_age(&versions, "1.5.0", cutoff).as_deref(),
+            Some("1.4.9"),
+        );
+    }
+
+    #[test]
+    fn test_pick_older_within_age_picks_latest_eligible() {
+        // 複数の age 内候補があれば semver 最大を選ぶ
+        let versions = vec![
+            version_at("1.3.0", 200),
+            version_at("1.4.0", 100),
+            version_at("1.4.9", 30),
+            version_at("2.0.0", 5), // 新しすぎる
+        ];
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(14);
+        assert_eq!(
+            pick_older_within_age(&versions, "2.0.0", cutoff).as_deref(),
+            Some("1.4.9"),
+        );
+    }
+
+    #[test]
+    fn test_pick_older_within_age_ignores_same_version() {
+        // current と同じバージョンは候補外 (downgrade できない)
+        let versions = vec![version_at("1.4.0", 30), version_at("1.5.0", 3)];
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(14);
+        assert_eq!(
+            pick_older_within_age(&versions, "1.5.0", cutoff).as_deref(),
+            Some("1.4.0"),
+        );
     }
 }
 

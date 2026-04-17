@@ -19,7 +19,10 @@ mod pnpm_settings;
 mod pyproject_toml;
 mod writer;
 
-pub use cargo_lock::{GitLockEntry, parse_git_entries, read_git_entries};
+pub use cargo_lock::{
+    GitLockEntry, RegistryLockEntries, parse_git_entries, parse_registry_entries, read_git_entries,
+    read_registry_entries,
+};
 pub use cargo_toml::CargoTomlParser;
 pub use composer_json::ComposerJsonParser;
 pub use detector::{ManifestFile, ManifestInfo, detect_manifests};

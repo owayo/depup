@@ -143,3 +143,4 @@ make help                # Makefileヘルプ
 - npm/Composer は semver の prerelease (`-...`) と build metadata (`+...`) を同時に含むバージョン（例: `^1.2.3-rc.1+build123`）も正しくパースする
 - Rust (Cargo) の git 依存 (`{ git = "...", branch/tag/rev = "..." }` / 省略形) を検出し、`git ls-remote` でリモート HEAD / タグを取得して更新判定する。branch / 省略形 (デフォルトブランチ) は最新コミットへ更新 (Cargo.toml は書き換えず、Cargo.lock を `--install` の `cargo update` で再解決)、tag は最新 semver タグへ更新 (Cargo.toml の tag 文字列を書き換え)、rev は常にスキップ (pinned 扱い)
 - Cargo.lock の git source 末尾 `#<hash>` から現在コミットハッシュを抽出し、`git ls-remote` の結果と比較して差分があれば更新として扱う
+- `--age` と `--install` を同時指定した Rust プロジェクトでは、`cargo update` 後に Cargo.lock を走査して transitive 依存にも age 制約を適用する。cutoff より新しいバージョンで解決された依存は `cargo update -p <name> --precise <older_version>` で age 内の最新 stable バージョンへ差し戻す。resolver 制約違反で差し戻し不可の場合は verbose でスキップ理由を表示して続行する

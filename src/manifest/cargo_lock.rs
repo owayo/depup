@@ -32,6 +32,59 @@ pub fn read_git_entries(path: &Path) -> HashMap<String, GitLockEntry> {
     parse_git_entries(&content)
 }
 
+/// Cargo.lock の registry 依存エントリ (name -> [resolved versions])
+///
+/// 1 パッケージ名につき複数の異なるバージョンが lock されているケース
+/// (依存ツリー内で同一クレートの別バージョンが共存する場合) に備え、
+/// バージョンの Vec を保持する。
+pub type RegistryLockEntries = HashMap<String, Vec<String>>;
+
+/// 指定された `Cargo.lock` パスから registry 依存をすべて読み込む
+pub fn read_registry_entries(path: &Path) -> RegistryLockEntries {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+    parse_registry_entries(&content)
+}
+
+/// `Cargo.lock` 文字列から registry 依存をすべて抽出する。
+/// registry source でないエントリ (git, path 依存) は除外する。
+pub fn parse_registry_entries(content: &str) -> RegistryLockEntries {
+    let mut result: RegistryLockEntries = HashMap::new();
+    let Ok(toml) = toml::from_str::<Value>(content) else {
+        return result;
+    };
+
+    let Some(packages) = toml.get("package").and_then(|v| v.as_array()) else {
+        return result;
+    };
+
+    for pkg in packages {
+        let Some(name) = pkg.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(version) = pkg.get("version").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(source) = pkg.get("source").and_then(|v| v.as_str()) else {
+            // source 無しは path 依存 (ワークスペースメンバー含む) なのでスキップ
+            continue;
+        };
+        if !source.starts_with("registry+") {
+            // git+ / sparse+ 以外は除外。ただし sparse+ (crates.io 新プロトコル) は許容。
+            if !source.starts_with("sparse+") {
+                continue;
+            }
+        }
+        result
+            .entry(name.to_string())
+            .or_default()
+            .push(version.to_string());
+    }
+
+    result
+}
+
 /// `Cargo.lock` 文字列から git 依存を抽出する
 pub fn parse_git_entries(content: &str) -> HashMap<String, GitLockEntry> {
     let mut result = HashMap::new();
@@ -175,5 +228,62 @@ source = "git+https://github.com/foo/bar.git?tag=v1.0#00000000000000000000000000
     fn test_parse_git_entries_missing_package_array() {
         let entries = parse_git_entries("version = 3\n");
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_parse_registry_entries_basic() {
+        let content = r#"
+version = 3
+
+[[package]]
+name = "serde"
+version = "1.0.210"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "tokio"
+version = "1.40.0"
+source = "sparse+https://index.crates.io/"
+
+[[package]]
+name = "tree-sitter-xojo"
+version = "0.1.0"
+source = "git+https://github.com/owayo/tree-sitter-xojo.git?branch=main#045c52a6db5390da14d96c0e4804a6208552dc8f"
+
+[[package]]
+name = "local-crate"
+version = "0.1.0"
+# path dependency, no source
+"#;
+        let entries = parse_registry_entries(content);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.get("serde").unwrap(), &vec!["1.0.210".to_string()]);
+        assert_eq!(entries.get("tokio").unwrap(), &vec!["1.40.0".to_string()]);
+        // git 依存は除外される
+        assert!(!entries.contains_key("tree-sitter-xojo"));
+        // path 依存も除外される
+        assert!(!entries.contains_key("local-crate"));
+    }
+
+    #[test]
+    fn test_parse_registry_entries_multiple_versions() {
+        // 同一 crate の別バージョンが lock されるケース (依存ツリー解決の結果)
+        let content = r#"
+[[package]]
+name = "syn"
+version = "1.0.109"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "syn"
+version = "2.0.77"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+"#;
+        let entries = parse_registry_entries(content);
+        assert_eq!(entries.len(), 1);
+        let versions = entries.get("syn").unwrap();
+        assert_eq!(versions.len(), 2);
+        assert!(versions.contains(&"1.0.109".to_string()));
+        assert!(versions.contains(&"2.0.77".to_string()));
     }
 }
