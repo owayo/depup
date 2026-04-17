@@ -3,10 +3,12 @@
 //! このモジュールが提供する機能:
 //! - インストール済みパッケージマネージャの検出
 //! - 各言語のインストールコマンドの実行
+//! - `--age` 指定時の transitive 依存 age 制約注入 (対応 PM のみ)
 
 use crate::domain::Language;
 use std::path::Path;
 use std::process::{Command, Output};
+use std::time::Duration;
 
 /// パッケージマネージャのインストール結果
 #[derive(Debug, Clone)]
@@ -60,8 +62,17 @@ impl InstallResult {
 
 /// パッケージマネージャのインストールコマンドを実行するトレイト
 pub trait PackageManagerRunner {
-    /// 指定されたディレクトリで言語のインストールコマンドを実行する
-    fn run_install(&self, language: Language, working_dir: &Path) -> InstallResult;
+    /// 指定されたディレクトリで言語のインストールコマンドを実行する。
+    ///
+    /// `min_age` が `Some` の場合、対応する PM には transitive 依存にも age 制約が
+    /// 効くようなオプションを注入する (例: pnpm の `--config.minimumReleaseAge`)。
+    /// 非対応 PM では無視される。
+    fn run_install(
+        &self,
+        language: Language,
+        working_dir: &Path,
+        min_age: Option<Duration>,
+    ) -> InstallResult;
 }
 
 /// 実際のコマンドを実行するデフォルトのパッケージマネージャランナー
@@ -127,6 +138,39 @@ impl SystemPackageManager {
         working_dir.join("src-tauri/Cargo.toml").exists()
     }
 
+    /// パッケージマネージャのインストールコマンドを取得する (引数付き形式)
+    ///
+    /// `min_age` が指定されていれば、各 PM の transitive 依存 age フィルタに変換する:
+    /// - pnpm: `--config.minimumReleaseAge=<分>`
+    /// - uv: `--exclude-newer <RFC3339 datetime>`
+    /// - 他 PM (npm/yarn/bun/pip/poetry/cargo/go/bundle/composer/gradle/swift):
+    ///   ネイティブ age 機能が無いためフラグを追加しない (direct deps のみ age 制御される)。
+    fn get_install_command_args(&self, pm: &str, min_age: Option<Duration>) -> Vec<String> {
+        let base: Vec<&'static str> = self.get_install_command(pm);
+        let mut out: Vec<String> = base.into_iter().map(String::from).collect();
+        if let Some(age) = min_age {
+            match pm {
+                "pnpm" => {
+                    // pnpm v9+: `--config.<key>=<value>` で npmrc 設定を上書き。
+                    // `minimumReleaseAge` は分単位。
+                    let minutes = age.as_secs() / 60;
+                    out.push(format!("--config.minimumReleaseAge={}", minutes));
+                }
+                "uv" => {
+                    // uv: `--exclude-newer <RFC3339>` で指定日時以降にリリースされた
+                    // バージョンを resolve から除外する (transitive 含む)。
+                    if let Ok(chrono_dur) = chrono::Duration::from_std(age) {
+                        let cutoff = chrono::Utc::now() - chrono_dur;
+                        out.push("--exclude-newer".to_string());
+                        out.push(cutoff.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
     /// パッケージマネージャのインストールコマンドを取得する
     fn get_install_command(&self, pm: &str) -> Vec<&'static str> {
         match pm {
@@ -175,7 +219,12 @@ impl SystemPackageManager {
 }
 
 impl PackageManagerRunner for SystemPackageManager {
-    fn run_install(&self, language: Language, working_dir: &Path) -> InstallResult {
+    fn run_install(
+        &self,
+        language: Language,
+        working_dir: &Path,
+        min_age: Option<Duration>,
+    ) -> InstallResult {
         // Tauri プロジェクトの Rust では src-tauri ディレクトリを使用
         let (effective_dir, pm) = match language {
             Language::Node => (working_dir.to_path_buf(), self.detect_node_pm(working_dir)),
@@ -244,14 +293,15 @@ impl PackageManagerRunner for SystemPackageManager {
             return InstallResult::skipped(language);
         };
 
-        let command_parts = self.get_install_command(pm);
+        let command_parts = self.get_install_command_args(pm, min_age);
         if command_parts.is_empty() {
             return InstallResult::skipped(language);
         }
 
         let command_str = command_parts.join(" ");
+        let command_refs: Vec<&str> = command_parts.iter().map(|s| s.as_str()).collect();
 
-        match self.run_command(&command_parts, &effective_dir) {
+        match self.run_command(&command_refs, &effective_dir) {
             Ok(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout).to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -277,10 +327,11 @@ pub fn run_installs<R: PackageManagerRunner>(
     runner: &R,
     languages: &[Language],
     working_dir: &Path,
+    min_age: Option<Duration>,
 ) -> Vec<InstallResult> {
     languages
         .iter()
-        .map(|lang| runner.run_install(*lang, working_dir))
+        .map(|lang| runner.run_install(*lang, working_dir, min_age))
         .collect()
 }
 
@@ -300,7 +351,12 @@ mod tests {
     }
 
     impl PackageManagerRunner for MockPackageManager {
-        fn run_install(&self, language: Language, _working_dir: &Path) -> InstallResult {
+        fn run_install(
+            &self,
+            language: Language,
+            _working_dir: &Path,
+            _min_age: Option<Duration>,
+        ) -> InstallResult {
             if self.should_succeed {
                 InstallResult::success(
                     language,
@@ -354,14 +410,14 @@ mod tests {
     #[test]
     fn test_mock_package_manager_success() {
         let runner = MockPackageManager::new(true);
-        let result = runner.run_install(Language::Node, Path::new("."));
+        let result = runner.run_install(Language::Node, Path::new("."), None);
         assert!(result.success);
     }
 
     #[test]
     fn test_mock_package_manager_failure() {
         let runner = MockPackageManager::new(false);
-        let result = runner.run_install(Language::Node, Path::new("."));
+        let result = runner.run_install(Language::Node, Path::new("."), None);
         assert!(!result.success);
     }
 
@@ -369,7 +425,7 @@ mod tests {
     fn test_run_installs() {
         let runner = MockPackageManager::new(true);
         let languages = vec![Language::Node, Language::Python];
-        let results = run_installs(&runner, &languages, Path::new("."));
+        let results = run_installs(&runner, &languages, Path::new("."), None);
 
         assert_eq!(results.len(), 2);
         assert!(results[0].success);
@@ -450,6 +506,57 @@ mod tests {
         let pm = SystemPackageManager::new();
         let cmd = pm.get_install_command("unknown");
         assert!(cmd.is_empty());
+    }
+
+    #[test]
+    fn test_get_install_command_args_pnpm_with_age() {
+        let pm = SystemPackageManager::new();
+        // 2 週間 = 20160 分
+        let age = Duration::from_secs(14 * 24 * 60 * 60);
+        let cmd = pm.get_install_command_args("pnpm", Some(age));
+        assert_eq!(
+            cmd,
+            vec![
+                "pnpm".to_string(),
+                "install".to_string(),
+                "--config.minimumReleaseAge=20160".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_get_install_command_args_pnpm_without_age() {
+        let pm = SystemPackageManager::new();
+        let cmd = pm.get_install_command_args("pnpm", None);
+        assert_eq!(cmd, vec!["pnpm".to_string(), "install".to_string()]);
+    }
+
+    #[test]
+    fn test_get_install_command_args_uv_with_age_has_exclude_newer() {
+        let pm = SystemPackageManager::new();
+        let age = Duration::from_secs(14 * 24 * 60 * 60);
+        let cmd = pm.get_install_command_args("uv", Some(age));
+        assert!(cmd.contains(&"--exclude-newer".to_string()));
+        // RFC3339 形式: 末尾に `Z` が付く
+        assert!(cmd.last().unwrap().ends_with('Z'));
+    }
+
+    #[test]
+    fn test_get_install_command_args_npm_ignores_age() {
+        // npm はネイティブ age サポートがないため age フラグは付かない
+        let pm = SystemPackageManager::new();
+        let age = Duration::from_secs(14 * 24 * 60 * 60);
+        let cmd = pm.get_install_command_args("npm", Some(age));
+        assert_eq!(cmd, vec!["npm".to_string(), "install".to_string()]);
+    }
+
+    #[test]
+    fn test_get_install_command_args_cargo_ignores_age() {
+        // cargo はネイティブ age サポートがない (post-install audit で対応)
+        let pm = SystemPackageManager::new();
+        let age = Duration::from_secs(14 * 24 * 60 * 60);
+        let cmd = pm.get_install_command_args("cargo", Some(age));
+        assert_eq!(cmd, vec!["cargo".to_string(), "update".to_string()]);
     }
 
     #[test]
@@ -546,7 +653,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let pm = SystemPackageManager::new();
 
-        let result = pm.run_install(Language::Node, temp_dir.path());
+        let result = pm.run_install(Language::Node, temp_dir.path(), None);
         assert!(result.success);
         assert!(result.command.is_empty());
     }
@@ -652,7 +759,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let pm = SystemPackageManager::new();
 
-        let result = pm.run_install(Language::Ruby, temp_dir.path());
+        let result = pm.run_install(Language::Ruby, temp_dir.path(), None);
         assert!(result.success);
         assert!(result.command.is_empty()); // スキップ
     }
@@ -662,7 +769,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let pm = SystemPackageManager::new();
 
-        let result = pm.run_install(Language::Php, temp_dir.path());
+        let result = pm.run_install(Language::Php, temp_dir.path(), None);
         assert!(result.success);
         assert!(result.command.is_empty()); // スキップ
     }
@@ -672,7 +779,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let pm = SystemPackageManager::new();
 
-        let result = pm.run_install(Language::Java, temp_dir.path());
+        let result = pm.run_install(Language::Java, temp_dir.path(), None);
         assert!(result.success);
         assert!(result.command.is_empty()); // スキップ
     }
@@ -682,7 +789,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let pm = SystemPackageManager::new();
 
-        let result = pm.run_install(Language::Go, temp_dir.path());
+        let result = pm.run_install(Language::Go, temp_dir.path(), None);
         assert!(result.success);
         assert!(result.command.is_empty()); // スキップ
     }

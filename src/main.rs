@@ -147,13 +147,45 @@ fn run_package_installs(
     if args.verbose {
         eprintln!();
         eprintln!("Running package manager install...");
+        if args.age.is_some() {
+            // age が指定されている場合、ネイティブ対応 PM とそうでないものを通知する
+            let mut unsupported: Vec<&str> = Vec::new();
+            for (_dir, langs) in &install_map {
+                for lang in langs {
+                    match lang {
+                        Language::Node => {
+                            // Node.js は pnpm のみネイティブ対応 (install 時に判定)
+                        }
+                        Language::Python => {
+                            // Python は uv のみネイティブ対応
+                        }
+                        Language::Rust => {
+                            // Rust は post-install audit (enforce_lock_age_rust) で対応
+                        }
+                        Language::Go => unsupported.push("Go"),
+                        Language::Ruby => unsupported.push("Ruby"),
+                        Language::Php => unsupported.push("PHP"),
+                        Language::Java => unsupported.push("Java"),
+                        Language::Swift => unsupported.push("Swift"),
+                    }
+                }
+            }
+            unsupported.sort();
+            unsupported.dedup();
+            if !unsupported.is_empty() {
+                eprintln!(
+                    "  Note: --age applies to direct deps only for: {} (no native transitive-age support)",
+                    unsupported.join(", ")
+                );
+            }
+        }
     }
 
     let pm_runner = SystemPackageManager::new();
     let mut any_install_failed = false;
 
     for (dir, languages) in &install_map {
-        let install_results = run_installs(&pm_runner, languages, dir);
+        let install_results = run_installs(&pm_runner, languages, dir, args.age);
 
         for install_result in &install_results {
             if install_result.command.is_empty() {
