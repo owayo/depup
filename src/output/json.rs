@@ -4,7 +4,9 @@
 //! - 更新結果の JSON シリアライズ
 //! - ファイルごとの構造化された更新/スキップ情報
 
-use crate::domain::{Language, ManifestUpdateResult, SkipReason, UpdateResult, UpdateSummary};
+use crate::domain::{
+    GitReference, Language, ManifestUpdateResult, SkipReason, UpdateResult, UpdateSummary,
+};
 use crate::orchestrator::OrchestratorResult;
 use crate::output::{OutputFormatter, Verbosity};
 use serde::Serialize;
@@ -79,12 +81,52 @@ struct JsonManifest {
 struct JsonUpdate {
     /// パッケージ名
     name: String,
+    /// 種別: `registry` または `git`
+    kind: &'static str,
     /// 旧バージョン
     from: String,
     /// 新バージョン
     to: String,
     /// 開発依存かどうか
     dev: bool,
+    /// git 依存の場合のリポジトリ URL
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    /// git 依存の場合の参照情報 (type/value)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reference: Option<JsonGitReference>,
+}
+
+/// git 参照の JSON 表現 (branch/tag/rev/default_branch)
+#[derive(Serialize)]
+struct JsonGitReference {
+    #[serde(rename = "type")]
+    ref_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<String>,
+}
+
+impl JsonGitReference {
+    fn from_reference(reference: &GitReference) -> Self {
+        match reference {
+            GitReference::Branch(b) => Self {
+                ref_type: "branch",
+                value: Some(b.clone()),
+            },
+            GitReference::Tag(t) => Self {
+                ref_type: "tag",
+                value: Some(t.clone()),
+            },
+            GitReference::Rev(r) => Self {
+                ref_type: "rev",
+                value: Some(r.clone()),
+            },
+            GitReference::DefaultBranch => Self {
+                ref_type: "default_branch",
+                value: None,
+            },
+        }
+    }
 }
 
 /// スキップの JSON 表現
@@ -127,12 +169,31 @@ impl JsonFormatter {
                     ..
                 } = result
                 {
-                    Some(JsonUpdate {
-                        name: dependency.name.clone(),
-                        from: dependency.version_spec.version.clone(),
-                        to: new_version.clone(),
-                        dev: dependency.is_dev,
-                    })
+                    if let Some(git) = &dependency.git_source {
+                        let from = match &git.reference {
+                            GitReference::Tag(t) => t.clone(),
+                            _ => git.current_commit.clone().unwrap_or_default(),
+                        };
+                        Some(JsonUpdate {
+                            name: dependency.name.clone(),
+                            kind: "git",
+                            from,
+                            to: new_version.clone(),
+                            dev: dependency.is_dev,
+                            source: Some(git.url.clone()),
+                            reference: Some(JsonGitReference::from_reference(&git.reference)),
+                        })
+                    } else {
+                        Some(JsonUpdate {
+                            name: dependency.name.clone(),
+                            kind: "registry",
+                            from: dependency.version_spec.version.clone(),
+                            to: new_version.clone(),
+                            dev: dependency.is_dev,
+                            source: None,
+                            reference: None,
+                        })
+                    }
                 } else {
                     None
                 }

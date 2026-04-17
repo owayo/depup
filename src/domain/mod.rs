@@ -8,12 +8,14 @@
 //! - サマリと結果の構造体
 
 mod dependency;
+mod git_source;
 mod language;
 mod summary;
 mod update_result;
 mod version_spec;
 
 pub use dependency::Dependency;
+pub use git_source::{GitReference, GitSource};
 pub use language::Language;
 pub use summary::{ManifestUpdateResult, UpdateSummary};
 pub use update_result::{SkipReason, UpdateResult};

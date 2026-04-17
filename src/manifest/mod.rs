@@ -6,6 +6,7 @@
 //! - モノレポ構造のサポート (pnpm-workspace.yaml)
 //! - Tauri プロジェクトのサポート (src-tauri/Cargo.toml)
 
+mod cargo_lock;
 mod cargo_toml;
 mod composer_json;
 mod detector;
@@ -18,6 +19,7 @@ mod pnpm_settings;
 mod pyproject_toml;
 mod writer;
 
+pub use cargo_lock::{GitLockEntry, parse_git_entries, read_git_entries};
 pub use cargo_toml::CargoTomlParser;
 pub use composer_json::ComposerJsonParser;
 pub use detector::{ManifestFile, ManifestInfo, detect_manifests};
@@ -49,6 +51,17 @@ pub trait ManifestParser {
         package: &str,
         new_version: &str,
     ) -> Result<String, ManifestError>;
+
+    /// git 依存の tag 値を更新する。デフォルトは no-op (対応しない言語向け)。
+    /// tag 以外の参照 (branch/rev/default) はマニフェストを書き換えないため呼び出し不要。
+    fn update_git_tag(
+        &self,
+        content: &str,
+        _package: &str,
+        _new_tag: &str,
+    ) -> Result<String, ManifestError> {
+        Ok(content.to_string())
+    }
 }
 
 /// 指定された言語に対応するマニフェストパーサを取得する

@@ -7,7 +7,10 @@
 //! - スキップされたパッケージの理由表示
 //! - 詳細な内訳付きサマリ
 
-use crate::domain::{Language, ManifestUpdateResult, SkipReason, UpdateResult, UpdateSummary};
+use crate::domain::{
+    GitReference, GitSource, Language, ManifestUpdateResult, SkipReason, UpdateResult,
+    UpdateSummary,
+};
 use crate::orchestrator::OrchestratorResult;
 use crate::output::{OutputFormatter, Verbosity};
 use chrono::{DateTime, Utc};
@@ -252,6 +255,56 @@ impl TextFormatter {
         }
     }
 
+    /// git 依存の更新行をフォーマットする
+    /// 例: `  tree-sitter-xojo  branch=main  f41817b3 → 045c52a6  [git]`
+    fn format_git_update_line(
+        &self,
+        name: &str,
+        git: &GitSource,
+        new_version: &str,
+        is_dev: bool,
+        max_name_len: usize,
+        writer: &mut dyn Write,
+    ) -> std::io::Result<()> {
+        let ref_label = git.reference.display_name();
+        let (old_display, new_display) = match &git.reference {
+            GitReference::Tag(current) => (current.clone(), new_version.to_string()),
+            _ => {
+                let old_short = git
+                    .short_current_commit()
+                    .unwrap_or_else(|| "-".to_string());
+                let new_short: String = new_version.chars().take(8).collect();
+                (old_short, new_short)
+            }
+        };
+        let dev_marker = if is_dev { " 🔧" } else { "" };
+        if self.color {
+            let name_display = format!("{:width$}", name, width = max_name_len);
+            writeln!(
+                writer,
+                "  {} {} {} {} {} {}{}",
+                name_display,
+                ref_label.cyan(),
+                old_display.dimmed(),
+                "→".dimmed(),
+                new_display.bright_white().bold(),
+                "[git]".dimmed(),
+                dev_marker.dimmed()
+            )
+        } else {
+            writeln!(
+                writer,
+                "  {:width$} {} {} -> {} [git]{}",
+                name,
+                ref_label,
+                old_display,
+                new_display,
+                dev_marker,
+                width = max_name_len
+            )
+        }
+    }
+
     /// グループ化した更新でマニフェストをフォーマット
     fn format_manifest_grouped(
         &self,
@@ -341,6 +394,18 @@ impl TextFormatter {
                     ..
                 } = result
                 {
+                    // git 依存は専用フォーマットで表示
+                    if let Some(git) = &dependency.git_source {
+                        self.format_git_update_line(
+                            &dependency.name,
+                            git,
+                            new_version,
+                            false,
+                            max_name_len,
+                            writer,
+                        )?;
+                        continue;
+                    }
                     // バージョンなしの依存には "-" を表示
                     let old_version = if dependency.version_spec.version.is_empty() {
                         "-"
@@ -371,6 +436,17 @@ impl TextFormatter {
                     ..
                 } = result
                 {
+                    if let Some(git) = &dependency.git_source {
+                        self.format_git_update_line(
+                            &dependency.name,
+                            git,
+                            new_version,
+                            true,
+                            max_name_len,
+                            writer,
+                        )?;
+                        continue;
+                    }
                     // バージョンなしの依存には "-" を表示
                     let old_version = if dependency.version_spec.version.is_empty() {
                         "-"

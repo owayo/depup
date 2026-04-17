@@ -1638,3 +1638,134 @@ dependencies {
         assert_eq!(pkg_c.version_spec.version, "3.0");
     }
 }
+
+mod git_dependency_support {
+    use super::*;
+    use depup::domain::{GitReference, Language};
+    use depup::manifest::{
+        CargoTomlParser, ManifestParser, detect_manifests, parse_git_entries, read_git_entries,
+    };
+
+    /// Cargo.toml に宣言された 4 種類の git 依存 (branch/tag/rev/省略形) を
+    /// すべてパースできることを確認する。
+    #[test]
+    fn test_parse_cargo_toml_mixed_git_dependencies() {
+        let content = r#"[package]
+name = "test"
+version = "0.1.0"
+
+[dependencies]
+regular = "1.0"
+with-branch = { git = "https://github.com/owner/with-branch.git", branch = "main" }
+with-tag = { git = "https://github.com/owner/with-tag.git", tag = "v1.2.3" }
+with-rev = { git = "https://github.com/owner/with-rev.git", rev = "abc1234" }
+default-ref = { git = "https://github.com/owner/default-ref.git" }
+"#;
+        let deps = CargoTomlParser.parse(content).unwrap();
+        assert_eq!(deps.len(), 5);
+
+        let regular = deps.iter().find(|d| d.name == "regular").unwrap();
+        assert!(regular.git_source.is_none());
+
+        let branch = deps.iter().find(|d| d.name == "with-branch").unwrap();
+        let b_git = branch.git_source.as_ref().unwrap();
+        assert_eq!(b_git.reference, GitReference::Branch("main".to_string()));
+        assert!(!branch.is_pinned());
+
+        let tag = deps.iter().find(|d| d.name == "with-tag").unwrap();
+        let t_git = tag.git_source.as_ref().unwrap();
+        assert_eq!(t_git.reference, GitReference::Tag("v1.2.3".to_string()));
+        assert!(!tag.is_pinned());
+
+        let rev = deps.iter().find(|d| d.name == "with-rev").unwrap();
+        let r_git = rev.git_source.as_ref().unwrap();
+        assert_eq!(r_git.reference, GitReference::Rev("abc1234".to_string()));
+        assert!(rev.is_pinned());
+
+        let default = deps.iter().find(|d| d.name == "default-ref").unwrap();
+        let d_git = default.git_source.as_ref().unwrap();
+        assert_eq!(d_git.reference, GitReference::DefaultBranch);
+        assert!(!default.is_pinned());
+    }
+
+    /// Cargo.lock から git 依存の現在コミットハッシュを抽出できることを確認する。
+    #[test]
+    fn test_cargo_lock_extracts_git_commits() {
+        let temp_dir = create_test_dir();
+        let lock_content = r#"version = 3
+
+[[package]]
+name = "registry-dep"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "tree-sitter-xojo"
+version = "0.1.0"
+source = "git+https://github.com/owayo/tree-sitter-xojo.git?branch=main#045c52a6db5390da14d96c0e4804a6208552dc8f"
+"#;
+        let lock_path = temp_dir.path().join("Cargo.lock");
+        fs::write(&lock_path, lock_content).unwrap();
+
+        let entries = read_git_entries(&lock_path);
+        assert_eq!(entries.len(), 1);
+        let xojo = entries.get("tree-sitter-xojo").unwrap();
+        assert_eq!(xojo.url, "https://github.com/owayo/tree-sitter-xojo.git");
+        assert_eq!(xojo.commit, "045c52a6db5390da14d96c0e4804a6208552dc8f");
+    }
+
+    /// Cargo.toml の tag 指定を新バージョンに書き換えられることを確認する。
+    #[test]
+    fn test_cargo_toml_tag_update_round_trip() {
+        let original = r#"[dependencies]
+bar = { git = "https://github.com/owner/bar.git", tag = "v1.2.3", features = ["async"] }
+serde = "1.0"
+"#;
+        let updated = CargoTomlParser
+            .update_git_tag(original, "bar", "v2.0.0")
+            .unwrap();
+        assert!(updated.contains(r#"tag = "v2.0.0""#));
+        // 他のフィールドが保持される
+        assert!(updated.contains(r#"features = ["async"]"#));
+        assert!(updated.contains(r#"serde = "1.0""#));
+    }
+
+    /// パースした Cargo.lock 文字列から直接 git 依存情報を抽出できる (ファイル I/O なし)
+    #[test]
+    fn test_parse_git_entries_from_string() {
+        let content = r#"[[package]]
+name = "foo"
+version = "0.1.0"
+source = "git+https://example.com/foo.git?tag=v1.0.0#1234567890abcdef1234567890abcdef12345678"
+"#;
+        let entries = parse_git_entries(content);
+        assert_eq!(entries.len(), 1);
+        let foo = entries.get("foo").unwrap();
+        assert_eq!(foo.url, "https://example.com/foo.git");
+    }
+
+    /// 通常マニフェスト検出パイプラインでも、git 依存を含む Cargo.toml が
+    /// 問題なく検出・パースされることを確認する。
+    #[test]
+    fn test_detect_and_parse_git_dependencies() {
+        let temp_dir = create_test_dir();
+        let cargo_toml = r#"[package]
+name = "example"
+version = "0.1.0"
+
+[dependencies]
+tree-sitter-xojo = { git = "https://github.com/owayo/tree-sitter-xojo.git", branch = "main" }
+"#;
+        fs::write(temp_dir.path().join("Cargo.toml"), cargo_toml).unwrap();
+
+        let manifests = detect_manifests(temp_dir.path());
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(manifests[0].language, Language::Rust);
+
+        let content = fs::read_to_string(&manifests[0].path).unwrap();
+        let deps = CargoTomlParser.parse(&content).unwrap();
+        assert_eq!(deps.len(), 1);
+        let git = deps[0].git_source.as_ref().unwrap();
+        assert_eq!(git.reference, GitReference::Branch("main".to_string()));
+    }
+}

@@ -1,6 +1,6 @@
 //! 依存関係情報の構造体
 
-use super::{Language, VersionSpec};
+use super::{GitSource, Language, VersionSpec};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -18,6 +18,9 @@ pub struct Dependency {
     /// バージョンが変数で定義されている場合のオプション変数名 (例: Gradle の def/val)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub variable_name: Option<String>,
+    /// git 依存 (Cargo.toml の `{ git = "..." }` など) の場合に設定される
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_source: Option<GitSource>,
 }
 
 impl Dependency {
@@ -34,6 +37,7 @@ impl Dependency {
             is_dev,
             language,
             variable_name: None,
+            git_source: None,
         }
     }
 
@@ -41,6 +45,17 @@ impl Dependency {
     pub fn with_variable(mut self, var_name: impl Into<String>) -> Self {
         self.variable_name = Some(var_name.into());
         self
+    }
+
+    /// この依存関係に git ソースを設定する (ビルダーパターン)
+    pub fn with_git_source(mut self, git_source: GitSource) -> Self {
+        self.git_source = Some(git_source);
+        self
+    }
+
+    /// git 依存かどうかを返す
+    pub fn is_git(&self) -> bool {
+        self.git_source.is_some()
     }
 
     /// 新しい本番依存関係を作成する
@@ -62,7 +77,13 @@ impl Dependency {
     }
 
     /// この依存関係がピン留めされているかどうかを返す
+    ///
+    /// git 依存の場合は `rev = "..."` 指定のみ pinned と判定する。
+    /// branch/tag/省略形はデフォルトで更新対象。
     pub fn is_pinned(&self) -> bool {
+        if let Some(git) = &self.git_source {
+            return git.reference.is_pinned();
+        }
         self.version_spec.is_pinned()
     }
 

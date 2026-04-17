@@ -8,20 +8,23 @@
 //! - 部分的な継続を伴うエラーハンドリング
 
 use crate::cli::CliArgs;
-use crate::domain::{Language, ManifestUpdateResult, SkipReason, UpdateResult, UpdateSummary};
+use crate::domain::{
+    Dependency, GitReference, Language, ManifestUpdateResult, SkipReason, UpdateResult,
+    UpdateSummary,
+};
 use crate::manifest::{
     ManifestInfo, ManifestWriter, PnpmSettings, WriteResult, detect_manifests, get_parser,
-    has_pnpm_workspace,
+    has_pnpm_workspace, read_git_entries,
 };
 use crate::progress::Progress;
 use crate::registry::{
-    CratesIoAdapter, GitHubTagsAdapter, GoProxyAdapter, HttpClient, MavenCentralAdapter,
+    CratesIoAdapter, GitHubTagsAdapter, GitRemote, GoProxyAdapter, HttpClient, MavenCentralAdapter,
     NpmAdapter, PackagistAdapter, PyPIAdapter, RegistryAdapter, RubyGemsAdapter,
 };
 use crate::tauri_sync::{TAURI_CRATE, TAURI_NPM_PACKAGES, TauriVersionSync};
-use crate::update::{UpdateFilter, UpdateJudge, VersionInfo};
+use crate::update::{UpdateFilter, UpdateJudge, VersionInfo, compare_versions};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
 
@@ -46,6 +49,8 @@ pub struct Orchestrator {
     crates_io_semaphore: Arc<Semaphore>,
     /// ディレクトリ間で共有されるバージョンキャッシュ
     version_cache: VersionCache,
+    /// URL 単位でキャッシュされる git ls-remote クライアント
+    git_remote: GitRemote,
 }
 
 /// オーケストレータの実行結果
@@ -107,6 +112,7 @@ impl Orchestrator {
             general_semaphore: Arc::new(Semaphore::new(DEFAULT_CONCURRENCY)),
             crates_io_semaphore: Arc::new(Semaphore::new(CRATES_IO_CONCURRENCY)),
             version_cache: Arc::new(Mutex::new(HashMap::new())),
+            git_remote: GitRemote::new(),
         })
     }
 
@@ -118,6 +124,7 @@ impl Orchestrator {
             general_semaphore: Arc::new(Semaphore::new(DEFAULT_CONCURRENCY)),
             crates_io_semaphore: Arc::new(Semaphore::new(CRATES_IO_CONCURRENCY)),
             version_cache: Arc::new(Mutex::new(HashMap::new())),
+            git_remote: GitRemote::new(),
         }
     }
 
@@ -125,6 +132,63 @@ impl Orchestrator {
     pub fn with_cache(mut self, cache: VersionCache) -> Self {
         self.version_cache = cache;
         self
+    }
+
+    /// git 依存の判定を実行する
+    ///
+    /// - branch / DefaultBranch: リモート HEAD/ブランチ commit と現在 commit を比較し、新しければ更新
+    /// - tag: リモートの全タグから最新 semver を選び、現在の tag より新しければ更新
+    /// - rev: `--include-pinned` が指定された場合のみ、デフォルトブランチ HEAD へ更新
+    async fn judge_git_dependency(&self, dep: &Dependency) -> UpdateResult {
+        let Some(git) = dep.git_source.as_ref() else {
+            return UpdateResult::skip(
+                dep.clone(),
+                SkipReason::ParseError("missing git source".to_string()),
+            );
+        };
+
+        let refs = match self.git_remote.fetch(&git.url).await {
+            Ok(refs) => refs,
+            Err(e) => {
+                return UpdateResult::skip_fetch_failed(dep.clone(), e.to_string());
+            }
+        };
+
+        match &git.reference {
+            GitReference::Branch(branch) => {
+                let Some(latest) = refs.branch_commit(branch) else {
+                    return UpdateResult::skip(
+                        dep.clone(),
+                        SkipReason::FetchFailed(format!("branch '{}' not found on remote", branch)),
+                    );
+                };
+                compare_and_update_commit(dep, latest, git.current_commit.as_deref())
+            }
+            GitReference::DefaultBranch => {
+                let Some(latest) = refs.head_commit() else {
+                    return UpdateResult::skip(
+                        dep.clone(),
+                        SkipReason::FetchFailed("remote HEAD not found".to_string()),
+                    );
+                };
+                compare_and_update_commit(dep, latest, git.current_commit.as_deref())
+            }
+            GitReference::Rev(_) => {
+                // rev 固定は Cargo.toml の rev 書き換えが必要なため現時点では常にスキップ。
+                // --include-pinned 指定時もサポート対象外 (情報提供のみ別経路で検討)。
+                UpdateResult::skip_pinned(dep.clone())
+            }
+            GitReference::Tag(current_tag) => {
+                let tags = refs.all_tag_names();
+                let Some(latest_tag) = latest_semver_tag(&tags) else {
+                    return UpdateResult::skip(dep.clone(), SkipReason::NoSuitableVersion);
+                };
+                if compare_versions(&latest_tag, current_tag) != std::cmp::Ordering::Greater {
+                    return UpdateResult::skip_already_latest(dep.clone());
+                }
+                UpdateResult::update(dep.clone(), latest_tag)
+            }
+        }
     }
 
     /// 更新ワークフローを実行する
@@ -207,7 +271,7 @@ impl Orchestrator {
                 }
             };
 
-            let dependencies = match parser.parse(&content) {
+            let mut dependencies = match parser.parse(&content) {
                 Ok(deps) => deps,
                 Err(e) => {
                     errors.push(OrchestratorError::ManifestParseError {
@@ -217,6 +281,11 @@ impl Orchestrator {
                     continue;
                 }
             };
+
+            // Rust プロジェクトでは Cargo.lock から git 依存の現在コミットを補完する
+            if manifest_info.language == Language::Rust {
+                enrich_with_cargo_lock(&manifest_info.path, &mut dependencies);
+            }
 
             parsed_manifests.push((manifest_info, dependencies));
         }
@@ -239,6 +308,14 @@ impl Orchestrator {
                 // この依存関係を早期スキップすべきかチェック
                 if let Some(reason) = judge.should_skip(&dep) {
                     manifest_result.add_result(UpdateResult::skip(dep, reason));
+                    progress.inc();
+                    continue;
+                }
+
+                // git 依存は専用ロジックで判定する (レジストリ API を使わない)
+                if dep.is_git() {
+                    let result = self.judge_git_dependency(&dep).await;
+                    manifest_result.add_result(result);
                     progress.inc();
                     continue;
                 }
@@ -614,6 +691,130 @@ impl Default for OrchestratorConfig {
             general_concurrency: DEFAULT_CONCURRENCY,
             crates_io_concurrency: CRATES_IO_CONCURRENCY,
         }
+    }
+}
+
+/// Cargo.toml と同じディレクトリの Cargo.lock を読み込み、
+/// git 依存の `current_commit` をセットする。
+fn enrich_with_cargo_lock(cargo_toml_path: &Path, dependencies: &mut [Dependency]) {
+    let Some(dir) = cargo_toml_path.parent() else {
+        return;
+    };
+    let lock_path = dir.join("Cargo.lock");
+    let git_entries = read_git_entries(&lock_path);
+    if git_entries.is_empty() {
+        return;
+    }
+    for dep in dependencies.iter_mut() {
+        if let Some(git) = dep.git_source.as_mut()
+            && let Some(entry) = git_entries.get(&dep.name)
+        {
+            git.current_commit = Some(entry.commit.clone());
+        }
+    }
+}
+
+/// リモート commit と現在 commit を比較し、差分があれば更新結果を作る
+fn compare_and_update_commit(
+    dep: &Dependency,
+    latest_commit: &str,
+    current_commit: Option<&str>,
+) -> UpdateResult {
+    match current_commit {
+        Some(current) if current == latest_commit => UpdateResult::skip_already_latest(dep.clone()),
+        _ => UpdateResult::update(dep.clone(), latest_commit.to_string()),
+    }
+}
+
+/// 指定されたタグ群から最新の semver 互換タグを選ぶ。
+/// プレリリースは除外する。
+fn latest_semver_tag(tags: &[String]) -> Option<String> {
+    let stable: Vec<&String> = tags
+        .iter()
+        .filter(|t| !crate::update::is_prerelease_version(t))
+        .filter(|t| {
+            // 少なくとも 1 つは数字を含むバージョンらしい文字列のみ許容
+            t.chars().any(|c| c.is_ascii_digit())
+        })
+        .collect();
+    if stable.is_empty() {
+        return None;
+    }
+    let mut latest: &String = stable[0];
+    for tag in stable.iter().skip(1) {
+        if compare_versions(tag, latest) == std::cmp::Ordering::Greater {
+            latest = tag;
+        }
+    }
+    Some(latest.clone())
+}
+
+#[cfg(test)]
+mod git_helper_tests {
+    use super::*;
+    use crate::domain::{GitReference, GitSource, VersionSpec, VersionSpecKind};
+
+    fn git_dep(name: &str, reference: GitReference) -> Dependency {
+        let spec = VersionSpec::new(VersionSpecKind::Exact, "main", "main");
+        let dep = Dependency::new(name, spec, false, Language::Rust);
+        dep.with_git_source(GitSource::new("https://example.com/r.git", reference))
+    }
+
+    #[test]
+    fn test_latest_semver_tag_basic() {
+        let tags = vec![
+            "v0.1.0".to_string(),
+            "v1.2.3".to_string(),
+            "v1.2.4".to_string(),
+        ];
+        assert_eq!(latest_semver_tag(&tags), Some("v1.2.4".to_string()));
+    }
+
+    #[test]
+    fn test_latest_semver_tag_filters_prereleases() {
+        let tags = vec![
+            "v1.0.0".to_string(),
+            "v1.1.0-beta.1".to_string(),
+            "v1.0.5".to_string(),
+        ];
+        // プレリリースは除外、v1.0.5 が最新
+        assert_eq!(latest_semver_tag(&tags), Some("v1.0.5".to_string()));
+    }
+
+    #[test]
+    fn test_latest_semver_tag_empty() {
+        assert_eq!(latest_semver_tag(&[]), None);
+    }
+
+    #[test]
+    fn test_latest_semver_tag_all_prereleases() {
+        let tags = vec!["v1.0.0-alpha".to_string(), "v1.0.0-beta".to_string()];
+        assert_eq!(latest_semver_tag(&tags), None);
+    }
+
+    #[test]
+    fn test_compare_and_update_commit_new() {
+        let dep = git_dep("foo", GitReference::Branch("main".to_string()));
+        let result = compare_and_update_commit(&dep, "new_sha_0000000000000000", Some("old_sha"));
+        assert!(result.is_update());
+        if let UpdateResult::Update { new_version, .. } = result {
+            assert_eq!(new_version, "new_sha_0000000000000000");
+        }
+    }
+
+    #[test]
+    fn test_compare_and_update_commit_same() {
+        let dep = git_dep("foo", GitReference::Branch("main".to_string()));
+        let result = compare_and_update_commit(&dep, "abc", Some("abc"));
+        assert!(result.is_skip());
+    }
+
+    #[test]
+    fn test_compare_and_update_commit_no_current() {
+        let dep = git_dep("foo", GitReference::DefaultBranch);
+        // 現在 commit 不明でも更新として扱う (lock 未生成時に lock 生成を誘発)
+        let result = compare_and_update_commit(&dep, "newsha", None);
+        assert!(result.is_update());
     }
 }
 

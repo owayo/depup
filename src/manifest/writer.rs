@@ -6,7 +6,7 @@
 //! - 更新時の書式保持
 //! - 失敗時も継続できるエラーハンドリング
 
-use crate::domain::{Language, ManifestUpdateResult, UpdateResult};
+use crate::domain::{GitReference, Language, ManifestUpdateResult, UpdateResult};
 use crate::error::ManifestError;
 use crate::manifest::ManifestParser;
 use std::fs;
@@ -97,6 +97,32 @@ impl ManifestWriter {
                 ..
             } = update
             {
+                // git 依存の場合は参照種別で挙動が変わる。
+                //   - tag: マニフェストの tag 文字列を書き換える
+                //   - branch/default/rev: マニフェストを書き換えない
+                //     (Cargo.lock 側で commit hash が更新されるのを待つ)
+                if let Some(git) = &dependency.git_source {
+                    if let GitReference::Tag(_) = &git.reference {
+                        match parser.update_git_tag(&current_content, &dependency.name, new_version)
+                        {
+                            Ok(updated_content) => {
+                                if updated_content != current_content {
+                                    current_content = updated_content;
+                                    result.updates_applied += 1;
+                                }
+                            }
+                            Err(e) => {
+                                result.updates_failed += 1;
+                                result.errors.push(format!(
+                                    "Failed to update git tag for {}: {}",
+                                    dependency.name, e
+                                ));
+                            }
+                        }
+                    }
+                    continue;
+                }
+
                 match parser.update_version(&current_content, &dependency.name, new_version) {
                     Ok(updated_content) => {
                         if updated_content != current_content {
@@ -175,7 +201,7 @@ pub fn write_manifest(path: &Path, content: &str) -> Result<(), ManifestError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Dependency, VersionSpec, VersionSpecKind};
+    use crate::domain::{Dependency, GitSource, VersionSpec, VersionSpecKind};
     use crate::manifest::ManifestParser;
     use std::io::Write;
     use tempfile::TempDir;
@@ -499,6 +525,75 @@ mod tests {
             ManifestError::WriteError { .. } => {}
             e => panic!("Expected WriteError, got: {:?}", e),
         }
+    }
+
+    #[test]
+    fn test_apply_updates_git_tag_updates_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let original_content = r#"[dependencies]
+my-crate = { git = "https://github.com/example/my-crate.git", tag = "v1.2.3" }
+"#;
+        let path = temp_dir.path().join("Cargo.toml");
+        fs::write(&path, original_content).unwrap();
+
+        // tag 指定の git 依存
+        let spec = VersionSpec::new(VersionSpecKind::Exact, "v1.2.3", "v1.2.3");
+        let dep = Dependency::new("my-crate", spec, false, Language::Rust).with_git_source(
+            GitSource::new(
+                "https://github.com/example/my-crate.git",
+                GitReference::Tag("v1.2.3".to_string()),
+            ),
+        );
+
+        let mut manifest_result = ManifestUpdateResult::new(&path, Language::Rust);
+        manifest_result.add_result(UpdateResult::update(dep, "v1.3.0"));
+
+        let writer = ManifestWriter::new(false);
+        let parser = crate::manifest::CargoTomlParser;
+        let result = writer.apply_updates(&manifest_result, &parser).unwrap();
+
+        assert_eq!(result.updates_applied, 1);
+        assert!(result.file_modified);
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains(r#"tag = "v1.3.0""#));
+        assert!(!content.contains(r#"tag = "v1.2.3""#));
+    }
+
+    #[test]
+    fn test_apply_updates_git_branch_does_not_modify_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let original_content = r#"[dependencies]
+my-crate = { git = "https://github.com/example/my-crate.git", branch = "main" }
+"#;
+        let path = temp_dir.path().join("Cargo.toml");
+        fs::write(&path, original_content).unwrap();
+
+        // branch 指定の git 依存
+        let spec = VersionSpec::new(VersionSpecKind::Exact, "main", "main");
+        let dep = Dependency::new("my-crate", spec, false, Language::Rust).with_git_source(
+            GitSource::new(
+                "https://github.com/example/my-crate.git",
+                GitReference::Branch("main".to_string()),
+            )
+            .with_current_commit("abc1234"),
+        );
+
+        let mut manifest_result = ManifestUpdateResult::new(&path, Language::Rust);
+        manifest_result.add_result(UpdateResult::update(dep, "def5678"));
+
+        let writer = ManifestWriter::new(false);
+        let parser = crate::manifest::CargoTomlParser;
+        let result = writer.apply_updates(&manifest_result, &parser).unwrap();
+
+        // branch 更新は Cargo.toml を書き換えない (Cargo.lock で反映される)
+        assert_eq!(result.updates_applied, 0);
+        assert!(!result.file_modified);
+        assert!(!result.has_errors());
+
+        // ファイル内容が元のままであることを確認
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(content, original_content);
     }
 
     #[test]

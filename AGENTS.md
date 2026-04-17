@@ -31,16 +31,18 @@ src/
   tauri_sync.rs    - Tauriバージョン同期
   domain/
     language.rs      - 対応言語enum (Node/Python/Rust/Go/Ruby/PHP/Java/Swift)
-    dependency.rs    - 依存関係構造体
+    dependency.rs    - 依存関係構造体 (Registry / Git 両対応)
+    git_source.rs    - Git 依存の情報型 (GitReference / GitSource)
     version_spec.rs  - バージョン指定種別 (Caret/Tilde/Range等)
     update_result.rs - 更新判定結果
     summary.rs       - 更新サマリ
   manifest/
     detector.rs      - マニフェストファイル検出
-    writer.rs        - マニフェストファイル書き込み
+    writer.rs        - マニフェストファイル書き込み (git tag 更新含む)
     package_json.rs  - Node.js パーサ
     pyproject_toml.rs - Python パーサ
-    cargo_toml.rs    - Rust パーサ
+    cargo_toml.rs    - Rust パーサ (git 依存検出対応)
+    cargo_lock.rs    - Cargo.lock から git 依存の現在 commit 抽出
     go_mod.rs        - Go パーサ
     gemfile.rs       - Ruby パーサ
     composer_json.rs - PHP パーサ
@@ -58,6 +60,7 @@ src/
     packagist.rs     - Packagist
     maven_central.rs - Maven Central
     github_tags.rs   - GitHub Tags (Swift)
+    git_remote.rs    - git ls-remote で branch/tag/HEAD を取得 (Rust git 依存向け)
   update/
     filter.rs        - フィルタ設定
     version_info.rs  - バージョン情報・比較
@@ -137,3 +140,5 @@ make help                # Makefileヘルプ
 - Go の `exclude` ディレクティブ（単一行・ブロック形式とも）はパースと更新の両方でスキップされる
 - Maven Central のクエリはグループID/アーティファクトIDの文字種を検証し、不正な文字によるURLインジェクションを防止する
 - npm/Composer は semver の prerelease (`-...`) と build metadata (`+...`) を同時に含むバージョン（例: `^1.2.3-rc.1+build123`）も正しくパースする
+- Rust (Cargo) の git 依存 (`{ git = "...", branch/tag/rev = "..." }` / 省略形) を検出し、`git ls-remote` でリモート HEAD / タグを取得して更新判定する。branch / 省略形 (デフォルトブランチ) は最新コミットへ更新 (Cargo.toml は書き換えず、Cargo.lock を `--install` の `cargo update` で再解決)、tag は最新 semver タグへ更新 (Cargo.toml の tag 文字列を書き換え)、rev は常にスキップ (pinned 扱い)
+- Cargo.lock の git source 末尾 `#<hash>` から現在コミットハッシュを抽出し、`git ls-remote` の結果と比較して差分があれば更新として扱う

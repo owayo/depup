@@ -8,7 +8,7 @@
 //! - inline table 形式: `{ version = "1.0" }`
 //! - workspace 依存関係
 
-use crate::domain::{Dependency, Language};
+use crate::domain::{Dependency, GitReference, GitSource, Language, VersionSpec, VersionSpecKind};
 use crate::error::ManifestError;
 use crate::manifest::ManifestParser;
 use crate::parser::{VersionParser, get_parser};
@@ -156,6 +156,54 @@ impl ManifestParser for CargoTomlParser {
             })
         }
     }
+
+    fn update_git_tag(
+        &self,
+        content: &str,
+        package: &str,
+        new_tag: &str,
+    ) -> Result<String, ManifestError> {
+        let mut result = content.to_string();
+        let mut updated = false;
+
+        // inline table: `package = { git = "...", tag = "v1.2.3", ... }`
+        //   行内の tag フィールドだけを差し替える
+        let inline_pattern = format!(
+            r#"(?m)^(\s*{})(\s*=\s*\{{[^{{}}]*\btag\s*=\s*")([^"]+)"#,
+            regex::escape(package)
+        );
+        if let Ok(re) = Regex::new(&inline_pattern)
+            && let Some(caps) = re.captures(&result)
+        {
+            let replacement = format!("{}{}{}", &caps[1], &caps[2], new_tag);
+            result = re.replace(&result, replacement.as_str()).to_string();
+            updated = true;
+        }
+
+        // 複数行テーブル: `[dependencies.package]` ブロック内の `tag = "..."` を差し替える
+        //   `[patch]` や `[workspace.dependencies]` にも対応する
+        let multiline_pattern = format!(
+            r#"(?m)(\[(?:dependencies|dev-dependencies|build-dependencies|workspace\.dependencies|patch\.[A-Za-z0-9_.-]+)\.{}[^\]]*\][^\[]*?\btag\s*=\s*)"([^"]+)""#,
+            regex::escape(package)
+        );
+        if let Ok(re) = Regex::new(&multiline_pattern)
+            && let Some(caps) = re.captures(&result)
+        {
+            let replacement = format!(r#"{}"{}""#, &caps[1], new_tag);
+            result = re.replace(&result, replacement.as_str()).to_string();
+            updated = true;
+        }
+
+        if updated {
+            Ok(result)
+        } else {
+            Err(ManifestError::InvalidVersionSpec {
+                path: PathBuf::from("Cargo.toml"),
+                spec: package.to_string(),
+                message: "git tag not found or could not be updated".to_string(),
+            })
+        }
+    }
 }
 
 fn parse_cargo_dependencies(
@@ -165,25 +213,75 @@ fn parse_cargo_dependencies(
     output: &mut Vec<Dependency>,
 ) {
     for (name, value) in deps {
-        let version_str = match value {
+        match value {
             // 単純な文字列: `package = "1.0.0"`
-            Value::String(s) => Some(s.clone()),
+            Value::String(s) => {
+                if let Some(spec) = parser.parse(s) {
+                    push_dependency(output, name, spec, is_dev, None);
+                }
+            }
             // inline table 形式: `package = { version = "1.0.0", features = [...] }`
-            Value::Table(t) => t.get("version").and_then(|v| v.as_str()).map(String::from),
-            _ => None,
-        };
-
-        if let Some(version_str) = version_str
-            && let Some(spec) = parser.parse(&version_str)
-        {
-            let dep = if is_dev {
-                Dependency::development(name.clone(), spec, Language::Rust)
-            } else {
-                Dependency::production(name.clone(), spec, Language::Rust)
-            };
-            output.push(dep);
+            Value::Table(t) => {
+                // git 依存の検出を先に試みる
+                if let Some(git_source) = try_parse_git_source(t) {
+                    let spec = git_reference_spec(&git_source.reference);
+                    push_dependency(output, name, spec, is_dev, Some(git_source));
+                    continue;
+                }
+                if let Some(version_str) = t.get("version").and_then(|v| v.as_str())
+                    && let Some(spec) = parser.parse(version_str)
+                {
+                    push_dependency(output, name, spec, is_dev, None);
+                }
+            }
+            _ => {}
         }
     }
+}
+
+fn push_dependency(
+    output: &mut Vec<Dependency>,
+    name: &str,
+    spec: VersionSpec,
+    is_dev: bool,
+    git_source: Option<GitSource>,
+) {
+    let mut dep = if is_dev {
+        Dependency::development(name.to_string(), spec, Language::Rust)
+    } else {
+        Dependency::production(name.to_string(), spec, Language::Rust)
+    };
+    if let Some(gs) = git_source {
+        dep = dep.with_git_source(gs);
+    }
+    output.push(dep);
+}
+
+/// inline table から git 依存を検出して `GitSource` を組み立てる
+fn try_parse_git_source(table: &toml::map::Map<String, Value>) -> Option<GitSource> {
+    let url = table.get("git").and_then(|v| v.as_str())?;
+    let reference = if let Some(branch) = table.get("branch").and_then(|v| v.as_str()) {
+        GitReference::Branch(branch.to_string())
+    } else if let Some(tag) = table.get("tag").and_then(|v| v.as_str()) {
+        GitReference::Tag(tag.to_string())
+    } else if let Some(rev) = table.get("rev").and_then(|v| v.as_str()) {
+        GitReference::Rev(rev.to_string())
+    } else {
+        GitReference::DefaultBranch
+    };
+    Some(GitSource::new(url, reference))
+}
+
+/// git 依存に対応する VersionSpec を組み立てる。
+/// raw/version は branch/tag/rev の表示名を保持する (更新判定・出力表示で利用)。
+fn git_reference_spec(reference: &GitReference) -> VersionSpec {
+    let display = match reference {
+        GitReference::Branch(_) | GitReference::Tag(_) | GitReference::Rev(_) => {
+            reference.raw_value().unwrap_or("").to_string()
+        }
+        GitReference::DefaultBranch => "HEAD".to_string(),
+    };
+    VersionSpec::new(VersionSpecKind::Exact, display.clone(), display)
 }
 
 #[cfg(test)]
@@ -322,15 +420,108 @@ version = "0.1.0"
     }
 
     #[test]
-    fn test_parse_git_dependency_skipped() {
+    fn test_parse_git_dependency_default_branch() {
         let content = r#"
 [dependencies]
 my-crate = { git = "https://github.com/example/my-crate" }
 "#;
 
         let deps = parse(content).unwrap();
-        // バージョンを持たない git 依存はスキップする
-        assert!(deps.is_empty());
+        assert_eq!(deps.len(), 1);
+        let dep = &deps[0];
+        assert_eq!(dep.name, "my-crate");
+        let git = dep.git_source.as_ref().unwrap();
+        assert_eq!(git.url, "https://github.com/example/my-crate");
+        assert_eq!(git.reference, GitReference::DefaultBranch);
+    }
+
+    #[test]
+    fn test_parse_git_dependency_branch() {
+        let content = r#"
+[dependencies]
+foo = { git = "https://github.com/owner/foo.git", branch = "main" }
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        let git = deps[0].git_source.as_ref().unwrap();
+        assert_eq!(git.url, "https://github.com/owner/foo.git");
+        assert_eq!(git.reference, GitReference::Branch("main".to_string()));
+    }
+
+    #[test]
+    fn test_parse_git_dependency_tag() {
+        let content = r#"
+[dependencies]
+bar = { git = "https://github.com/owner/bar.git", tag = "v1.2.3" }
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        let git = deps[0].git_source.as_ref().unwrap();
+        assert_eq!(git.reference, GitReference::Tag("v1.2.3".to_string()));
+        // tag 指定は is_pinned() = false (更新対象)
+        assert!(!deps[0].is_pinned());
+    }
+
+    #[test]
+    fn test_parse_git_dependency_rev_is_pinned() {
+        let content = r#"
+[dependencies]
+baz = { git = "https://github.com/owner/baz.git", rev = "abc1234" }
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        let git = deps[0].git_source.as_ref().unwrap();
+        assert_eq!(git.reference, GitReference::Rev("abc1234".to_string()));
+        // rev 指定は is_pinned() = true
+        assert!(deps[0].is_pinned());
+    }
+
+    #[test]
+    fn test_update_git_tag_inline_table() {
+        let content = r#"[dependencies]
+bar = { git = "https://github.com/owner/bar.git", tag = "v1.2.3" }
+serde = "1.0.0"
+"#;
+        let result = CargoTomlParser
+            .update_git_tag(content, "bar", "v1.3.0")
+            .unwrap();
+        assert!(result.contains(r#"tag = "v1.3.0""#));
+        assert!(!result.contains(r#"tag = "v1.2.3""#));
+        // 他の行が保持される
+        assert!(result.contains(r#"serde = "1.0.0""#));
+    }
+
+    #[test]
+    fn test_update_git_tag_multiline_table() {
+        let content = r#"[dependencies.bar]
+git = "https://github.com/owner/bar.git"
+tag = "v1.2.3"
+features = ["async"]
+"#;
+        let result = CargoTomlParser
+            .update_git_tag(content, "bar", "v1.3.0")
+            .unwrap();
+        assert!(result.contains(r#"tag = "v1.3.0""#));
+        assert!(result.contains(r#"features = ["async"]"#));
+    }
+
+    #[test]
+    fn test_update_git_tag_not_found() {
+        let content = r#"[dependencies]
+serde = "1.0.0"
+"#;
+        let result = CargoTomlParser.update_git_tag(content, "serde", "v1.3.0");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_update_version_ignores_git_dependency() {
+        // update_version は git 依存 (version 無し) を見つけられずエラーを返す
+        let content = r#"[dependencies]
+my-crate = { git = "https://github.com/example/my-crate", branch = "main" }
+"#;
+        let result = CargoTomlParser.update_version(content, "my-crate", "1.0.0");
+        assert!(result.is_err());
     }
 
     #[test]
