@@ -36,6 +36,12 @@ const DEFAULT_CONCURRENCY: usize = 10;
 /// crates.io 用の同時実行数 (レート制限あり)
 const CRATES_IO_CONCURRENCY: usize = 1;
 
+/// `enforce_lock_age_rust` の最大反復回数。
+/// 1 回の `cargo update -p --precise` は依存サブツリーを再解決するため、
+/// 差し戻しの結果として別の依存が新たに age 違反になるケースがある。
+/// 反復することで連鎖を解消するが、無限ループを避けるため上限を設ける。
+const MAX_ENFORCE_LOCK_AGE_PASSES: usize = 5;
+
 /// バージョン情報のキャッシュ (言語, パッケージ名) をキーとする
 pub type VersionCache = Arc<Mutex<HashMap<(Language, String), Vec<VersionInfo>>>>;
 
@@ -143,81 +149,110 @@ impl Orchestrator {
     /// semver 解決で 2 週間以内にリリースされた transitive 依存を引き込んでしまう場合に
     /// それらを age 境界以前の最新バージョンへ戻す。
     ///
-    /// 戻り値: 調整が試行された依存のリスト (Downgraded / 候補なし / コマンド失敗)
+    /// 1 つの依存を差し戻すと cargo が依存サブツリーを再解決し、別の依存が
+    /// 新たに age 違反になる可能性があるため、最大 `MAX_ENFORCE_LOCK_AGE_PASSES` 回
+    /// 反復する。変化がなくなった時点で終了する。
+    ///
+    /// 戻り値: 反復全体で試行された調整のリスト (最終結果の集約)
     pub async fn enforce_lock_age_rust(
         &self,
         project_dir: &Path,
         min_age: Duration,
     ) -> Vec<LockAgeAdjustment> {
-        let lock_path = project_dir.join("Cargo.lock");
-        let entries = read_registry_entries(&lock_path);
-        if entries.is_empty() {
-            return Vec::new();
-        }
-
         let Ok(chrono_duration) = chrono::Duration::from_std(min_age) else {
             return Vec::new();
         };
         let cutoff = chrono::Utc::now() - chrono_duration;
-
         let adapter = CratesIoAdapter::new(self.client.clone());
-        let mut adjustments: Vec<LockAgeAdjustment> = Vec::new();
 
-        for (name, versions) in &entries {
-            let all_versions = match self.fetch_versions(&adapter, name).await {
-                Ok(v) => v,
-                Err(_) => {
-                    for v in versions {
-                        adjustments.push(LockAgeAdjustment {
-                            name: name.clone(),
-                            from: v.clone(),
-                            to: None,
-                            status: LockAgeStatus::ReleaseDateUnavailable,
-                        });
+        let mut aggregated: Vec<LockAgeAdjustment> = Vec::new();
+        let mut previously_tried: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+
+        for _pass in 0..MAX_ENFORCE_LOCK_AGE_PASSES {
+            let lock_path = project_dir.join("Cargo.lock");
+            let entries = read_registry_entries(&lock_path);
+            if entries.is_empty() {
+                break;
+            }
+
+            let mut pass_adjustments: Vec<LockAgeAdjustment> = Vec::new();
+            let mut any_downgraded = false;
+
+            for (name, versions) in &entries {
+                let all_versions = match self.fetch_versions(&adapter, name).await {
+                    Ok(v) => v,
+                    Err(_) => {
+                        for v in versions {
+                            let key = (name.clone(), v.clone());
+                            if previously_tried.insert(key) {
+                                pass_adjustments.push(LockAgeAdjustment {
+                                    name: name.clone(),
+                                    from: v.clone(),
+                                    to: None,
+                                    status: LockAgeStatus::ReleaseDateUnavailable,
+                                });
+                            }
+                        }
+                        continue;
                     }
-                    continue;
-                }
-            };
-
-            for current in versions {
-                let Some(current_info) = all_versions
-                    .iter()
-                    .find(|v| compare_versions(&v.version, current) == std::cmp::Ordering::Equal)
-                else {
-                    continue;
                 };
 
-                if current_info.released_at <= cutoff {
-                    // age 内 (十分に古い) なのでそのまま
-                    continue;
-                }
+                for current in versions {
+                    let key = (name.clone(), current.clone());
+                    if previously_tried.contains(&key) {
+                        // 既に試行済みの (name, version) 組合せはスキップ (無限ループ回避)
+                        continue;
+                    }
 
-                // age 違反: 現在バージョン未満 (下方) かつ cutoff 以前の最新を探す
-                let Some(target) = pick_older_within_age(&all_versions, current, cutoff) else {
-                    adjustments.push(LockAgeAdjustment {
+                    let Some(current_info) = all_versions.iter().find(|v| {
+                        compare_versions(&v.version, current) == std::cmp::Ordering::Equal
+                    }) else {
+                        continue;
+                    };
+
+                    if current_info.released_at <= cutoff {
+                        continue;
+                    }
+
+                    let Some(target) = pick_older_within_age(&all_versions, current, cutoff) else {
+                        previously_tried.insert(key.clone());
+                        pass_adjustments.push(LockAgeAdjustment {
+                            name: name.clone(),
+                            from: current.clone(),
+                            to: None,
+                            status: LockAgeStatus::NoOlderCandidate,
+                        });
+                        continue;
+                    };
+
+                    previously_tried.insert(key.clone());
+                    let status = run_cargo_update_precise(project_dir, name, &target);
+                    let (adjust_to, downgraded) = match &status {
+                        LockAgeStatus::Downgraded => (Some(target.clone()), true),
+                        _ => (None, false),
+                    };
+                    if downgraded {
+                        any_downgraded = true;
+                    }
+                    pass_adjustments.push(LockAgeAdjustment {
                         name: name.clone(),
                         from: current.clone(),
-                        to: None,
-                        status: LockAgeStatus::NoOlderCandidate,
+                        to: adjust_to,
+                        status,
                     });
-                    continue;
-                };
+                }
+            }
 
-                let status = run_cargo_update_precise(project_dir, name, &target);
-                let adjust_to = match &status {
-                    LockAgeStatus::Downgraded => Some(target.clone()),
-                    _ => None,
-                };
-                adjustments.push(LockAgeAdjustment {
-                    name: name.clone(),
-                    from: current.clone(),
-                    to: adjust_to,
-                    status,
-                });
+            aggregated.extend(pass_adjustments);
+
+            if !any_downgraded {
+                // このパスで実際の差し戻しが発生しなかった → 収束
+                break;
             }
         }
 
-        adjustments
+        aggregated
     }
 
     /// git 依存の判定を実行する
