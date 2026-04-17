@@ -138,37 +138,51 @@ impl SystemPackageManager {
         working_dir.join("src-tauri/Cargo.toml").exists()
     }
 
-    /// パッケージマネージャのインストールコマンドを取得する (引数付き形式)
+    /// パッケージマネージャのインストールコマンドの引数を決定する。
     ///
-    /// `min_age` が指定されていれば、各 PM の transitive 依存 age フィルタに変換する:
-    /// - pnpm: `--config.minimumReleaseAge=<分>`
-    /// - uv: `--exclude-newer <RFC3339 datetime>`
-    /// - 他 PM (npm/yarn/bun/pip/poetry/cargo/go/bundle/composer/gradle/swift):
-    ///   ネイティブ age 機能が無いためフラグを追加しない (direct deps のみ age 制御される)。
+    /// `min_age` が指定されていれば CLI フラグでネイティブに受ける PM のみここで追加する:
+    /// - uv: `--exclude-newer <RFC3339 datetime>` (公式 CLI フラグ)
+    ///
+    /// pnpm は `minimumReleaseAge` 用の公式 CLI フラグが無い (pnpm v10.33 時点で
+    /// 未実装: https://github.com/pnpm/pnpm/issues/11224) ため、引数ではなく
+    /// 環境変数経由で指定する。`get_install_env` を参照。
     fn get_install_command_args(&self, pm: &str, min_age: Option<Duration>) -> Vec<String> {
         let base: Vec<&'static str> = self.get_install_command(pm);
         let mut out: Vec<String> = base.into_iter().map(String::from).collect();
-        if let Some(age) = min_age {
-            match pm {
-                "pnpm" => {
-                    // pnpm v9+: `--config.<key>=<value>` で npmrc 設定を上書き。
-                    // `minimumReleaseAge` は分単位。
-                    let minutes = age.as_secs() / 60;
-                    out.push(format!("--config.minimumReleaseAge={}", minutes));
-                }
-                "uv" => {
-                    // uv: `--exclude-newer <RFC3339>` で指定日時以降にリリースされた
-                    // バージョンを resolve から除外する (transitive 含む)。
-                    if let Ok(chrono_dur) = chrono::Duration::from_std(age) {
-                        let cutoff = chrono::Utc::now() - chrono_dur;
-                        out.push("--exclude-newer".to_string());
-                        out.push(cutoff.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
-                    }
-                }
-                _ => {}
+        if let Some(age) = min_age
+            && pm == "uv"
+        {
+            // uv: `--exclude-newer <RFC3339>` で指定日時以降にリリースされた
+            // バージョンを resolve から除外する (transitive 含む)。
+            if let Ok(chrono_dur) = chrono::Duration::from_std(age) {
+                let cutoff = chrono::Utc::now() - chrono_dur;
+                out.push("--exclude-newer".to_string());
+                out.push(cutoff.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
             }
         }
         out
+    }
+
+    /// パッケージマネージャ実行時に追加する環境変数を決定する。
+    ///
+    /// - **pnpm (v10.16+)**: `npm_config_minimum_release_age=<分>` で
+    ///   `minimumReleaseAge` 設定を注入する。pnpm は npm の config 規約に
+    ///   従うため、この env var は `.npmrc` の `minimum-release-age=<分>` と
+    ///   等価になる。pnpm v10.16 未満ではこの env var は未知の設定として
+    ///   無視される (graceful no-op)。
+    /// - 他 PM: 現状追加なし。
+    fn get_install_env(&self, pm: &str, min_age: Option<Duration>) -> Vec<(String, String)> {
+        let mut env: Vec<(String, String)> = Vec::new();
+        if let Some(age) = min_age
+            && pm == "pnpm"
+        {
+            let minutes = age.as_secs() / 60;
+            env.push((
+                "npm_config_minimum_release_age".to_string(),
+                minutes.to_string(),
+            ));
+        }
+        env
     }
 
     /// パッケージマネージャのインストールコマンドを取得する
@@ -203,7 +217,12 @@ impl SystemPackageManager {
     }
 
     /// コマンドを実行して出力をキャプチャする
-    fn run_command(&self, command: &[&str], working_dir: &Path) -> std::io::Result<Output> {
+    fn run_command(
+        &self,
+        command: &[&str],
+        working_dir: &Path,
+        env: &[(String, String)],
+    ) -> std::io::Result<Output> {
         if command.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -211,10 +230,12 @@ impl SystemPackageManager {
             ));
         }
 
-        Command::new(command[0])
-            .args(&command[1..])
-            .current_dir(working_dir)
-            .output()
+        let mut cmd = Command::new(command[0]);
+        cmd.args(&command[1..]).current_dir(working_dir);
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        cmd.output()
     }
 }
 
@@ -298,10 +319,18 @@ impl PackageManagerRunner for SystemPackageManager {
             return InstallResult::skipped(language);
         }
 
-        let command_str = command_parts.join(" ");
+        let env = self.get_install_env(pm, min_age);
         let command_refs: Vec<&str> = command_parts.iter().map(|s| s.as_str()).collect();
 
-        match self.run_command(&command_refs, &effective_dir) {
+        // 表示用コマンド文字列: env var 付与時は `KEY=VALUE cmd args...` で表現
+        let command_str = if env.is_empty() {
+            command_parts.join(" ")
+        } else {
+            let env_str: Vec<String> = env.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+            format!("{} {}", env_str.join(" "), command_parts.join(" "))
+        };
+
+        match self.run_command(&command_refs, &effective_dir, &env) {
             Ok(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout).to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -509,26 +538,61 @@ mod tests {
     }
 
     #[test]
-    fn test_get_install_command_args_pnpm_with_age() {
-        let pm = SystemPackageManager::new();
-        // 2 週間 = 20160 分
-        let age = Duration::from_secs(14 * 24 * 60 * 60);
-        let cmd = pm.get_install_command_args("pnpm", Some(age));
-        assert_eq!(
-            cmd,
-            vec![
-                "pnpm".to_string(),
-                "install".to_string(),
-                "--config.minimumReleaseAge=20160".to_string(),
-            ]
-        );
-    }
-
-    #[test]
     fn test_get_install_command_args_pnpm_without_age() {
         let pm = SystemPackageManager::new();
         let cmd = pm.get_install_command_args("pnpm", None);
         assert_eq!(cmd, vec!["pnpm".to_string(), "install".to_string()]);
+    }
+
+    #[test]
+    fn test_get_install_command_args_pnpm_age_does_not_inject_cli_flag() {
+        // pnpm は CLI フラグでの minimumReleaseAge をサポートしないため、
+        // age 指定時でも CLI 引数は変化しない (env 変数経由で渡す)。
+        let pm = SystemPackageManager::new();
+        let age = Duration::from_secs(14 * 24 * 60 * 60);
+        let cmd = pm.get_install_command_args("pnpm", Some(age));
+        assert_eq!(cmd, vec!["pnpm".to_string(), "install".to_string()]);
+    }
+
+    #[test]
+    fn test_get_install_env_pnpm_with_age() {
+        // pnpm への age 指定は npm_config_minimum_release_age env 変数で渡す。
+        // 2 週間 = 20160 分。
+        let pm = SystemPackageManager::new();
+        let age = Duration::from_secs(14 * 24 * 60 * 60);
+        let env = pm.get_install_env("pnpm", Some(age));
+        assert_eq!(
+            env,
+            vec![(
+                "npm_config_minimum_release_age".to_string(),
+                "20160".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn test_get_install_env_pnpm_without_age() {
+        let pm = SystemPackageManager::new();
+        let env = pm.get_install_env("pnpm", None);
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn test_get_install_env_npm_does_not_set_age() {
+        // npm 本体は別の age 機能 (`--min-release-age`) を使うため、ここでは設定しない。
+        let pm = SystemPackageManager::new();
+        let age = Duration::from_secs(14 * 24 * 60 * 60);
+        let env = pm.get_install_env("npm", Some(age));
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn test_get_install_env_uv_does_not_set_age_via_env() {
+        // uv は CLI フラグで age を受けるため env 変数は設定しない。
+        let pm = SystemPackageManager::new();
+        let age = Duration::from_secs(14 * 24 * 60 * 60);
+        let env = pm.get_install_env("uv", Some(age));
+        assert!(env.is_empty());
     }
 
     #[test]
@@ -543,7 +607,7 @@ mod tests {
 
     #[test]
     fn test_get_install_command_args_npm_ignores_age() {
-        // npm はネイティブ age サポートがないため age フラグは付かない
+        // npm はネイティブ age サポートがないため CLI 引数は変化しない
         let pm = SystemPackageManager::new();
         let age = Duration::from_secs(14 * 24 * 60 * 60);
         let cmd = pm.get_install_command_args("npm", Some(age));
