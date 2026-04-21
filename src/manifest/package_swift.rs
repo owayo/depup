@@ -9,7 +9,7 @@
 //! - `.package(url:, "V1"..."V2")` → Range
 //! - `.package(path:)` → スキップ (ローカル依存)
 //! - `branch:` / `revision:` / `.branch()` / `.revision()` → スキップ (バージョンなし)
-//! - コメント行 (`//`) はスキップ
+//! - 行コメント (`//`) とブロックコメント (`/* ... */`) はスキップ
 //! - 複数行の `.package()` 宣言に対応
 
 use crate::domain::{Dependency, Language, VersionSpec, VersionSpecKind};
@@ -116,19 +116,122 @@ fn extract_github_owner_repo(url: &str) -> Option<String> {
     None
 }
 
-/// パース用にコンテンツからコメント行を除去する
-fn strip_comment_lines(content: &str) -> String {
-    content
-        .lines()
-        .filter(|line| !line.trim().starts_with("//"))
-        .collect::<Vec<_>>()
-        .join("\n")
+/// コメントを空白に置き換え、元のバイト位置を保ったまま検索しやすくする
+fn mask_comments(content: &str) -> String {
+    fn push_masked(masked: &mut String, ch: char) {
+        if matches!(ch, '\n' | '\r') {
+            masked.push(ch);
+        } else {
+            for _ in 0..ch.len_utf8() {
+                masked.push(' ');
+            }
+        }
+    }
+
+    let mut masked = String::with_capacity(content.len());
+    let mut index = 0;
+    let bytes = content.as_bytes();
+    let mut in_string = false;
+    let mut block_depth = 0usize;
+
+    while index < bytes.len() {
+        if block_depth > 0 {
+            if bytes[index..].starts_with(b"/*") {
+                masked.push_str("  ");
+                block_depth += 1;
+                index += 2;
+                continue;
+            }
+
+            if bytes[index..].starts_with(b"*/") {
+                masked.push_str("  ");
+                block_depth -= 1;
+                index += 2;
+                continue;
+            }
+
+            let ch = content[index..]
+                .chars()
+                .next()
+                .expect("有効な UTF-8 文字を読む");
+            push_masked(&mut masked, ch);
+            index += ch.len_utf8();
+            continue;
+        }
+
+        if in_string {
+            if bytes[index] == b'\\' {
+                masked.push('\\');
+                index += 1;
+                if index < bytes.len() {
+                    let ch = content[index..]
+                        .chars()
+                        .next()
+                        .expect("有効な UTF-8 文字を読む");
+                    masked.push(ch);
+                    index += ch.len_utf8();
+                }
+                continue;
+            }
+
+            let ch = content[index..]
+                .chars()
+                .next()
+                .expect("有効な UTF-8 文字を読む");
+            masked.push(ch);
+            index += ch.len_utf8();
+
+            if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if bytes[index..].starts_with(b"//") {
+            masked.push_str("  ");
+            index += 2;
+            while index < bytes.len() {
+                let ch = content[index..]
+                    .chars()
+                    .next()
+                    .expect("有効な UTF-8 文字を読む");
+                if matches!(ch, '\n' | '\r') {
+                    masked.push(ch);
+                    index += ch.len_utf8();
+                    break;
+                }
+                push_masked(&mut masked, ch);
+                index += ch.len_utf8();
+            }
+            continue;
+        }
+
+        if bytes[index..].starts_with(b"/*") {
+            masked.push_str("  ");
+            block_depth = 1;
+            index += 2;
+            continue;
+        }
+
+        let ch = content[index..]
+            .chars()
+            .next()
+            .expect("有効な UTF-8 文字を読む");
+        masked.push(ch);
+        index += ch.len_utf8();
+
+        if ch == '"' {
+            in_string = true;
+        }
+    }
+
+    masked
 }
 
 impl ManifestParser for PackageSwiftParser {
     fn parse(&self, content: &str) -> Result<Vec<Dependency>, ManifestError> {
-        // コメント行を除去し、複数行対応のため全体に対してマッチする
-        let clean = strip_comment_lines(content);
+        // コメントをマスクし、URL やバージョン文字列の位置を保ったまま全体を走査する
+        let clean = mask_comments(content);
         let mut found: Vec<(usize, Dependency)> = Vec::new();
 
         // より具体的なパターンを先に、汎用の FROM_RE を最後に試す
@@ -233,6 +336,7 @@ impl ManifestParser for PackageSwiftParser {
     ) -> Result<String, ManifestError> {
         let escaped_package = regex::escape(package);
         let url_pattern = format!(r#"github\.com[/:]{}(?:\.git)?"#, escaped_package);
+        let masked = mask_comments(content);
 
         let url_re = Regex::new(&url_pattern).map_err(|e| ManifestError::InvalidVersionSpec {
             path: PathBuf::from("Package.swift"),
@@ -250,29 +354,15 @@ impl ManifestParser for PackageSwiftParser {
 
         // 全体から URL を検索する (複数行宣言に対応)
         let url_match = url_re
-            .find(content)
+            .find(&masked)
             .ok_or_else(|| ManifestError::InvalidVersionSpec {
                 path: PathBuf::from("Package.swift"),
                 spec: package.to_string(),
                 message: "package not found or version could not be updated".to_string(),
             })?;
 
-        // URL がコメント行にあるかどうかを確認する
-        let line_start = content[..url_match.start()]
-            .rfind('\n')
-            .map(|i| i + 1)
-            .unwrap_or(0);
-        let line_prefix = content[line_start..url_match.start()].trim_start();
-        if line_prefix.starts_with("//") {
-            return Err(ManifestError::InvalidVersionSpec {
-                path: PathBuf::from("Package.swift"),
-                spec: package.to_string(),
-                message: "package not found or version could not be updated".to_string(),
-            });
-        }
-
         // 囲む .package() 宣言を見つける
-        let prefix = &content[..url_match.start()];
+        let prefix = &masked[..url_match.start()];
         let pkg_start =
             prefix
                 .rfind(".package(")
@@ -284,7 +374,7 @@ impl ManifestParser for PackageSwiftParser {
 
         // .package( から URL 末尾までの括弧深度を数える
         let mut depth: i32 = 0;
-        for c in content[pkg_start..url_match.end()].chars() {
+        for c in masked[pkg_start..url_match.end()].chars() {
             match c {
                 '(' => depth += 1,
                 ')' => depth -= 1,
@@ -302,7 +392,7 @@ impl ManifestParser for PackageSwiftParser {
 
         // 対応する閉じ括弧を見つける
         let mut end_pos = content.len();
-        for (i, c) in content[url_match.end()..].char_indices() {
+        for (i, c) in masked[url_match.end()..].char_indices() {
             match c {
                 '(' => depth += 1,
                 ')' => {
@@ -316,28 +406,25 @@ impl ManifestParser for PackageSwiftParser {
             }
         }
 
-        // URL 末尾からパッケージ宣言末尾までのバージョン文字列を置換する
-        let before = &content[..url_match.end()];
-        let version_section = &content[url_match.end()..end_pos];
-        let after = &content[end_pos..];
-
-        let mut updated = false;
-        // replace (replace_all ではなく) を使い、最初のバージョンのみ置換する。
-        // レンジ構文 ("1.0.0"..<"2.0.0") で上限まで置換されるのを防ぐ。
-        let new_section = version_re.replace(version_section, |_caps: &regex::Captures| {
-            updated = true;
-            format!("\"{}\"", new_version)
-        });
-
-        if !updated {
+        // URL 末尾からパッケージ宣言末尾までの実バージョン文字列だけを差し替える
+        let masked_section = &masked[url_match.end()..end_pos];
+        let Some(version_match) = version_re.find(masked_section) else {
             return Err(ManifestError::InvalidVersionSpec {
                 path: PathBuf::from("Package.swift"),
                 spec: package.to_string(),
                 message: "package not found or version could not be updated".to_string(),
             });
-        }
+        };
 
-        Ok(format!("{}{}{}", before, new_section, after))
+        let replace_start = url_match.end() + version_match.start();
+        let replace_end = url_match.end() + version_match.end();
+
+        Ok(format!(
+            "{}\"{}\"{}",
+            &content[..replace_start],
+            new_version,
+            &content[replace_end..]
+        ))
     }
 }
 
@@ -928,5 +1015,57 @@ let package = Package(
             .unwrap();
         assert!(result.contains("\"1.2.0\""));
         assert!(!result.contains("\"v1.0.0\""));
+    }
+
+    #[test]
+    fn test_parse_skips_block_comments() {
+        let content = r#"
+/*
+.package(url: "https://github.com/apple/swift-nio.git", from: "2.40.0")
+*/
+.package(url: "https://github.com/apple/swift-log.git", from: "1.5.0")
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "apple/swift-log");
+    }
+
+    #[test]
+    fn test_parse_skips_nested_block_comments() {
+        let content = r#"
+/*
+.package(url: "https://github.com/apple/swift-nio.git", from: "2.40.0")
+/*
+.package(url: "https://github.com/grpc/grpc-swift.git", from: "1.5.0")
+*/
+*/
+.package(url: "https://github.com/apple/swift-log.git", from: "1.5.0")
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "apple/swift-log");
+    }
+
+    #[test]
+    fn test_update_version_ignores_block_commented_dependency() {
+        let content = r#"
+/*
+.package(url: "https://github.com/apple/swift-nio.git", from: "2.40.0")
+*/
+.package(url: "https://github.com/apple/swift-nio.git", from: "2.41.0")
+"#;
+
+        let result = PackageSwiftParser
+            .update_version(content, "apple/swift-nio", "2.42.0")
+            .unwrap();
+
+        assert!(result.contains(
+            r#".package(url: "https://github.com/apple/swift-nio.git", from: "2.42.0")"#
+        ));
+        assert!(result.contains(
+            r#".package(url: "https://github.com/apple/swift-nio.git", from: "2.40.0")"#
+        ));
     }
 }

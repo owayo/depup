@@ -294,6 +294,7 @@ When a dependency has an upper bound constraint (e.g., `<4.0.0`, `<=2.0`, `...4.
 Constraints that cannot be rewritten safely are skipped instead of being rewritten partially. This includes examples such as npm/Composer OR constraints (`^1 || ^2`), exclusion-only constraints (`!=1.2.3`), and Maven-style ranges without a lower bound (`(,2.0]`).
 
 For Swift GitHub dependencies, depup recognizes both `v1.2.3` and `V1.2.3` tag prefixes.
+depup also skips `Package.swift` dependencies that appear inside `//` line comments or `/* ... */` block comments.
 
 ## Age Filter
 
