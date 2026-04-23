@@ -1034,9 +1034,9 @@ mod registry_response_parsing {
         let stable = VersionInfo::new("1.0.0", now);
         let patch = VersionInfo::new("1.0.1", now);
 
-        // Pre-release and stable compare equal in simplified comparison
-        // (non-numeric "alpha" is filtered out, leaving [1,0,0] == [1,0,0])
-        assert_eq!(prerelease.cmp(&stable), std::cmp::Ordering::Equal);
+        // semver 仕様: 数値コアが等しい場合、プレリリース付きは安定版より小さい。
+        // 1.0.0-alpha < 1.0.0
+        assert!(prerelease < stable);
         // Stable should come before next patch
         assert!(stable < patch);
         // Pre-release also comes before next patch

@@ -321,6 +321,10 @@ depup automatically reads `minimumReleaseAge` from pnpm configuration:
 3. `pnpm-workspace.yaml` (`minimumReleaseAge: 14400` in minutes)
 4. `package.json` (`pnpm.settings.minimumReleaseAge`)
 
+### Swift and Age Filter
+
+The GitHub Tags API does not return per-tag release timestamps, so Swift packages are exempt from the `--age` filter (they are always eligible for updates regardless of the cutoff).
+
 ## Output
 
 ### Progress Display

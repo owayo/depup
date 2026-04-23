@@ -18,22 +18,25 @@ pub struct RustVersionParser;
 
 // Rust のバージョン指定用正規表現
 // 演算子後の空白を許容する（Cargo は `>= 1.2.3` のようなスペース付き指定を受け入れる）
+// SemVer の prerelease (`-...`) と build metadata (`+...`) は同時指定を許容する
+// (例: `1.2.3-rc.1+build123`)。ビルドメタデータはバージョン比較時には無視されるが、
+// マニフェスト上の表記はそのまま保持する。
 static EXACT_PINNED_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^=\s*([\d]+(?:\.[\d]+)*(?:-[\w.]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^=\s*([\d]+(?:\.[\d]+)*(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap());
 static CARET_EXPLICIT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\^\s*([\d]+(?:\.[\d]+)*(?:-[\w.]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^\^\s*([\d]+(?:\.[\d]+)*(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap());
 static TILDE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^~\s*([\d]+(?:\.[\d]+)*(?:-[\w.]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^~\s*([\d]+(?:\.[\d]+)*(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap());
 static GTE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^>=\s*([\d]+(?:\.[\d]+)*(?:-[\w.]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^>=\s*([\d]+(?:\.[\d]+)*(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap());
 static GT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^>\s*([\d]+(?:\.[\d]+)*(?:-[\w.]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^>\s*([\d]+(?:\.[\d]+)*(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap());
 static LTE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^<=\s*([\d]+(?:\.[\d]+)*(?:-[\w.]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^<=\s*([\d]+(?:\.[\d]+)*(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap());
 static LT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^<\s*([\d]+(?:\.[\d]+)*(?:-[\w.]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^<\s*([\d]+(?:\.[\d]+)*(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap());
 static BARE_VERSION_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^([\d]+(?:\.[\d]+)*(?:-[\w.]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^([\d]+(?:\.[\d]+)*(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap());
 static RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^[<>=]+\s*[\d]+(?:\.[\d]+)*\s*,\s*[<>=]+\s*[\d]+(?:\.[\d]+)*$").unwrap()
 });
@@ -275,9 +278,49 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_build_metadata_not_supported() {
-        // ビルドメタデータ付きバージョンは Cargo.toml では使用されない
-        assert!(parse("1.0.0+build").is_none());
+    fn test_parse_bare_with_build_metadata() {
+        // ビルドメタデータ付きの裸バージョンは Cargo では caret 扱い
+        let spec = parse("1.0.0+build").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Caret);
+        assert_eq!(spec.version, "1.0.0+build");
+    }
+
+    #[test]
+    fn test_parse_caret_with_build_metadata() {
+        let spec = parse("^1.0.0+build").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Caret);
+        assert_eq!(spec.version, "1.0.0+build");
+        assert_eq!(spec.prefix, Some("^".to_string()));
+    }
+
+    #[test]
+    fn test_parse_exact_pinned_with_build_metadata() {
+        let spec = parse("=1.0.0+build").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "1.0.0+build");
+    }
+
+    #[test]
+    fn test_parse_caret_with_prerelease_and_build() {
+        // prerelease + build metadata の組み合わせ
+        let spec = parse("^1.2.3-rc.1+build123").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Caret);
+        assert_eq!(spec.version, "1.2.3-rc.1+build123");
+    }
+
+    #[test]
+    fn test_parse_gte_with_build_metadata() {
+        let spec = parse(">=1.0.0+sha.abc123").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::GreaterOrEqual);
+        assert_eq!(spec.version, "1.0.0+sha.abc123");
+        assert_eq!(spec.prefix, Some(">=".to_string()));
+    }
+
+    #[test]
+    fn test_format_updated_caret_with_build_metadata_to_stable() {
+        // build metadata 付きから安定版への更新
+        let spec = parse("^1.2.3-rc.1+build123").unwrap();
+        assert_eq!(spec.format_updated("1.2.3"), "^1.2.3");
     }
 
     #[test]

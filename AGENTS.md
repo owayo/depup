@@ -117,7 +117,7 @@ make help                # Makefileヘルプ
 
 ## Important Notes
 
-- バージョン比較は数値ベースの semver 比較を使用 (文字列比較ではない)
+- バージョン比較は数値ベースの semver 比較を使用 (文字列比較ではない)。数値コアが等しい場合、プレリリース付き (例: `1.0.0-rc.1`) は安定版 (`1.0.0`) より小さい (semver 11.4.3)。両方ともプレリリースの場合はプレリリース部の数値識別子で比較される (例: `19.3.0-canary-123 < 19.3.0-canary-456`)
 - プレリリースバージョン (alpha/beta/canary/dev/rc) はデフォルトでフィルタされる
 - 作者が非推奨を示すためにリリース末尾へ付与するマーカー (`-deprecated` / `-obsolete` / `-retired` / `-yanked` / `-unmaintained`) も prerelease として扱われ、デフォルト更新対象から除外される (例: `serde_yaml 0.9.34-deprecated` は 0.9.33 から更新されない)
 - Go は常に pinned 扱い (`--include-pinned` 不要) だが、`// pinned` コメント付き依存は `--include-pinned` がないとスキップされる
@@ -131,7 +131,7 @@ make help                # Makefileヘルプ
 - Maven 形式の qualifier 付き上限（例: `[1.0,2.0.Final)`）も上限制約として解釈される
 - Cargo workspace の `[workspace] members` に指定されたメンバークレートの Cargo.toml も自動検出
 - Tauriプロジェクトでは npm/crate のバージョンを自動同期
-- Swift は GitHub Tags API を使用 (`GITHUB_TOKEN`/`GH_TOKEN` で認証可能)
+- Swift は GitHub Tags API を使用 (`GITHUB_TOKEN`/`GH_TOKEN` で認証可能)。GitHub Tags API はリリース日を返さないため、各バージョンの `released_at` には UNIX_EPOCH を使う (= 「十分古い」として扱う)。これにより `--age` 指定時でも Swift パッケージの更新が抑制されない
 - Swift の GitHub タグは `v1.2.3` と `V1.2.3` の両方を認識する
 - Swift の非 GitHub URL はスキップされる (警告なし)
 - Swift の `branch:` / `revision:` 依存はバージョンなしとしてスキップ
@@ -141,7 +141,7 @@ make help                # Makefileヘルプ
 - Go の `replace` ディレクティブ（単一行・ブロック形式とも）はパースと更新の両方でスキップされる
 - Go の `exclude` ディレクティブ（単一行・ブロック形式とも）はパースと更新の両方でスキップされる
 - Maven Central のクエリはグループID/アーティファクトIDの文字種を検証し、不正な文字によるURLインジェクションを防止する
-- npm/Composer は semver の prerelease (`-...`) と build metadata (`+...`) を同時に含むバージョン（例: `^1.2.3-rc.1+build123`）も正しくパースする
+- npm/Composer/Cargo は semver の prerelease (`-...`) と build metadata (`+...`) を同時に含むバージョン（例: `^1.2.3-rc.1+build123`）も正しくパースする。ビルドメタデータはバージョン比較時には無視される (semver 仕様)
 - Rust (Cargo) の git 依存 (`{ git = "...", branch/tag/rev = "..." }` / 省略形) を検出し、`git ls-remote` でリモート HEAD / タグを取得して更新判定する。branch / 省略形 (デフォルトブランチ) は最新コミットへ更新 (Cargo.toml は書き換えず、Cargo.lock を `--install` の `cargo update` で再解決)、tag は最新 semver タグへ更新 (Cargo.toml の tag 文字列を書き換え)、rev は常にスキップ (pinned 扱い)
 - Cargo.lock の git source 末尾 `#<hash>` から現在コミットハッシュを抽出し、`git ls-remote` の結果と比較して差分があれば更新として扱う
 - バージョンチェックはマニフェストごとに並列処理される (`futures::stream::buffered`)。並列度は依存数に応じて `clamp(dep_count, 1, 4)` で適応 (最大 4)。内部では各レジストリ別のセマフォ (crates.io は 1、他は 10) が効くため、レート制限は従来どおり尊重される。結果は入力順で返るため表示順は安定する

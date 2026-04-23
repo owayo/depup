@@ -144,11 +144,16 @@ impl PartialOrd for VersionInfo {
     }
 }
 
-/// semver 風ルールでバージョン文字列を比較する
-/// 不足パートは 0 として扱う (例: "1.0" == "1.0.0")
-/// ビルドメタデータ ('+' 以降) は semver 仕様に従い無視する
+/// semver 風ルールでバージョン文字列を比較する。
+///
+/// - 不足パートは 0 として扱う (例: `"1.0" == "1.0.0"`)
+/// - ビルドメタデータ (`+` 以降) は semver 仕様に従い無視する
+/// - 数値コアが等しい場合、プレリリース付き (例: `1.0.0-rc.1`) は
+///   プレリリースなし (例: `1.0.0`) より小さい (semver 11.4.3)
+/// - 両方ともプレリリースの場合、プレリリース部の数値識別子で比較する
+///   (例: `canary-123 < canary-456`、`rc.1 < rc.2`)
 pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
-    let parse_parts = |s: &str| -> Vec<u64> {
+    let parse_parts = |s: &str| -> (Vec<u64>, Option<Vec<u64>>) {
         // 先頭の 'v' または 'V' を除去
         let s = s
             .strip_prefix('v')
@@ -156,12 +161,33 @@ pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
             .unwrap_or(s);
         // ビルドメタデータ (+...) を除去
         let s = s.split('+').next().unwrap_or(s);
-        // '.' と '-' で分割し、数値部分のみ取得
-        s.split(['.', '-']).filter_map(|p| p.parse().ok()).collect()
+        // 数値コアとプレリリース部に分離する。最初の '-' 以前が数値コア。
+        // (Java 風 qualifier `5.0.0.RELEASE` は '-' を含まないため数値コアのみ抽出される)
+        let mut split = s.splitn(2, '-');
+        let core = split.next().unwrap_or("");
+        let pre = split.next();
+        // プレリリース識別子があり、かつ非数値セグメントを含む場合のみ prerelease 扱い
+        // (純粋に数値だけのサフィックスは Java SNAPSHOT 等の qualifier ではないため除外)
+        let pre_nums = pre.and_then(|s| {
+            if !s.is_empty() && s.split('.').any(|p| p.parse::<u64>().is_err()) {
+                // プレリリース内の数値識別子を順序付けに使う
+                // (例: "canary-456" → [456], "rc.1" → [1])
+                Some(
+                    s.split(['.', '-'])
+                        .filter_map(|p| p.parse::<u64>().ok())
+                        .collect(),
+                )
+            } else {
+                None
+            }
+        });
+        // 数値コアのみ '.' で分割して数値部分を取得 (prerelease 部の数字は含めない)
+        let nums = core.split('.').filter_map(|p| p.parse().ok()).collect();
+        (nums, pre_nums)
     };
 
-    let parts_a = parse_parts(a);
-    let parts_b = parse_parts(b);
+    let (parts_a, pre_a) = parse_parts(a);
+    let (parts_b, pre_b) = parse_parts(b);
 
     let max_len = parts_a.len().max(parts_b.len());
 
@@ -175,7 +201,26 @@ pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
         }
     }
 
-    std::cmp::Ordering::Equal
+    // 数値コアが等しい場合のプレリリース処理:
+    // - 片方のみ prerelease なら stable > prerelease (semver 仕様)
+    // - 両方 prerelease なら prerelease 部の数値で比較
+    match (&pre_a, &pre_b) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (Some(a_nums), Some(b_nums)) => {
+            let pmax = a_nums.len().max(b_nums.len());
+            for i in 0..pmax {
+                let pa = a_nums.get(i).copied().unwrap_or(0);
+                let pb = b_nums.get(i).copied().unwrap_or(0);
+                match pa.cmp(&pb) {
+                    std::cmp::Ordering::Equal => continue,
+                    other => return other,
+                }
+            }
+            std::cmp::Ordering::Equal
+        }
+    }
 }
 
 #[cfg(test)]
@@ -677,6 +722,71 @@ mod tests {
         assert!(is_prerelease_version("1.0.0-dev"));
         assert!(is_prerelease_version("1.0.0-dev.1"));
         assert!(is_prerelease_version("1.0.0-dev0"));
+    }
+
+    /// バグ回帰テスト: semver 仕様に従い、数値コアが等しい場合
+    /// プレリリース付きは安定版より小さく扱われる。
+    /// 以前は `1.0.0-rc.1 == 1.0.0` と判定されていたため、
+    /// `pick_older_within_age` が安定版を候補としてスキップしてしまう不具合があった。
+    #[test]
+    fn test_compare_versions_prerelease_is_less_than_stable() {
+        assert_eq!(
+            compare_versions("1.0.0-rc.1", "1.0.0"),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_versions("1.0.0", "1.0.0-rc.1"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_versions("2.0.0-beta.2", "2.0.0"),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_versions("1.0.0-alpha", "1.0.0"),
+            std::cmp::Ordering::Less
+        );
+        // 異なる数値コアならプレリリースの有無に関わらず数値が優先される
+        assert_eq!(
+            compare_versions("1.0.0", "0.9.0-rc.1"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_versions("1.0.1", "1.0.0-rc.1"),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn test_compare_versions_both_prerelease_numeric_identifier_ordered() {
+        // 両方ともプレリリースの場合、プレリリース部の数値識別子で順序付けする
+        // (canary-123 < canary-456, rc.1 < rc.2)
+        assert_eq!(
+            compare_versions("1.0.0-rc.1", "1.0.0-rc.2"),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_versions("19.3.0-canary-123", "19.3.0-canary-456"),
+            std::cmp::Ordering::Less
+        );
+        // 数値識別子が無いプレリリースは Equal (alpha vs beta は順序付けできない)
+        assert_eq!(
+            compare_versions("1.0.0-alpha", "1.0.0-beta"),
+            std::cmp::Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn test_compare_versions_prerelease_with_build_metadata() {
+        // build metadata はバージョン比較で無視されるが、prerelease 判定は維持される
+        assert_eq!(
+            compare_versions("1.0.0-rc.1+build", "1.0.0"),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_versions("1.0.0+build", "1.0.0-rc.1"),
+            std::cmp::Ordering::Greater
+        );
     }
 
     #[test]

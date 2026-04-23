@@ -26,9 +26,9 @@ use crate::update::{UpdateFilter, UpdateJudge, VersionInfo, compare_versions};
 use futures::stream::{self, StreamExt};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::process::Command;
 use tokio::sync::{Mutex, Semaphore};
 
 /// レジストリリクエストのデフォルト同時実行数
@@ -238,7 +238,7 @@ impl Orchestrator {
                     };
 
                     previously_tried.insert(key.clone());
-                    let status = run_cargo_update_precise(project_dir, name, &target);
+                    let status = run_cargo_update_precise(project_dir, name, &target).await;
                     let (adjust_to, downgraded) = match &status {
                         LockAgeStatus::Downgraded => (Some(target.clone()), true),
                         _ => (None, false),
@@ -938,11 +938,15 @@ fn pick_older_within_age(
 
 /// `cargo update -p <name> --precise <version>` を実行する。
 /// resolver 制約違反など失敗ケースでは stderr を保持した `UpdateCommandFailed` を返す。
-fn run_cargo_update_precise(project_dir: &Path, name: &str, version: &str) -> LockAgeStatus {
+///
+/// `tokio::process::Command` を使い、`cargo update` の長時間実行で tokio エグゼキュータの
+/// ワーカースレッドがブロックされて他の async タスク (HTTP リクエスト等) が止まるのを防ぐ。
+async fn run_cargo_update_precise(project_dir: &Path, name: &str, version: &str) -> LockAgeStatus {
     match Command::new("cargo")
         .args(["update", "-p", name, "--precise", version])
         .current_dir(project_dir)
         .output()
+        .await
     {
         Ok(output) if output.status.success() => LockAgeStatus::Downgraded,
         Ok(output) => LockAgeStatus::UpdateCommandFailed(

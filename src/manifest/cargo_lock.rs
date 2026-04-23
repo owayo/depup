@@ -286,4 +286,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         assert!(versions.contains(&"1.0.109".to_string()));
         assert!(versions.contains(&"2.0.77".to_string()));
     }
+
+    #[test]
+    fn test_parse_registry_entries_with_build_metadata() {
+        // crates.io が build metadata 付きバージョンを返すケース
+        // (例: `1.0.0+spec-1.1.0`)。enforce_lock_age_rust などで
+        // バージョン文字列をそのまま扱うため、`+` 部分も保持する
+        let content = r#"
+[[package]]
+name = "wasi"
+version = "0.11.0+wasi-snapshot-preview1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+"#;
+        let entries = parse_registry_entries(content);
+        assert_eq!(entries.len(), 1);
+        let versions = entries.get("wasi").unwrap();
+        assert_eq!(versions, &vec!["0.11.0+wasi-snapshot-preview1".to_string()]);
+    }
 }

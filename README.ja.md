@@ -321,6 +321,10 @@ depupはpnpm設定から `minimumReleaseAge` を自動的に読み取ります�
 3. `pnpm-workspace.yaml`（`minimumReleaseAge: 14400` 分単位）
 4. `package.json`（`pnpm.settings.minimumReleaseAge`）
 
+### Swift とエイジフィルター
+
+GitHub Tags API はタグのリリース日時を返しません。そのため Swift パッケージは `--age` 指定時もエイジフィルターの対象外として扱われます（更新対象に含まれます）。
+
 ## 出力
 
 ### 進捗表示

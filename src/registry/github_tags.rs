@@ -11,7 +11,7 @@ use crate::error::RegistryError;
 use crate::registry::{HttpClient, RegistryAdapter};
 use crate::update::VersionInfo;
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::Deserialize;
 use std::sync::LazyLock;
@@ -146,14 +146,15 @@ impl RegistryAdapter for GitHubTagsAdapter {
                 })?;
 
         let mut versions = Vec::new();
-        let now = Utc::now();
 
         for tag in tags {
             // タグ名から semver を抽出
             if let Some(caps) = SEMVER_RE.captures(&tag.name) {
                 let version = caps.get(1).unwrap().as_str();
-                // リリース日のフォールバックとして現在時刻を使用
-                versions.push(VersionInfo::new(version, now));
+                // GitHub Tags API はリリース日を返さない。
+                // `Utc::now()` を使うと `--age` フィルタが全 Swift 更新を抑制してしまうため、
+                // age フィルタを通過させるための「十分古い」値として UNIX_EPOCH を採用する。
+                versions.push(VersionInfo::new(version, DateTime::<Utc>::UNIX_EPOCH));
             }
         }
 
@@ -243,5 +244,22 @@ mod tests {
         let json = r#"{"name": "1.0.0", "zipball_url": "...", "tarball_url": "...", "commit": {"sha": "abc", "url": "..."}}"#;
         let tag: GitHubTag = serde_json::from_str(json).unwrap();
         assert_eq!(tag.name, "1.0.0");
+    }
+
+    /// バグ回帰テスト: GitHub Tags API はリリース日を返さないため、
+    /// `--age` フィルタが Swift 更新を全スキップしないように
+    /// `released_at` には UNIX_EPOCH (= 古いとして扱う) を使う。
+    /// 以前は `Utc::now()` を使っていたため、`--age 1d` 等で全 Swift 更新が抑制されていた。
+    #[test]
+    fn test_version_info_uses_epoch_for_age_filter_compatibility() {
+        let epoch = DateTime::<Utc>::UNIX_EPOCH;
+        let info = VersionInfo::new("1.2.3", epoch);
+        assert_eq!(info.released_at, epoch);
+        // 通常の age 指定 (例: 1日前) のカットオフは UNIX_EPOCH (1970年) より新しいので、
+        // epoch をリリース日とするバージョンは age フィルタを通過する。
+        let cutoff_1d = Utc::now() - chrono::Duration::days(1);
+        assert!(info.released_at <= cutoff_1d);
+        let cutoff_1y = Utc::now() - chrono::Duration::days(365);
+        assert!(info.released_at <= cutoff_1y);
     }
 }
