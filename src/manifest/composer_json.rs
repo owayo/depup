@@ -9,8 +9,8 @@
 use crate::domain::{Dependency, Language};
 use crate::error::ManifestError;
 use crate::manifest::ManifestParser;
+use crate::manifest::json_sections::replace_string_property_in_top_level_sections;
 use crate::parser::get_parser;
-use regex::Regex;
 use serde_json::{Map, Value};
 use std::path::PathBuf;
 
@@ -53,34 +53,27 @@ impl ManifestParser for ComposerJsonParser {
     ) -> Result<String, ManifestError> {
         let parser = get_parser(Language::Php);
 
-        // 元の整形を保つため、正規表現ベースのテキスト置換で更新する
-        // `"vendor/package": "version"` を空白ゆらぎ込みで拾う
-        // パッケージ名中の特殊文字は正規表現用にエスケープする
-        let escaped_package = regex::escape(package);
-        let pattern = format!(r#"("{}"\s*:\s*)"([^"]+)""#, escaped_package);
-
-        let re = Regex::new(&pattern).map_err(|e| ManifestError::InvalidVersionSpec {
+        // 元の整形を保つため、依存セクション内だけをテキスト置換で更新する
+        let sections = ["require", "require-dev"];
+        let (result, updated) = replace_string_property_in_top_level_sections(
+            content,
+            &sections,
+            package,
+            |old_version| {
+                if let Some(spec) = parser.parse(old_version)
+                    && let Some(new_ver) = spec.try_format_updated(new_version)
+                {
+                    return Some(new_ver);
+                }
+                // 解釈できない制約は元の値を維持する
+                None
+            },
+        )
+        .map_err(|e| ManifestError::InvalidVersionSpec {
             path: PathBuf::from("composer.json"),
             spec: package.to_string(),
             message: format!("invalid regex pattern: {}", e),
         })?;
-
-        let mut updated = false;
-        let result = re.replace(content, |caps: &regex::Captures| {
-            let prefix = &caps[1];
-            let old_version = &caps[2];
-
-            if let Some(spec) = parser.parse(old_version) {
-                if let Some(new_ver) = spec.try_format_updated(new_version) {
-                    updated = true;
-                    return format!(r#"{}"{}""#, prefix, new_ver);
-                }
-                caps[0].to_string()
-            } else {
-                // 解釈できない制約は元の値を維持する
-                caps[0].to_string()
-            }
-        });
 
         if !updated {
             return Err(ManifestError::InvalidVersionSpec {
@@ -322,6 +315,24 @@ mod tests {
             .update_version(content, "vendor/package", "2.0.0")
             .unwrap();
         assert!(result.contains("\"2.0.0\""));
+    }
+
+    #[test]
+    fn test_update_version_ignores_replace_section() {
+        let content = r#"{
+  "require": {
+    "vendor/package": "^1.0"
+  },
+  "replace": {
+    "vendor/package": "1.0.0"
+  }
+}"#;
+
+        let result = ComposerJsonParser
+            .update_version(content, "vendor/package", "1.2.0")
+            .unwrap();
+        assert!(result.contains(r#""vendor/package": "^1.2.0""#));
+        assert!(result.contains(r#""vendor/package": "1.0.0""#));
     }
 
     #[test]

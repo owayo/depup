@@ -47,6 +47,7 @@ src/
     gemfile.rs       - Ruby パーサ
     composer_json.rs - PHP パーサ
     gradle.rs        - Java パーサ
+    json_sections.rs - JSON マニフェストの依存セクション限定書き換え補助
     package_swift.rs - Swift パーサ
     pnpm_settings.rs - pnpm設定読み取り
   parser/           - 言語別パース処理
@@ -128,7 +129,8 @@ make help                # Makefileヘルプ
 - 完全浮動指定（例: `*`, npm dist-tag の `latest`, Gradle の `latest.release` / `latest.integration`）は意味を変えないため更新対象から除外される
 - Range制約 (`>=X,<Y` / `>=X,<=Y` / `A..<B` / `A...B` / `A - B` / `[A,B)` / `[A,B]` / `]A,B[` / `[A,B[` / `]A,B]`) では上限を超えるバージョンは除外され、更新時は上限制約を維持したまま下限側のみを互換な最新バージョンへ進める (`<=` / `...` / 閉じ `]` は上限値を含む。npm/Composer の `A - B` は右辺が完全指定なら包含、`1.0 - 2.0` のような部分指定ならワイルドカード展開後の排他的上限として扱う)
 - 安全に書き換えられない複合制約（例: npm/Composer の `^1 || ^2`、除外専用制約 `!=1.2.3`、下限なし Maven 形式 `(,2.0]`）は更新候補から除外される
-- Maven 形式の qualifier 付き上限（例: `[1.0,2.0.Final)`）も上限制約として解釈される
+- Maven 形式の qualifier 付き上限（例: `[1.0,2.0.Final)`, `[1.0,2.0-beta1-SNAPSHOT)`）も上限制約として解釈される。Gradle のバージョン部は `.`, `-`, `_`, `+` 区切りと `1a1` のような英数字混在パートを許容する
+- `package.json` の更新は `dependencies` / `devDependencies` / `peerDependencies` / `optionalDependencies` に限定し、`overrides` 等は書き換えない。`composer.json` の更新は `require` / `require-dev` に限定し、`replace` / `provide` / `conflict` 等は書き換えない
 - Cargo workspace の `[workspace] members` に指定されたメンバークレートの Cargo.toml も自動検出
 - Tauriプロジェクトでは npm/crate のバージョンを自動同期
 - Swift は GitHub Tags API を使用 (`GITHUB_TOKEN`/`GH_TOKEN` で認証可能)。GitHub Tags API はリリース日を返さないため、各バージョンの `released_at` には UNIX_EPOCH を使う (= 「十分古い」として扱う)。これにより `--age` 指定時でも Swift パッケージの更新が抑制されない

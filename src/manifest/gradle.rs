@@ -703,6 +703,20 @@ dependencies {
     }
 
     #[test]
+    fn test_parse_string_notation_maven_range_with_multi_part_qualifier() {
+        let content = r#"
+dependencies {
+    implementation "org.springframework:spring-core:[5.2.0,5.3.8-beta1-SNAPSHOT]"
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "org.springframework:spring-core");
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Range);
+        assert_eq!(deps[0].version_spec.version, "5.2.0");
+    }
+
+    #[test]
     fn test_parse_map_notation() {
         let content = r#"
 dependencies {

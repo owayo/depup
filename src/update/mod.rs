@@ -18,8 +18,9 @@ use std::sync::LazyLock;
 
 /// レンジの上限制約抽出で共通利用するバージョントークン。
 const VERSION_TOKEN: &str = r"[vV]?\d+(?:\.\d+)*(?:[-+][0-9A-Za-z.-]+)?";
-/// Maven レンジ専用のバージョントークン。`2.0.Final` のような qualifier を許容する。
-const MAVEN_VERSION_TOKEN: &str = r"[vV]?\d+(?:\.[0-9A-Za-z]+)*(?:[-+][0-9A-Za-z.-]+)?";
+/// Maven レンジ専用のバージョントークン。
+/// Gradle の順序付け規則に合わせ、`.`, `-`, `_`, `+` 区切りと英数字混在パートを許容する。
+const MAVEN_VERSION_TOKEN: &str = r"[vV]?\d[0-9A-Za-z]*(?:[.\-_+][0-9A-Za-z]+)*";
 
 /// Range 制約から包含上限 (`<=X`) を抽出する正規表現。
 static UPPER_BOUND_LTE_RE: LazyLock<Regex> =
@@ -485,7 +486,7 @@ mod tests {
     #[test]
     fn test_judge_age_filter() {
         let now = fixed_time();
-        let filter = UpdateFilter::new().with_min_age(Duration::from_secs(7 * 24 * 60 * 60)); // 7 days
+        let filter = UpdateFilter::new().with_min_age(Duration::from_secs(7 * 24 * 60 * 60)); // 7日
         let judge = UpdateJudge::with_time(filter, now);
 
         let dep = make_dependency("lodash", "1.0.0", Language::Node, false);
@@ -594,7 +595,7 @@ mod tests {
     #[test]
     fn test_judge_go_pinned_without_include_pinned_flag() {
         // Go 依存は `--include-pinned` なしでも更新対象にする
-        let filter = UpdateFilter::new(); // include_pinned = false
+        let filter = UpdateFilter::new(); // include_pinned は false
         let judge = UpdateJudge::new(filter);
 
         let dep = make_dependency("github.com/gin-gonic/gin", "1.9.0", Language::Go, true);
@@ -612,7 +613,7 @@ mod tests {
     fn test_judge_java_pinned_without_include_pinned_flag() {
         // Java/Gradle はレンジ指定を扱えるため、
         // `--include-pinned` なしでは pinned 依存をスキップする
-        let filter = UpdateFilter::new(); // include_pinned = false
+        let filter = UpdateFilter::new(); // include_pinned は false
         let judge = UpdateJudge::new(filter);
 
         let dep = make_dependency(
@@ -1364,6 +1365,13 @@ mod tests {
         // Maven qualifier 付き上限
         let result = extract_upper_bound("[1.0,2.0.Final)");
         assert_eq!(result, Some(("2.0.Final".to_string(), false)));
+    }
+
+    #[test]
+    fn test_extract_upper_bound_maven_multi_part_qualifier() {
+        // 複数区切りの qualifier 付き上限
+        let result = extract_upper_bound("[1.0,2.0-beta1-SNAPSHOT)");
+        assert_eq!(result, Some(("2.0-beta1-SNAPSHOT".to_string(), false)));
     }
 
     #[test]

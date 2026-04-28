@@ -9,8 +9,8 @@
 use crate::domain::{Dependency, Language};
 use crate::error::ManifestError;
 use crate::manifest::ManifestParser;
+use crate::manifest::json_sections::replace_string_property_in_top_level_sections;
 use crate::parser::{VersionParser, get_parser};
-use regex::Regex;
 use serde_json::{Map, Value};
 use std::path::PathBuf;
 
@@ -63,41 +63,37 @@ impl ManifestParser for PackageJsonParser {
     ) -> Result<String, ManifestError> {
         let parser = get_parser(Language::Node);
 
-        // 元の整形とキー順を保つため、テキスト置換で更新する
-        // `"package-name": "version"` を空白ゆらぎ込みで拾う
-        // `@scope/package` のような特殊文字は正規表現用にエスケープする
-        let escaped_package = regex::escape(package);
-        let pattern = format!(r#"("{}"\s*:\s*)"([^"]+)""#, escaped_package);
-
-        let re = Regex::new(&pattern).map_err(|e| ManifestError::InvalidVersionSpec {
+        // 元の整形とキー順を保つため、依存セクション内だけをテキスト置換で更新する
+        let sections = [
+            "dependencies",
+            "devDependencies",
+            "peerDependencies",
+            "optionalDependencies",
+        ];
+        let (result, updated) = replace_string_property_in_top_level_sections(
+            content,
+            &sections,
+            package,
+            |old_version| {
+                if let Some((parse_target, alias_prefix)) = normalize_node_constraint(old_version)
+                    && let Some(spec) = parser.parse(parse_target)
+                    && let Some(new_ver) = spec.try_format_updated(new_version)
+                {
+                    return Some(if let Some(alias) = alias_prefix {
+                        format!("{}{}", alias, new_ver)
+                    } else {
+                        new_ver
+                    });
+                }
+                // 解釈できないものは元の値を維持する
+                None
+            },
+        )
+        .map_err(|e| ManifestError::InvalidVersionSpec {
             path: PathBuf::from("package.json"),
             spec: package.to_string(),
             message: format!("invalid regex pattern: {}", e),
         })?;
-
-        let mut updated = false;
-        let result = re.replace(content, |caps: &regex::Captures| {
-            let prefix = &caps[1]; // `"package":` または `"package" :`
-            let old_version = &caps[2];
-
-            if let Some((parse_target, alias_prefix)) = normalize_node_constraint(old_version) {
-                if let Some(spec) = parser.parse(parse_target)
-                    && let Some(new_ver) = spec.try_format_updated(new_version)
-                {
-                    updated = true;
-                    let rendered = if let Some(alias) = alias_prefix {
-                        format!("{}{}", alias, new_ver)
-                    } else {
-                        new_ver
-                    };
-                    return format!(r#"{}"{}""#, prefix, rendered);
-                }
-                caps[0].to_string()
-            } else {
-                // 解釈できないものは元の値を維持する
-                caps[0].to_string()
-            }
-        });
 
         if !updated {
             return Err(ManifestError::InvalidVersionSpec {
@@ -308,6 +304,24 @@ mod tests {
             .update_version(content, "express", "4.19.0")
             .unwrap();
         assert!(result.contains("~4.19.0"));
+    }
+
+    #[test]
+    fn test_update_version_ignores_overrides_section() {
+        let content = r#"{
+  "dependencies": {
+    "lodash": "^4.17.21"
+  },
+  "overrides": {
+    "lodash": "4.17.20"
+  }
+}"#;
+
+        let result = PackageJsonParser
+            .update_version(content, "lodash", "4.18.0")
+            .unwrap();
+        assert!(result.contains(r#""lodash": "^4.18.0""#));
+        assert!(result.contains(r#""lodash": "4.17.20""#));
     }
 
     #[test]

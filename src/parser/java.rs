@@ -20,13 +20,17 @@ pub struct JavaVersionParser;
 
 // Gradle バージョン指定の正規表現
 
+// Gradle は `.`, `-`, `_`, `+` を区切りとして扱い、`1a1` のような
+// 数字と英字が混ざったパートも解釈する。
+const GRADLE_VERSION_TOKEN: &str = r"\d[0-9A-Za-z]*(?:[.\-_+][0-9A-Za-z]+)*";
+
 // 通常バージョン: 1.2.3 / 1.2.3-SNAPSHOT / 1.2.3.RELEASE
 static VERSION_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(\d+(?:\.\d+)*(?:[.-][A-Za-z0-9]+)*)$").unwrap());
+    LazyLock::new(|| Regex::new(&format!("^({GRADLE_VERSION_TOKEN})$")).unwrap());
 
 // strict 記法: 1.2.3!!
 static STRICT_VERSION_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(\d+(?:\.\d+)*(?:[.-][A-Za-z0-9]+)*)!!$").unwrap());
+    LazyLock::new(|| Regex::new(&format!("^({GRADLE_VERSION_TOKEN})!!$")).unwrap());
 
 // プレフィックス指定: 1.2.+ / 1.+
 static PREFIX_VERSION_RE: LazyLock<Regex> =
@@ -39,7 +43,10 @@ static DYNAMIC_VERSION_RE: LazyLock<Regex> =
 // Maven 形式レンジ: [1.0,2.0], [1.0,), (,2.0], [1.0,2.0)
 // 形式: [(] lower , upper [)] (lower/upper は空またはバージョン)
 static MAVEN_RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^[\[\(\]](\d+(?:\.\d+)*(?:[.-][A-Za-z0-9]+)?)?\s*,\s*(\d+(?:\.\d+)*(?:[.-][A-Za-z0-9]+)?)?[\]\)\[]$").unwrap()
+    Regex::new(&format!(
+        r"^[\[\(\]]({GRADLE_VERSION_TOKEN})?\s*,\s*({GRADLE_VERSION_TOKEN})?[\]\)\[]$"
+    ))
+    .unwrap()
 });
 
 impl VersionParser for JavaVersionParser {
@@ -186,6 +193,15 @@ mod tests {
         assert_eq!(spec.version, "4.0.0.Final");
     }
 
+    #[test]
+    fn test_parse_gradle_mixed_separator_versions() {
+        for version in ["1a1", "1.0_final", "1-a+1"] {
+            let spec = parse(version).unwrap();
+            assert_eq!(spec.kind, VersionSpecKind::Exact);
+            assert_eq!(spec.version, version);
+        }
+    }
+
     // エッジケースのテスト
     #[test]
     fn test_parse_empty() {
@@ -229,7 +245,7 @@ mod tests {
         assert_eq!(spec.format_updated("2.0.0"), "2.0.0");
     }
 
-    // language のテスト
+    // 対応言語のテスト
     #[test]
     fn test_java_parser_language() {
         let parser = JavaVersionParser;
@@ -237,7 +253,7 @@ mod tests {
     }
 
     // Gradle バージョン指定のテスト
-    // implementation("org.springframework:spring-core:5.3.8")
+    // Gradle 文字列記法: implementation("org.springframework:spring-core:5.3.8")
     #[test]
     fn test_parse_gradle_exact_version() {
         let spec = parse("5.3.8").unwrap();
@@ -246,7 +262,7 @@ mod tests {
         assert!(spec.is_pinned());
     }
 
-    // implementation("org.springframework:spring-core:5.3.+")
+    // Gradle プレフィックス指定: implementation("org.springframework:spring-core:5.3.+")
     #[test]
     fn test_parse_gradle_prefix_version() {
         let spec = parse("5.3.+").unwrap();
@@ -255,7 +271,7 @@ mod tests {
         assert!(!spec.is_pinned());
     }
 
-    // implementation("org.springframework:spring-core:latest.release")
+    // Gradle 動的指定: implementation("org.springframework:spring-core:latest.release")
     #[test]
     fn test_parse_gradle_latest_release() {
         assert!(parse("latest.release").is_none());
@@ -266,21 +282,21 @@ mod tests {
         assert!(parse("latest.integration").is_none());
     }
 
-    // implementation("org.springframework:spring-core:[5.2.0, 5.3.8]")
+    // Gradle の Maven 形式レンジ: implementation("org.springframework:spring-core:[5.2.0, 5.3.8]")
     #[test]
     fn test_parse_gradle_maven_range_closed() {
         let spec = parse("[5.2.0, 5.3.8]").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Range);
-        assert_eq!(spec.version, "5.2.0"); // lower bound
+        assert_eq!(spec.version, "5.2.0"); // 下限
         assert!(!spec.is_pinned());
     }
 
-    // implementation("org.springframework:spring-core:[5.2.0,)")
+    // Gradle の上限なし Maven 形式レンジ: implementation("org.springframework:spring-core:[5.2.0,)")
     #[test]
     fn test_parse_gradle_maven_range_open_upper() {
         let spec = parse("[5.2.0,)").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Range);
-        assert_eq!(spec.version, "5.2.0"); // lower bound
+        assert_eq!(spec.version, "5.2.0"); // 下限
         assert!(!spec.is_pinned());
     }
 
@@ -288,7 +304,7 @@ mod tests {
     fn test_parse_gradle_maven_range_open_lower() {
         let spec = parse("(,2.0.0]").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Range);
-        assert_eq!(spec.version, "2.0.0"); // upper bound when lower is empty
+        assert_eq!(spec.version, "2.0.0"); // 下限が空の場合は上限
         assert!(!spec.is_pinned());
     }
 
@@ -296,7 +312,7 @@ mod tests {
     fn test_parse_gradle_maven_range_exclusive() {
         let spec = parse("(1.0.0,2.0.0)").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Range);
-        assert_eq!(spec.version, "1.0.0"); // lower bound
+        assert_eq!(spec.version, "1.0.0"); // 下限
         assert!(!spec.is_pinned());
     }
 
@@ -304,7 +320,7 @@ mod tests {
     fn test_parse_gradle_maven_range_alt_brackets() {
         let spec = parse("]1.0.0,2.0.0[").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Range);
-        assert_eq!(spec.version, "1.0.0"); // lower bound
+        assert_eq!(spec.version, "1.0.0"); // 下限
         assert!(!spec.is_pinned());
     }
 
@@ -312,7 +328,7 @@ mod tests {
     fn test_parse_gradle_maven_range_alt_upper_exclusive() {
         let spec = parse("[1.0.0,2.0.0[").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Range);
-        assert_eq!(spec.version, "1.0.0"); // lower bound
+        assert_eq!(spec.version, "1.0.0"); // 下限
         assert!(!spec.is_pinned());
     }
 
@@ -427,6 +443,14 @@ mod tests {
     fn test_parse_maven_range_with_spaces() {
         // Maven レンジ内のスペース
         let spec = parse("[1.0, 2.0)").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1.0");
+    }
+
+    #[test]
+    fn test_parse_maven_range_with_multi_part_qualifier() {
+        // Gradle の Maven 形式レンジは SNAPSHOT など複数区切りの qualifier も境界にできる
+        let spec = parse("[1.0,1.4.9-beta1-SNAPSHOT]").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Range);
         assert_eq!(spec.version, "1.0");
     }

@@ -278,6 +278,7 @@ depup respects upper-bound range constraints (both exclusive and inclusive):
 "[1.0,2.0)"        → "[1.9.3,2.0)" (Maven-style)
 "[1.0,2.0]"        → "[2.0,2.0]" (Maven-style)
 "[1.0,2.0.Final)"  → "[1.9.3,2.0.Final)" (Maven qualifier)
+"[1.0,2.0-beta1-SNAPSHOT)" → "[1.9.3,2.0-beta1-SNAPSHOT)" (multi-part Maven qualifier)
 "]1.0,2.0["        → "]1.9.3,2.0[" (Maven alt brackets)
 "]1.0,2.0]"        → "]2.0,2.0]" (Maven alt inclusive)
 "[1.0,2.0["        → "[1.9.3,2.0[" (Maven alt upper bracket)
@@ -292,6 +293,8 @@ When a dependency has an upper bound constraint (e.g., `<4.0.0`, `<=2.0`, `...4.
 - **Update only the lower-bound side** to the newest compatible version within the range
 
 Constraints that cannot be rewritten safely are skipped instead of being rewritten partially. This includes examples such as npm/Composer OR constraints (`^1 || ^2`), exclusion-only constraints (`!=1.2.3`), and Maven-style ranges without a lower bound (`(,2.0]`).
+
+For JSON manifests, depup only rewrites dependency sections it parses. In `package.json`, `overrides` is left untouched; in `composer.json`, sections such as `replace`, `provide`, and `conflict` are left untouched.
 
 For Swift GitHub dependencies, depup recognizes both `v1.2.3` and `V1.2.3` tag prefixes.
 depup also skips `Package.swift` dependencies that appear inside `//` line comments or `/* ... */` block comments.

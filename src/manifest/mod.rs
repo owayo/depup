@@ -13,6 +13,7 @@ mod detector;
 mod gemfile;
 mod go_mod;
 mod gradle;
+mod json_sections;
 mod package_json;
 mod package_swift;
 mod pnpm_settings;
