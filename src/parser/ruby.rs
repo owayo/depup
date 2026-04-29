@@ -16,43 +16,45 @@ pub struct RubyVersionParser;
 
 // Ruby バージョン指定用正規表現
 // 演算子とバージョンの間のスペースは省略可
+// プレリリース識別子は複数のドット/ハイフン区切りに対応する
+// 例: `1.0.0.pre.1`, `7.0.0.alpha.2`, `1.2.3-beta.1`
 
-// ペシミスティック制約: ~> 1.2 or ~> 1.2.3
+// ペシミスティック制約: ~> 1.2 or ~> 1.2.3 or ~> 1.0.0.pre.1
 static PESSIMISTIC_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^~>\s*(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^~>\s*(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)*)$").unwrap());
 
 // = 接頭辞付き固定: = 1.2.3
 static EXACT_EQ_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^=\s*(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^=\s*(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)*)$").unwrap());
 
 // 以上: >= 1.2.3
 static GTE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^>=\s*(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^>=\s*(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)*)$").unwrap());
 
 // より大きい: > 1.2.3
 static GT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^>\s*(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^>\s*(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)*)$").unwrap());
 
 // 以下: <= 1.2.3
 static LTE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^<=\s*(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^<=\s*(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)*)$").unwrap());
 
 // より小さい: < 1.2.3
 static LT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^<\s*(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^<\s*(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)*)$").unwrap());
 static NOT_EQUAL_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^!=\s*(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^!=\s*(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)*)$").unwrap());
 
 // 裸のバージョン (固定): 1.2.3
 static BARE_VERSION_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)*)$").unwrap());
 
 // 複合制約パターン (個別パースの前に検出する)
 static COMPOUND_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r",").unwrap());
 static COMPOUND_SPACE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[<>=~!].*\s+[<>=~!]").unwrap());
 static VERSION_TOKEN_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)?").unwrap());
+    LazyLock::new(|| Regex::new(r"\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)*").unwrap());
 
 fn extract_first_version(raw: &str) -> String {
     VERSION_TOKEN_RE
@@ -453,5 +455,49 @@ mod tests {
         // 4セグメントバージョンの更新フォーマット
         let spec = parse("1.2.3.4").unwrap();
         assert_eq!(spec.format_updated("1.2.3.5"), "1.2.3.5");
+    }
+
+    // RubyGems / Bundler でよく使われるドット区切りプレリリースを許容する
+    #[test]
+    fn test_parse_dotted_prerelease_multiple_segments() {
+        // Rails の慣用的な書き方: `7.0.0.alpha.2`, `1.0.0.pre.1`
+        let spec = parse("7.0.0.alpha.2").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "7.0.0.alpha.2");
+    }
+
+    #[test]
+    fn test_parse_dotted_prerelease_pre_dot_one() {
+        let spec = parse("1.0.0.pre.1").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "1.0.0.pre.1");
+    }
+
+    #[test]
+    fn test_parse_pessimistic_dotted_prerelease() {
+        let spec = parse("~> 7.0.0.alpha.2").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Tilde);
+        assert_eq!(spec.version, "7.0.0.alpha.2");
+        assert_eq!(spec.prefix, Some("~> ".to_string()));
+    }
+
+    #[test]
+    fn test_parse_gte_dotted_prerelease() {
+        let spec = parse(">= 1.0.0.pre.1").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::GreaterOrEqual);
+        assert_eq!(spec.version, "1.0.0.pre.1");
+    }
+
+    #[test]
+    fn test_parse_exact_eq_dotted_prerelease() {
+        let spec = parse("= 7.0.0.beta.1").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "7.0.0.beta.1");
+    }
+
+    #[test]
+    fn test_format_updated_dotted_prerelease() {
+        let spec = parse("~> 7.0.0.alpha.2").unwrap();
+        assert_eq!(spec.format_updated("7.0.0.alpha.3"), "~> 7.0.0.alpha.3");
     }
 }

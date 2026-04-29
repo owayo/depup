@@ -262,7 +262,7 @@ depupは元のバージョン範囲形式を維持します：
 "1.2.3!!" → "2.0.0!!" （Gradle strict を維持）
 ```
 
-`"*"`、npm の dist-tag（`"latest"` など）、Gradle の動的指定（`"latest.release"` など）のような完全浮動指定は、厳密バージョンへ変質させないため更新対象から除外されます。
+`"*"`、npm の dist-tag（`"latest"` など）、Gradle の動的指定（`"latest.release"`、`"latest.integration"`、`"latest.milestone"`、ユーザ定義 `latest.<status>` など全般）のような完全浮動指定は、厳密バージョンへ変質させないため更新対象から除外されます。
 
 ### 範囲制約
 

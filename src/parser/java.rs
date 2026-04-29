@@ -36,9 +36,11 @@ static STRICT_VERSION_RE: LazyLock<Regex> =
 static PREFIX_VERSION_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(\d+(?:\.\d+)*)\.\+$").unwrap());
 
-// 動的指定: latest.release / latest.integration
+// 動的指定: latest.release / latest.integration / latest.milestone / latest.<custom-status>
+// Gradle 公式仕様では任意の status 識別子を取れる (status scheme で定義可能)。
+// すべての `latest.*` を更新対象外として一律にスキップする。
 static DYNAMIC_VERSION_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(latest\.(?:release|integration))$").unwrap());
+    LazyLock::new(|| Regex::new(r"^(latest\.[a-zA-Z][A-Za-z0-9_-]*)$").unwrap());
 
 // Maven 形式レンジ: [1.0,2.0], [1.0,), (,2.0], [1.0,2.0)
 // 形式: [(] lower , upper [)] (lower/upper は空またはバージョン)
@@ -484,5 +486,33 @@ mod tests {
         // strict 記法の !! が更新後も保持される
         let spec = parse("5.3.8!!").unwrap();
         assert_eq!(spec.format_updated("5.4.0"), "5.4.0!!");
+    }
+
+    // Gradle 公式仕様で定義される追加の dynamic status は更新対象外として扱う
+    #[test]
+    fn test_parse_gradle_latest_milestone() {
+        // Gradle のビルトイン status (release < milestone < integration)
+        assert!(parse("latest.milestone").is_none());
+    }
+
+    #[test]
+    fn test_parse_gradle_latest_custom_status() {
+        // ユーザ定義 status スキーム (例: latest.snapshot, latest.beta)
+        assert!(parse("latest.snapshot").is_none());
+        assert!(parse("latest.beta").is_none());
+    }
+
+    #[test]
+    fn test_parse_gradle_latest_status_with_dash() {
+        // ハイフン/アンダースコア入り status 名も許容する
+        assert!(parse("latest.pre-release").is_none());
+        assert!(parse("latest.dev_build").is_none());
+    }
+
+    #[test]
+    fn test_parse_gradle_latest_invalid_status() {
+        // status 名が空・数字始まり・記号始まりの場合は通常バージョンとして扱われ得る
+        assert!(parse("latest.").is_none());
+        assert!(parse("latest.123").is_none());
     }
 }

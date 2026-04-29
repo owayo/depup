@@ -122,16 +122,18 @@ make help                # Makefileヘルプ
 - プレリリースバージョン (alpha/beta/canary/dev/rc) はデフォルトでフィルタされる
 - 作者が非推奨を示すためにリリース末尾へ付与するマーカー (`-deprecated` / `-obsolete` / `-retired` / `-yanked` / `-unmaintained`) も prerelease として扱われ、デフォルト更新対象から除外される (例: `serde_yaml 0.9.34-deprecated` は 0.9.33 から更新されない)
 - Go は常に pinned 扱い (`--include-pinned` 不要) だが、`// pinned` コメント付き依存は `--include-pinned` がないとスキップされる
-- Ruby の `group` ブロックはネストを考慮して判定され、内側の `:development` / `:test` を抜けた後の gem は開発依存として漏れない。`platforms` / `source` 等のネストされた `do...end` ブロックもグループスタックを壊さず正しく追跡する
+- Ruby の `group` ブロックはネストを考慮して判定され、内側の `:development` / `:test` を抜けた後の gem は開発依存として漏れない。`platforms` / `source` 等のネストされた `do...end` ブロックもグループスタックを壊さず正しく追跡する。`group :development do # comment` のようにインラインコメントが付いた group 開始行も正しくグループとして認識される
+- Ruby のドット区切りプレリリース (例: `7.0.0.alpha.2`, `1.0.0.pre.1`) もパースと更新に対応する
 - Gemfile の複合制約・除外制約（例: `'>= 0.18', '< 2.0'`, `'!= 2.2.4'`）は解析対象だが、安全に書き換えられないため自動更新ではエラーとして扱う
 - Java/Gradle の strict 記法（例: `1.2.3!!`）は固定バージョンとして解釈され、`!!` を保持して更新される
 - Node/Python/Rust/PHP/Gradle の部分ワイルドカード指定（例: `1.x`, `1.x.x`, `v1.*`, `1.2.*`, `1.+`）は形を保って更新される
-- 完全浮動指定（例: `*`, npm dist-tag の `latest`, Gradle の `latest.release` / `latest.integration`）は意味を変えないため更新対象から除外される
+- 完全浮動指定（例: `*`, npm dist-tag の `latest`, Gradle の `latest.release` / `latest.integration` / `latest.milestone` / ユーザ定義 status）は意味を変えないため更新対象から除外される
 - Range制約 (`>=X,<Y` / `>=X,<=Y` / `A..<B` / `A...B` / `A - B` / `[A,B)` / `[A,B]` / `]A,B[` / `[A,B[` / `]A,B]`) では上限を超えるバージョンは除外され、更新時は上限制約を維持したまま下限側のみを互換な最新バージョンへ進める (`<=` / `...` / 閉じ `]` は上限値を含む。npm/Composer の `A - B` は右辺が完全指定なら包含、`1.0 - 2.0` のような部分指定ならワイルドカード展開後の排他的上限として扱う)
 - 安全に書き換えられない複合制約（例: npm/Composer の `^1 || ^2`、除外専用制約 `!=1.2.3`、下限なし Maven 形式 `(,2.0]`）は更新候補から除外される
 - Maven 形式の qualifier 付き上限（例: `[1.0,2.0.Final)`, `[1.0,2.0-beta1-SNAPSHOT)`）も上限制約として解釈される。Gradle のバージョン部は `.`, `-`, `_`, `+` 区切りと `1a1` のような英数字混在パートを許容する
 - `package.json` の更新は `dependencies` / `devDependencies` / `peerDependencies` / `optionalDependencies` に限定し、`overrides` 等は書き換えない。`composer.json` の更新は `require` / `require-dev` に限定し、`replace` / `provide` / `conflict` 等は書き換えない
 - Cargo workspace の `[workspace] members` に指定されたメンバークレートの Cargo.toml も自動検出
+- Cargo.toml の `[dependencies.<name>]` テーブル形式の更新では、`serde` を更新する際に `serde_json` のような名前プレフィックスを共有するパッケージへ誤マッチしない (パッケージ名の直後は `]` か空白のみを許容)
 - Tauriプロジェクトでは npm/crate のバージョンを自動同期
 - Swift は GitHub Tags API を使用 (`GITHUB_TOKEN`/`GH_TOKEN` で認証可能)。GitHub Tags API はリリース日を返さないため、各バージョンの `released_at` には UNIX_EPOCH を使う (= 「十分古い」として扱う)。これにより `--age` 指定時でも Swift パッケージの更新が抑制されない
 - Swift の GitHub タグは `v1.2.3` と `V1.2.3` の両方を認識する

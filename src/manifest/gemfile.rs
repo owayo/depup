@@ -35,7 +35,8 @@ static GROUP_START_RE: LazyLock<Regex> = LazyLock::new(|| {
     // 例:
     // group :development do
     // group :development, :test do
-    Regex::new(r"^\s*group\s+(.+?)\s+do\s*$").unwrap()
+    // group :development do # security gems  <- 行末コメントも許容する
+    Regex::new(r"^\s*group\s+(.+?)\s+do\s*(?:#.*)?$").unwrap()
 });
 
 // `group` ブロック終端
@@ -796,5 +797,40 @@ end
 
         assert!(private.is_dev);
         assert!(debug.is_dev);
+    }
+
+    #[test]
+    fn test_parse_group_with_inline_comment() {
+        // 回帰テスト: `group :development do # comment` のように
+        // インラインコメントが付いていても開発グループとして認識されること
+        let content = r#"
+group :development do # security gems
+  gem 'brakeman', '~> 6.0'
+end
+
+group :test, :development do  # bundler comment
+  gem 'rspec', '~> 3.13'
+end
+
+gem 'pg', '~> 1.5'
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 3);
+
+        let brakeman = deps.iter().find(|d| d.name == "brakeman").unwrap();
+        let rspec = deps.iter().find(|d| d.name == "rspec").unwrap();
+        let pg = deps.iter().find(|d| d.name == "pg").unwrap();
+
+        // インラインコメント付きの group も開発依存と認識されること
+        assert!(
+            brakeman.is_dev,
+            "brakeman should be dev (group has inline comment)"
+        );
+        assert!(
+            rspec.is_dev,
+            "rspec should be dev (group has trailing space + comment)"
+        );
+        // グループ外の gem は本番依存
+        assert!(!pg.is_dev);
     }
 }

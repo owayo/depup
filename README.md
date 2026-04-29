@@ -262,7 +262,7 @@ depup preserves the original version range format:
 "1.2.3!!" → "2.0.0!!" (Gradle strict preserved)
 ```
 
-Floating selectors such as `"*"`, npm dist-tags like `"latest"`, and Gradle dynamic selectors like `"latest.release"` are skipped to avoid changing them into exact versions.
+Floating selectors such as `"*"`, npm dist-tags like `"latest"`, and Gradle dynamic selectors (`"latest.release"`, `"latest.integration"`, `"latest.milestone"`, and any user-defined `latest.<status>`) are skipped to avoid changing them into exact versions.
 
 ### Range Constraints
 

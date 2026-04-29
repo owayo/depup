@@ -128,9 +128,11 @@ impl ManifestParser for CargoTomlParser {
         // 複数行テーブル:
         // [dependencies.package]
         // version = "1.0.0"
-        // [workspace.dependencies.package] も含めて処理する
+        // [workspace.dependencies.package] も含めて処理する。
+        // パッケージ名の直後は終端 `]` か空白のみを許可することで、
+        // `[dependencies.serde_json]` を `serde` で誤マッチしないようにする。
         let multiline_pattern = format!(
-            r#"(?m)(\[(?:dependencies|dev-dependencies|build-dependencies|workspace\.dependencies)\.{}[^\]]*\][^\[]*version\s*=\s*)"([^"]+)""#,
+            r#"(?m)(\[(?:dependencies|dev-dependencies|build-dependencies|workspace\.dependencies)\.{}[ \t]*\][^\[]*version\s*=\s*)"([^"]+)""#,
             regex::escape(package)
         );
         if let Ok(re) = Regex::new(&multiline_pattern)
@@ -180,10 +182,12 @@ impl ManifestParser for CargoTomlParser {
             updated = true;
         }
 
-        // 複数行テーブル: `[dependencies.package]` ブロック内の `tag = "..."` を差し替える
-        //   `[patch]` や `[workspace.dependencies]` にも対応する
+        // 複数行テーブル: `[dependencies.package]` ブロック内の `tag = "..."` を差し替える。
+        //   `[patch]` や `[workspace.dependencies]` にも対応する。
+        //   パッケージ名の直後は終端 `]` か空白のみを許可することで、
+        //   `[dependencies.foo-extra]` を `foo` で誤マッチしないようにする。
         let multiline_pattern = format!(
-            r#"(?m)(\[(?:dependencies|dev-dependencies|build-dependencies|workspace\.dependencies|patch\.[A-Za-z0-9_.-]+)\.{}[^\]]*\][^\[]*?\btag\s*=\s*)"([^"]+)""#,
+            r#"(?m)(\[(?:dependencies|dev-dependencies|build-dependencies|workspace\.dependencies|patch\.[A-Za-z0-9_.-]+)\.{}[ \t]*\][^\[]*?\btag\s*=\s*)"([^"]+)""#,
             regex::escape(package)
         );
         if let Ok(re) = Regex::new(&multiline_pattern)
@@ -701,6 +705,68 @@ version = "0.21"
 
         assert!(result2.contains("version = \"0.25.1\""));
         assert!(result2.contains("version = \"0.26.3\""));
+    }
+
+    #[test]
+    fn test_update_multiline_table_prefix_collision() {
+        // 回帰テスト: パッケージ名が他のパッケージのプレフィックスと一致する場合に
+        // 誤って prefix-only のパッケージ更新で suffix が長いパッケージが書き換わらない
+        // 例: `[dependencies.serde_json]` が先に出現する状況で `serde` を更新する
+        let content = r#"[dependencies.serde_json]
+version = "1.0.0"
+
+[dependencies.serde]
+version = "1.0.2"
+"#;
+
+        let result = CargoTomlParser
+            .update_version(content, "serde", "1.1.0")
+            .unwrap();
+
+        // serde_json は変更されていないこと
+        assert!(
+            result.contains("[dependencies.serde_json]\nversion = \"1.0.0\""),
+            "serde_json should not be modified, but got:\n{}",
+            result
+        );
+        // serde が更新されていること
+        assert!(
+            result.contains("[dependencies.serde]\nversion = \"1.1.0\""),
+            "serde should be updated, but got:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_update_git_tag_prefix_collision() {
+        // 回帰テスト: プレフィックスが一致する別パッケージの git tag が誤って書き換わらない
+        let content = r#"[dependencies.foo-extra]
+git = "https://example.com/foo-extra"
+tag = "v1.0.0"
+
+[dependencies.foo]
+git = "https://example.com/foo"
+tag = "v0.5.0"
+"#;
+
+        let result = CargoTomlParser
+            .update_git_tag(content, "foo", "v0.6.0")
+            .unwrap();
+
+        // foo-extra の tag は変わらない
+        assert!(
+            result.contains("[dependencies.foo-extra]\ngit = \"https://example.com/foo-extra\"\ntag = \"v1.0.0\""),
+            "foo-extra tag should not be modified, but got:\n{}",
+            result
+        );
+        // foo の tag は更新される
+        assert!(
+            result.contains(
+                "[dependencies.foo]\ngit = \"https://example.com/foo\"\ntag = \"v0.6.0\""
+            ),
+            "foo tag should be updated, but got:\n{}",
+            result
+        );
     }
 
     #[test]
