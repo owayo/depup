@@ -1026,7 +1026,7 @@ mod tests {
 
     #[test]
     fn test_judge_maven_range_exclusive_alt_brackets() {
-        // Maven の代替記法 `]1.0,2.0[` は `>1.0 && <2.0`
+        // Maven の代替記法 `]1.0,2.0[` は下限排他なので安全に書き換えられない
         let filter = UpdateFilter::new();
         let judge = UpdateJudge::new(filter);
 
@@ -1038,9 +1038,12 @@ mod tests {
         ];
 
         let result = judge.judge(&dep, &versions);
-        assert!(result.is_update());
-        if let UpdateResult::Update { new_version, .. } = result {
-            assert_eq!(new_version, "1.9");
+        assert!(result.is_skip());
+        if let UpdateResult::Skip { reason, .. } = result {
+            assert_eq!(
+                reason,
+                SkipReason::ParseError("constraint cannot be updated safely".to_string())
+            );
         }
     }
 
@@ -1134,6 +1137,85 @@ mod tests {
         if let UpdateResult::Update { new_version, .. } = result {
             // 4.0.0 ではなく 3.9.0 に更新される
             assert_eq!(new_version, "3.9.0");
+        }
+    }
+
+    #[test]
+    fn test_judge_range_upper_bound_first_updates_lower_bound() {
+        // 上限制約が先に書かれていても、更新するのは下限側だけ
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_range_dependency("paramiko", "<4.0.0,>=3.5.0", "3.5.0", Language::Python);
+        let versions = vec![
+            make_version_info("3.5.0", 100),
+            make_version_info("3.9.0", 20),
+            make_version_info("4.0.0", 10), // 上限制約により除外される
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_update());
+        if let UpdateResult::Update { new_version, .. } = result {
+            assert_eq!(new_version, "3.9.0");
+        }
+    }
+
+    #[test]
+    fn test_judge_range_exclusive_lower_bound_skips_with_parse_error() {
+        // `>最新候補` に書き換えると最新候補自身が制約を満たさない
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_range_dependency("package", ">1.0,<2.0", "1.0", Language::Python);
+        let versions = vec![make_version_info("1.9", 20), make_version_info("2.0", 10)];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_skip());
+        if let UpdateResult::Skip { reason, .. } = result {
+            assert_eq!(
+                reason,
+                SkipReason::ParseError("constraint cannot be updated safely".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn test_judge_strict_greater_skips_with_parse_error() {
+        // 単独の `>` は最新候補へ更新すると `>最新候補` になり、解決不能になり得る
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let spec = VersionSpec::new(VersionSpecKind::Greater, ">1.0", "1.0").with_prefix(">");
+        let dep = Dependency::new("package", spec, false, Language::Python);
+        let versions = vec![make_version_info("2.0", 20)];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_skip());
+        if let UpdateResult::Skip { reason, .. } = result {
+            assert_eq!(
+                reason,
+                SkipReason::ParseError("constraint cannot be updated safely".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn test_judge_upper_bound_only_skips_with_parse_error() {
+        // 単独の `<` / `<=` は上限だけの制約なので、自動更新で上限を広げない
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let spec = VersionSpec::new(VersionSpecKind::LessOrEqual, "<=2.0", "2.0").with_prefix("<=");
+        let dep = Dependency::new("package", spec, false, Language::Python);
+        let versions = vec![make_version_info("3.0", 20)];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_skip());
+        if let UpdateResult::Skip { reason, .. } = result {
+            assert_eq!(
+                reason,
+                SkipReason::ParseError("constraint cannot be updated safely".to_string())
+            );
         }
     }
 

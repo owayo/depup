@@ -279,20 +279,21 @@ depup respects upper-bound range constraints (both exclusive and inclusive):
 "[1.0,2.0]"        → "[2.0,2.0]" (Maven-style)
 "[1.0,2.0.Final)"  → "[1.9.3,2.0.Final)" (Maven qualifier)
 "[1.0,2.0-beta1-SNAPSHOT)" → "[1.9.3,2.0-beta1-SNAPSHOT)" (multi-part Maven qualifier)
-"]1.0,2.0["        → "]1.9.3,2.0[" (Maven alt brackets)
-"]1.0,2.0]"        → "]2.0,2.0]" (Maven alt inclusive)
 "[1.0,2.0["        → "[1.9.3,2.0[" (Maven alt upper bracket)
+"<4.0.0"           → skipped (upper-bound only)
+">1.0.0"           → skipped (exclusive lower bound)
+"]1.0,2.0["        → skipped (exclusive Maven lower bound)
 ```
 
 For npm/Composer hyphen ranges, a partial right-hand side like `1.0 - 2.0` is interpreted as a wildcard-expanded exclusive upper bound, so `2.0.x` updates remain eligible while `2.1.0` is excluded.
 
-When a dependency has an upper bound constraint (e.g., `<4.0.0`, `<=2.0`, `...4.9.9`), depup will:
+When a dependency has a range with an upper bound (e.g., `>=3.5.0,<4.0.0`, `>=1.0,<=2.0`, `4.0.0...4.9.9`), depup will:
 - **Not propose** versions that exceed the upper bound
 - Keep inclusive boundaries (`<=`, `...`) eligible
 - **Preserve** the original constraint shape in the manifest file
 - **Update only the lower-bound side** to the newest compatible version within the range
 
-Constraints that cannot be rewritten safely are skipped instead of being rewritten partially. This includes examples such as npm/Composer OR constraints (`^1 || ^2`), exclusion-only constraints (`!=1.2.3`), and Maven-style ranges without a lower bound (`(,2.0]`).
+Constraints that cannot be rewritten safely are skipped instead of being rewritten partially. This includes examples such as npm/Composer OR constraints (`^1 || ^2`), exclusion-only constraints (`!=1.2.3`), upper-bound-only constraints (`<4.0.0`, `<=2.0`), strict lower bounds (`>1.0.0`), Maven-style ranges without a lower bound (`(,2.0]`), and Maven ranges with an exclusive lower bound (`]1.0,2.0[`).
 
 For JSON manifests, depup only rewrites dependency sections it parses. In `package.json`, `overrides` is left untouched; in `composer.json`, sections such as `replace`, `provide`, and `conflict` are left untouched.
 

@@ -209,8 +209,63 @@ fn find_first_version_token(raw: &str) -> Option<(usize, usize)> {
     None
 }
 
+fn replace_version_token(raw: &str, start: usize, end: usize, new_version: &str) -> Option<String> {
+    let token = &raw[start..end];
+    let replacement = if token.contains('*') {
+        format_wildcard_like(token, new_version)?
+    } else {
+        preserve_version_prefix(token, new_version)
+    };
+
+    Some(format!("{}{}{}", &raw[..start], replacement, &raw[end..]))
+}
+
+fn find_version_token_at(raw: &str, offset: usize) -> Option<(usize, usize)> {
+    let rest = raw.get(offset..)?;
+    let whitespace_len = rest.len() - rest.trim_start().len();
+    let token_start = offset + whitespace_len;
+    let token_rest = raw.get(token_start..)?;
+    let (start, end) = find_first_version_token(token_rest)?;
+    if start == 0 {
+        Some((token_start, token_start + end))
+    } else {
+        None
+    }
+}
+
+fn find_inclusive_lower_bound_token(raw: &str) -> Option<(usize, usize)> {
+    let operators = [">=", "~=", "==", "=", "^", "~"];
+    let mut index = 0;
+
+    while index < raw.len() {
+        let rest = &raw[index..];
+        let is_operator_continuation =
+            index > 0 && matches!(raw.as_bytes()[index - 1], b'<' | b'>' | b'!' | b'=' | b'~');
+        if is_operator_continuation {
+            let ch = rest.chars().next()?;
+            index += ch.len_utf8();
+            continue;
+        }
+
+        for operator in operators {
+            if rest.starts_with(operator) {
+                let after_operator = index + operator.len();
+                if let Some(token) = find_version_token_at(raw, after_operator) {
+                    return Some(token);
+                }
+            }
+        }
+
+        let ch = rest.chars().next()?;
+        index += ch.len_utf8();
+    }
+
+    None
+}
+
 fn format_range_like(raw: &str, new_version: &str) -> Option<String> {
     let trimmed = raw.trim();
+    let leading_ws_len = raw.len() - raw.trim_start().len();
 
     if trimmed.contains("||")
         || trimmed.starts_with("!=")
@@ -246,22 +301,30 @@ fn format_range_like(raw: &str, new_version: &str) -> Option<String> {
         return format_partial_version_like(trimmed, new_version);
     }
 
-    if matches!(trimmed.chars().next(), Some('[' | '(' | ']'))
-        && let Some(comma_index) = trimmed.find(',')
-        && trimmed[1..comma_index].trim().is_empty()
-    {
-        return None;
+    if matches!(trimmed.chars().next(), Some('[' | '(' | ']')) {
+        let comma_index = trimmed.find(',')?;
+        let lower = trimmed[1..comma_index].trim();
+        if lower.is_empty() || !trimmed.starts_with('[') {
+            return None;
+        }
+
+        let lower_offset = leading_ws_len + 1;
+        let lower_start = find_version_token_at(raw, lower_offset)?;
+        if lower_start.0 >= leading_ws_len + comma_index {
+            return None;
+        }
+
+        return replace_version_token(raw, lower_start.0, lower_start.1, new_version);
     }
 
-    let (start, end) = find_first_version_token(raw)?;
-    let token = &raw[start..end];
-    let replacement = if token.contains('*') {
-        format_wildcard_like(token, new_version)?
-    } else {
-        preserve_version_prefix(token, new_version)
-    };
+    if trimmed.contains(" - ") || trimmed.contains("..<") || trimmed.contains("...") {
+        let (start, end) = find_first_version_token(raw)?;
+        return replace_version_token(raw, start, end, new_version);
+    }
 
-    Some(format!("{}{}{}", &raw[..start], replacement, &raw[end..]))
+    let (start, end) = find_inclusive_lower_bound_token(raw)?;
+
+    replace_version_token(raw, start, end, new_version)
 }
 
 impl VersionSpec {
@@ -298,6 +361,7 @@ impl VersionSpec {
         match self.kind {
             VersionSpecKind::Wildcard => format_wildcard_like(&self.raw, new_version),
             VersionSpecKind::Range => format_range_like(&self.raw, new_version),
+            VersionSpecKind::Greater | VersionSpecKind::LessOrEqual | VersionSpecKind::Less => None,
             _ => {
                 let mut result = String::new();
 
@@ -419,6 +483,24 @@ mod tests {
     }
 
     #[test]
+    fn test_try_format_updated_rejects_strict_greater() {
+        // `>最新候補` に書き換えると、その最新候補自身が制約を満たさない
+        let spec = VersionSpec::new(VersionSpecKind::Greater, ">1.2.3", "1.2.3").with_prefix(">");
+        assert!(spec.try_format_updated("2.0.0").is_none());
+    }
+
+    #[test]
+    fn test_try_format_updated_rejects_upper_bound_only_constraints() {
+        // 上限だけの制約を書き換えると許容範囲を広げるため安全ではない
+        let less = VersionSpec::new(VersionSpecKind::Less, "<2.0.0", "2.0.0").with_prefix("<");
+        let less_or_equal =
+            VersionSpec::new(VersionSpecKind::LessOrEqual, "<=2.0.0", "2.0.0").with_prefix("<=");
+
+        assert!(less.try_format_updated("3.0.0").is_none());
+        assert!(less_or_equal.try_format_updated("3.0.0").is_none());
+    }
+
+    #[test]
     fn test_format_updated_wildcard_major() {
         let spec = VersionSpec::new(VersionSpecKind::Wildcard, "1.*", "1");
         assert_eq!(spec.format_updated("2.3.4"), "2.*");
@@ -479,6 +561,22 @@ mod tests {
     }
 
     #[test]
+    fn test_try_format_updated_range_updates_inclusive_lower_bound_when_ordered_later() {
+        let spec = VersionSpec::new(VersionSpecKind::Range, "<=2.0,>=1.0", "1.0");
+        assert_eq!(
+            spec.try_format_updated("1.9.3").as_deref(),
+            Some("<=2.0,>=1.9.3")
+        );
+    }
+
+    #[test]
+    fn test_try_format_updated_range_rejects_exclusive_lower_bound() {
+        // `>最新候補` に書き換えると、その最新候補自身が制約を満たさない
+        let spec = VersionSpec::new(VersionSpecKind::Range, ">1.0,<2.0", "1.0");
+        assert!(spec.try_format_updated("1.9.3").is_none());
+    }
+
+    #[test]
     fn test_try_format_updated_range_hyphen_updates_left_side() {
         let spec = VersionSpec::new(VersionSpecKind::Range, "1.0 - 2.0", "1.0");
         assert_eq!(
@@ -493,6 +591,15 @@ mod tests {
         assert_eq!(
             spec.try_format_updated("1.9.3").as_deref(),
             Some("[1.9.3,2.0)")
+        );
+    }
+
+    #[test]
+    fn test_try_format_updated_range_maven_open_upper_updates_lower_bound() {
+        let spec = VersionSpec::new(VersionSpecKind::Range, "[1.0,)", "1.0");
+        assert_eq!(
+            spec.try_format_updated("1.9.3").as_deref(),
+            Some("[1.9.3,)")
         );
     }
 
@@ -570,12 +677,9 @@ mod tests {
 
     #[test]
     fn test_format_range_like_maven_alt_brackets() {
-        // Maven の反転ブラケット記法 ]...[ で下限のみ更新される
+        // Maven の反転ブラケット記法 ]...[ は下限排他なので安全に書き換えられない
         let spec = VersionSpec::new(VersionSpecKind::Range, "]1.0,2.0[", "1.0");
-        assert_eq!(
-            spec.try_format_updated("1.5.0").as_deref(),
-            Some("]1.5.0,2.0[")
-        );
+        assert!(spec.try_format_updated("1.5.0").is_none());
     }
 
     #[test]
