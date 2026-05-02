@@ -90,6 +90,7 @@ impl ManifestParser for ComposerJsonParser {
 /// パッケージ名がプラットフォームパッケージかどうかを返す
 fn is_platform_package(name: &str) -> bool {
     name == "php"
+        || name == "hhvm"
         || name.starts_with("php-")
         || name.starts_with("ext-")
         || name.starts_with("lib-")
@@ -234,6 +235,7 @@ mod tests {
         let content = r#"{
             "require": {
                 "php": ">=8.1",
+                "hhvm": "^4.0",
                 "ext-json": "*",
                 "ext-mbstring": "*",
                 "lib-curl": ">=7.0",

@@ -57,7 +57,7 @@ static EXT_BLOCK_START: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*ext\
 // 非後方参照パターンを使用 (シングル/ダブルクォート両対応)
 static DEP_MAP: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"^\s*(\w+)\s*[\(\s]+group:\s*['"]([^'"]+)['"]\s*,\s*name:\s*['"]([^'"]+)['"]\s*,\s*version:\s*['"]?([^'",\)\s]+)['"]?"#,
+        r#"^\s*(\w+)\s*[\(\s]+group\s*[:=]\s*['"]([^'"]+)['"]\s*,\s*name\s*[:=]\s*['"]([^'"]+)['"]\s*,\s*version\s*[:=]\s*['"]?([^'",\)\s]+)['"]?"#,
     )
     .unwrap()
 });
@@ -584,7 +584,7 @@ impl GradleParser {
         // map 記法を更新: group: 'x', name: 'y', version: 'z'
         // 非後方参照パターンでシングル/ダブルクォート両対応
         let map_pattern = format!(
-            r#"(group:\s*['"]{}['"]\s*,\s*name:\s*['"]{}['"]\s*,\s*version:\s*)(['"])([^'"]+)['"]"#,
+            r#"(group\s*[:=]\s*['"]{}['"]\s*,\s*name\s*[:=]\s*['"]{}['"]\s*,\s*version\s*[:=]\s*)(['"])([^'"]+)['"]"#,
             escaped_group, escaped_artifact
         );
         let map_re = Regex::new(&map_pattern).map_err(|e| ManifestError::InvalidVersionSpec {
@@ -742,6 +742,19 @@ dependencies {
     }
 
     #[test]
+    fn test_parse_kotlin_named_argument_map_notation() {
+        let content = r#"
+dependencies {
+    implementation(group = "com.google.guava", name = "guava", version = "32.1.2-jre")
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "com.google.guava:guava");
+        assert_eq!(deps[0].version_spec.version, "32.1.2-jre");
+    }
+
+    #[test]
     fn test_parse_test_implementation() {
         let content = r#"
 dependencies {
@@ -877,6 +890,19 @@ dependencies {
             .update_version(content, "org.apache.wicket:wicket-core", "10.0.0")
             .unwrap();
         assert!(result.contains("version: '10.0.0'"));
+    }
+
+    #[test]
+    fn test_update_kotlin_named_argument_map_notation() {
+        let content = r#"
+dependencies {
+    implementation(group = "com.google.guava", name = "guava", version = "32.1.2-jre")
+}
+"#;
+        let result = GradleParser
+            .update_version(content, "com.google.guava:guava", "33.4.0-jre")
+            .unwrap();
+        assert!(result.contains(r#"version = "33.4.0-jre""#));
     }
 
     #[test]

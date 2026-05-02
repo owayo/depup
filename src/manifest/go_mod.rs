@@ -40,6 +40,7 @@ impl ManifestParser for GoModParser {
 
         for line in content.lines() {
             let trimmed = line.trim();
+            let logical = trimmed.split("//").next().unwrap_or("").trim();
 
             // 空行とコメントをスキップする
             if trimmed.is_empty() || trimmed.starts_with("//") {
@@ -47,17 +48,17 @@ impl ManifestParser for GoModParser {
             }
 
             // ブロックの開始/終了を確認する
-            if trimmed.starts_with("require (") || trimmed == "require (" {
+            if logical.starts_with("require (") || logical == "require (" {
                 in_require_block = true;
                 continue;
             }
 
-            if trimmed.starts_with("replace (") || trimmed == "replace (" {
+            if logical.starts_with("replace (") || logical == "replace (" {
                 in_replace_block = true;
                 continue;
             }
 
-            if trimmed == ")" {
+            if logical == ")" {
                 in_require_block = false;
                 in_replace_block = false;
                 continue;
@@ -115,13 +116,14 @@ impl ManifestParser for GoModParser {
 
         for line in content.lines() {
             let trimmed = line.trim();
+            let logical = trimmed.split("//").next().unwrap_or("").trim();
 
             // replace ブロックの開始/終了を追跡する
-            if trimmed.starts_with("replace (") || trimmed == "replace (" {
+            if logical.starts_with("replace (") || logical == "replace (" {
                 in_replace_block = true;
-            } else if trimmed.starts_with("exclude (") || trimmed == "exclude (" {
+            } else if logical.starts_with("exclude (") || logical == "exclude (" {
                 in_exclude_block = true;
-            } else if (in_replace_block || in_exclude_block) && trimmed == ")" {
+            } else if (in_replace_block || in_exclude_block) && logical == ")" {
                 in_replace_block = false;
                 in_exclude_block = false;
             }
@@ -290,6 +292,25 @@ require (
             .find(|d| d.name == "github.com/stretchr/testify")
             .unwrap();
         assert_eq!(testify.version_spec.version, "1.8.4");
+    }
+
+    #[test]
+    fn test_parse_block_close_with_comment() {
+        let content = r#"
+module example.com/myproject
+
+replace (
+	github.com/example/old => ../old
+) // local replacements
+
+require (
+	github.com/gin-gonic/gin v1.9.1
+) // direct deps
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "github.com/gin-gonic/gin");
     }
 
     #[test]
@@ -846,6 +867,24 @@ exclude (
         // exclude ブロック内は変更されない
         assert!(result.contains("github.com/gin-gonic/gin v1.8.0"));
         assert!(result.contains("github.com/gin-gonic/gin v1.8.1"));
+    }
+
+    #[test]
+    fn test_update_after_exclude_block_close_with_comment() {
+        let content = r#"module example.com/myproject
+
+exclude (
+	github.com/gin-gonic/gin v1.8.0
+) // excluded versions
+
+require github.com/gin-gonic/gin v1.9.1
+"#;
+
+        let result = GoModParser
+            .update_version(content, "github.com/gin-gonic/gin", "v1.10.0")
+            .unwrap();
+        assert!(result.contains("require github.com/gin-gonic/gin v1.10.0"));
+        assert!(result.contains("github.com/gin-gonic/gin v1.8.0"));
     }
 
     #[test]

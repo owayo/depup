@@ -175,13 +175,20 @@ impl UpdateJudge {
             return Some(SkipReason::LanguageFiltered);
         }
 
-        // パッケージフィルタ（exclude/only）を確認する
-        if !self.filter.should_process_package(&dependency.name) {
-            if !self.filter.only.is_empty() {
-                return Some(SkipReason::NotInOnlyList);
-            } else {
-                return Some(SkipReason::Excluded);
-            }
+        // パッケージフィルタ（exclude/only）を確認する。
+        // Cargo のリネーム依存では実パッケージ名とマニフェスト上のキー名の両方を受け付ける。
+        let manifest_name = dependency.manifest_name();
+        if !self.filter.only.is_empty()
+            && !self.filter.only.iter().any(|p| {
+                p == &dependency.name || (manifest_name != dependency.name && p == manifest_name)
+            })
+        {
+            return Some(SkipReason::NotInOnlyList);
+        }
+        if self.filter.exclude.iter().any(|p| {
+            p == &dependency.name || (manifest_name != dependency.name && p == manifest_name)
+        }) {
+            return Some(SkipReason::Excluded);
         }
 
         // GoPinned (// pinned コメント付き) は always_pinned に関係なくスキップ
@@ -549,6 +556,26 @@ mod tests {
 
         let dep = make_dependency("lodash", "1.0.0", Language::Node, false);
         assert!(judge.should_skip(&dep).is_none());
+    }
+
+    #[test]
+    fn test_should_skip_only_matches_manifest_name() {
+        let filter = UpdateFilter::new().with_only(vec!["tokio_v1".to_string()]);
+        let judge = UpdateJudge::new(filter);
+
+        let dep =
+            make_dependency("tokio", "1.0.0", Language::Rust, false).with_manifest_name("tokio_v1");
+        assert!(judge.should_skip(&dep).is_none());
+    }
+
+    #[test]
+    fn test_should_skip_exclude_matches_manifest_name() {
+        let filter = UpdateFilter::new().with_exclude(vec!["tokio_v1".to_string()]);
+        let judge = UpdateJudge::new(filter);
+
+        let dep =
+            make_dependency("tokio", "1.0.0", Language::Rust, false).with_manifest_name("tokio_v1");
+        assert_eq!(judge.should_skip(&dep), Some(SkipReason::Excluded));
     }
 
     #[test]

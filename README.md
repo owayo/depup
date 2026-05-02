@@ -245,6 +245,12 @@ Use `--include-pinned` to update pinned versions.
 > **Note**: Go dependencies are always included in updates regardless of the `--include-pinned` flag, because `go.mod` only supports exact versions (no range specifiers like `^` or `~`). All Go versions are effectively "pinned" by nature.
 >
 > **Note**: Gemfile compound and exclusion constraints such as `gem "pg", ">= 0.18", "< 2.0"` and `gem "rack", "!= 2.2.4"` are parsed, but depup does not rewrite them automatically. Replacing only part of those constraints can change their meaning, so depup reports them instead of applying an unsafe edit.
+>
+> **Note**: Gemfile entries that point to non-registry sources without a version (`git:`, `github:`, `bitbucket:`, `gist:`, `path:`, `source:`) are skipped instead of being converted into RubyGems registry constraints. Inline `group:` / `groups:` options are used to classify development dependencies.
+>
+> **Note**: Cargo renamed dependencies such as `alias = { package = "actual-crate", version = "1" }` are fetched by the real package name and written back through the manifest key. `--only` and `--exclude` accept either name.
+>
+> **Note**: Composer platform packages such as `php`, `hhvm`, `ext-*`, `lib-*`, and Composer API packages are skipped.
 
 ### Range Preservation
 
@@ -254,12 +260,15 @@ depup preserves the original version range format:
 "^1.2.3" → "^2.0.0"  (caret preserved)
 "~1.2.3" → "~1.3.0"  (tilde preserved)
 ">=1.0.0" → ">=2.0.0" (range preserved)
+"requests (>=2.28,<3); python_version < '3.12'" → "requests (>=2.31,<3); python_version < '3.12'" (PEP 508 parentheses and marker preserved)
+"coverage [toml] >=7,<8" → "coverage [toml] >=7.6,<8" (PEP 508 extras spacing preserved)
 "1.x" → "2.x" (wildcard shape preserved)
 "1.x.x" → "2.x.x" (all wildcard positions preserved)
 "1.2.*" → "1.3.*" (wildcard shape preserved)
 "v1.*" → "v2.*" (leading `v` preserved)
 "5.3.+" → "5.4.+" (Gradle prefix preserved)
 "1.2.3!!" → "2.0.0!!" (Gradle strict preserved)
+group = "com.google.guava", name = "guava", version = "32.1.2-jre" → version = "33.4.0-jre" (Gradle Kotlin map notation)
 ```
 
 Floating selectors such as `"*"`, npm dist-tags like `"latest"`, and Gradle dynamic selectors (`"latest.release"`, `"latest.integration"`, `"latest.milestone"`, and any user-defined `latest.<status>`) are skipped to avoid changing them into exact versions.
@@ -299,6 +308,8 @@ For JSON manifests, depup only rewrites dependency sections it parses. In `packa
 
 For Swift GitHub dependencies, depup recognizes both `v1.2.3` and `V1.2.3` tag prefixes.
 depup also skips `Package.swift` dependencies that appear inside `//` line comments or `/* ... */` block comments.
+
+For `go.mod`, depup treats block endings with trailing comments such as `) // direct deps` as normal block endings when parsing and updating `require`, `replace`, and `exclude` blocks.
 
 ## Age Filter
 

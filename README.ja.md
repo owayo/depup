@@ -245,6 +245,12 @@ depup --cd ./projects/myapp -n
 > **注意**: Goの依存関係は `--include-pinned` フラグに関係なく常に更新対象に含まれます。これは `go.mod` が正確なバージョンのみをサポートし、`^` や `~` のような範囲指定子がないためです。Goのすべてのバージョンは本質的に「固定」されています。
 >
 > **注意**: `gem "pg", ">= 0.18", "< 2.0"` や `gem "rack", "!= 2.2.4"` のような Gemfile の複合制約・除外制約は解析対象ですが、自動では書き換えません。制約の一部だけを更新すると意味が壊れるため、unsafe な編集は適用せずに報告します。
+>
+> **注意**: バージョンなしで `git:` / `github:` / `bitbucket:` / `gist:` / `path:` / `source:` を指定した Gemfile 依存は、RubyGems のレジストリ制約へ変換せずにスキップします。行単位の `group:` / `groups:` オプションは開発依存の判定に使います。
+>
+> **注意**: `alias = { package = "actual-crate", version = "1" }` のような Cargo のリネーム依存は、実パッケージ名で取得し、マニフェスト上のキーへ書き戻します。`--only` / `--exclude` はどちらの名前でも指定できます。
+>
+> **注意**: Composer の platform package（`php`, `hhvm`, `ext-*`, `lib-*`, Composer API パッケージなど）は更新対象から除外します。
 
 ### 範囲形式の維持
 
@@ -254,12 +260,15 @@ depupは元のバージョン範囲形式を維持します：
 "^1.2.3" → "^2.0.0"  （キャレット維持）
 "~1.2.3" → "~1.3.0"  （チルダ維持）
 ">=1.0.0" → ">=2.0.0" （範囲維持）
+"requests (>=2.28,<3); python_version < '3.12'" → "requests (>=2.31,<3); python_version < '3.12'" （PEP 508 の括弧とマーカーを維持）
+"coverage [toml] >=7,<8" → "coverage [toml] >=7.6,<8" （PEP 508 extras の空白を維持）
 "1.x" → "2.x" （ワイルドカード形式を維持）
 "1.x.x" → "2.x.x" （複数のワイルドカード位置を維持）
 "1.2.*" → "1.3.*" （ワイルドカード形式を維持）
 "v1.*" → "v2.*" （先頭の `v` を維持）
 "5.3.+" → "5.4.+" （Gradle プレフィックスを維持）
 "1.2.3!!" → "2.0.0!!" （Gradle strict を維持）
+group = "com.google.guava", name = "guava", version = "32.1.2-jre" → version = "33.4.0-jre" （Gradle Kotlin map 記法）
 ```
 
 `"*"`、npm の dist-tag（`"latest"` など）、Gradle の動的指定（`"latest.release"`、`"latest.integration"`、`"latest.milestone"`、ユーザ定義 `latest.<status>` など全般）のような完全浮動指定は、厳密バージョンへ変質させないため更新対象から除外されます。
@@ -299,6 +308,8 @@ JSON マニフェストでは、depup が解析対象にする依存セクショ
 
 Swift の GitHub 依存では、タグの接頭辞 `v1.2.3` と `V1.2.3` の両方を認識します。
 また、`Package.swift` では `//` 行コメントや `/* ... */` ブロックコメント内に書かれた依存宣言は解析対象から除外します。
+
+`go.mod` では、`) // direct deps` のようなコメント付きブロック終端も通常のブロック終端として扱い、`require` / `replace` / `exclude` ブロックのパースと更新に反映します。
 
 ## エイジフィルター
 

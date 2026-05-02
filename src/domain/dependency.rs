@@ -9,6 +9,9 @@ use std::fmt;
 pub struct Dependency {
     /// パッケージ名
     pub name: String,
+    /// マニフェスト上の依存キー名。Cargo の `package` リネームなどで実パッケージ名と異なる場合に使う
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_name: Option<String>,
     /// バージョン指定
     pub version_spec: VersionSpec,
     /// 開発依存かどうか
@@ -33,6 +36,7 @@ impl Dependency {
     ) -> Self {
         Self {
             name: name.into(),
+            manifest_name: None,
             version_spec,
             is_dev,
             language,
@@ -44,6 +48,15 @@ impl Dependency {
     /// この依存関係の変数名を設定する (ビルダーパターン)
     pub fn with_variable(mut self, var_name: impl Into<String>) -> Self {
         self.variable_name = Some(var_name.into());
+        self
+    }
+
+    /// マニフェスト上の依存キー名を設定する (ビルダーパターン)
+    pub fn with_manifest_name(mut self, manifest_name: impl Into<String>) -> Self {
+        let manifest_name = manifest_name.into();
+        if manifest_name != self.name {
+            self.manifest_name = Some(manifest_name);
+        }
         self
     }
 
@@ -91,6 +104,11 @@ impl Dependency {
     pub fn version(&self) -> &str {
         &self.version_spec.version
     }
+
+    /// マニフェストを書き戻すときに使う依存キー名を返す
+    pub fn manifest_name(&self) -> &str {
+        self.manifest_name.as_deref().unwrap_or(&self.name)
+    }
 }
 
 impl fmt::Display for Dependency {
@@ -121,6 +139,7 @@ mod tests {
     fn test_dependency_new() {
         let dep = Dependency::new("lodash", sample_version_spec(), false, Language::Node);
         assert_eq!(dep.name, "lodash");
+        assert!(dep.manifest_name.is_none());
         assert!(!dep.is_dev);
         assert_eq!(dep.language, Language::Node);
     }
@@ -223,6 +242,21 @@ mod tests {
             .with_variable("guavaVersion");
         assert_eq!(dep.variable_name, Some("guavaVersion".to_string()));
         assert_eq!(dep.name, "guava");
+    }
+
+    #[test]
+    fn test_dependency_with_manifest_name() {
+        let dep = Dependency::new("foo", sample_version_spec(), false, Language::Rust)
+            .with_manifest_name("bar");
+        assert_eq!(dep.name, "foo");
+        assert_eq!(dep.manifest_name, Some("bar".to_string()));
+        assert_eq!(dep.manifest_name(), "bar");
+    }
+
+    #[test]
+    fn test_dependency_manifest_name_defaults_to_package_name() {
+        let dep = Dependency::new("foo", sample_version_spec(), false, Language::Rust);
+        assert_eq!(dep.manifest_name(), "foo");
     }
 
     #[test]

@@ -211,9 +211,9 @@ impl ManifestParser for PyprojectTomlParser {
             }
         }
 
-        // 配列中の PEP 508 形式: `"package>=1.0,<2.0"` / `"package[extras]>=1.0"`
+        // 配列中の PEP 508 形式: `"package>=1.0,<2.0"` / `"package [extras] (>=1.0); marker"`
         let pep508_pattern = format!(
-            r#""({}(?:\[[^\]]*\])?(?:\s*[<>=!~^]+[^"]+)?)""#,
+            r#""({}(?:(?:\s*\[[^\]]*\])?\s*(?:[<>=!~^]|\()[^"]*)?)""#,
             regex::escape(package)
         );
         if let Ok(re) = Regex::new(&pep508_pattern) {
@@ -222,23 +222,16 @@ impl ManifestParser for PyprojectTomlParser {
                 let full_dep = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                 if let Some(pep_caps) = PEP508_RE.captures(full_dep) {
                     let pkg_name = pep_caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                    let raw_version = pep_caps.get(2).map(|m| m.as_str()).unwrap_or("").trim();
-
-                    // `package[extra]>=1.0` の extras 部分を切り出して保持する
-                    let (extras_str, version_part) = if raw_version.starts_with('[') {
-                        if let Some(idx) = raw_version.find(']') {
-                            (&raw_version[..=idx], raw_version[idx + 1..].trim())
-                        } else {
-                            ("", raw_version)
-                        }
-                    } else {
-                        ("", raw_version)
-                    };
+                    let after_name = &full_dep[pkg_name.len()..];
+                    let (extras_str, version_part) = split_pep508_extras_and_version(after_name);
 
                     if pkg_name == package
                         && !version_part.is_empty()
-                        && let Some(spec) = parser.parse(version_part)
-                        && let Some(new_ver) = spec.try_format_updated(new_version)
+                        && let Some(new_ver) = format_pep508_updated_version(
+                            version_part,
+                            parser.as_ref(),
+                            new_version,
+                        )
                     {
                         let new_dep = format!("{}{}{}", package, extras_str, new_ver);
                         result =
@@ -283,6 +276,7 @@ fn parse_pep508_dependency(
         .next()
         .unwrap_or(version_part)
         .trim();
+    let (version_part, _) = strip_pep508_version_parens(version_part);
 
     if version_part.is_empty() {
         return None;
@@ -294,6 +288,62 @@ fn parse_pep508_dependency(
     } else {
         Dependency::production(name, spec, Language::Python)
     })
+}
+
+fn strip_pep508_version_parens(version_part: &str) -> (&str, bool) {
+    let trimmed = version_part.trim();
+    if let Some(inner) = trimmed
+        .strip_prefix('(')
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        (inner.trim(), true)
+    } else {
+        (trimmed, false)
+    }
+}
+
+fn split_pep508_extras_and_version(after_name: &str) -> (&str, &str) {
+    let leading_ws_len = after_name.len() - after_name.trim_start().len();
+    let mut prefix_end = leading_ws_len;
+
+    if let Some(rest) = after_name.get(prefix_end..)
+        && rest.starts_with('[')
+        && let Some(idx) = rest.find(']')
+    {
+        prefix_end += idx + 1;
+        if let Some(after_extras) = after_name.get(prefix_end..) {
+            prefix_end += after_extras.len() - after_extras.trim_start().len();
+        }
+    }
+
+    (&after_name[..prefix_end], after_name[prefix_end..].trim())
+}
+
+fn format_pep508_updated_version(
+    version_part: &str,
+    parser: &dyn VersionParser,
+    new_version: &str,
+) -> Option<String> {
+    let (constraint, marker) = version_part
+        .split_once(';')
+        .map(|(constraint, marker)| (constraint.trim(), Some(marker)))
+        .unwrap_or((version_part.trim(), None));
+    let (parse_target, has_parens) = strip_pep508_version_parens(constraint);
+    if parse_target.is_empty() {
+        return None;
+    }
+    let spec = parser.parse(parse_target)?;
+    let updated = spec.try_format_updated(new_version)?;
+    let mut result = if has_parens {
+        format!("({})", updated)
+    } else {
+        updated
+    };
+    if let Some(marker) = marker {
+        result.push(';');
+        result.push_str(marker);
+    }
+    Some(result)
 }
 
 fn parse_poetry_dependency(
@@ -587,6 +637,22 @@ dependencies = [
     }
 
     #[test]
+    fn test_parse_pep508_parenthesized_version_spec() {
+        let content = r#"
+[project]
+dependencies = [
+    "requests (>=2.28,<3)",
+]
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "requests");
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Range);
+        assert_eq!(deps[0].version_spec.raw, ">=2.28,<3");
+    }
+
+    #[test]
     fn test_update_pep508_range_preserves_constraint() {
         // 下限つき Range は上限制約を保ったまま下限だけ更新する
         let content = r#"
@@ -612,6 +678,46 @@ dependencies = [
     }
 
     #[test]
+    fn test_update_pep508_parenthesized_version_spec() {
+        let content = r#"
+[project]
+dependencies = [
+    "requests (>=2.28,<3)",
+]
+"#;
+
+        let result = PyprojectTomlParser
+            .update_version(content, "requests", "2.31.0")
+            .unwrap();
+
+        assert!(
+            result.contains("requests (>=2.31.0,<3)"),
+            "Parenthesized versionspec should keep parentheses, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_update_pep508_parenthesized_version_spec_with_marker() {
+        let content = r#"
+[project]
+dependencies = [
+    "requests (>=2.28,<3); python_version < '3.12'",
+]
+"#;
+
+        let result = PyprojectTomlParser
+            .update_version(content, "requests", "2.31.0")
+            .unwrap();
+
+        assert!(
+            result.contains("requests (>=2.31.0,<3); python_version < '3.12'"),
+            "括弧付き versionspec と環境マーカーを維持できていません: {}",
+            result
+        );
+    }
+
+    #[test]
     fn test_update_pep508_range_with_space() {
         let content = r#"
 [project]
@@ -627,6 +733,26 @@ dependencies = [
         assert!(
             result.contains("requests>=2.31.0, <3.0"),
             "Range constraint with space should update the lower bound, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_update_pep508_extras_with_spaces() {
+        let content = r#"
+[project]
+dependencies = [
+    "coverage [toml] >=7,<8",
+]
+"#;
+
+        let result = PyprojectTomlParser
+            .update_version(content, "coverage", "7.6.0")
+            .unwrap();
+
+        assert!(
+            result.contains("coverage [toml] >=7.6.0,<8"),
+            "Extras spacing should be preserved, got: {}",
             result
         );
     }

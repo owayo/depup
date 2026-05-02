@@ -53,6 +53,31 @@ fn is_dev_group(group_line: &str) -> bool {
     lowered.contains(":development") || lowered.contains(":test")
 }
 
+fn has_dev_group_option(line: &str) -> bool {
+    let lowered = line.to_lowercase();
+    let has_group_option = lowered.contains("group:")
+        || lowered.contains("groups:")
+        || lowered.contains(":group =>")
+        || lowered.contains(":groups =>");
+    has_group_option
+        && (lowered.contains(":development")
+            || lowered.contains(":test")
+            || lowered.contains("\"development\"")
+            || lowered.contains("\"test\"")
+            || lowered.contains("'development'")
+            || lowered.contains("'test'"))
+}
+
+fn has_non_registry_source(line: &str) -> bool {
+    let lowered = line.to_lowercase();
+    lowered.contains("git:")
+        || lowered.contains("github:")
+        || lowered.contains("bitbucket:")
+        || lowered.contains("gist:")
+        || lowered.contains("path:")
+        || lowered.contains("source:")
+}
+
 impl ManifestParser for GemfileParser {
     fn parse(&self, content: &str) -> Result<Vec<Dependency>, ManifestError> {
         let mut dependencies = Vec::new();
@@ -110,6 +135,9 @@ impl ManifestParser for GemfileParser {
 
                 // バージョン指定から `VersionSpec` を組み立てる
                 let spec = if version_parts.is_empty() {
+                    if has_non_registry_source(line) {
+                        continue;
+                    }
                     // バージョン指定がなければ `Any`
                     VersionSpec::new(VersionSpecKind::Any, "", "")
                 } else {
@@ -120,7 +148,9 @@ impl ManifestParser for GemfileParser {
                     }
                 };
 
-                let dep = if group_stack.iter().copied().any(|is_dev| is_dev) {
+                let dep = if group_stack.iter().copied().any(|is_dev| is_dev)
+                    || has_dev_group_option(line)
+                {
                     Dependency::development(name, spec, Language::Ruby)
                 } else {
                     Dependency::production(name, spec, Language::Ruby)
@@ -180,6 +210,11 @@ impl ManifestParser for GemfileParser {
 
                 match version_parts.len() {
                     0 => {
+                        if has_non_registry_source(line) {
+                            lines.push(line.to_string());
+                            continue;
+                        }
+
                         if let Some(caps) = no_version_re.captures(line) {
                             let gem_keyword = &caps[1];
                             let quote_start = &caps[2];
@@ -562,6 +597,18 @@ gem 'pg', '~> 1.1'
     }
 
     #[test]
+    fn test_parse_unversioned_gem_with_git_source_skipped() {
+        let content = r#"
+gem 'rails', git: 'https://github.com/rails/rails'
+gem 'pg', '~> 1.5'
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "pg");
+    }
+
+    #[test]
     fn test_parse_gte_constraint() {
         let content = r#"gem 'web-console', '>= 4.1.0'"#;
         let deps = parse(content).unwrap();
@@ -832,5 +879,29 @@ gem 'pg', '~> 1.5'
         );
         // グループ外の gem は本番依存
         assert!(!pg.is_dev);
+    }
+
+    #[test]
+    fn test_parse_gem_group_option_as_dev() {
+        let content = r#"
+gem 'rspec', '~> 3.0', group: :test
+gem 'rubocop', '~> 1.0', groups: [:development, :test]
+gem 'rails', '~> 7.0'
+"#;
+
+        let deps = parse(content).unwrap();
+        let rspec = deps.iter().find(|d| d.name == "rspec").unwrap();
+        let rubocop = deps.iter().find(|d| d.name == "rubocop").unwrap();
+        let rails = deps.iter().find(|d| d.name == "rails").unwrap();
+        assert!(rspec.is_dev);
+        assert!(rubocop.is_dev);
+        assert!(!rails.is_dev);
+    }
+
+    #[test]
+    fn test_update_unversioned_git_source_is_skipped() {
+        let content = r#"gem 'rails', git: 'https://github.com/rails/rails'"#;
+        let result = GemfileParser.update_version(content, "rails", "7.1.0");
+        assert!(result.is_err());
     }
 }

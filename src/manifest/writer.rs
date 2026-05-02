@@ -103,8 +103,11 @@ impl ManifestWriter {
                 //     (Cargo.lock 側で commit hash が更新されるのを待つ)
                 if let Some(git) = &dependency.git_source {
                     if let GitReference::Tag(_) = &git.reference {
-                        match parser.update_git_tag(&current_content, &dependency.name, new_version)
-                        {
+                        match parser.update_git_tag(
+                            &current_content,
+                            dependency.manifest_name(),
+                            new_version,
+                        ) {
                             Ok(updated_content) => {
                                 if updated_content != current_content {
                                     current_content = updated_content;
@@ -123,7 +126,11 @@ impl ManifestWriter {
                     continue;
                 }
 
-                match parser.update_version(&current_content, &dependency.name, new_version) {
+                match parser.update_version(
+                    &current_content,
+                    dependency.manifest_name(),
+                    new_version,
+                ) {
                     Ok(updated_content) => {
                         if updated_content != current_content {
                             current_content = updated_content;
@@ -240,6 +247,13 @@ mod tests {
         path
     }
 
+    fn create_temp_cargo_toml(dir: &TempDir, content: &str) -> std::path::PathBuf {
+        let path = dir.path().join("Cargo.toml");
+        let mut file = fs::File::create(&path).unwrap();
+        file.write_all(content.as_bytes()).unwrap();
+        path
+    }
+
     #[test]
     fn test_manifest_writer_new() {
         let writer = ManifestWriter::new(false);
@@ -335,6 +349,27 @@ mod tests {
         let content = fs::read_to_string(&path).unwrap();
         assert!(content.contains("^4.18.0"));
         assert!(!content.contains("4.17.21"));
+    }
+
+    #[test]
+    fn test_apply_updates_uses_manifest_name() {
+        let temp_dir = TempDir::new().unwrap();
+        let original_content = r#"[dependencies]
+tokio_v1 = { package = "tokio", version = "1.0", features = ["rt"] }
+"#;
+        let path = create_temp_cargo_toml(&temp_dir, original_content);
+
+        let mut manifest_result = ManifestUpdateResult::new(&path, Language::Rust);
+        let dep = sample_dependency("tokio", "1.0", Language::Rust).with_manifest_name("tokio_v1");
+        manifest_result.add_result(UpdateResult::update(dep, "1.45.0"));
+
+        let writer = ManifestWriter::new(false);
+        let parser = crate::manifest::CargoTomlParser;
+        let result = writer.apply_updates(&manifest_result, &parser).unwrap();
+
+        assert_eq!(result.updates_applied, 1);
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains(r#"tokio_v1 = { package = "tokio", version = "1.45.0""#));
     }
 
     #[test]

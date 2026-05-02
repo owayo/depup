@@ -58,6 +58,12 @@ impl ManifestParser for CargoTomlParser {
                 {
                     parse_cargo_dependencies(deps, parser.as_ref(), true, &mut dependencies);
                 }
+                if let Some(deps) = target_config
+                    .get("build-dependencies")
+                    .and_then(|d| d.as_table())
+                {
+                    parse_cargo_dependencies(deps, parser.as_ref(), true, &mut dependencies);
+                }
             }
         }
 
@@ -109,7 +115,7 @@ impl ManifestParser for CargoTomlParser {
         // inline table 形式: `package = { version = "1.0.0", ... }`
         // 行の残りを保つため、version の値だけを差し替える
         let table_pattern = format!(
-            r#"(?m)({})\s*=\s*\{{\s*version\s*=\s*"([^"]+)""#,
+            r#"(?m)^(\s*{}\s*=\s*\{{[^\n}}]*?\bversion\s*=\s*)"([^"]+)""#,
             regex::escape(package)
         );
         if let Ok(re) = Regex::new(&table_pattern)
@@ -119,7 +125,7 @@ impl ManifestParser for CargoTomlParser {
             if let Some(spec) = parser.parse(old_version)
                 && let Some(new_ver) = spec.try_format_updated(new_version)
             {
-                let replacement = format!(r#"{} = {{ version = "{}""#, &caps[1], new_ver);
+                let replacement = format!(r#"{}"{}""#, &caps[1], new_ver);
                 result = re.replace(&result, replacement.as_str()).to_string();
                 updated = true;
             }
@@ -132,7 +138,7 @@ impl ManifestParser for CargoTomlParser {
         // パッケージ名の直後は終端 `]` か空白のみを許可することで、
         // `[dependencies.serde_json]` を `serde` で誤マッチしないようにする。
         let multiline_pattern = format!(
-            r#"(?m)(\[(?:dependencies|dev-dependencies|build-dependencies|workspace\.dependencies)\.{}[ \t]*\][^\[]*version\s*=\s*)"([^"]+)""#,
+            r#"(?m)(\[(?:dependencies|dev-dependencies|build-dependencies|workspace\.dependencies|target\.[^\]]+\.(?:dependencies|dev-dependencies|build-dependencies))\.{}[ \t]*\][^\[]*version\s*=\s*)"([^"]+)""#,
             regex::escape(package)
         );
         if let Ok(re) = Regex::new(&multiline_pattern)
@@ -187,7 +193,7 @@ impl ManifestParser for CargoTomlParser {
         //   パッケージ名の直後は終端 `]` か空白のみを許可することで、
         //   `[dependencies.foo-extra]` を `foo` で誤マッチしないようにする。
         let multiline_pattern = format!(
-            r#"(?m)(\[(?:dependencies|dev-dependencies|build-dependencies|workspace\.dependencies|patch\.[A-Za-z0-9_.-]+)\.{}[ \t]*\][^\[]*?\btag\s*=\s*)"([^"]+)""#,
+            r#"(?m)(\[(?:dependencies|dev-dependencies|build-dependencies|workspace\.dependencies|target\.[^\]]+\.(?:dependencies|dev-dependencies|build-dependencies)|patch\.[A-Za-z0-9_.-]+)\.{}[ \t]*\][^\[]*?\btag\s*=\s*)"([^"]+)""#,
             regex::escape(package)
         );
         if let Ok(re) = Regex::new(&multiline_pattern)
@@ -221,21 +227,31 @@ fn parse_cargo_dependencies(
             // 単純な文字列: `package = "1.0.0"`
             Value::String(s) => {
                 if let Some(spec) = parser.parse(s) {
-                    push_dependency(output, name, spec, is_dev, None);
+                    push_dependency(output, name, spec, is_dev, None, None);
                 }
             }
             // inline table 形式: `package = { version = "1.0.0", features = [...] }`
             Value::Table(t) => {
+                let package_name = t.get("package").and_then(|v| v.as_str()).unwrap_or(name);
+                let manifest_name = (package_name != name).then_some(name.as_str());
+
                 // git 依存の検出を先に試みる
                 if let Some(git_source) = try_parse_git_source(t) {
                     let spec = git_reference_spec(&git_source.reference);
-                    push_dependency(output, name, spec, is_dev, Some(git_source));
+                    push_dependency(
+                        output,
+                        package_name,
+                        spec,
+                        is_dev,
+                        manifest_name,
+                        Some(git_source),
+                    );
                     continue;
                 }
                 if let Some(version_str) = t.get("version").and_then(|v| v.as_str())
                     && let Some(spec) = parser.parse(version_str)
                 {
-                    push_dependency(output, name, spec, is_dev, None);
+                    push_dependency(output, package_name, spec, is_dev, manifest_name, None);
                 }
             }
             _ => {}
@@ -248,6 +264,7 @@ fn push_dependency(
     name: &str,
     spec: VersionSpec,
     is_dev: bool,
+    manifest_name: Option<&str>,
     git_source: Option<GitSource>,
 ) {
     let mut dep = if is_dev {
@@ -255,6 +272,9 @@ fn push_dependency(
     } else {
         Dependency::production(name.to_string(), spec, Language::Rust)
     };
+    if let Some(manifest_name) = manifest_name {
+        dep = dep.with_manifest_name(manifest_name);
+    }
     if let Some(gs) = git_source {
         dep = dep.with_git_source(gs);
     }
@@ -573,6 +593,47 @@ libc = "0.2"
     }
 
     #[test]
+    fn test_parse_target_specific_build_dependencies() {
+        let content = r#"
+[target.'cfg(unix)'.build-dependencies]
+cc = "1.0"
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "cc");
+        assert!(deps[0].is_dev);
+    }
+
+    #[test]
+    fn test_parse_renamed_package_dependency() {
+        let content = r#"
+[dependencies]
+tokio_v1 = { package = "tokio", version = "1.0", features = ["rt"] }
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "tokio");
+        assert_eq!(deps[0].manifest_name(), "tokio_v1");
+        assert_eq!(deps[0].version_spec.version, "1.0");
+    }
+
+    #[test]
+    fn test_parse_renamed_git_dependency() {
+        let content = r#"
+[dependencies]
+regex_alias = { package = "regex", git = "https://github.com/rust-lang/regex.git", tag = "1.10.3" }
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "regex");
+        assert_eq!(deps[0].manifest_name(), "regex_alias");
+        assert!(deps[0].is_git());
+    }
+
+    #[test]
     fn test_update_simple_version() {
         let content = r#"
 [dependencies]
@@ -583,6 +644,49 @@ serde = "1.0.0"
             .update_version(content, "serde", "1.1.0")
             .unwrap();
         assert!(result.contains("\"1.1.0\""));
+    }
+
+    #[test]
+    fn test_update_renamed_package_dependency_uses_manifest_key() {
+        let content = r#"
+[dependencies]
+tokio_v1 = { package = "tokio", version = "1.0", features = ["rt"] }
+"#;
+
+        let deps = parse(content).unwrap();
+        let result = CargoTomlParser
+            .update_version(content, deps[0].manifest_name(), "1.45.0")
+            .unwrap();
+        assert!(result.contains(r#"tokio_v1 = { package = "tokio", version = "1.45.0""#));
+    }
+
+    #[test]
+    fn test_update_target_specific_multiline_table() {
+        let content = r#"
+[target.'cfg(unix)'.dependencies.openssl]
+version = "0.10"
+features = ["vendored"]
+"#;
+
+        let result = CargoTomlParser
+            .update_version(content, "openssl", "0.10.72")
+            .unwrap();
+        assert!(result.contains(r#"version = "0.10.72""#));
+        assert!(result.contains(r#"features = ["vendored"]"#));
+    }
+
+    #[test]
+    fn test_update_target_specific_git_tag_multiline_table() {
+        let content = r#"
+[target.'cfg(unix)'.dependencies.regex]
+git = "https://github.com/rust-lang/regex.git"
+tag = "1.10.3"
+"#;
+
+        let result = CargoTomlParser
+            .update_git_tag(content, "regex", "1.11.0")
+            .unwrap();
+        assert!(result.contains(r#"tag = "1.11.0""#));
     }
 
     #[test]
