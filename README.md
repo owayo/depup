@@ -237,6 +237,7 @@ Pinned versions are intentionally fixed and excluded from updates by default:
 | PHP | `"^1.2.3"`, `"~1.2.3"` | ✅ |
 | Java | Fixed version in Gradle | ❌ |
 | Java | Strict version in Gradle (`1.2.3!!`) | ❌ |
+| Java | Maven Hard requirement (`[1.0]`) | ❌ |
 | Swift | `exact: "1.2.3"` | ❌ |
 | Swift | `from: "1.2.3"`, `.upToNextMinor` | ✅ |
 
@@ -268,6 +269,8 @@ depup preserves the original version range format:
 "v1.*" → "v2.*" (leading `v` preserved)
 "5.3.+" → "5.4.+" (Gradle prefix preserved)
 "1.2.3!!" → "2.0.0!!" (Gradle strict preserved)
+"[1.0]" → "[2.0]" (Maven Hard requirement preserved)
+"[1.2.3.Final]" → "[1.3.0]" (Maven Hard requirement with qualifier)
 group = "com.google.guava", name = "guava", version = "32.1.2-jre" → version = "33.4.0-jre" (Gradle Kotlin map notation)
 ```
 

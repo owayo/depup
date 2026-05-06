@@ -51,12 +51,30 @@ static MAVEN_RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
+// Maven 単一指定 (Hard requirement): [1.0]
+// Maven Enforcer / Gradle の仕様で「このバージョンに完全一致する」ことを要求する形式。
+// [1.0] は = 1.0 と同義として扱う。
+static MAVEN_HARD_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!(r"^\[({GRADLE_VERSION_TOKEN})\]$")).unwrap());
+
 impl VersionParser for JavaVersionParser {
     fn parse(&self, version_str: &str) -> Option<VersionSpec> {
         let trimmed = version_str.trim();
 
         if trimmed.is_empty() {
             return None;
+        }
+
+        // Maven 単一指定 (Hard requirement) を判定: [1.0]
+        // 範囲レンジより先に判定する (両者ともブラケットで始まるため、
+        // カンマを含まないこちらを優先するとマッチが安定する)。
+        if let Some(caps) = MAVEN_HARD_RE.captures(trimmed) {
+            let version = caps.get(1)?.as_str();
+            return Some(
+                VersionSpec::new(VersionSpecKind::Exact, trimmed, version)
+                    .with_prefix("[")
+                    .with_suffix("]"),
+            );
         }
 
         // Maven 形式レンジを判定: [1.0,2.0], [1.0,), (,2.0]
@@ -475,10 +493,33 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_maven_range_single_version() {
-        // Maven の単一バージョンレンジ [1.0]
-        // 実際には下限と上限が同じ → カンマなしなのでマッチしない
-        assert!(parse("[1.0]").is_none());
+    fn test_parse_maven_hard_requirement_single_version() {
+        // Maven の単一バージョン指定 [1.0] は Hard requirement (= 1.0 と同義)
+        let spec = parse("[1.0]").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "1.0");
+        assert_eq!(spec.prefix, Some("[".to_string()));
+        assert_eq!(spec.suffix, Some("]".to_string()));
+        assert!(spec.is_pinned());
+        assert_eq!(spec.format_updated("1.5"), "[1.5]");
+    }
+
+    #[test]
+    fn test_parse_maven_hard_requirement_three_segments() {
+        // 3 セグメントの Hard requirement
+        let spec = parse("[1.2.3]").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "1.2.3");
+        assert_eq!(spec.format_updated("2.0.0"), "[2.0.0]");
+    }
+
+    #[test]
+    fn test_parse_maven_hard_requirement_with_qualifier() {
+        // qualifier 付きの Hard requirement
+        let spec = parse("[1.2.3.Final]").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "1.2.3.Final");
+        assert_eq!(spec.format_updated("1.3.0"), "[1.3.0]");
     }
 
     #[test]

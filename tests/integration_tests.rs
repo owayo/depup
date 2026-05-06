@@ -906,6 +906,56 @@ let package = Package(
             updated
         );
     }
+
+    /// Maven Hard requirement (`[1.0]`) は Exact と同義として扱われ、ブラケットを保持して更新される
+    #[test]
+    fn test_gradle_maven_hard_requirement_update() {
+        let content = r#"dependencies {
+    implementation("org.example:mylib:[1.0.0]")
+}"#;
+
+        let parser = get_parser(Language::Java);
+        let deps = parser.parse(content).unwrap();
+
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Exact);
+        assert_eq!(deps[0].version_spec.version, "1.0.0");
+        // Hard requirement は固定指定なので pinned 扱い
+        assert!(deps[0].version_spec.is_pinned());
+
+        let updated = parser
+            .update_version(content, "org.example:mylib", "2.0.0")
+            .unwrap();
+        assert!(
+            updated.contains("[2.0.0]"),
+            "Maven Hard requirement のブラケット表記が保持されるべき: {}",
+            updated
+        );
+    }
+
+    /// Maven Hard requirement (Kotlin DSL での書き方も含む)
+    #[test]
+    fn test_gradle_kts_maven_hard_requirement_update() {
+        let content = r#"dependencies {
+    implementation("org.springframework:spring-core:[5.3.8]")
+}"#;
+
+        let parser = get_parser(Language::Java);
+        let deps = parser.parse(content).unwrap();
+
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Exact);
+        assert_eq!(deps[0].version_spec.version, "5.3.8");
+
+        let updated = parser
+            .update_version(content, "org.springframework:spring-core", "5.4.0")
+            .unwrap();
+        assert!(
+            updated.contains("[5.4.0]"),
+            "Hard requirement のブラケット表記が更新後も保持されるべき: {}",
+            updated
+        );
+    }
 }
 
 mod registry_response_parsing {
