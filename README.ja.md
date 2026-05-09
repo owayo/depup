@@ -272,9 +272,12 @@ depupは元のバージョン範囲形式を維持します：
 "[1.0]" → "[2.0]" （Maven Hard requirement を維持）
 "[1.2.3.Final]" → "[1.3.0]" （qualifier 付き Maven Hard requirement）
 group = "com.google.guava", name = "guava", version = "32.1.2-jre" → version = "33.4.0-jre" （Gradle Kotlin map 記法）
+prefer("1.7.25") → prefer("1.7.36") （Gradle rich version の strict 範囲内の prefer）
 ```
 
 `"*"`、npm の dist-tag（`"latest"` など）、Gradle の動的指定（`"latest.release"`、`"latest.integration"`、`"latest.milestone"`、ユーザ定義 `latest.<status>` など全般）のような完全浮動指定は、厳密バージョンへ変質させないため更新対象から除外されます。
+
+Gradle の `strictly` / `require` / `prefer` を使う rich version 宣言は、`implementation("org.slf4j:slf4j-api") { version { ... } }` のような依存ブロック内でも解析対象になります。`strictly` または `require` が範囲を指定し、`prefer` が選好バージョンを指定している場合、depup は範囲を上限制約として維持しつつ `prefer` の値を更新します。
 
 ### 範囲制約
 

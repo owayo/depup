@@ -31,6 +31,32 @@ struct VariableDefinition {
     quote_char: char,
 }
 
+/// Gradle rich version の宣言種別
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RichVersionMethod {
+    Strictly,
+    Require,
+    Prefer,
+}
+
+/// rich version ブロック内で見つけた 1 つの宣言
+#[derive(Debug, Clone)]
+struct RichVersionMatch {
+    spec: Option<VersionSpec>,
+    line_offset: usize,
+    value_start: usize,
+    value_end: usize,
+}
+
+/// rich version として採用する宣言と、更新すべき位置
+#[derive(Debug, Clone)]
+struct RichVersionSelection {
+    spec: VersionSpec,
+    update_line_offset: usize,
+    value_start: usize,
+    value_end: usize,
+}
+
 // Gradle DSL 用の正規表現
 
 // 変数定義 (Groovy): def wicketVersion = '1.2.3' または "1.2.3"
@@ -73,6 +99,16 @@ static DEP_STRING_VAR: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"^\s*(\w+)\s*[\(\s]*"([^:"]+):([^:"]+):\$\{?(\w+)\}?""#).unwrap()
 });
 
+// rich version ブロックを持つ文字列記法依存: implementation("group:name") { ... }
+static DEP_STRING_NO_VERSION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^\s*(\w+)\s*[\(\s]*['"]([^:'"]+):([^:'"]+)['"]\s*\)?\s*(?:\{|$)"#).unwrap()
+});
+
+// rich version 宣言: strictly("1.2.3") / require '1.2.3' / prefer "1.2.3"
+static RICH_VERSION_DECL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"\b(strictly|require|prefer)\s*(?:\(\s*)?['"]([^'"]+)['"]\s*\)?"#).unwrap()
+});
+
 // 開発用 configuration
 const DEV_CONFIGURATIONS: [&str; 6] = [
     "testImplementation",
@@ -82,6 +118,55 @@ const DEV_CONFIGURATIONS: [&str; 6] = [
     "androidTestImplementation",
     "debugImplementation",
 ];
+
+fn rich_version_method(name: &str) -> Option<RichVersionMethod> {
+    match name {
+        "strictly" => Some(RichVersionMethod::Strictly),
+        "require" => Some(RichVersionMethod::Require),
+        "prefer" => Some(RichVersionMethod::Prefer),
+        _ => None,
+    }
+}
+
+fn strip_gradle_comments_from_line(line: &str, in_block_comment: &mut bool) -> String {
+    let mut rest = line;
+    let mut output = String::new();
+
+    loop {
+        if *in_block_comment {
+            if let Some(end) = rest.find("*/") {
+                let comment_len = end + 2;
+                output.push_str(&" ".repeat(comment_len));
+                rest = &rest[comment_len..];
+                *in_block_comment = false;
+            } else {
+                output.push_str(&" ".repeat(rest.len()));
+                return output;
+            }
+        } else if let Some(start) = rest.find("/*") {
+            output.push_str(&rest[..start]);
+            let comment_rest = &rest[start + 2..];
+            if let Some(end) = comment_rest.find("*/") {
+                let comment_len = 2 + end + 2;
+                output.push_str(&" ".repeat(comment_len));
+                rest = &rest[start + comment_len..];
+            } else {
+                output.push_str(&" ".repeat(rest.len() - start));
+                *in_block_comment = true;
+                return output;
+            }
+        } else {
+            output.push_str(rest);
+            break;
+        }
+    }
+
+    if let Some(start) = output.find("//") {
+        output.truncate(start);
+    }
+
+    output
+}
 
 impl GradleParser {
     /// content から変数定義を抽出
@@ -322,6 +407,142 @@ impl GradleParser {
         Some((dep, None))
     }
 
+    /// 依存宣言のクロージャ範囲を行番号で取得
+    fn dependency_block_end(&self, lines: &[&str], start_index: usize) -> Option<usize> {
+        let first_line = lines.get(start_index)?;
+        if !first_line.contains('{') {
+            return None;
+        }
+
+        let mut depth = 0usize;
+        let mut opened = false;
+
+        for (line_index, line) in lines.iter().enumerate().skip(start_index) {
+            let open_count = line.matches('{').count();
+            let close_count = line.matches('}').count();
+
+            if open_count > 0 {
+                opened = true;
+            }
+
+            if opened {
+                depth = depth.saturating_add(open_count);
+                depth = depth.saturating_sub(close_count);
+
+                if depth == 0 {
+                    return Some(line_index);
+                }
+            }
+        }
+
+        if opened { Some(lines.len() - 1) } else { None }
+    }
+
+    /// rich version ブロックの代表バージョンを選ぶ
+    fn find_rich_version_selection(
+        &self,
+        block_lines: &[&str],
+        parser: &dyn crate::parser::VersionParser,
+    ) -> Option<RichVersionSelection> {
+        let mut strong: Option<RichVersionMatch> = None;
+        let mut prefer: Option<RichVersionMatch> = None;
+        let mut in_block_comment = false;
+
+        for (line_offset, line) in block_lines.iter().enumerate() {
+            let code = strip_gradle_comments_from_line(line, &mut in_block_comment);
+            let trimmed = code.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            for caps in RICH_VERSION_DECL.captures_iter(&code) {
+                let method = rich_version_method(caps.get(1)?.as_str())?;
+                let version_match = caps.get(2)?;
+                let version = version_match.as_str();
+                let found = RichVersionMatch {
+                    spec: parser.parse(version),
+                    line_offset,
+                    value_start: version_match.start(),
+                    value_end: version_match.end(),
+                };
+
+                match method {
+                    RichVersionMethod::Strictly | RichVersionMethod::Require => {
+                        // MutableVersionConstraint は後勝ちなので、最後の強い宣言を採用する。
+                        strong = Some(found);
+                    }
+                    RichVersionMethod::Prefer => {
+                        prefer = Some(found);
+                    }
+                }
+            }
+        }
+
+        if let Some(strong_match) = strong {
+            let strong_spec = strong_match.spec.clone()?;
+
+            if strong_spec.kind == VersionSpecKind::Range
+                && let Some(prefer_match) = prefer
+                && let Some(prefer_spec) = prefer_match.spec.clone()
+            {
+                return Some(RichVersionSelection {
+                    // strictly/require の範囲は上限判定に使い、現在値と更新対象は prefer とする。
+                    spec: VersionSpec::new(
+                        VersionSpecKind::Range,
+                        strong_spec.raw,
+                        prefer_spec.version,
+                    ),
+                    update_line_offset: prefer_match.line_offset,
+                    value_start: prefer_match.value_start,
+                    value_end: prefer_match.value_end,
+                });
+            }
+
+            return Some(RichVersionSelection {
+                spec: strong_spec,
+                update_line_offset: strong_match.line_offset,
+                value_start: strong_match.value_start,
+                value_end: strong_match.value_end,
+            });
+        }
+
+        let prefer_match = prefer?;
+        Some(RichVersionSelection {
+            spec: prefer_match.spec?,
+            update_line_offset: prefer_match.line_offset,
+            value_start: prefer_match.value_start,
+            value_end: prefer_match.value_end,
+        })
+    }
+
+    /// rich version ブロック付き依存をパース
+    fn parse_rich_version_notation(
+        &self,
+        lines: &[&str],
+        start_index: usize,
+        parser: &dyn crate::parser::VersionParser,
+    ) -> Option<Dependency> {
+        let line = lines.get(start_index)?;
+        let caps = DEP_STRING_NO_VERSION.captures(line)?;
+
+        let config = caps.get(1).map(|m| m.as_str())?;
+        let group = caps.get(2).map(|m| m.as_str())?;
+        let artifact = caps.get(3).map(|m| m.as_str())?;
+        let end_index = self.dependency_block_end(lines, start_index)?;
+        let selection =
+            self.find_rich_version_selection(&lines[start_index..=end_index], parser)?;
+        let is_dev = DEV_CONFIGURATIONS.contains(&config);
+        let name = format!("{}:{}", group, artifact);
+
+        let dep = if is_dev {
+            Dependency::development(name, selection.spec, Language::Java)
+        } else {
+            Dependency::production(name, selection.spec, Language::Java)
+        };
+
+        Some(dep)
+    }
+
     /// 変数参照を考慮してバージョン値を解決
     fn resolve_version(
         &self,
@@ -373,8 +594,9 @@ impl ManifestParser for GradleParser {
         let mut dependencies = Vec::new();
         let parser = get_parser(Language::Java);
         let variables = self.extract_variables(content);
+        let lines: Vec<&str> = content.lines().collect();
 
-        for line in content.lines() {
+        for (line_index, line) in lines.iter().enumerate() {
             let trimmed = line.trim();
 
             // 空行とコメントをスキップ
@@ -404,6 +626,13 @@ impl ManifestParser for GradleParser {
                 } else {
                     dep
                 };
+                dependencies.push(dep);
+                continue;
+            }
+
+            // rich version ブロック付き文字列記法を試す
+            if let Some(dep) = self.parse_rich_version_notation(&lines, line_index, parser.as_ref())
+            {
                 dependencies.push(dep);
             }
         }
@@ -641,18 +870,93 @@ impl GradleParser {
             return Ok(result.to_string());
         }
 
+        if let Some(result) =
+            self.update_rich_version_block(content, group, artifact, new_version)?
+        {
+            return Ok(result);
+        }
+
         Err(ManifestError::InvalidVersionSpec {
             path: PathBuf::from("build.gradle"),
             spec: package.to_string(),
             message: "dependency not found or version could not be updated".to_string(),
         })
     }
+
+    /// rich version ブロック内の更新対象宣言を書き換える
+    fn update_rich_version_block(
+        &self,
+        content: &str,
+        group: &str,
+        artifact: &str,
+        new_version: &str,
+    ) -> Result<Option<String>, ManifestError> {
+        let lines: Vec<&str> = content.lines().collect();
+        let parser = get_parser(Language::Java);
+
+        for (line_index, line) in lines.iter().enumerate() {
+            let Some(caps) = DEP_STRING_NO_VERSION.captures(line) else {
+                continue;
+            };
+
+            if caps.get(2).map(|m| m.as_str()) != Some(group)
+                || caps.get(3).map(|m| m.as_str()) != Some(artifact)
+            {
+                continue;
+            }
+
+            let Some(end_index) = self.dependency_block_end(&lines, line_index) else {
+                continue;
+            };
+            let Some(selection) =
+                self.find_rich_version_selection(&lines[line_index..=end_index], parser.as_ref())
+            else {
+                continue;
+            };
+
+            let update_line_index = line_index + selection.update_line_offset;
+            let current_line = lines[update_line_index];
+            let current_version = &current_line[selection.value_start..selection.value_end];
+            let Some(formatted_version) = parser
+                .parse(current_version)
+                .and_then(|spec| spec.try_format_updated(new_version))
+            else {
+                return Err(ManifestError::InvalidVersionSpec {
+                    path: PathBuf::from("build.gradle"),
+                    spec: package_name(group, artifact),
+                    message: "version could not be updated safely".to_string(),
+                });
+            };
+
+            let mut result_lines: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+            result_lines[update_line_index] = format!(
+                "{}{}{}",
+                &current_line[..selection.value_start],
+                formatted_version,
+                &current_line[selection.value_end..]
+            );
+
+            let mut joined = result_lines.join("\n");
+            if content.ends_with('\n') {
+                joined.push('\n');
+            }
+            return Ok(Some(joined));
+        }
+
+        Ok(None)
+    }
+}
+
+fn package_name(group: &str, artifact: &str) -> String {
+    format!("{}:{}", group, artifact)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::VersionSpecKind;
+    use crate::domain::{UpdateResult, VersionSpecKind};
+    use crate::update::{UpdateFilter, UpdateJudge, VersionInfo};
+    use chrono::{TimeZone, Utc};
 
     fn parse(content: &str) -> Result<Vec<Dependency>, ManifestError> {
         GradleParser.parse(content)
@@ -764,6 +1068,105 @@ dependencies {
         let deps = parse(content).unwrap();
         assert_eq!(deps.len(), 1);
         assert!(deps[0].is_dev);
+    }
+
+    #[test]
+    fn test_parse_rich_version_strictly_groovy() {
+        let content = r#"
+dependencies {
+    implementation('org.slf4j:slf4j-api') {
+        version {
+            strictly '1.7.36'
+        }
+    }
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "org.slf4j:slf4j-api");
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Exact);
+        assert_eq!(deps[0].version_spec.version, "1.7.36");
+    }
+
+    #[test]
+    fn test_parse_rich_version_range_with_prefer_kotlin() {
+        let content = r#"
+dependencies {
+    implementation("org.slf4j:slf4j-api") {
+        version {
+            strictly("[1.7, 1.8[")
+            prefer("1.7.25")
+        }
+    }
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "org.slf4j:slf4j-api");
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Range);
+        assert_eq!(deps[0].version_spec.raw, "[1.7, 1.8[");
+        // 更新判定に使う現在値は Gradle が選好する prefer 側を採用する。
+        assert_eq!(deps[0].version_spec.version, "1.7.25");
+    }
+
+    #[test]
+    fn test_parse_rich_version_ignores_commented_declaration() {
+        let content = r#"
+dependencies {
+    implementation("org.slf4j:slf4j-api") {
+        version {
+            // prefer("1.7.25")
+        }
+    }
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_parse_rich_version_ignores_block_commented_declaration() {
+        let content = r#"
+dependencies {
+    implementation("org.slf4j:slf4j-api") {
+        version {
+            /*
+             * prefer("1.7.25")
+             */
+        }
+    }
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_judge_rich_version_prefer_respects_strict_range() {
+        let content = r#"
+dependencies {
+    implementation("org.slf4j:slf4j-api") {
+        version {
+            strictly("[1.7, 1.8[")
+            prefer("1.7.25")
+        }
+    }
+}
+"#;
+        let dep = parse(content).unwrap().remove(0);
+        let released_at = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let versions = vec![
+            VersionInfo::new("1.7.36", released_at),
+            VersionInfo::new("1.8.0", released_at),
+        ];
+
+        let result = UpdateJudge::new(UpdateFilter::new()).judge(&dep, &versions);
+        match result {
+            UpdateResult::Update { new_version, .. } => {
+                assert_eq!(new_version, "1.7.36");
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
     }
 
     #[test]
@@ -963,6 +1366,59 @@ dependencies {
             .update_version(content, "org.springframework:spring-core", "6.0.0")
             .unwrap();
         assert!(result.contains("\"org.springframework:spring-core:6.0.0!!\""));
+    }
+
+    #[test]
+    fn test_update_rich_version_strictly() {
+        let content = r#"
+dependencies {
+    implementation('org.slf4j:slf4j-api') {
+        version {
+            strictly '1.7.36'
+        }
+    }
+}
+"#;
+        let result = GradleParser
+            .update_version(content, "org.slf4j:slf4j-api", "2.0.17")
+            .unwrap();
+        assert!(result.contains("strictly '2.0.17'"));
+    }
+
+    #[test]
+    fn test_update_rich_version_prefer_with_strict_range() {
+        let content = r#"
+dependencies {
+    implementation("org.slf4j:slf4j-api") {
+        version {
+            strictly("[1.7, 1.8[")
+            prefer("1.7.25")
+        }
+    }
+}
+"#;
+        let result = GradleParser
+            .update_version(content, "org.slf4j:slf4j-api", "1.7.36")
+            .unwrap();
+        assert!(result.contains(r#"strictly("[1.7, 1.8[")"#));
+        assert!(result.contains(r#"prefer("1.7.36")"#));
+    }
+
+    #[test]
+    fn test_update_rich_version_after_inline_block_comment() {
+        let content = r#"
+dependencies {
+    implementation("org.slf4j:slf4j-api") {
+        version {
+            /* 現在の推奨版 */ prefer("1.7.25")
+        }
+    }
+}
+"#;
+        let result = GradleParser
+            .update_version(content, "org.slf4j:slf4j-api", "1.7.36")
+            .unwrap();
+        assert!(result.contains(r#"/* 現在の推奨版 */ prefer("1.7.36")"#));
     }
 
     #[test]
