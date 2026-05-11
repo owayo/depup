@@ -58,7 +58,7 @@
 - **固定バージョン検出**: 意図的に固定されたバージョンはデフォルトでスキップ
 - **エイジフィルター**: N日/週前以降にリリースされたバージョンのみに更新
 - **pnpm連携**: pnpm設定の `minimumReleaseAge` を自動適用
-- **モノレポ対応**: pnpmワークスペースとTauriプロジェクト
+- **モノレポ対応**: `.depup`、pnpmワークスペース、ネストした package install、Tauriプロジェクト
 - **リリース日表示**: 各バージョンのリリース日時を表示
 - **複数出力形式**: テキスト（カラー）、JSON、diff
 
@@ -194,6 +194,9 @@ depup --only lodash --only typescript
 # reactを更新から除外
 depup --exclude react
 
+# 同じパッケージが exclude にあっても only が優先される
+depup --only lodash --exclude lodash
+
 # 2週間以上経過したパッケージのみ更新
 depup --age 2w
 
@@ -251,6 +254,8 @@ depup --cd ./projects/myapp -n
 >
 > **注意**: `alias = { package = "actual-crate", version = "1" }` のような Cargo のリネーム依存は、実パッケージ名で取得し、マニフェスト上のキーへ書き戻します。`--only` / `--exclude` はどちらの名前でも指定できます。
 >
+> **注意**: `--only` が指定されている場合は `--exclude` より優先されます。明示的に許可したパッケージは、同じ名前が広い除外リストに含まれていても更新対象に残ります。
+>
 > **注意**: Composer の platform package（`php`, `hhvm`, `ext-*`, `lib-*`, Composer API パッケージなど）は更新対象から除外します。
 
 ### 範囲形式の維持
@@ -263,6 +268,7 @@ depupは元のバージョン範囲形式を維持します：
 ">=1.0.0" → ">=2.0.0" （範囲維持）
 "requests (>=2.28,<3); python_version < '3.12'" → "requests (>=2.31,<3); python_version < '3.12'" （PEP 508 の括弧とマーカーを維持）
 "coverage [toml] >=7,<8" → "coverage [toml] >=7.6,<8" （PEP 508 extras の空白を維持）
+"'paramiko>=3.5.0,<4.0.0'" → "'paramiko>=3.9.1,<4.0.0'" （TOML リテラル文字列の引用符を維持）
 "1.x" → "2.x" （ワイルドカード形式を維持）
 "1.x.x" → "2.x.x" （複数のワイルドカード位置を維持）
 "1.2.*" → "1.3.*" （ワイルドカード形式を維持）
@@ -273,6 +279,7 @@ depupは元のバージョン範囲形式を維持します：
 "[1.2.3.Final]" → "[1.3.0]" （qualifier 付き Maven Hard requirement）
 group = "com.google.guava", name = "guava", version = "32.1.2-jre" → version = "33.4.0-jre" （Gradle Kotlin map 記法）
 prefer("1.7.25") → prefer("1.7.36") （Gradle rich version の strict 範囲内の prefer）
+"group:name:1.0.0:classifier@zip" → "group:name:1.1.0:classifier@zip" （Gradle classifier/extension を維持）
 ```
 
 `"*"`、npm の dist-tag（`"latest"` など）、Gradle の動的指定（`"latest.release"`、`"latest.integration"`、`"latest.milestone"`、ユーザ定義 `latest.<status>` など全般）のような完全浮動指定は、厳密バージョンへ変質させないため更新対象から除外されます。
@@ -312,10 +319,15 @@ npm/Composer のハイフンレンジでは、右辺が `1.0 - 2.0` のような
 
 JSON マニフェストでは、depup が解析対象にする依存セクションだけを書き換えます。`package.json` の `overrides`、`composer.json` の `replace` / `provide` / `conflict` などは変更しません。
 
+TOML マニフェストでは、基本文字列（`"..."`）とリテラル文字列（`'...'`）のどちらも、対応する依存セクション内では引用符を維持して更新します。`Cargo.toml` では `[dependencies]`、`[dev-dependencies]`、`[build-dependencies]`、`[workspace.dependencies]`、target 固有の依存テーブルだけを書き換え、metadata テーブルは変更しません。Cargo の比較レンジは `>=1.0, <2.0, >=1.0.100` のように3個以上のカンマ区切り requirement にも対応します。
+
+Gradle の文字列記法では `:resources@zip` や `@aar` のような classifier / extension サフィックスを維持します。`//` 行コメントや `/* ... */` ブロックコメント内だけにある依存宣言は更新対象にしません。
+
 Swift の GitHub 依存では、タグの接頭辞 `v1.2.3` と `V1.2.3` の両方を認識します。
 また、`Package.swift` では `//` 行コメントや `/* ... */` ブロックコメント内に書かれた依存宣言は解析対象から除外します。
 
 `go.mod` では、`) // direct deps` のようなコメント付きブロック終端も通常のブロック終端として扱い、`require` / `replace` / `exclude` ブロックのパースと更新に反映します。
+`require "golang.org/x/text" "v0.14.0"` のような quoted module path / version も解析し、引用符を維持して更新します。
 
 ## エイジフィルター
 
@@ -416,6 +428,7 @@ shared    # 共有ライブラリ
 ```
 
 ルートディレクトリから `depup` を実行すると、ルート自体と全ディレクトリの依存関係を一括更新します。バージョン情報はキャッシュされるため、同じパッケージは1回のみ取得されます。
+`--install` 指定時は、更新された各マニフェストに最も近いモノレポ対象ディレクトリで package manager install を実行します。ネストしたアプリの依存更新は、リポジトリルートではなく各アプリのディレクトリで反映されます。
 
 - `#` 以降はコメント（行頭・インライン両対応）
 - 空行は無視

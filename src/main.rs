@@ -245,10 +245,7 @@ async fn enforce_rust_lock_age(
             continue;
         };
         let working_dir = if let Some(dirs) = monorepo_dirs {
-            dirs.iter()
-                .find(|d| manifest.path.starts_with(d))
-                .cloned()
-                .unwrap_or_else(|| parent.to_path_buf())
+            nearest_monorepo_dir(&manifest.path, dirs, parent)
         } else {
             parent.to_path_buf()
         };
@@ -322,6 +319,19 @@ async fn enforce_rust_lock_age(
 }
 
 /// 結果からディレクトリ -> install が必要な言語のマップを構築する
+fn nearest_monorepo_dir(
+    manifest_path: &Path,
+    monorepo_dirs: &[PathBuf],
+    fallback: &Path,
+) -> PathBuf {
+    monorepo_dirs
+        .iter()
+        .filter(|dir| manifest_path.starts_with(dir))
+        .max_by_key(|dir| dir.components().count())
+        .cloned()
+        .unwrap_or_else(|| fallback.to_path_buf())
+}
+
 fn build_install_map(
     result: &OrchestratorResult,
     monorepo_dirs: &Option<Vec<PathBuf>>,
@@ -337,10 +347,7 @@ fn build_install_map(
         // このマニフェストが属するディレクトリを特定
         let working_dir = if let Some(dirs) = monorepo_dirs {
             let manifest_path = &manifest.path;
-            dirs.iter()
-                .find(|d| manifest_path.starts_with(d))
-                .cloned()
-                .unwrap_or_else(|| default_path.to_path_buf())
+            nearest_monorepo_dir(manifest_path, dirs, default_path)
         } else {
             default_path.to_path_buf()
         };
@@ -352,4 +359,52 @@ fn build_install_map(
     }
 
     dir_langs.into_iter().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use depup::domain::{
+        Dependency, ManifestUpdateResult, UpdateResult, UpdateSummary, VersionSpec, VersionSpecKind,
+    };
+
+    fn result_with_update(path: PathBuf, language: Language) -> OrchestratorResult {
+        let spec = VersionSpec::new(VersionSpecKind::Caret, "1.0.0", "1.0.0");
+        let dep = Dependency::production("pkg", spec, language);
+        let mut manifest = ManifestUpdateResult::new(path, language);
+        manifest.add_result(UpdateResult::update(dep, "2.0.0"));
+
+        let mut summary = UpdateSummary::new(false);
+        summary.add_manifest(manifest);
+
+        OrchestratorResult {
+            summary,
+            write_results: Vec::new(),
+            errors: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_nearest_monorepo_dir_uses_deepest_match() {
+        let root = PathBuf::from("/repo");
+        let app = PathBuf::from("/repo/apps/web");
+        let manifest = app.join("package.json");
+        let dirs = vec![root.clone(), app.clone()];
+
+        assert_eq!(nearest_monorepo_dir(&manifest, &dirs, &root), app);
+    }
+
+    #[test]
+    fn test_build_install_map_uses_nested_monorepo_dir() {
+        let root = PathBuf::from("/repo");
+        let app = PathBuf::from("/repo/apps/web");
+        let result = result_with_update(app.join("package.json"), Language::Node);
+        let dirs = Some(vec![root.clone(), app.clone()]);
+
+        let install_map = build_install_map(&result, &dirs, &root);
+
+        assert_eq!(install_map.len(), 1);
+        assert_eq!(install_map[0].0, app);
+        assert_eq!(install_map[0].1, vec![Language::Node]);
+    }
 }

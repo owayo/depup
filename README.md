@@ -58,7 +58,7 @@
 - **Pinned Version Detection**: Skips intentionally pinned versions by default
 - **Age Filter**: Only update to versions released N days/weeks ago
 - **pnpm Integration**: Respects `minimumReleaseAge` from pnpm settings
-- **Monorepo Support**: pnpm workspaces and Tauri projects
+- **Monorepo Support**: `.depup`, pnpm workspaces, nested package installs, and Tauri projects
 - **Release Date Display**: Shows when each new version was released
 - **Multiple Output Formats**: Text (colored), JSON, diff
 
@@ -194,6 +194,9 @@ depup --only lodash --only typescript
 # Exclude react from updates
 depup --exclude react
 
+# --only takes precedence if the same package is also excluded
+depup --only lodash --exclude lodash
+
 # Update packages at least 2 weeks old
 depup --age 2w
 
@@ -251,6 +254,8 @@ Use `--include-pinned` to update pinned versions.
 >
 > **Note**: Cargo renamed dependencies such as `alias = { package = "actual-crate", version = "1" }` are fetched by the real package name and written back through the manifest key. `--only` and `--exclude` accept either name.
 >
+> **Note**: When `--only` is present, it takes precedence over `--exclude`. This lets an explicit allow-list entry remain updatable even if the same package also appears in a broader exclude list.
+>
 > **Note**: Composer platform packages such as `php`, `hhvm`, `ext-*`, `lib-*`, and Composer API packages are skipped.
 
 ### Range Preservation
@@ -263,6 +268,7 @@ depup preserves the original version range format:
 ">=1.0.0" → ">=2.0.0" (range preserved)
 "requests (>=2.28,<3); python_version < '3.12'" → "requests (>=2.31,<3); python_version < '3.12'" (PEP 508 parentheses and marker preserved)
 "coverage [toml] >=7,<8" → "coverage [toml] >=7.6,<8" (PEP 508 extras spacing preserved)
+"'paramiko>=3.5.0,<4.0.0'" → "'paramiko>=3.9.1,<4.0.0'" (TOML literal string quote preserved)
 "1.x" → "2.x" (wildcard shape preserved)
 "1.x.x" → "2.x.x" (all wildcard positions preserved)
 "1.2.*" → "1.3.*" (wildcard shape preserved)
@@ -273,6 +279,7 @@ depup preserves the original version range format:
 "[1.2.3.Final]" → "[1.3.0]" (Maven Hard requirement with qualifier)
 group = "com.google.guava", name = "guava", version = "32.1.2-jre" → version = "33.4.0-jre" (Gradle Kotlin map notation)
 prefer("1.7.25") → prefer("1.7.36") (Gradle rich version inside a strict range)
+"group:name:1.0.0:classifier@zip" → "group:name:1.1.0:classifier@zip" (Gradle classifier/extension preserved)
 ```
 
 Floating selectors such as `"*"`, npm dist-tags like `"latest"`, and Gradle dynamic selectors (`"latest.release"`, `"latest.integration"`, `"latest.milestone"`, and any user-defined `latest.<status>`) are skipped to avoid changing them into exact versions.
@@ -312,10 +319,15 @@ Constraints that cannot be rewritten safely are skipped instead of being rewritt
 
 For JSON manifests, depup only rewrites dependency sections it parses. In `package.json`, `overrides` is left untouched; in `composer.json`, sections such as `replace`, `provide`, and `conflict` are left untouched.
 
+For TOML manifests, depup preserves both basic strings (`"..."`) and literal strings (`'...'`) when updating supported dependency sections. In `Cargo.toml`, dependency updates are limited to dependency tables such as `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]`, `[workspace.dependencies]`, and target-specific dependency tables; metadata tables are left untouched. Cargo comparison ranges may contain more than two comma-separated requirements, for example `>=1.0, <2.0, >=1.0.100`.
+
+For Gradle string notation, depup preserves classifier and extension suffixes such as `:resources@zip` or `@aar`, and skips dependencies that appear only in `//` line comments or `/* ... */` block comments.
+
 For Swift GitHub dependencies, depup recognizes both `v1.2.3` and `V1.2.3` tag prefixes.
 depup also skips `Package.swift` dependencies that appear inside `//` line comments or `/* ... */` block comments.
 
 For `go.mod`, depup treats block endings with trailing comments such as `) // direct deps` as normal block endings when parsing and updating `require`, `replace`, and `exclude` blocks.
+Quoted `go.mod` module paths and versions, such as `require "golang.org/x/text" "v0.14.0"`, are parsed and updated while preserving the quotes.
 
 ## Age Filter
 
@@ -416,6 +428,7 @@ shared    # Shared libraries
 ```
 
 Run `depup` from the root directory to update dependencies across all listed directories at once. The root directory itself is always scanned in addition to the listed directories. Version lookups are cached, so shared packages are only fetched once.
+When `--install` is used, depup runs the package manager in the nearest matching monorepo directory for each updated manifest, so nested apps install in their own directories instead of the repository root.
 
 - `#` starts a comment (line or inline)
 - Empty lines are ignored

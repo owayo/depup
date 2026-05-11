@@ -91,7 +91,10 @@ static DEP_MAP: LazyLock<Regex> = LazyLock::new(|| {
 // 文字列記法依存: implementation 'group:name:version'
 // 非後方参照パターンを使用 (シングル/ダブルクォート両対応)
 static DEP_STRING: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"^\s*(\w+)\s*[\(\s]*['"]([^:'"]+):([^:'"]+):([^'"]+)['"]"#).unwrap()
+    Regex::new(
+        r#"^\s*(\w+)\s*[\(\s]*['"]([^:'"]+):([^:'"]+):([^:'"@]+)(?::[^'"]+)?(?:@[^'"]+)?['"]"#,
+    )
+    .unwrap()
 });
 
 // 変数展開あり文字列記法: implementation "group:name:$version"
@@ -166,6 +169,49 @@ fn strip_gradle_comments_from_line(line: &str, in_block_comment: &mut bool) -> S
     }
 
     output
+}
+
+fn replace_first_active_gradle_match<F>(
+    content: &str,
+    re: &Regex,
+    mut replacement: F,
+) -> (String, bool)
+where
+    F: FnMut(&regex::Captures) -> Option<String>,
+{
+    let mut output = String::new();
+    let mut updated = false;
+    let mut in_block_comment = false;
+
+    for segment in content.split_inclusive('\n') {
+        let (line, newline) = if let Some(line) = segment.strip_suffix('\n') {
+            (line, "\n")
+        } else {
+            (segment, "")
+        };
+
+        if updated {
+            output.push_str(segment);
+            continue;
+        }
+
+        let active_line = strip_gradle_comments_from_line(line, &mut in_block_comment);
+        if let Some(caps) = re.captures(&active_line)
+            && let Some(new_match) = replacement(&caps)
+            && let Some(whole) = caps.get(0)
+        {
+            output.push_str(&line[..whole.start()]);
+            output.push_str(&new_match);
+            output.push_str(&line[whole.end()..]);
+            output.push_str(newline);
+            updated = true;
+            continue;
+        }
+
+        output.push_str(segment);
+    }
+
+    (output, updated)
 }
 
 impl GradleParser {
@@ -822,27 +868,24 @@ impl GradleParser {
             message: format!("invalid regex pattern: {}", e),
         })?;
 
-        let mut updated = false;
-        let result = map_re.replace(content, |caps: &regex::Captures| {
-            let prefix = &caps[1];
-            let quote = &caps[2];
-            let current_version = caps.get(3).map(|m| m.as_str()).unwrap_or("");
-            if let Some(updated_version) = format_updated(current_version) {
-                updated = true;
-                format!("{}{}{}{}", prefix, quote, updated_version, quote)
-            } else {
-                caps[0].to_string()
-            }
-        });
+        let (result, mut updated) =
+            replace_first_active_gradle_match(content, &map_re, |caps: &regex::Captures| {
+                let prefix = &caps[1];
+                let quote = &caps[2];
+                let current_version = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+                format_updated(current_version).map(|updated_version| {
+                    format!("{}{}{}{}", prefix, quote, updated_version, quote)
+                })
+            });
 
         if updated {
-            return Ok(result.to_string());
+            return Ok(result);
         }
 
         // 文字列記法を更新: 'group:artifact:version'
         // 非後方参照パターンでシングル/ダブルクォート両対応
         let string_pattern = format!(
-            r#"(['"]){}:{}:([^'"]+)['"]"#,
+            r#"(['"]){}:{}:([^:'"@]+)((?::[^'"]+)?(?:@[^'"]+)?)['"]"#,
             escaped_group, escaped_artifact
         );
         let string_re =
@@ -852,22 +895,22 @@ impl GradleParser {
                 message: format!("invalid regex pattern: {}", e),
             })?;
 
-        let result = string_re.replace(content, |caps: &regex::Captures| {
-            let quote = &caps[1];
-            let current_version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-            if let Some(updated_version) = format_updated(current_version) {
-                updated = true;
-                format!(
-                    "{}{}:{}:{}{}",
-                    quote, group, artifact, updated_version, quote
-                )
-            } else {
-                caps[0].to_string()
-            }
-        });
+        let (result, string_updated) =
+            replace_first_active_gradle_match(content, &string_re, |caps: &regex::Captures| {
+                let quote = &caps[1];
+                let current_version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+                let suffix = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+                format_updated(current_version).map(|updated_version| {
+                    format!(
+                        "{}{}:{}:{}{}{}",
+                        quote, group, artifact, updated_version, suffix, quote
+                    )
+                })
+            });
+        updated = string_updated;
 
         if updated {
-            return Ok(result.to_string());
+            return Ok(result);
         }
 
         if let Some(result) =
@@ -977,6 +1020,31 @@ dependencies {
         assert_eq!(deps[0].version_spec.version, "9.12.0");
         assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Exact);
         assert!(!deps[0].is_dev);
+    }
+
+    #[test]
+    fn test_parse_string_notation_with_classifier_and_extension() {
+        // Gradle の group:name:version:classifier@extension 形式も version 部だけを解析する
+        let content = r#"
+dependencies {
+    runtimeOnly("net.sf.docbook:docbook-xsl:1.75.2:resources@zip")
+    implementation("com.google.android.material:material:1.11.0@aar")
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 2);
+
+        let docbook = deps
+            .iter()
+            .find(|d| d.name == "net.sf.docbook:docbook-xsl")
+            .unwrap();
+        assert_eq!(docbook.version_spec.version, "1.75.2");
+
+        let material = deps
+            .iter()
+            .find(|d| d.name == "com.google.android.material:material")
+            .unwrap();
+        assert_eq!(material.version_spec.version, "1.11.0");
     }
 
     #[test]
@@ -1280,6 +1348,35 @@ dependencies {
             .update_version(content, "org.apache.wicket:wicket-core", "10.0.0")
             .unwrap();
         assert!(result.contains("'org.apache.wicket:wicket-core:10.0.0'"));
+    }
+
+    #[test]
+    fn test_update_string_notation_preserves_classifier_and_extension() {
+        // classifier / extension は依存座標の一部なので、version だけを差し替えて維持する
+        let content = r#"
+dependencies {
+    runtimeOnly("net.sf.docbook:docbook-xsl:1.75.2:resources@zip")
+}
+"#;
+        let result = GradleParser
+            .update_version(content, "net.sf.docbook:docbook-xsl", "1.76.0")
+            .unwrap();
+        assert!(result.contains(r#""net.sf.docbook:docbook-xsl:1.76.0:resources@zip""#));
+    }
+
+    #[test]
+    fn test_update_string_notation_ignores_line_comment() {
+        let content = r#"
+dependencies {
+    // implementation 'org.apache.wicket:wicket-core:9.12.0'
+    implementation 'org.apache.wicket:wicket-core:9.13.0'
+}
+"#;
+        let result = GradleParser
+            .update_version(content, "org.apache.wicket:wicket-core", "10.0.0")
+            .unwrap();
+        assert!(result.contains("// implementation 'org.apache.wicket:wicket-core:9.12.0'"));
+        assert!(result.contains("implementation 'org.apache.wicket:wicket-core:10.0.0'"));
     }
 
     #[test]

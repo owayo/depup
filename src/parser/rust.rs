@@ -38,7 +38,10 @@ static LT_RE: LazyLock<Regex> =
 static BARE_VERSION_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^([\d]+(?:\.[\d]+)*(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap());
 static RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^[<>=]+\s*[\d]+(?:\.[\d]+)*\s*,\s*[<>=]+\s*[\d]+(?:\.[\d]+)*$").unwrap()
+    Regex::new(
+        r"^(?:(?:>=|<=|>|<|=)\s*[\d]+(?:\.[\d]+)*(?:-[\w.-]+)?(?:\+[\w.-]+)?\s*,\s*)+(?:>=|<=|>|<|=)\s*[\d]+(?:\.[\d]+)*(?:-[\w.-]+)?(?:\+[\w.-]+)?$",
+    )
+    .unwrap()
 });
 static WILDCARD_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\*$|^[\d]+(?:\.[\d]+)*\.\*$").unwrap());
@@ -246,6 +249,14 @@ mod tests {
         assert_eq!(spec.kind, VersionSpecKind::Range);
         assert_eq!(spec.raw, ">=1.0, <2.0");
         assert!(!spec.is_pinned());
+    }
+
+    #[test]
+    fn test_parse_range_three_comparators() {
+        // Cargo はカンマ区切りの複数 requirement を2個に限定していない
+        let spec = parse(">=1.0, <2.0, >=1.0.100").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1.0");
     }
 
     #[test]

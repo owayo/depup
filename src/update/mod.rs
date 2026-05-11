@@ -178,16 +178,14 @@ impl UpdateJudge {
         // パッケージフィルタ（exclude/only）を確認する。
         // Cargo のリネーム依存では実パッケージ名とマニフェスト上のキー名の両方を受け付ける。
         let manifest_name = dependency.manifest_name();
-        if !self.filter.only.is_empty()
-            && !self.filter.only.iter().any(|p| {
-                p == &dependency.name || (manifest_name != dependency.name && p == manifest_name)
-            })
-        {
-            return Some(SkipReason::NotInOnlyList);
-        }
-        if self.filter.exclude.iter().any(|p| {
+        let matches_package_filter = |p: &String| {
             p == &dependency.name || (manifest_name != dependency.name && p == manifest_name)
-        }) {
+        };
+        if !self.filter.only.is_empty() {
+            if !self.filter.only.iter().any(matches_package_filter) {
+                return Some(SkipReason::NotInOnlyList);
+            }
+        } else if self.filter.exclude.iter().any(matches_package_filter) {
             return Some(SkipReason::Excluded);
         }
 
@@ -576,6 +574,17 @@ mod tests {
         let dep =
             make_dependency("tokio", "1.0.0", Language::Rust, false).with_manifest_name("tokio_v1");
         assert_eq!(judge.should_skip(&dep), Some(SkipReason::Excluded));
+    }
+
+    #[test]
+    fn test_should_skip_only_takes_precedence_over_exclude() {
+        let filter = UpdateFilter::new()
+            .with_only(vec!["lodash".to_string()])
+            .with_exclude(vec!["lodash".to_string()]);
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_dependency("lodash", "1.0.0", Language::Node, false);
+        assert!(judge.should_skip(&dep).is_none());
     }
 
     #[test]

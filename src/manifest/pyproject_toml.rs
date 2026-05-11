@@ -178,16 +178,25 @@ impl ManifestParser for PyprojectTomlParser {
         let mut result = content.to_string();
         let mut updated = false;
 
-        // Poetry 形式: `name = "^1.0.0"` / `name = { version = "^1.0.0" }`
-        let simple_pattern = format!(r#"(?m)^(\s*{}\s*=\s*)"([^"]+)"#, regex::escape(package));
+        // Poetry 形式: `name = "^1.0.0"` / `name = '^1.0.0'`
+        let simple_pattern = format!(
+            r#"(?m)^(\s*{}\s*=\s*)(?:"([^"]+)"|'([^']+)')"#,
+            regex::escape(package)
+        );
         if let Ok(re) = Regex::new(&simple_pattern)
             && let Some(caps) = re.captures(&result)
         {
-            let old_version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+            let (quote, old_version) = if let Some(m) = caps.get(2) {
+                ("\"", m.as_str())
+            } else if let Some(m) = caps.get(3) {
+                ("'", m.as_str())
+            } else {
+                ("\"", "")
+            };
             if let Some(spec) = parser.parse(old_version)
                 && let Some(new_ver) = spec.try_format_updated(new_version)
             {
-                let replacement = format!(r#"{}"{}"#, &caps[1], new_ver);
+                let replacement = format!("{}{}{}{}", &caps[1], quote, new_ver, quote);
                 result = re.replace(&result, replacement.as_str()).to_string();
                 updated = true;
             }
@@ -195,17 +204,23 @@ impl ManifestParser for PyprojectTomlParser {
 
         // Poetry の inline table 形式: `name = { version = "^1.0.0", ... }`
         let table_pattern = format!(
-            r#"(?m)({}\s*=\s*\{{\s*[^}}]*version\s*=\s*)"([^"]+)""#,
+            r#"(?m)({}\s*=\s*\{{\s*[^}}]*version\s*=\s*)(?:"([^"]+)"|'([^']+)')"#,
             regex::escape(package)
         );
         if let Ok(re) = Regex::new(&table_pattern)
             && let Some(caps) = re.captures(&result)
         {
-            let old_version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+            let (quote, old_version) = if let Some(m) = caps.get(2) {
+                ("\"", m.as_str())
+            } else if let Some(m) = caps.get(3) {
+                ("'", m.as_str())
+            } else {
+                ("\"", "")
+            };
             if let Some(spec) = parser.parse(old_version)
                 && let Some(new_ver) = spec.try_format_updated(new_version)
             {
-                let replacement = format!(r#"{}"{}"#, &caps[1], new_ver);
+                let replacement = format!("{}{}{}{}", &caps[1], quote, new_ver, quote);
                 result = re.replace(&result, replacement.as_str()).to_string();
                 updated = true;
             }
@@ -213,13 +228,20 @@ impl ManifestParser for PyprojectTomlParser {
 
         // 配列中の PEP 508 形式: `"package>=1.0,<2.0"` / `"package [extras] (>=1.0); marker"`
         let pep508_pattern = format!(
-            r#""({}(?:(?:\s*\[[^\]]*\])?\s*(?:[<>=!~^]|\()[^"]*)?)""#,
+            r#""({}(?:(?:\s*\[[^\]]*\])?\s*(?:[<>=!~^]|\()[^"]*)?)"|'({}(?:(?:\s*\[[^\]]*\])?\s*(?:[<>=!~^]|\()[^']*)?)'"#,
+            regex::escape(package),
             regex::escape(package)
         );
         if let Ok(re) = Regex::new(&pep508_pattern) {
             let result_clone = result.clone();
             for caps in re.captures_iter(&result_clone) {
-                let full_dep = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                let (quote, full_dep) = if let Some(m) = caps.get(1) {
+                    ("\"", m.as_str())
+                } else if let Some(m) = caps.get(2) {
+                    ("'", m.as_str())
+                } else {
+                    ("\"", "")
+                };
                 if let Some(pep_caps) = PEP508_RE.captures(full_dep) {
                     let pkg_name = pep_caps.get(1).map(|m| m.as_str()).unwrap_or("");
                     let after_name = &full_dep[pkg_name.len()..];
@@ -234,8 +256,10 @@ impl ManifestParser for PyprojectTomlParser {
                         )
                     {
                         let new_dep = format!("{}{}{}", package, extras_str, new_ver);
-                        result =
-                            result.replace(&format!(r#""{full_dep}""#), &format!(r#""{new_dep}""#));
+                        result = result.replace(
+                            &format!("{quote}{full_dep}{quote}"),
+                            &format!("{quote}{new_dep}{quote}"),
+                        );
                         updated = true;
                     }
                 }
@@ -572,6 +596,25 @@ requests = "^2.28.0"
     }
 
     #[test]
+    fn test_update_poetry_single_quoted_version() {
+        // Poetry 形式でも TOML の単一引用符を維持して更新する
+        let content = r#"
+[tool.poetry.dependencies]
+requests = '^2.28.0'
+"#;
+
+        let result = PyprojectTomlParser
+            .update_version(content, "requests", "2.31.0")
+            .unwrap();
+
+        assert!(
+            result.contains("requests = '^2.31.0'"),
+            "単一引用符の Poetry バージョンを更新できていません: {}",
+            result
+        );
+    }
+
+    #[test]
     fn test_update_poetry_inline_table() {
         let content = r#"
 [tool.poetry.dependencies]
@@ -582,6 +625,25 @@ requests = { version = "^2.28.0", extras = ["security"] }
             .update_version(content, "requests", "2.31.0")
             .unwrap();
         assert!(result.contains("^2.31.0"));
+    }
+
+    #[test]
+    fn test_update_poetry_inline_table_single_quoted_version() {
+        // inline table の version 値でも TOML の単一引用符を維持する
+        let content = r#"
+[tool.poetry.dependencies]
+requests = { version = '^2.28.0', extras = ["security"] }
+"#;
+
+        let result = PyprojectTomlParser
+            .update_version(content, "requests", "2.31.0")
+            .unwrap();
+
+        assert!(
+            result.contains("version = '^2.31.0'"),
+            "inline table の単一引用符バージョンを更新できていません: {}",
+            result
+        );
     }
 
     #[test]
@@ -678,6 +740,27 @@ dependencies = [
     }
 
     #[test]
+    fn test_update_pep508_single_quoted_dependency_preserves_quote() {
+        // TOML のリテラル文字列でも、依存指定を更新して引用符を維持する
+        let content = r#"
+[project]
+dependencies = [
+    'paramiko>=3.5.0,<4.0.0',
+]
+"#;
+
+        let result = PyprojectTomlParser
+            .update_version(content, "paramiko", "3.9.1")
+            .unwrap();
+
+        assert!(
+            result.contains("'paramiko>=3.9.1,<4.0.0'"),
+            "単一引用符の PEP 508 依存を更新できていません: {}",
+            result
+        );
+    }
+
+    #[test]
     fn test_update_pep508_parenthesized_version_spec() {
         let content = r#"
 [project]
@@ -713,6 +796,27 @@ dependencies = [
         assert!(
             result.contains("requests (>=2.31.0,<3); python_version < '3.12'"),
             "括弧付き versionspec と環境マーカーを維持できていません: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_update_pep508_single_quoted_dependency_with_double_quoted_marker() {
+        // 単一引用符の TOML 文字列では、PEP 508 マーカー側の二重引用符も維持する
+        let content = r#"
+[project]
+dependencies = [
+    'requests (>=2.28,<3); python_version < "3.12"',
+]
+"#;
+
+        let result = PyprojectTomlParser
+            .update_version(content, "requests", "2.31.0")
+            .unwrap();
+
+        assert!(
+            result.contains("'requests (>=2.31.0,<3); python_version < \"3.12\"'"),
+            "単一引用符の依存と二重引用符の環境マーカーを維持できていません: {}",
             result
         );
     }

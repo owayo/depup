@@ -18,13 +18,20 @@ use std::sync::LazyLock;
 pub struct GoModParser;
 
 // 単一 require 文の正規表現: require module/path v1.2.3
+// go.mod では ModulePath / Version ともに quoted string も許容される
 static SINGLE_REQUIRE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^\s*require\s+(\S+)\s+(v[\d]+\.[\d]+\.[\d]+[^\s]*)\s*(//.*)?\s*$").unwrap()
+    Regex::new(
+        r#"^\s*require\s+("[^"]+"|`[^`]+`|\S+)\s+("[^"]+"|`[^`]+`|v[\d]+\.[\d]+\.[\d]+[^\s]*)\s*(//.*)?\s*$"#,
+    )
+    .unwrap()
 });
 
 // require ブロック内エントリの正規表現: module/path v1.2.3
 static BLOCK_ENTRY_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^\s*(\S+)\s+(v[\d]+\.[\d]+\.[\d]+[^\s]*)\s*(//.*)?\s*$").unwrap()
+    Regex::new(
+        r#"^\s*("[^"]+"|`[^`]+`|\S+)\s+("[^"]+"|`[^`]+`|v[\d]+\.[\d]+\.[\d]+[^\s]*)\s*(//.*)?\s*$"#,
+    )
+    .unwrap()
 });
 
 // pinned コメントの正規表現
@@ -136,13 +143,16 @@ impl ManifestParser for GoModParser {
             let updated_line = if !in_replace && !in_exclude && trimmed.contains(package) {
                 // 単一 require 文とのマッチを試みる
                 if let Some(caps) = SINGLE_REQUIRE_RE.captures(trimmed) {
-                    let module = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                    let module_token = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                    let module = unquote_go_token(module_token);
                     if module == package {
                         let comment = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+                        let version_token = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+                        let formatted_version = quote_go_version_like(version_token, &new_ver);
                         let new_line = if comment.is_empty() {
-                            format!("require {} {}", package, new_ver)
+                            format!("require {} {}", module_token, formatted_version)
                         } else {
-                            format!("require {} {} {}", package, new_ver, comment)
+                            format!("require {} {} {}", module_token, formatted_version, comment)
                         };
                         updated = true;
                         Some(new_line)
@@ -151,16 +161,22 @@ impl ManifestParser for GoModParser {
                     }
                 } else if let Some(caps) = BLOCK_ENTRY_RE.captures(trimmed) {
                     // ブロックエントリとのマッチを試みる
-                    let module = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                    let module_token = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                    let module = unquote_go_token(module_token);
                     if module == package {
                         let comment = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+                        let version_token = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+                        let formatted_version = quote_go_version_like(version_token, &new_ver);
                         // 先頭の空白を保持する
                         let leading_ws = line.len() - line.trim_start().len();
                         let indent = &line[..leading_ws];
                         let new_line = if comment.is_empty() {
-                            format!("{}{} {}", indent, package, new_ver)
+                            format!("{}{} {}", indent, module_token, formatted_version)
                         } else {
-                            format!("{}{} {} {}", indent, package, new_ver, comment)
+                            format!(
+                                "{}{} {} {}",
+                                indent, module_token, formatted_version, comment
+                            )
                         };
                         updated = true;
                         Some(new_line)
@@ -199,13 +215,34 @@ impl ManifestParser for GoModParser {
     }
 }
 
+fn unquote_go_token(token: &str) -> &str {
+    if token.len() >= 2
+        && ((token.starts_with('"') && token.ends_with('"'))
+            || (token.starts_with('`') && token.ends_with('`')))
+    {
+        &token[1..token.len() - 1]
+    } else {
+        token
+    }
+}
+
+fn quote_go_version_like(original: &str, new_version: &str) -> String {
+    if original.starts_with('"') && original.ends_with('"') {
+        format!("\"{}\"", new_version)
+    } else if original.starts_with('`') && original.ends_with('`') {
+        format!("`{}`", new_version)
+    } else {
+        new_version.to_string()
+    }
+}
+
 fn parse_go_dependency(
     caps: &regex::Captures,
     parser: &dyn VersionParser,
     is_pinned: bool,
 ) -> Option<Dependency> {
-    let module = caps.get(1)?.as_str();
-    let version = caps.get(2)?.as_str();
+    let module = unquote_go_token(caps.get(1)?.as_str());
+    let version = unquote_go_token(caps.get(2)?.as_str());
 
     // 間接依存をスキップする (通常 // indirect コメントが付いている)
     let comment = caps.get(3).map(|m| m.as_str()).unwrap_or("");
@@ -266,6 +303,22 @@ require github.com/gin-gonic/gin v1.9.1
     }
 
     #[test]
+    fn test_parse_quoted_single_require() {
+        let content = r#"
+module example.com/myproject
+
+go 1.21
+
+require "golang.org/x/text" "v0.14.0"
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "golang.org/x/text");
+        assert_eq!(deps[0].version_spec.version, "0.14.0");
+    }
+
+    #[test]
     fn test_parse_require_block() {
         let content = r#"
 module example.com/myproject
@@ -292,6 +345,24 @@ require (
             .find(|d| d.name == "github.com/stretchr/testify")
             .unwrap();
         assert_eq!(testify.version_spec.version, "1.8.4");
+    }
+
+    #[test]
+    fn test_parse_quoted_require_block_entry() {
+        let content = r#"
+module example.com/myproject
+
+go 1.21
+
+require (
+	"golang.org/x/text" "v0.14.0"
+)
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "golang.org/x/text");
+        assert_eq!(deps[0].version_spec.version, "0.14.0");
     }
 
     #[test]
@@ -448,6 +519,26 @@ require github.com/gin-gonic/gin v1.9.1
             .unwrap();
         assert!(result.contains("v1.10.0"));
         assert!(!result.contains("v1.9.1"));
+    }
+
+    #[test]
+    fn test_update_quoted_single_require_preserves_quotes() {
+        let content = r#"module example.com/myproject
+
+go 1.21
+
+require "golang.org/x/text" "v0.14.0"
+"#;
+
+        let result = GoModParser
+            .update_version(content, "golang.org/x/text", "v0.15.0")
+            .unwrap();
+
+        assert!(
+            result.contains(r#"require "golang.org/x/text" "v0.15.0""#),
+            "quoted require の引用符を維持できていません: {}",
+            result
+        );
     }
 
     #[test]

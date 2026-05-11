@@ -18,6 +18,11 @@ use std::sync::LazyLock;
 /// `Gemfile` 用パーサ
 pub struct GemfileParser;
 
+enum GemfileBlock {
+    Group(bool),
+    Other,
+}
+
 // `gem 'name'` または `gem "name"` を解釈する正規表現
 static GEM_RE: LazyLock<Regex> = LazyLock::new(|| {
     // 例:
@@ -82,9 +87,7 @@ impl ManifestParser for GemfileParser {
     fn parse(&self, content: &str) -> Result<Vec<Dependency>, ManifestError> {
         let mut dependencies = Vec::new();
         let parser = get_parser(Language::Ruby);
-        let mut group_stack = Vec::new();
-        // group 以外の do...end ブロックのネスト深度
-        let mut non_group_nesting: usize = 0;
+        let mut block_stack = Vec::new();
 
         for line in content.lines() {
             let trimmed = line.trim();
@@ -97,23 +100,19 @@ impl ManifestParser for GemfileParser {
             // `group ... do` を積む
             if let Some(caps) = GROUP_START_RE.captures(trimmed) {
                 let group_spec = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                group_stack.push(is_dev_group(group_spec));
+                block_stack.push(GemfileBlock::Group(is_dev_group(group_spec)));
                 continue;
             }
 
             // group 以外の `do` ブロック（platforms, source 等）を追跡する
             if DO_BLOCK_RE.is_match(trimmed) {
-                non_group_nesting += 1;
+                block_stack.push(GemfileBlock::Other);
                 continue;
             }
 
             // 対応する `end` で適切なスタック/カウンタを戻す
             if GROUP_END_RE.is_match(trimmed) {
-                if non_group_nesting > 0 {
-                    non_group_nesting -= 1;
-                } else if !group_stack.is_empty() {
-                    group_stack.pop();
-                }
+                block_stack.pop();
                 continue;
             }
 
@@ -148,7 +147,9 @@ impl ManifestParser for GemfileParser {
                     }
                 };
 
-                let dep = if group_stack.iter().copied().any(|is_dev| is_dev)
+                let dep = if block_stack
+                    .iter()
+                    .any(|block| matches!(block, GemfileBlock::Group(true)))
                     || has_dev_group_option(line)
                 {
                     Dependency::development(name, spec, Language::Ruby)
@@ -844,6 +845,27 @@ end
 
         assert!(private.is_dev);
         assert!(debug.is_dev);
+    }
+
+    #[test]
+    fn test_parse_group_inside_source_does_not_leak() {
+        // source do の内側で閉じた group が、後続の gem に漏れないこと
+        let content = r#"
+source 'https://gems.example.com' do
+  group :development do
+    gem 'debug', '~> 1.0'
+  end
+  gem 'pg', '~> 1.5'
+end
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 2);
+
+        let debug = deps.iter().find(|d| d.name == "debug").unwrap();
+        let pg = deps.iter().find(|d| d.name == "pg").unwrap();
+
+        assert!(debug.is_dev);
+        assert!(!pg.is_dev);
     }
 
     #[test]

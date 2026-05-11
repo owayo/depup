@@ -19,6 +19,25 @@ use toml::Value;
 /// `Cargo.toml` 用パーサ
 pub struct CargoTomlParser;
 
+fn cargo_section_name(line: &str) -> Option<&str> {
+    let trimmed = line.split('#').next().unwrap_or(line).trim();
+    if trimmed.starts_with('[') && trimmed.ends_with(']') {
+        Some(trimmed.trim_matches(['[', ']']))
+    } else {
+        None
+    }
+}
+
+fn is_cargo_dependency_section(section: &str) -> bool {
+    matches!(
+        section,
+        "dependencies" | "dev-dependencies" | "build-dependencies" | "workspace.dependencies"
+    ) || (section.starts_with("target.")
+        && (section.ends_with(".dependencies")
+            || section.ends_with(".dev-dependencies")
+            || section.ends_with(".build-dependencies")))
+}
+
 impl ManifestParser for CargoTomlParser {
     fn parse(&self, content: &str) -> Result<Vec<Dependency>, ManifestError> {
         let toml: Value = toml::from_str(content).map_err(|e: toml::de::Error| {
@@ -94,42 +113,92 @@ impl ManifestParser for CargoTomlParser {
         let mut result = content.to_string();
         let mut updated = false;
 
-        // 単純な依存宣言: `package = "1.0.0"` / `package = "^1.0.0"`
-        let simple_pattern = format!(r#"(?m)^(\s*{})\s*=\s*"([^"]+)""#, regex::escape(package));
-        if let Ok(re) = Regex::new(&simple_pattern)
-            && let Some(caps) = re.captures(&result)
-        {
-            let old_version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-            // パス依存や git 依存ではない通常のバージョン文字列だけを対象にする
-            if !old_version.contains('/')
-                && !old_version.starts_with('{')
-                && let Some(spec) = parser.parse(old_version)
-                && let Some(new_ver) = spec.try_format_updated(new_version)
-            {
-                let replacement = format!(r#"{} = "{}""#, &caps[1], new_ver);
-                result = re.replace(&result, replacement.as_str()).to_string();
-                updated = true;
-            }
-        }
-
-        // inline table 形式: `package = { version = "1.0.0", ... }`
-        // 行の残りを保つため、version の値だけを差し替える
-        let table_pattern = format!(
-            r#"(?m)^(\s*{}\s*=\s*\{{[^\n}}]*?\bversion\s*=\s*)"([^"]+)""#,
+        // 単純な依存宣言と inline table は、現在の TOML セクションが依存セクションの時だけ更新する
+        let simple_pattern = format!(
+            r#"^(\s*{})\s*=\s*(?:"([^"]+)"|'([^']+)')"#,
             regex::escape(package)
         );
-        if let Ok(re) = Regex::new(&table_pattern)
-            && let Some(caps) = re.captures(&result)
-        {
-            let old_version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-            if let Some(spec) = parser.parse(old_version)
-                && let Some(new_ver) = spec.try_format_updated(new_version)
-            {
-                let replacement = format!(r#"{}"{}""#, &caps[1], new_ver);
-                result = re.replace(&result, replacement.as_str()).to_string();
-                updated = true;
+        let table_pattern = format!(
+            r#"^(\s*{}\s*=\s*\{{[^\n}}]*?\bversion\s*=\s*)(?:"([^"]+)"|'([^']+)')"#,
+            regex::escape(package)
+        );
+        let simple_re =
+            Regex::new(&simple_pattern).map_err(|e| ManifestError::InvalidVersionSpec {
+                path: PathBuf::from("Cargo.toml"),
+                spec: package.to_string(),
+                message: format!("invalid regex pattern: {}", e),
+            })?;
+        let table_re =
+            Regex::new(&table_pattern).map_err(|e| ManifestError::InvalidVersionSpec {
+                path: PathBuf::from("Cargo.toml"),
+                spec: package.to_string(),
+                message: format!("invalid regex pattern: {}", e),
+            })?;
+        let mut section = String::new();
+        let mut rebuilt = String::new();
+        for segment in result.split_inclusive('\n') {
+            let (line, newline) = if let Some(line) = segment.strip_suffix('\n') {
+                (line, "\n")
+            } else {
+                (segment, "")
+            };
+
+            if let Some(name) = cargo_section_name(line) {
+                section.clear();
+                section.push_str(name);
+                rebuilt.push_str(segment);
+                continue;
             }
+
+            if !updated && is_cargo_dependency_section(&section) {
+                let replacement = if let Some(caps) = simple_re.captures(line) {
+                    let (quote, old_version) = if let Some(m) = caps.get(2) {
+                        ("\"", m.as_str())
+                    } else if let Some(m) = caps.get(3) {
+                        ("'", m.as_str())
+                    } else {
+                        ("\"", "")
+                    };
+                    if !old_version.contains('/')
+                        && let Some(spec) = parser.parse(old_version)
+                        && let Some(new_ver) = spec.try_format_updated(new_version)
+                    {
+                        let replacement = format!("{} = {}{}{}", &caps[1], quote, new_ver, quote);
+                        Some(simple_re.replace(line, replacement.as_str()).to_string())
+                    } else {
+                        None
+                    }
+                } else if let Some(caps) = table_re.captures(line) {
+                    let (quote, old_version) = if let Some(m) = caps.get(2) {
+                        ("\"", m.as_str())
+                    } else if let Some(m) = caps.get(3) {
+                        ("'", m.as_str())
+                    } else {
+                        ("\"", "")
+                    };
+                    if let Some(spec) = parser.parse(old_version)
+                        && let Some(new_ver) = spec.try_format_updated(new_version)
+                    {
+                        let replacement = format!("{}{}{}{}", &caps[1], quote, new_ver, quote);
+                        Some(table_re.replace(line, replacement.as_str()).to_string())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(new_line) = replacement {
+                    rebuilt.push_str(&new_line);
+                    rebuilt.push_str(newline);
+                    updated = true;
+                    continue;
+                }
+            }
+
+            rebuilt.push_str(segment);
         }
+        result = rebuilt;
 
         // 複数行テーブル:
         // [dependencies.package]
@@ -138,17 +207,23 @@ impl ManifestParser for CargoTomlParser {
         // パッケージ名の直後は終端 `]` か空白のみを許可することで、
         // `[dependencies.serde_json]` を `serde` で誤マッチしないようにする。
         let multiline_pattern = format!(
-            r#"(?m)(\[(?:dependencies|dev-dependencies|build-dependencies|workspace\.dependencies|target\.[^\]]+\.(?:dependencies|dev-dependencies|build-dependencies))\.{}[ \t]*\][^\[]*version\s*=\s*)"([^"]+)""#,
+            r#"(?m)(\[(?:dependencies|dev-dependencies|build-dependencies|workspace\.dependencies|target\.[^\]]+\.(?:dependencies|dev-dependencies|build-dependencies))\.{}[ \t]*\][^\[]*version\s*=\s*)(?:"([^"]+)"|'([^']+)')"#,
             regex::escape(package)
         );
         if let Ok(re) = Regex::new(&multiline_pattern)
             && let Some(caps) = re.captures(&result)
         {
-            let old_version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+            let (quote, old_version) = if let Some(m) = caps.get(2) {
+                ("\"", m.as_str())
+            } else if let Some(m) = caps.get(3) {
+                ("'", m.as_str())
+            } else {
+                ("\"", "")
+            };
             if let Some(spec) = parser.parse(old_version)
                 && let Some(new_ver) = spec.try_format_updated(new_version)
             {
-                let replacement = format!(r#"{}"{}""#, &caps[1], new_ver);
+                let replacement = format!("{}{}{}{}", &caps[1], quote, new_ver, quote);
                 result = re.replace(&result, replacement.as_str()).to_string();
                 updated = true;
             }
@@ -647,6 +722,58 @@ serde = "1.0.0"
     }
 
     #[test]
+    fn test_update_simple_version_single_quotes() {
+        // TOML のリテラル文字列でも、引用符の種類を維持して更新する
+        let content = r#"
+[dependencies]
+serde = '1.0.0'
+"#;
+
+        let result = CargoTomlParser
+            .update_version(content, "serde", "1.1.0")
+            .unwrap();
+
+        assert!(
+            result.contains("serde = '1.1.0'"),
+            "単一引用符の依存を更新できていません: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_update_simple_version_ignores_non_dependency_section() {
+        // 同名キーが依存セクション外にあっても、実際の依存だけを更新する
+        let content = r#"
+[package.metadata]
+serde = "metadata-value"
+
+[dependencies]
+serde = "1.0.0"
+"#;
+
+        let result = CargoTomlParser
+            .update_version(content, "serde", "1.1.0")
+            .unwrap();
+
+        assert!(result.contains(r#"serde = "metadata-value""#));
+        assert!(result.contains(r#"serde = "1.1.0""#));
+    }
+
+    #[test]
+    fn test_update_simple_version_under_commented_section_header() {
+        let content = r#"
+[dependencies] # direct deps
+serde = "1.0.0"
+"#;
+
+        let result = CargoTomlParser
+            .update_version(content, "serde", "1.1.0")
+            .unwrap();
+
+        assert!(result.contains(r#"serde = "1.1.0""#));
+    }
+
+    #[test]
     fn test_update_renamed_package_dependency_uses_manifest_key() {
         let content = r#"
 [dependencies]
@@ -743,6 +870,47 @@ serde = { version = "1.0.0", features = ["derive"] }
     }
 
     #[test]
+    fn test_update_inline_table_single_quotes() {
+        // inline table の version 値でも単一引用符を維持する
+        let content = r#"
+[dependencies]
+serde = { version = '1.0.0', features = ["derive"] }
+"#;
+
+        let result = CargoTomlParser
+            .update_version(content, "serde", "1.1.0")
+            .unwrap();
+
+        assert!(
+            result.contains("version = '1.1.0'"),
+            "inline table の単一引用符バージョンを更新できていません: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_update_inline_table_ignores_non_dependency_section() {
+        // metadata の inline table ではなく、依存セクションの inline table だけを更新する
+        let content = r#"
+[package.metadata]
+serde = { version = "metadata-value" }
+
+[dependencies]
+serde = { version = "1.0.0", features = ["derive"] }
+"#;
+
+        let result = CargoTomlParser
+            .update_version(content, "serde", "1.1.0")
+            .unwrap();
+
+        assert!(result.contains(
+            r#"[package.metadata]
+serde = { version = "metadata-value" }"#
+        ));
+        assert!(result.contains(r#"serde = { version = "1.1.0", features = ["derive"] }"#));
+    }
+
+    #[test]
     fn test_update_version_not_found() {
         let content = r#"
 [dependencies]
@@ -809,6 +977,26 @@ version = "0.21"
 
         assert!(result2.contains("version = \"0.25.1\""));
         assert!(result2.contains("version = \"0.26.3\""));
+    }
+
+    #[test]
+    fn test_update_multiline_table_single_quotes() {
+        // 複数行テーブルの version 値でも単一引用符を維持する
+        let content = r#"[dependencies.tree-sitter]
+version = '0.22'
+features = ["derive"]
+"#;
+
+        let result = CargoTomlParser
+            .update_version(content, "tree-sitter", "0.26.3")
+            .unwrap();
+
+        assert!(
+            result.contains("version = '0.26.3'"),
+            "複数行テーブルの単一引用符バージョンを更新できていません: {}",
+            result
+        );
+        assert!(result.contains(r#"features = ["derive"]"#));
     }
 
     #[test]
