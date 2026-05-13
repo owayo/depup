@@ -344,13 +344,13 @@ impl ManifestParser for PackageSwiftParser {
             message: format!("invalid regex pattern: {}", e),
         })?;
 
-        let version_re = Regex::new(r#""([vV]?\d+(?:\.\d+)*)""#).map_err(|e| {
-            ManifestError::InvalidVersionSpec {
+        // SPM は semver 2.0.0 準拠のためプレリリース識別子とビルドメタデータも許容する
+        let version_re = Regex::new(r#""([vV]?\d+(?:\.\d+)*(?:-[\w.-]+)?(?:\+[\w.-]+)?)""#)
+            .map_err(|e| ManifestError::InvalidVersionSpec {
                 path: PathBuf::from("Package.swift"),
                 spec: package.to_string(),
                 message: format!("invalid regex pattern: {}", e),
-            }
-        })?;
+            })?;
 
         // 全体から URL を検索する (複数行宣言に対応)
         let url_match = url_re
@@ -1067,5 +1067,71 @@ let package = Package(
         assert!(result.contains(
             r#".package(url: "https://github.com/apple/swift-nio.git", from: "2.40.0")"#
         ));
+    }
+
+    // --- semver 2.0.0 のプレリリース / ビルドメタデータ対応 ---
+
+    #[test]
+    fn test_parse_prerelease_from_version() {
+        // from: にプレリリース付きバージョンを指定するケース
+        let content =
+            r#".package(url: "https://github.com/apple/swift-nio.git", from: "2.40.0-beta.1")"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "apple/swift-nio");
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Caret);
+        assert_eq!(deps[0].version_spec.version, "2.40.0-beta.1");
+    }
+
+    #[test]
+    fn test_parse_prerelease_up_to_next_major() {
+        // .upToNextMajor(from:) にプレリリース付きバージョンを指定するケース
+        let content = r#".package(url: "https://github.com/vapor/vapor.git", .upToNextMajor(from: "4.0.0-rc.1"))"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Caret);
+        assert_eq!(deps[0].version_spec.version, "4.0.0-rc.1");
+    }
+
+    #[test]
+    fn test_parse_prerelease_exact() {
+        // exact: にプレリリース付きバージョンを指定するケース
+        let content =
+            r#".package(url: "https://github.com/apple/swift-nio.git", exact: "2.40.0-alpha.1")"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Exact);
+        assert_eq!(deps[0].version_spec.version, "2.40.0-alpha.1");
+    }
+
+    #[test]
+    fn test_update_version_prerelease_to_stable() {
+        // プレリリースから安定版への更新が正しく行われる
+        let content =
+            r#".package(url: "https://github.com/apple/swift-nio.git", from: "2.40.0-beta.1")"#;
+        let result = PackageSwiftParser
+            .update_version(content, "apple/swift-nio", "2.40.0")
+            .unwrap();
+        assert!(result.contains(r#"from: "2.40.0""#));
+    }
+
+    #[test]
+    fn test_update_version_stable_to_prerelease() {
+        // 安定版からプレリリースへの更新も正しく行える (新しい RC 等)
+        let content = r#".package(url: "https://github.com/apple/swift-nio.git", from: "2.40.0")"#;
+        let result = PackageSwiftParser
+            .update_version(content, "apple/swift-nio", "2.41.0-rc.1")
+            .unwrap();
+        assert!(result.contains(r#"from: "2.41.0-rc.1""#));
+    }
+
+    #[test]
+    fn test_update_version_build_metadata() {
+        // ビルドメタデータ付きバージョンへの更新
+        let content = r#".package(url: "https://github.com/apple/swift-nio.git", from: "2.40.0")"#;
+        let result = PackageSwiftParser
+            .update_version(content, "apple/swift-nio", "2.41.0+build.123")
+            .unwrap();
+        assert!(result.contains(r#"from: "2.41.0+build.123""#));
     }
 }

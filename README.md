@@ -329,6 +329,7 @@ For Gradle string notation, depup preserves classifier and extension suffixes su
 
 For Swift GitHub dependencies, depup recognizes both `v1.2.3` and `V1.2.3` tag prefixes.
 depup also skips `Package.swift` dependencies that appear inside `//` line comments or `/* ... */` block comments.
+Per the SPM semver 2.0.0 specification, depup parses and updates dependencies that include prerelease identifiers (`1.0.0-beta.1`) and build metadata (`1.0.0+build.123`), including combined forms (`1.0.0-rc.1+sha.abc`).
 
 For `go.mod`, depup treats block endings with trailing comments such as `) // direct deps` as normal block endings when parsing and updating `require`, `replace`, and `exclude` blocks.
 Quoted `go.mod` module paths and versions, such as `require "golang.org/x/text" "v0.14.0"`, are parsed and updated while preserving the quotes.

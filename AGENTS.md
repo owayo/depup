@@ -148,6 +148,7 @@ make help                # Makefileヘルプ
 - Swift の非 GitHub URL はスキップされる (警告なし)
 - Swift の `branch:` / `revision:` 依存はバージョンなしとしてスキップ
 - Swift の `Package.swift` では `//` 行コメントと `/* ... */` ブロックコメント内の依存宣言をスキップする
+- Swift (SPM) は semver 2.0.0 準拠のためプレリリース識別子 (例: `1.0.0-beta.1`) とビルドメタデータ (例: `1.0.0+build.123`)、両者の組み合わせ (例: `1.0.0-rc.1+sha.abc`) を `from:` / `exact:` / `.upToNextMajor` / `.upToNextMinor` のいずれでも解析・更新できる
 - Rust (Cargo) の演算子は `>= 1.2.3` のようにスペースを含む形式も対応し、`>=1.0, <2.0, >=1.0.100` のような3個以上の複数 comparison requirement も Range として解析する
 - Cargo.toml の通常依存・inline table・複数行テーブルの更新では TOML の単一引用符 (`'1.0.0'`) も保持する。通常依存・inline table の書き換えは `[dependencies]` / `[dev-dependencies]` / `[build-dependencies]` / `[workspace.dependencies]` / target 固有依存セクションに限定し、`[package.metadata]` 等の依存セクション外の同名キーは書き換えない
 - Python の Range 制約は単一セグメントバージョン（例: `>=3,<4`）も正しくパースする。PEP 508 の括弧付き versionspec（例: `requests (>=2.28,<3); python_version < "3.12"`）と、空白を含む extras（例: `coverage [toml] >=7,<8`）も元の形を保って更新する。`pyproject.toml` の Poetry 形式・inline table・PEP 508 配列要素では TOML の単一引用符も保持して更新する
