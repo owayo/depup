@@ -155,25 +155,6 @@ impl Orchestrator {
         })
     }
 
-    /// カスタムHTTPクライアントでオーケストレータを作成する (テスト用)
-    pub fn with_client(args: CliArgs, client: HttpClient) -> Self {
-        Self {
-            args,
-            client,
-            general_semaphore: Arc::new(Semaphore::new(DEFAULT_CONCURRENCY)),
-            crates_io_semaphore: Arc::new(Semaphore::new(CRATES_IO_CONCURRENCY)),
-            version_cache: Arc::new(Mutex::new(HashMap::new())),
-            git_remote: GitRemote::new(),
-            osv_checker: None,
-        }
-    }
-
-    /// 共有バージョンキャッシュを設定する (モノレポの複数ディレクトリ実行用)
-    pub fn with_cache(mut self, cache: VersionCache) -> Self {
-        self.version_cache = cache;
-        self
-    }
-
     /// Rust プロジェクトの Cargo.lock を走査し、`--age` を満たさない
     /// transitive 依存を検出して `cargo update -p --precise <older_version>` で差し戻す。
     ///
