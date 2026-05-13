@@ -55,6 +55,15 @@ pub enum UpdateResult {
         /// 新バージョンのリリース日時
         #[serde(skip_serializing_if = "Option::is_none")]
         released_at: Option<DateTime<Utc>>,
+        /// OSV チェックで脆弱と判定され、採用しなかった候補のリスト
+        /// (新しい順)。各要素は `"<version> (<advisory ids>)"` の形式。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        osv_skipped: Vec<String>,
+        /// 採用版が OSV で検査され脆弱性なしと判定されたか。
+        /// `false` は OSV 未実行 (`--osv` 無効、または Swift 等の未対応エコシステム、
+        /// API エラー時) を意味する。
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        osv_checked: bool,
     },
     /// 依存関係の更新がスキップされた
     Skip {
@@ -75,6 +84,8 @@ impl UpdateResult {
             dependency,
             new_version: new_version.into(),
             released_at: None,
+            osv_skipped: Vec::new(),
+            osv_checked: false,
         }
     }
 
@@ -88,7 +99,35 @@ impl UpdateResult {
             dependency,
             new_version: new_version.into(),
             released_at: Some(released_at),
+            osv_skipped: Vec::new(),
+            osv_checked: false,
         }
+    }
+
+    /// OSV チェックで除外した候補リストを Update 結果に紐付ける。
+    /// `Skip` 結果に対しては no-op。
+    pub fn with_osv_skipped(mut self, skipped: Vec<String>) -> Self {
+        if let UpdateResult::Update {
+            ref mut osv_skipped,
+            ..
+        } = self
+        {
+            *osv_skipped = skipped;
+        }
+        self
+    }
+
+    /// 採用版が OSV で検査済みであることを示すマーカーをセットする。
+    /// `Skip` 結果に対しては no-op。
+    pub fn with_osv_checked(mut self, checked: bool) -> Self {
+        if let UpdateResult::Update {
+            ref mut osv_checked,
+            ..
+        } = self
+        {
+            *osv_checked = checked;
+        }
+        self
     }
 
     /// Skip結果を作成する
@@ -168,6 +207,7 @@ impl fmt::Display for UpdateResult {
                 dependency,
                 new_version,
                 released_at,
+                ..
             } => {
                 write!(
                     f,
@@ -256,11 +296,14 @@ mod tests {
             dependency,
             new_version,
             released_at,
+            osv_skipped,
+            ..
         } = result
         {
             assert_eq!(dependency, dep);
             assert_eq!(new_version, "2.0.0");
             assert!(released_at.is_none()); // update() 使用時はリリース日なし
+            assert!(osv_skipped.is_empty());
         } else {
             panic!("Expected Update variant");
         }
@@ -279,14 +322,41 @@ mod tests {
             dependency,
             new_version,
             released_at,
+            osv_skipped,
+            ..
         } = result
         {
             assert_eq!(dependency, dep);
             assert_eq!(new_version, "2.0.0");
             assert_eq!(released_at, Some(date));
+            assert!(osv_skipped.is_empty());
         } else {
             panic!("Expected Update variant");
         }
+    }
+
+    #[test]
+    fn test_with_osv_skipped_attaches_to_update() {
+        let dep = sample_dependency();
+        let result = UpdateResult::update(dep, "2.0.0").with_osv_skipped(vec![
+            "2.0.1 (GHSA-xxxx)".to_string(),
+            "2.0.0-rc1 (GHSA-yyyy)".to_string(),
+        ]);
+        match result {
+            UpdateResult::Update { osv_skipped, .. } => {
+                assert_eq!(osv_skipped.len(), 2);
+                assert_eq!(osv_skipped[0], "2.0.1 (GHSA-xxxx)");
+            }
+            _ => panic!("Expected Update variant"),
+        }
+    }
+
+    #[test]
+    fn test_with_osv_skipped_noop_on_skip() {
+        let dep = pinned_dependency();
+        let result = UpdateResult::skip_pinned(dep).with_osv_skipped(vec!["1.0.0".to_string()]);
+        // Skip 結果は変更されない
+        assert!(result.is_skip());
     }
 
     #[test]

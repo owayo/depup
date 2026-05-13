@@ -191,6 +191,8 @@ impl TextFormatter {
         is_dev: bool,
         released_at: Option<DateTime<Utc>>,
         variable_name: Option<&str>,
+        osv_skipped: &[String],
+        osv_checked: bool,
         max_name_len: usize,
         writer: &mut dyn Write,
     ) -> std::io::Result<()> {
@@ -206,6 +208,9 @@ impl TextFormatter {
         let var_display = variable_name
             .map(|v| format!(" via ${}", v))
             .unwrap_or_default();
+
+        // OSV インジケータ (採用版が OSV を通過した場合のみ)
+        let osv_marker_plain = if osv_checked { " [osv-ok]" } else { "" };
 
         if self.color {
             let name_display = format!("{:width$}", name, width = max_name_len);
@@ -226,10 +231,15 @@ impl TextFormatter {
             let var_colored = variable_name
                 .map(|v| format!(" via ${}", v).cyan().to_string())
                 .unwrap_or_default();
+            let osv_colored = if osv_checked {
+                " ✓ OSV".green().to_string()
+            } else {
+                String::new()
+            };
 
             writeln!(
                 writer,
-                "  {} {} {} {} [{}]{}{}{}",
+                "  {} {} {} {} [{}]{}{}{}{}",
                 name_display,
                 old_version.dimmed(),
                 arrow,
@@ -237,22 +247,36 @@ impl TextFormatter {
                 change_label,
                 date_colored,
                 var_colored,
+                osv_colored,
                 dev_display
-            )
+            )?;
         } else {
             writeln!(
                 writer,
-                "  {:width$} {} -> {} [{}]{}{}{}",
+                "  {:width$} {} -> {} [{}]{}{}{}{}",
                 name,
                 old_version,
                 new_version,
                 change_type.label(),
                 date_display,
                 var_display,
+                osv_marker_plain,
                 dev_marker,
                 width = max_name_len
-            )
+            )?;
         }
+
+        // OSV で除外された候補があれば 1 行追記
+        if !osv_skipped.is_empty() {
+            let indent = " ".repeat(max_name_len + 4);
+            let body = format!("↳ OSV skipped: {}", osv_skipped.join(", "));
+            if self.color {
+                writeln!(writer, "{}{}", indent, body.yellow())?;
+            } else {
+                writeln!(writer, "{}{}", indent, body)?;
+            }
+        }
+        Ok(())
     }
 
     /// git 依存の更新行をフォーマットする
@@ -391,7 +415,8 @@ impl TextFormatter {
                     dependency,
                     new_version,
                     released_at,
-                    ..
+                    osv_skipped,
+                    osv_checked,
                 } = result
                 {
                     // git 依存は専用フォーマットで表示
@@ -419,6 +444,8 @@ impl TextFormatter {
                         false,
                         *released_at,
                         dependency.variable_name.as_deref(),
+                        osv_skipped,
+                        *osv_checked,
                         max_name_len,
                         writer,
                     )?;
@@ -433,7 +460,8 @@ impl TextFormatter {
                     dependency,
                     new_version,
                     released_at,
-                    ..
+                    osv_skipped,
+                    osv_checked,
                 } = result
                 {
                     if let Some(git) = &dependency.git_source {
@@ -460,6 +488,8 @@ impl TextFormatter {
                         true,
                         *released_at,
                         dependency.variable_name.as_deref(),
+                        osv_skipped,
+                        *osv_checked,
                         max_name_len,
                         writer,
                     )?;

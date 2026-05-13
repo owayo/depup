@@ -43,10 +43,6 @@ const CRATES_IO_CONCURRENCY: usize = 1;
 /// 依存数が少ない場合はそれに合わせて並列度を下げる (`dep_count.clamp(1, 4)`)。
 const MAX_VERSION_CHECK_CONCURRENCY: usize = 4;
 
-/// OSV.dev API への同時並列リクエスト数の上限。
-/// 1 依存に紐づく candidate version 数分のチェックを並列実行する。
-const OSV_CHECK_CONCURRENCY: usize = 4;
-
 /// マニフェスト内の依存数から並列度を計算する。
 /// 最小 1、最大 `MAX_VERSION_CHECK_CONCURRENCY`。
 fn version_check_concurrency(dep_count: usize) -> usize {
@@ -302,16 +298,18 @@ impl Orchestrator {
         // registry 経由のフェッチ
         match self.fetch_versions(adapter, &dep.name).await {
             Ok(versions) => {
-                // OSV チェック: 脆弱な candidate を除外する。
+                // OSV チェック: judge で採用しようとした候補だけを問い合わせる。
+                // 脆弱なら、その候補を除外して再 judge するループで安全な候補に
+                // 自然にフォールバックする (1 依存あたり通常 1〜2 API call で済む)。
                 // Swift など osv_ecosystem() == None の言語はスキップ。
-                let (versions, osv_warnings) =
-                    match (self.osv_checker.as_ref(), dep.language.osv_ecosystem()) {
-                        (Some(checker), Some(eco)) => {
-                            filter_vulnerable_versions(checker, &dep.name, eco, versions, bar).await
-                        }
-                        _ => (versions, Vec::new()),
-                    };
-                let result = judge.judge(&dep, &versions);
+                let mut osv_warnings = Vec::new();
+                let result = match (self.osv_checker.as_ref(), dep.language.osv_ecosystem()) {
+                    (Some(checker), Some(eco)) => {
+                        judge_with_osv(judge, &dep, versions, checker, eco, bar, &mut osv_warnings)
+                            .await
+                    }
+                    _ => judge.judge(&dep, &versions),
+                };
                 OnePassResult {
                     name: dep.name.clone(),
                     outcome: ResultOutcome::Skip(result),
@@ -936,67 +934,113 @@ pub enum LockAgeStatus {
     ReleaseDateUnavailable,
 }
 
-/// OSV.dev API を使い、各 candidate version を脆弱性チェックする。
+/// `judge` の判定結果に対し、採用しようとした候補だけ OSV.dev に問い合わせ、
+/// 脆弱性が見つかればその候補を除外して再 judge するループ。
 ///
-/// 戻り値: `(脆弱性なし or 判定不能なバージョン一覧, 警告メッセージ一覧)`
-/// - 脆弱性が確認されたバージョンは安全リストから除外され、警告に含める
-/// - API エラー等で判定できなかったバージョンは「安全側」として残し、警告に含める
+/// 動作:
+/// 1. 全 versions で judge → `UpdateResult::Update { new_version }` を取得
+/// 2. その `new_version` を OSV に問い合わせ
+///    - Safe → そのまま採用
+///    - Vulnerable → versions から該当を除き、警告を残してループ再開
+///    - API エラー → 元の候補を採用し、警告を残して終了 (チェック不能は安全側)
+/// 3. `UpdateResult::Skip` (= 更新不要) はそのまま返す
 ///
-/// `bar` が `Some` のとき、チェック中の進捗メッセージを更新する。
-async fn filter_vulnerable_versions(
-    checker: &OsvChecker,
-    name: &str,
-    ecosystem: &str,
+/// 通常 1 依存あたり 1〜2 API call で済む。
+/// 全 candidate を網羅的にチェックする旧実装と違い、`@angular/*` のように
+/// 1000+ バージョンを持つパッケージでも実用的な速度で完了する。
+async fn judge_with_osv(
+    judge: &UpdateJudge,
+    dep: &Dependency,
     versions: Vec<VersionInfo>,
+    checker: &OsvChecker,
+    ecosystem: &str,
     bar: Option<&ProgressBar>,
-) -> (Vec<VersionInfo>, Vec<String>) {
-    if versions.is_empty() {
-        return (versions, Vec::new());
-    }
+    warnings: &mut Vec<String>,
+) -> UpdateResult {
+    let mut allowed = versions;
+    let mut fallback_chain: Vec<String> = Vec::new();
+    loop {
+        let result = judge.judge(dep, &allowed);
+        let UpdateResult::Update {
+            new_version: target,
+            ..
+        } = &result
+        else {
+            // Skip 結果は OSV と無関係に確定
+            return result;
+        };
+        let target = target.clone();
 
-    if let Some(b) = bar {
-        b.set_message(format!(
-            "OSV: {} ({} version{})",
-            name,
-            versions.len(),
-            if versions.len() == 1 { "" } else { "s" }
-        ));
-    }
+        if let Some(b) = bar {
+            b.set_message(format!("OSV: {} {}", dep.name, target));
+        }
 
-    let checks = versions.iter().map(|v| {
-        let checker = checker.clone();
-        let name = name.to_string();
-        let ecosystem = ecosystem.to_string();
-        let version = v.version.clone();
-        async move { checker.check(&ecosystem, &name, &version).await }
-    });
-
-    let outcomes: Vec<Result<OsvCheck, String>> = stream::iter(checks)
-        .buffered(OSV_CHECK_CONCURRENCY)
-        .collect()
-        .await;
-
-    let mut safe = Vec::with_capacity(versions.len());
-    let mut warnings = Vec::new();
-    for (v, outcome) in versions.into_iter().zip(outcomes) {
-        match outcome {
-            Ok(OsvCheck::Safe) => safe.push(v),
+        match checker.check(ecosystem, &dep.name, &target).await {
+            Ok(OsvCheck::Safe) => {
+                if !fallback_chain.is_empty() {
+                    let line = format!(
+                        "  ↓ {}: skipped {} due to OSV → using {}",
+                        dep.name,
+                        fallback_chain.join(", "),
+                        target
+                    );
+                    osv_println(bar, &line);
+                    return result
+                        .with_osv_skipped(fallback_chain)
+                        .with_osv_checked(true);
+                }
+                // チェック完了・脆弱性なし
+                return result.with_osv_checked(true);
+            }
             Ok(OsvCheck::Vulnerable(ids)) => {
                 let detail = if ids.is_empty() {
                     "no advisory IDs".to_string()
                 } else {
                     ids.join(", ")
                 };
-                warnings.push(format!("{} vulnerable, skipped ({})", v.version, detail));
+                let line = format!("  ⚠ OSV: {} {} vulnerable ({})", dep.name, target, detail);
+                osv_println(bar, &line);
+
+                fallback_chain.push(format!("{} ({})", target, detail));
+                warnings.push(format!("{} vulnerable, falling back ({})", target, detail));
+                let before = allowed.len();
+                allowed
+                    .retain(|v| compare_versions(&v.version, &target) != std::cmp::Ordering::Equal);
+                if allowed.len() == before {
+                    // 除外できなかった (compare_versions の都合) → 無限ループ防止
+                    let line = format!(
+                        "  ⚠ {}: could not exclude {} from candidates, keeping it",
+                        dep.name, target
+                    );
+                    osv_println(bar, &line);
+                    warnings.push(format!(
+                        "could not exclude {} from candidates, stopping OSV check",
+                        target
+                    ));
+                    return result.with_osv_skipped(fallback_chain);
+                }
+                // ループ継続 → 次の候補で再判定
             }
             Err(e) => {
-                warnings.push(format!("{} could not be checked: {}", v.version, e));
-                safe.push(v);
+                let line = format!("  ⚠ OSV check failed for {} {}: {}", dep.name, target, e);
+                osv_println(bar, &line);
+                warnings.push(format!("OSV check failed for {}: {}", target, e));
+                return if fallback_chain.is_empty() {
+                    result
+                } else {
+                    result.with_osv_skipped(fallback_chain)
+                };
             }
         }
     }
+}
 
-    (safe, warnings)
+/// 進捗バーがあれば `println` で行を出力 (バーを維持)、なければ stderr へ直接出す。
+fn osv_println(bar: Option<&ProgressBar>, line: &str) {
+    match bar {
+        Some(b) => b.println(line),
+        None => eprintln!("{}", line),
+    }
 }
 
 /// オーケストレータの設定
