@@ -166,6 +166,7 @@ impl TextFormatter {
             SkipReason::LanguageFiltered => "filtered".to_string(),
             SkipReason::NoSuitableVersion => "no suitable version".to_string(),
             SkipReason::ParseError(msg) => format!("parse error: {}", msg),
+            SkipReason::ChangeLevelLimited(level) => format!("max-change={}", level),
         }
     }
 

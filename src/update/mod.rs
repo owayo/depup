@@ -284,13 +284,53 @@ impl UpdateJudge {
             return UpdateResult::skip(dependency.clone(), SkipReason::NoSuitableVersion);
         }
 
+        // --max-change が指定されていれば、許容レベルを超える候補を除外する
+        // (現在版との semver 差分で判定。比較不能・同一は通す)
+        let allowed: Vec<&VersionInfo> = if let Some(max) = self.filter.max_change {
+            let current = dependency.version();
+            eligible_versions
+                .iter()
+                .copied()
+                .filter(|v| {
+                    crate::domain::ChangeLevel::from_versions(current, &v.version)
+                        .is_none_or(|level| level <= max)
+                })
+                .collect()
+        } else {
+            eligible_versions.clone()
+        };
+
+        if allowed.is_empty() {
+            // 全候補が max_change で除外された (.unwrap() は max_change=Some の文脈でのみ到達)
+            return UpdateResult::skip(
+                dependency.clone(),
+                SkipReason::ChangeLevelLimited(self.filter.max_change.unwrap()),
+            );
+        }
+
         // semver 比較で最新の更新候補を選ぶ
-        let latest = eligible_versions.iter().max().unwrap();
+        let latest = allowed.iter().max().unwrap();
 
         // 現在版が最新以上ならダウングレードを防いでスキップする
         if version_info::compare_versions(dependency.version(), &latest.version)
             != std::cmp::Ordering::Less
         {
+            // max_change で除外された「より新しい候補」が存在すれば ChangeLevelLimited
+            if let Some(max) = self.filter.max_change {
+                let current = dependency.version();
+                let has_newer_excluded = eligible_versions.iter().any(|v| {
+                    version_info::compare_versions(&v.version, current)
+                        == std::cmp::Ordering::Greater
+                        && crate::domain::ChangeLevel::from_versions(current, &v.version)
+                            .is_some_and(|level| level > max)
+                });
+                if has_newer_excluded {
+                    return UpdateResult::skip(
+                        dependency.clone(),
+                        SkipReason::ChangeLevelLimited(max),
+                    );
+                }
+            }
             return UpdateResult::skip_already_latest_with_date(
                 dependency.clone(),
                 latest.released_at,

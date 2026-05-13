@@ -13,7 +13,7 @@ use clap::Parser;
 use depup::cli::CliArgs;
 use depup::config::DepupConfig;
 use depup::domain::Language;
-use depup::global_config::{GlobalConfig, resolve_age, resolve_osv};
+use depup::global_config::{GlobalConfig, resolve_age, resolve_max_change, resolve_osv};
 use depup::orchestrator::{Orchestrator, OrchestratorResult};
 use depup::output::{OutputConfig, create_formatter};
 use depup::package_manager::{SystemPackageManager, run_installs};
@@ -63,6 +63,7 @@ async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
     let global_config = GlobalConfig::load();
     args.age = resolve_age(args.age, args.no_age, global_config.as_ref());
     args.osv = resolve_osv(args.osv, args.no_osv, global_config.as_ref());
+    args.max_change = resolve_max_change(args.max_change, global_config.as_ref());
 
     // verbose モードではバージョン情報を表示
     if args.verbose {

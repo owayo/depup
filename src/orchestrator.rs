@@ -644,15 +644,29 @@ impl Orchestrator {
         }
 
         // 経過日数フィルタ
-        // 優先順位: CLI --age > pnpm設定 (Node.jsプロジェクトの場合)
+        // 優先順位: CLI --age > pnpm 設定 (--no-age 指定時も pnpm 設定は残るが警告する)
         if let Some(age) = self.args.age {
             filter = filter.with_min_age(age);
         } else if has_pnpm_workspace(&self.args.path) {
-            // pnpm設定から最小リリース経過日数を読み取る
             let pnpm_settings = PnpmSettings::from_dir(&self.args.path);
             if let Some(age) = pnpm_settings.minimum_release_age {
+                if self.args.no_age {
+                    use colored::Colorize as _;
+                    let days = age.as_secs() / 86400;
+                    let unit = if days == 1 { "day" } else { "days" };
+                    let msg = format!(
+                        "⚠ --no-age specified, but pnpm-workspace.yaml minimumReleaseAge ({} {}) is still in effect",
+                        days, unit
+                    );
+                    eprintln!("{}", msg.yellow());
+                }
                 filter = filter.with_min_age(age);
             }
+        }
+
+        // 変更レベル上限
+        if let Some(level) = self.args.max_change {
+            filter = filter.with_max_change(level);
         }
 
         filter

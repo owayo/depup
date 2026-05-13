@@ -179,6 +179,7 @@ depup [OPTIONS] [PATH]
 | `--no-age` | | このランのみ age フィルターを無効化（グローバル設定とデフォルトを上書き） |
 | `--osv` | | OSV.dev の脆弱性データベースで candidate を照会し、既知の脆弱性があるバージョンをスキップ |
 | `--no-osv` | | このランのみ OSV 脆弱性チェックを無効化（グローバル設定を上書き） |
+| `--max-change <LEVEL>` | | 許容するアップデートの上限: `patch`（patch のみ）/ `minor`（patch + minor）/ `major`（デフォルト＝全許可） |
 | `--json` | | JSON形式で出力 |
 | `--diff` | | diff形式で変更を表示 |
 | `--install` | | 更新後にパッケージマネージャのinstallを実行 |
@@ -384,9 +385,46 @@ depupはpnpm設定から `minimumReleaseAge` を自動的に読み取ります�
 3. `pnpm-workspace.yaml`（`minimumReleaseAge: 14400` 分単位）
 4. `package.json`（`pnpm.settings.minimumReleaseAge`）
 
+> **`--no-age` の注意**: pnpm の `minimumReleaseAge` はプロジェクトレベルの設定で、`--no-age` を指定しても依然として効きます。その場合 depup は黄色で警告を出します：
+> ```
+> ⚠ --no-age specified, but pnpm-workspace.yaml minimumReleaseAge (14 days) is still in effect
+> ```
+> pnpm 設定を含めて完全に無効化したい場合は、`pnpm-workspace.yaml` / `.npmrc` の値を削除または上書きしてください。
+
 ### Swift とエイジフィルター
 
 GitHub Tags API はタグのリリース日時を返しません。そのため Swift パッケージは `--age` 指定時もエイジフィルターの対象外として扱われます（更新対象に含まれます）。
+
+## アップデートレベルの制限（`--max-change`）
+
+`--max-change <LEVEL>` で、depup の bump を抑制できます：
+
+```bash
+# patch のみ許可（1.0.0 → 1.0.5 OK、1.0.0 → 1.1.0 NG）
+depup --max-change patch
+
+# patch + minor 許可（1.0.0 → 1.5.3 OK、1.0.0 → 2.0.0 NG）
+depup --max-change minor
+
+# デフォルト — 全 bump 許可（major 含む）
+depup --max-change major
+```
+
+候補が上限を超える場合、その依存は `max-change=<LEVEL>` でスキップとして表示されます。
+
+### グローバル設定
+
+`~/.config/depup/config.toml` で既定の上限を設定できます：
+
+```toml
+# 既定で patch + minor まで許可
+max_change = "minor"
+```
+
+**優先順位（高い順）:**
+1. `--max-change <LEVEL>` CLI フラグ
+2. `~/.config/depup/config.toml` の `max_change` 値
+3. 組み込みデフォルト（制限なし）
 
 ## 脆弱性チェック（OSV.dev）
 

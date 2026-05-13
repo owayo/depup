@@ -3,7 +3,7 @@
 //! このモジュールは更新判定のためのフィルタオプションを
 //! カプセル化する UpdateFilter 構造体を提供する。
 
-use crate::domain::Language;
+use crate::domain::{ChangeLevel, Language};
 use std::time::Duration;
 
 /// 更新判定用のフィルタ設定
@@ -19,6 +19,8 @@ pub struct UpdateFilter {
     pub include_pinned: bool,
     /// バージョンが考慮されるための最小経過日数
     pub min_age: Option<Duration>,
+    /// 許容する変更レベルの上限 (例: `Patch` を指定すると patch のみ許可)
+    pub max_change: Option<ChangeLevel>,
 }
 
 impl UpdateFilter {
@@ -54,6 +56,12 @@ impl UpdateFilter {
     /// バージョンの最小経過日数を設定する
     pub fn with_min_age(mut self, age: Duration) -> Self {
         self.min_age = Some(age);
+        self
+    }
+
+    /// 許容する変更レベルの上限を設定する
+    pub fn with_max_change(mut self, level: ChangeLevel) -> Self {
+        self.max_change = Some(level);
         self
     }
 

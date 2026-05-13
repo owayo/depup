@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::cli::parse_duration;
+use crate::domain::ChangeLevel;
 
 /// 組み込みデフォルトの age (1週間)。
 ///
@@ -36,6 +37,12 @@ age = "1w"
 # and skip versions with known vulnerabilities.
 # Override per-run with --osv / --no-osv.
 # osv = false
+
+# Limit the maximum allowed version change.
+# Accepts: "patch" (allow only patch bumps), "minor" (allow patch + minor),
+# or "major" (default — all bumps allowed).
+# Override per-run with --max-change <LEVEL>.
+# max_change = "minor"
 "#;
 
 /// `~/.config/depup/config.toml` の内容。
@@ -52,6 +59,11 @@ pub struct GlobalConfig {
     /// 未指定または `false` の場合は OSV チェック無効 (組み込みデフォルト)。
     #[serde(default)]
     pub osv: Option<bool>,
+
+    /// 許容する変更レベルの上限 (`"patch"` / `"minor"` / `"major"`)。
+    /// 未指定の場合は制限なし (= major bumps も許可)。
+    #[serde(default)]
+    pub max_change: Option<String>,
 }
 
 impl GlobalConfig {
@@ -119,6 +131,23 @@ impl GlobalConfig {
             }
         }
     }
+
+    /// 設定の `max_change` を [`ChangeLevel`] に変換する。
+    ///
+    /// 未指定 or パース失敗の場合は `None`。パース失敗時は警告を出す。
+    pub fn max_change_level(&self) -> Option<ChangeLevel> {
+        let raw = self.max_change.as_deref()?;
+        match ChangeLevel::parse(raw) {
+            Ok(level) => Some(level),
+            Err(e) => {
+                eprintln!(
+                    "Warning: invalid 'max_change' value in global config: {} ({})",
+                    raw, e
+                );
+                None
+            }
+        }
+    }
 }
 
 /// 指定パスにデフォルト設定の雛形を書き出す。
@@ -156,6 +185,22 @@ pub fn resolve_age(
         return Some(d);
     }
     Some(DEFAULT_AGE)
+}
+
+/// グローバル設定と CLI フラグから、許容する変更レベルの上限を決定する。
+///
+/// 優先順位 (高い順):
+/// 1. `--max-change <LEVEL>` が指定されていればその値
+/// 2. グローバル設定の `max_change` がパースできればその値
+/// 3. それ以外は `None` (= 制限なし、major bumps も許可)
+pub fn resolve_max_change(
+    cli: Option<ChangeLevel>,
+    config: Option<&GlobalConfig>,
+) -> Option<ChangeLevel> {
+    if let Some(level) = cli {
+        return Some(level);
+    }
+    config.and_then(|cfg| cfg.max_change_level())
 }
 
 /// グローバル設定と CLI フラグから、OSV チェックを有効にするか決定する。

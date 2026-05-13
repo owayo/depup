@@ -7,6 +7,7 @@
 //! - 更新判定結果
 //! - サマリと結果の構造体
 
+mod change_level;
 mod dependency;
 mod git_source;
 mod language;
@@ -14,6 +15,7 @@ mod summary;
 mod update_result;
 mod version_spec;
 
+pub use change_level::ChangeLevel;
 pub use dependency::Dependency;
 pub use git_source::{GitReference, GitSource};
 pub use language::Language;

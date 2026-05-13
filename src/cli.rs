@@ -1,8 +1,14 @@
 //! depup の CLI 引数解析モジュール
 
+use crate::domain::ChangeLevel;
 use clap::{ArgAction, Parser};
 use std::path::PathBuf;
 use std::time::Duration;
+
+/// `--max-change` 用に `ChangeLevel` をパースする
+pub fn parse_change_level(s: &str) -> Result<ChangeLevel, String> {
+    ChangeLevel::parse(s)
+}
 
 /// 期間文字列をパースする (形式: Nd (日), Nw (週), Nm (月))
 pub fn parse_duration(s: &str) -> Result<Duration, String> {
@@ -133,6 +139,12 @@ pub struct CliArgs {
     #[arg(long = "no-osv")]
     pub no_osv: bool,
 
+    // 変更レベル上限
+    /// Limit the maximum allowed version change (patch / minor / major).
+    /// Default: no limit (= major bumps allowed).
+    #[arg(long, value_parser = parse_change_level)]
+    pub max_change: Option<ChangeLevel>,
+
     // 出力オプション
     /// Output results in JSON format
     #[arg(long)]
@@ -217,6 +229,7 @@ mod tests {
         assert!(!args.no_age);
         assert!(!args.osv);
         assert!(!args.no_osv);
+        assert!(args.max_change.is_none());
         assert!(!args.json);
         assert!(!args.diff);
         assert!(!args.install);
@@ -381,6 +394,24 @@ mod tests {
     fn test_osv_and_no_osv_conflict() {
         // --osv と --no-osv は同時指定できない
         let result = CliArgs::try_parse_from(["depup", "--osv", "--no-osv"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_max_change_values() {
+        let args = CliArgs::parse_from(["depup", "--max-change", "patch"]);
+        assert_eq!(args.max_change, Some(ChangeLevel::Patch));
+
+        let args = CliArgs::parse_from(["depup", "--max-change", "minor"]);
+        assert_eq!(args.max_change, Some(ChangeLevel::Minor));
+
+        let args = CliArgs::parse_from(["depup", "--max-change", "major"]);
+        assert_eq!(args.max_change, Some(ChangeLevel::Major));
+    }
+
+    #[test]
+    fn test_max_change_invalid_rejected() {
+        let result = CliArgs::try_parse_from(["depup", "--max-change", "foo"]);
         assert!(result.is_err());
     }
 

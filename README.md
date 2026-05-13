@@ -179,6 +179,7 @@ depup [OPTIONS] [PATH]
 | `--no-age` | | Disable age filter for this run (overrides global config and default) |
 | `--osv` | | Check candidates against the OSV.dev vulnerability database and skip versions with known vulnerabilities |
 | `--no-osv` | | Disable OSV vulnerability check for this run (overrides global config) |
+| `--max-change <LEVEL>` | | Limit allowed bumps: `patch` (patch only), `minor` (patch + minor), `major` (default — all) |
 | `--json` | | Output results in JSON format |
 | `--diff` | | Show changes in diff format |
 | `--install` | | Run package manager install after update |
@@ -384,9 +385,46 @@ depup automatically reads `minimumReleaseAge` from pnpm configuration:
 3. `pnpm-workspace.yaml` (`minimumReleaseAge: 14400` in minutes)
 4. `package.json` (`pnpm.settings.minimumReleaseAge`)
 
+> **Note on `--no-age`**: pnpm's `minimumReleaseAge` is a project-level setting and remains in effect even when `--no-age` is passed. In that case depup prints a yellow warning so the active fallback is visible:
+> ```
+> ⚠ --no-age specified, but pnpm-workspace.yaml minimumReleaseAge (14 days) is still in effect
+> ```
+> To bypass pnpm's setting too, remove or override it in `pnpm-workspace.yaml` / `.npmrc`.
+
 ### Swift and Age Filter
 
 The GitHub Tags API does not return per-tag release timestamps, so Swift packages are exempt from the `--age` filter (they are always eligible for updates regardless of the cutoff).
+
+## Limiting Bumps (`--max-change`)
+
+Use `--max-change <LEVEL>` to cap how aggressive depup is about a bump:
+
+```bash
+# Only allow patch bumps (1.0.0 → 1.0.5 OK, 1.0.0 → 1.1.0 NG)
+depup --max-change patch
+
+# Allow patch + minor (1.0.0 → 1.5.3 OK, 1.0.0 → 2.0.0 NG)
+depup --max-change minor
+
+# Default — allow all bumps including major
+depup --max-change major
+```
+
+When a newer candidate exists but exceeds the cap, that dependency is skipped with reason `max-change=<LEVEL>` instead of being updated.
+
+### Global Configuration
+
+Set a default cap in `~/.config/depup/config.toml`:
+
+```toml
+# Limit every depup run to patch + minor by default
+max_change = "minor"
+```
+
+**Priority order (highest first):**
+1. `--max-change <LEVEL>` CLI flag
+2. `~/.config/depup/config.toml` `max_change`
+3. Built-in default (no cap)
 
 ## Vulnerability Check (OSV.dev)
 

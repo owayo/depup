@@ -1,6 +1,6 @@
 //! 更新判定結果の型定義
 
-use super::Dependency;
+use super::{ChangeLevel, Dependency};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -25,6 +25,9 @@ pub enum SkipReason {
     ParseError(String),
     /// 言語フィルタで除外された
     LanguageFiltered,
+    /// 採用候補が `--max-change` の許容範囲を超えるためスキップ
+    /// (内側の値は `max-change` に指定されたレベル)
+    ChangeLevelLimited(ChangeLevel),
 }
 
 impl fmt::Display for SkipReason {
@@ -38,6 +41,9 @@ impl fmt::Display for SkipReason {
             SkipReason::NoSuitableVersion => write!(f, "no suitable version"),
             SkipReason::ParseError(msg) => write!(f, "parse error: {}", msg),
             SkipReason::LanguageFiltered => write!(f, "language filtered"),
+            SkipReason::ChangeLevelLimited(level) => {
+                write!(f, "limited by --max-change={}", level)
+            }
         }
     }
 }
