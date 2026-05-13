@@ -16,6 +16,7 @@ use crate::manifest::{
     ManifestInfo, ManifestWriter, PnpmSettings, WriteResult, detect_manifests, get_parser,
     has_pnpm_workspace, read_git_entries, read_registry_entries,
 };
+use crate::osv::{OsvCheck, OsvChecker};
 use crate::progress::Progress;
 use crate::registry::{
     CratesIoAdapter, GitHubTagsAdapter, GitRemote, GoProxyAdapter, HttpClient, MavenCentralAdapter,
@@ -40,6 +41,10 @@ const CRATES_IO_CONCURRENCY: usize = 1;
 /// バージョンチェックの並列度上限 (マニフェスト内の依存関係に対して)。
 /// 依存数が少ない場合はそれに合わせて並列度を下げる (`dep_count.clamp(1, 4)`)。
 const MAX_VERSION_CHECK_CONCURRENCY: usize = 4;
+
+/// OSV.dev API への同時並列リクエスト数の上限。
+/// 1 依存に紐づく candidate version 数分のチェックを並列実行する。
+const OSV_CHECK_CONCURRENCY: usize = 4;
 
 /// マニフェスト内の依存数から並列度を計算する。
 /// 最小 1、最大 `MAX_VERSION_CHECK_CONCURRENCY`。
@@ -70,6 +75,8 @@ pub struct Orchestrator {
     version_cache: VersionCache,
     /// URL 単位でキャッシュされる git ls-remote クライアント
     git_remote: GitRemote,
+    /// OSV チェッカー (`args.osv` が true のときのみ初期化)
+    osv_checker: Option<OsvChecker>,
 }
 
 /// オーケストレータの実行結果
@@ -95,6 +102,8 @@ pub enum OrchestratorError {
     RegistryError { package: String, message: String },
     /// マニフェストの書き込みに失敗
     WriteError { path: String, message: String },
+    /// OSV 脆弱性チェックに失敗または脆弱性を検出
+    OsvWarning { package: String, message: String },
 }
 
 impl std::fmt::Display for OrchestratorError {
@@ -113,6 +122,9 @@ impl std::fmt::Display for OrchestratorError {
             OrchestratorError::WriteError { path, message } => {
                 write!(f, "Failed to write {}: {}", path, message)
             }
+            OrchestratorError::OsvWarning { package, message } => {
+                write!(f, "OSV check for {}: {}", package, message)
+            }
         }
     }
 }
@@ -125,6 +137,12 @@ impl Orchestrator {
         let client =
             HttpClient::new().map_err(|e| OrchestratorError::HttpClientError(e.to_string()))?;
 
+        let osv_checker = if args.osv {
+            Some(OsvChecker::new().map_err(OrchestratorError::HttpClientError)?)
+        } else {
+            None
+        };
+
         Ok(Self {
             args,
             client,
@@ -132,6 +150,7 @@ impl Orchestrator {
             crates_io_semaphore: Arc::new(Semaphore::new(CRATES_IO_CONCURRENCY)),
             version_cache: Arc::new(Mutex::new(HashMap::new())),
             git_remote: GitRemote::new(),
+            osv_checker,
         })
     }
 
@@ -144,6 +163,7 @@ impl Orchestrator {
             crates_io_semaphore: Arc::new(Semaphore::new(CRATES_IO_CONCURRENCY)),
             version_cache: Arc::new(Mutex::new(HashMap::new())),
             git_remote: GitRemote::new(),
+            osv_checker: None,
         }
     }
 
@@ -454,6 +474,7 @@ impl Orchestrator {
                                 name: dep.name.clone(),
                                 outcome: ResultOutcome::Skip(UpdateResult::skip(dep, reason)),
                                 fetch_error: None,
+                                osv_warnings: Vec::new(),
                             };
                         }
 
@@ -464,17 +485,32 @@ impl Orchestrator {
                                 name: dep.name.clone(),
                                 outcome: ResultOutcome::Skip(result),
                                 fetch_error: None,
+                                osv_warnings: Vec::new(),
                             };
                         }
 
                         // registry 経由のフェッチ
                         match self.fetch_versions(&*adapter, &dep.name).await {
                             Ok(versions) => {
+                                // OSV チェック: 脆弱な candidate を除外する。
+                                // Swift など osv_ecosystem() == None の言語はスキップ。
+                                let (versions, osv_warnings) =
+                                    match (self.osv_checker.as_ref(), dep.language.osv_ecosystem())
+                                    {
+                                        (Some(checker), Some(eco)) => {
+                                            filter_vulnerable_versions(
+                                                checker, &dep.name, eco, versions,
+                                            )
+                                            .await
+                                        }
+                                        _ => (versions, Vec::new()),
+                                    };
                                 let result = judge_ref.judge(&dep, &versions);
                                 OnePassResult {
                                     name: dep.name.clone(),
                                     outcome: ResultOutcome::Skip(result),
                                     fetch_error: None,
+                                    osv_warnings,
                                 }
                             }
                             Err(e) => {
@@ -486,6 +522,7 @@ impl Orchestrator {
                                         SkipReason::FetchFailed(e),
                                     )),
                                     fetch_error: Some(err_msg),
+                                    osv_warnings: Vec::new(),
                                 }
                             }
                         }
@@ -502,6 +539,12 @@ impl Orchestrator {
                     errors.push(OrchestratorError::RegistryError {
                         package: result.name.clone(),
                         message: err_msg,
+                    });
+                }
+                for warn in result.osv_warnings {
+                    errors.push(OrchestratorError::OsvWarning {
+                        package: result.name.clone(),
+                        message: warn,
                     });
                 }
                 match result.outcome {
@@ -852,6 +895,8 @@ struct OnePassResult {
     outcome: ResultOutcome,
     /// fetch 失敗時の原因メッセージ (存在する場合のみ `OrchestratorError` として記録される)
     fetch_error: Option<String>,
+    /// OSV チェックで除外・問題が生じた version のメッセージ
+    osv_warnings: Vec<String>,
 }
 
 enum ResultOutcome {
@@ -882,6 +927,53 @@ pub enum LockAgeStatus {
     UpdateCommandFailed(String),
     /// レジストリからの release 日取得に失敗
     ReleaseDateUnavailable,
+}
+
+/// OSV.dev API を使い、各 candidate version を脆弱性チェックする。
+///
+/// 戻り値: `(脆弱性なし or 判定不能なバージョン一覧, 警告メッセージ一覧)`
+/// - 脆弱性が確認されたバージョンは安全リストから除外され、警告に含める
+/// - API エラー等で判定できなかったバージョンは「安全側」として残し、警告に含める
+async fn filter_vulnerable_versions(
+    checker: &OsvChecker,
+    name: &str,
+    ecosystem: &str,
+    versions: Vec<VersionInfo>,
+) -> (Vec<VersionInfo>, Vec<String>) {
+    let checks = versions.iter().map(|v| {
+        let checker = checker.clone();
+        let name = name.to_string();
+        let ecosystem = ecosystem.to_string();
+        let version = v.version.clone();
+        async move { checker.check(&ecosystem, &name, &version).await }
+    });
+
+    let outcomes: Vec<Result<OsvCheck, String>> = stream::iter(checks)
+        .buffered(OSV_CHECK_CONCURRENCY)
+        .collect()
+        .await;
+
+    let mut safe = Vec::with_capacity(versions.len());
+    let mut warnings = Vec::new();
+    for (v, outcome) in versions.into_iter().zip(outcomes) {
+        match outcome {
+            Ok(OsvCheck::Safe) => safe.push(v),
+            Ok(OsvCheck::Vulnerable(ids)) => {
+                let detail = if ids.is_empty() {
+                    "no advisory IDs".to_string()
+                } else {
+                    ids.join(", ")
+                };
+                warnings.push(format!("{} vulnerable, skipped ({})", v.version, detail));
+            }
+            Err(e) => {
+                warnings.push(format!("{} could not be checked: {}", v.version, e));
+                safe.push(v);
+            }
+        }
+    }
+
+    (safe, warnings)
 }
 
 /// オーケストレータの設定

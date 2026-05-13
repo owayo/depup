@@ -175,7 +175,10 @@ depup [OPTIONS] [PATH]
 | `--exclude <PKG>` | | Exclude specific packages (repeatable) |
 | `--only <PKG>` | | Update only specific packages (repeatable) |
 | `--include-pinned` | | Include pinned versions in update |
-| `--age <DURATION>` | | Minimum release age (e.g., 2w, 10d, 1m) |
+| `--age <DURATION>` | | Minimum release age (e.g., 2w, 10d, 1m). Overrides global config |
+| `--no-age` | | Disable age filter for this run (overrides global config and default) |
+| `--osv` | | Check candidates against the OSV.dev vulnerability database and skip versions with known vulnerabilities |
+| `--no-osv` | | Disable OSV vulnerability check for this run (overrides global config) |
 | `--json` | | Output results in JSON format |
 | `--diff` | | Show changes in diff format |
 | `--install` | | Run package manager install after update |
@@ -331,9 +334,12 @@ Quoted `go.mod` module paths and versions, such as `require "golang.org/x/text" 
 
 ## Age Filter
 
-The `--age` option ensures stability by only updating to versions that have been released for a certain period:
+The `--age` option ensures stability by only updating to versions that have been released for a certain period. **A 1 week (`1w`) age filter is applied by default** to all runs unless overridden:
 
 ```bash
+# Default — implicit --age 1w
+depup
+
 # Only update to versions at least 2 weeks old
 depup --age 2w
 
@@ -342,7 +348,31 @@ depup --age 10d
 
 # Only update to versions at least 1 month old
 depup --age 1m
+
+# Disable the age filter for this run
+depup --no-age
 ```
+
+### Global Configuration
+
+depup auto-generates `~/.config/depup/config.toml` on first run with commented defaults. Edit it to change depup's defaults globally:
+
+```toml
+# ~/.config/depup/config.toml
+
+# Apply this age filter by default to every depup run.
+# Accepts the same format as --age (Nd / Nw / Nm). Omit to use the built-in default (1w).
+age = "1w"
+
+# Enable OSV vulnerability check by default (commented out by default).
+# osv = false
+```
+
+**Priority order (highest first):**
+1. `--no-age` (disables age entirely)
+2. `--age <DURATION>` CLI flag
+3. `~/.config/depup/config.toml` `age` value
+4. Built-in default (`1w`)
 
 ### pnpm Integration
 
@@ -357,6 +387,39 @@ depup automatically reads `minimumReleaseAge` from pnpm configuration:
 ### Swift and Age Filter
 
 The GitHub Tags API does not return per-tag release timestamps, so Swift packages are exempt from the `--age` filter (they are always eligible for updates regardless of the cutoff).
+
+## Vulnerability Check (OSV.dev)
+
+The `--osv` flag queries the public [OSV.dev](https://osv.dev/) database for each candidate version and skips versions with known vulnerabilities. Combined with the age filter, depup naturally falls back to the next safe, mature version:
+
+```bash
+# Check candidates against OSV and skip vulnerable versions
+depup --osv
+
+# Disable OSV check for this run (overrides global config)
+depup --no-osv
+```
+
+- The OSV.dev API is public and **does not require any authentication token**.
+- Swift packages are skipped — OSV indexes packages by GitHub repository URL rather than by GitHub Tags–style names, so Swift queries from depup would not match.
+- API errors do not block updates; affected versions remain in the candidate list and the failure is reported in `--verbose`.
+
+### Global Configuration
+
+Enable OSV checking by default in the auto-generated `~/.config/depup/config.toml`:
+
+```toml
+# ~/.config/depup/config.toml
+
+# Default to skipping vulnerable versions on every run.
+osv = true
+```
+
+**Priority order (highest first):**
+1. `--no-osv` (disables the check)
+2. `--osv` CLI flag
+3. `~/.config/depup/config.toml` `osv` value
+4. Built-in default (`false` — OSV check disabled)
 
 ## Output
 

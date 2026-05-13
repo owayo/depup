@@ -13,6 +13,7 @@ use clap::Parser;
 use depup::cli::CliArgs;
 use depup::config::DepupConfig;
 use depup::domain::Language;
+use depup::global_config::{GlobalConfig, resolve_age, resolve_osv};
 use depup::orchestrator::{Orchestrator, OrchestratorResult};
 use depup::output::{OutputConfig, create_formatter};
 use depup::package_manager::{SystemPackageManager, run_installs};
@@ -55,6 +56,14 @@ async fn main() -> ExitCode {
 
 /// アプリケーションのメインロジック
 async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
+    let mut args = args;
+
+    // グローバル設定 (~/.config/depup/config.toml) を読み込み、
+    // CLI > config > 組み込みデフォルトの優先順位で age / osv を確定する。
+    let global_config = GlobalConfig::load();
+    args.age = resolve_age(args.age, args.no_age, global_config.as_ref());
+    args.osv = resolve_osv(args.osv, args.no_osv, global_config.as_ref());
+
     // verbose モードではバージョン情報を表示
     if args.verbose {
         eprintln!("depup v{}", env!("CARGO_PKG_VERSION"));
@@ -62,6 +71,14 @@ async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
         if args.dry_run {
             eprintln!("Mode: dry-run");
         }
+        match args.age {
+            Some(age) => eprintln!("Age filter: {}s", age.as_secs()),
+            None => eprintln!("Age filter: disabled"),
+        }
+        eprintln!(
+            "OSV vulnerability check: {}",
+            if args.osv { "enabled" } else { "disabled" }
+        );
     }
 
     // .depup モノレポ設定を確認

@@ -98,6 +98,25 @@ impl Language {
     pub fn uses_github_tags(&self) -> bool {
         matches!(self, Language::Swift)
     }
+
+    /// この言語に対応する OSV.dev の ecosystem 名を返す。
+    ///
+    /// `None` の場合は OSV による脆弱性チェックの対象外。
+    /// Swift は GitHub URL ベースで OSV に問い合わせる必要があり、本機能のスコープ外。
+    ///
+    /// 公式リスト: <https://ossf.github.io/osv-schema/#defined-ecosystems>
+    pub fn osv_ecosystem(&self) -> Option<&'static str> {
+        match self {
+            Language::Node => Some("npm"),
+            Language::Python => Some("PyPI"),
+            Language::Rust => Some("crates.io"),
+            Language::Go => Some("Go"),
+            Language::Ruby => Some("RubyGems"),
+            Language::Php => Some("Packagist"),
+            Language::Java => Some("Maven"),
+            Language::Swift => None,
+        }
+    }
 }
 
 impl fmt::Display for Language {
@@ -236,6 +255,19 @@ mod tests {
 
         let lang: Language = serde_json::from_str("\"java\"").unwrap();
         assert_eq!(lang, Language::Java);
+    }
+
+    #[test]
+    fn test_osv_ecosystem() {
+        assert_eq!(Language::Node.osv_ecosystem(), Some("npm"));
+        assert_eq!(Language::Python.osv_ecosystem(), Some("PyPI"));
+        assert_eq!(Language::Rust.osv_ecosystem(), Some("crates.io"));
+        assert_eq!(Language::Go.osv_ecosystem(), Some("Go"));
+        assert_eq!(Language::Ruby.osv_ecosystem(), Some("RubyGems"));
+        assert_eq!(Language::Php.osv_ecosystem(), Some("Packagist"));
+        assert_eq!(Language::Java.osv_ecosystem(), Some("Maven"));
+        // Swift は GitHub URL ベースで対象外
+        assert_eq!(Language::Swift.osv_ecosystem(), None);
     }
 
     #[test]

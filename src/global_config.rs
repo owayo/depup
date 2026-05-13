@@ -1,0 +1,401 @@
+//! グローバル設定ファイル (`~/.config/depup/config.toml`) のローダ
+//!
+//! ユーザー単位のデフォルトを定義する。現状は `age` と `osv` をサポート。
+//! ファイルが無い場合は初回読み込み時にコメント付きの雛形を自動生成する
+//! (生成に失敗してもツールの動作は続行され、組み込みデフォルトが使われる)。
+
+use serde::Deserialize;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use crate::cli::parse_duration;
+
+/// 組み込みデフォルトの age (1週間)。
+///
+/// グローバル設定ファイルが存在しないとき、または存在しても `age` が
+/// 未指定のときに使用される。
+pub const DEFAULT_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// 初回起動時に書き出されるデフォルト設定の TOML 内容。
+///
+/// 組み込みデフォルト (age=1w, osv=false) と一致するキーを生成する。
+/// オプトイン項目 (osv) はコメントアウトしておき、ユーザーが必要時に
+/// アンコメントできるようにする。
+pub const DEFAULT_CONFIG_CONTENT: &str = r#"# depup global configuration
+# https://github.com/owayo/depup
+#
+# This file is auto-generated on first run.
+# Edit values below to override depup's built-in defaults.
+
+# Default age filter applied to every depup run.
+# Accepts the same format as --age: Nd (days), Nw (weeks), Nm (months).
+# Override per-run with --age <DURATION> or disable with --no-age.
+age = "1w"
+
+# Check candidate versions against the OSV.dev vulnerability database
+# and skip versions with known vulnerabilities.
+# Override per-run with --osv / --no-osv.
+# osv = false
+"#;
+
+/// `~/.config/depup/config.toml` の内容。
+///
+/// 全フィールドはオプショナル。未指定時は組み込みデフォルトが使われる。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GlobalConfig {
+    /// 経過時間フィルタのデフォルト (例: `"1w"`, `"10d"`, `"2m"`)。
+    /// 未指定の場合は組み込みデフォルト [`DEFAULT_AGE`] が使われる。
+    #[serde(default)]
+    pub age: Option<String>,
+
+    /// OSV.dev による脆弱性チェックをデフォルトで有効にするか。
+    /// 未指定または `false` の場合は OSV チェック無効 (組み込みデフォルト)。
+    #[serde(default)]
+    pub osv: Option<bool>,
+}
+
+impl GlobalConfig {
+    /// 既定の設定ファイルパス: `~/.config/depup/config.toml`。
+    ///
+    /// クロスプラットフォームでの一貫性のため、macOS でも `~/.config/...` を
+    /// 使用する (`dirs::config_dir()` ではない)。
+    pub fn default_path() -> PathBuf {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".config")
+            .join("depup")
+            .join("config.toml")
+    }
+
+    /// 既定パスから設定を読み込む。
+    ///
+    /// ファイルが存在しなければコメント付きの雛形を自動生成してから読み込む
+    /// (生成に失敗した場合は警告を出して `None`)。
+    /// パース失敗時も警告を出して `None` を返す。
+    pub fn load() -> Option<Self> {
+        Self::load_from(&Self::default_path())
+    }
+
+    /// 指定パスから設定を読み込む。存在しなければ自動生成する。
+    pub fn load_from(path: &Path) -> Option<Self> {
+        if !path.exists()
+            && let Err(e) = generate_default_at(path)
+        {
+            eprintln!(
+                "Warning: failed to create default global config at '{}': {}",
+                path.display(),
+                e
+            );
+            return None;
+        }
+
+        let content = std::fs::read_to_string(path).ok()?;
+        match toml::from_str::<GlobalConfig>(&content) {
+            Ok(config) => Some(config),
+            Err(e) => {
+                eprintln!(
+                    "Warning: failed to parse global config '{}': {}",
+                    path.display(),
+                    e
+                );
+                None
+            }
+        }
+    }
+
+    /// 設定の `age` を [`Duration`] に変換する。
+    ///
+    /// 未指定 or パース失敗の場合は `None`。パース失敗時は警告を出す。
+    pub fn age_duration(&self) -> Option<Duration> {
+        let raw = self.age.as_deref()?;
+        match parse_duration(raw) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                eprintln!(
+                    "Warning: invalid 'age' value in global config: {} ({})",
+                    raw, e
+                );
+                None
+            }
+        }
+    }
+}
+
+/// 指定パスにデフォルト設定の雛形を書き出す。
+///
+/// 親ディレクトリが無ければ作成する。既に同名ファイルが存在する場合は
+/// 上書きしない (呼び出し側で `path.exists()` を確認すること)。
+pub fn generate_default_at(path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, DEFAULT_CONFIG_CONTENT)
+}
+
+/// グローバル設定と CLI フラグから、実際に適用する age を決定する。
+///
+/// 優先順位 (高い順):
+/// 1. `--no-age` が指定されていれば `None` (age 無効)
+/// 2. `--age VALUE` が指定されていればその値
+/// 3. グローバル設定の `age` がパースできればその値
+/// 4. それ以外は組み込みデフォルト [`DEFAULT_AGE`] (1週間)
+pub fn resolve_age(
+    cli_age: Option<Duration>,
+    no_age: bool,
+    config: Option<&GlobalConfig>,
+) -> Option<Duration> {
+    if no_age {
+        return None;
+    }
+    if let Some(d) = cli_age {
+        return Some(d);
+    }
+    if let Some(cfg) = config
+        && let Some(d) = cfg.age_duration()
+    {
+        return Some(d);
+    }
+    Some(DEFAULT_AGE)
+}
+
+/// グローバル設定と CLI フラグから、OSV チェックを有効にするか決定する。
+///
+/// 優先順位 (高い順):
+/// 1. `--no-osv` が指定されていれば `false`
+/// 2. `--osv` が指定されていれば `true`
+/// 3. グローバル設定の `osv` が指定されていればその値
+/// 4. それ以外は `false` (組み込みデフォルト = OSV チェック無効)
+pub fn resolve_osv(cli_osv: bool, no_osv: bool, config: Option<&GlobalConfig>) -> bool {
+    if no_osv {
+        return false;
+    }
+    if cli_osv {
+        return true;
+    }
+    if let Some(cfg) = config
+        && let Some(v) = cfg.osv
+    {
+        return v;
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_default_path_under_home_dot_config() {
+        let path = GlobalConfig::default_path();
+        let s = path.to_string_lossy();
+        assert!(s.contains(".config"), "path should contain .config: {}", s);
+        assert!(s.ends_with("depup/config.toml"), "unexpected path: {}", s);
+    }
+
+    #[test]
+    fn test_load_from_missing_file_auto_generates() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nope.toml");
+        assert!(!path.exists());
+
+        let cfg = GlobalConfig::load_from(&path).expect("missing file should be auto-created");
+        // 雛形のデフォルトでは age=1w が書かれ、osv はコメントアウト
+        assert_eq!(cfg.age.as_deref(), Some("1w"));
+        assert!(cfg.osv.is_none());
+        assert!(path.exists(), "file should be created");
+    }
+
+    #[test]
+    fn test_load_from_creates_parent_dirs() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nested").join("dir").join("config.toml");
+        assert!(!path.parent().unwrap().exists());
+
+        let _ = GlobalConfig::load_from(&path).expect("nested path should be created");
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn test_load_from_does_not_overwrite_existing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "age = \"3w\"\n").unwrap();
+
+        let cfg = GlobalConfig::load_from(&path).unwrap();
+        assert_eq!(cfg.age.as_deref(), Some("3w"));
+
+        // 中身が上書きされていないことを確認
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "age = \"3w\"\n");
+    }
+
+    #[test]
+    fn test_generate_default_at_writes_template() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        generate_default_at(&path).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("depup global configuration"));
+        assert!(content.contains("age = \"1w\""));
+        assert!(content.contains("# osv = false"));
+    }
+
+    #[test]
+    fn test_default_template_parses_cleanly() {
+        // 自動生成テンプレートが GlobalConfig としてパース可能であることを保証
+        let cfg: GlobalConfig = toml::from_str(DEFAULT_CONFIG_CONTENT).unwrap();
+        assert_eq!(cfg.age.as_deref(), Some("1w"));
+        assert!(
+            cfg.osv.is_none(),
+            "osv はコメントアウトされているため未指定"
+        );
+    }
+
+    #[test]
+    fn test_load_from_empty_file_returns_default() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "").unwrap();
+        let cfg = GlobalConfig::load_from(&path).expect("empty file should parse as default");
+        assert!(cfg.age.is_none());
+    }
+
+    #[test]
+    fn test_load_from_valid_age() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "age = \"2w\"\n").unwrap();
+        let cfg = GlobalConfig::load_from(&path).unwrap();
+        assert_eq!(cfg.age.as_deref(), Some("2w"));
+        assert_eq!(
+            cfg.age_duration(),
+            Some(Duration::from_secs(14 * 24 * 60 * 60))
+        );
+    }
+
+    #[test]
+    fn test_load_from_invalid_toml_returns_none() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "age = =[[[invalid").unwrap();
+        assert!(GlobalConfig::load_from(&path).is_none());
+    }
+
+    #[test]
+    fn test_age_duration_invalid_value_returns_none() {
+        let cfg = GlobalConfig {
+            age: Some("nonsense".to_string()),
+            ..Default::default()
+        };
+        assert!(cfg.age_duration().is_none());
+    }
+
+    #[test]
+    fn test_age_duration_none_when_unset() {
+        let cfg = GlobalConfig::default();
+        assert!(cfg.age_duration().is_none());
+    }
+
+    #[test]
+    fn test_resolve_age_no_age_wins_over_cli() {
+        let cli = Some(Duration::from_secs(86400));
+        let cfg = GlobalConfig {
+            age: Some("2w".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_age(cli, true, Some(&cfg)), None);
+    }
+
+    #[test]
+    fn test_resolve_age_cli_wins_over_config() {
+        let cli = Some(Duration::from_secs(86400));
+        let cfg = GlobalConfig {
+            age: Some("2w".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_age(cli, false, Some(&cfg)), cli);
+    }
+
+    #[test]
+    fn test_resolve_age_config_when_cli_absent() {
+        let cfg = GlobalConfig {
+            age: Some("2w".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_age(None, false, Some(&cfg)),
+            Some(Duration::from_secs(14 * 86400))
+        );
+    }
+
+    #[test]
+    fn test_resolve_age_default_when_nothing_set() {
+        assert_eq!(resolve_age(None, false, None), Some(DEFAULT_AGE));
+    }
+
+    #[test]
+    fn test_resolve_age_default_when_config_age_unset() {
+        let cfg = GlobalConfig::default();
+        assert_eq!(resolve_age(None, false, Some(&cfg)), Some(DEFAULT_AGE));
+    }
+
+    #[test]
+    fn test_resolve_age_default_when_config_age_invalid() {
+        let cfg = GlobalConfig {
+            age: Some("garbage".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_age(None, false, Some(&cfg)), Some(DEFAULT_AGE));
+    }
+
+    #[test]
+    fn test_default_age_is_one_week() {
+        assert_eq!(DEFAULT_AGE, Duration::from_secs(7 * 24 * 60 * 60));
+    }
+
+    #[test]
+    fn test_resolve_osv_no_osv_wins() {
+        let cfg = GlobalConfig {
+            osv: Some(true),
+            ..Default::default()
+        };
+        assert!(!resolve_osv(true, true, Some(&cfg)));
+    }
+
+    #[test]
+    fn test_resolve_osv_cli_wins_over_config() {
+        let cfg = GlobalConfig {
+            osv: Some(false),
+            ..Default::default()
+        };
+        assert!(resolve_osv(true, false, Some(&cfg)));
+    }
+
+    #[test]
+    fn test_resolve_osv_config_when_cli_absent() {
+        let cfg = GlobalConfig {
+            osv: Some(true),
+            ..Default::default()
+        };
+        assert!(resolve_osv(false, false, Some(&cfg)));
+    }
+
+    #[test]
+    fn test_resolve_osv_default_false() {
+        assert!(!resolve_osv(false, false, None));
+        let cfg = GlobalConfig::default();
+        assert!(!resolve_osv(false, false, Some(&cfg)));
+    }
+
+    #[test]
+    fn test_load_from_with_both_age_and_osv() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "age = \"2w\"\nosv = true\n").unwrap();
+        let cfg = GlobalConfig::load_from(&path).unwrap();
+        assert_eq!(cfg.age.as_deref(), Some("2w"));
+        assert_eq!(cfg.osv, Some(true));
+    }
+}

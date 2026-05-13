@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 /// 期間文字列をパースする (形式: Nd (日), Nw (週), Nm (月))
-fn parse_duration(s: &str) -> Result<Duration, String> {
+pub fn parse_duration(s: &str) -> Result<Duration, String> {
     let s = s.trim();
     if s.is_empty() {
         return Err("empty duration string".to_string());
@@ -116,8 +116,22 @@ pub struct CliArgs {
 
     // 経過時間フィルタ
     /// Only update to versions released at least this long ago (e.g., 2w, 10d, 1m)
-    #[arg(long, value_parser = parse_duration)]
+    #[arg(long, value_parser = parse_duration, conflicts_with = "no_age")]
     pub age: Option<Duration>,
+
+    /// Disable the age filter for this run (overrides global config and default)
+    #[arg(long = "no-age")]
+    pub no_age: bool,
+
+    // 脆弱性チェック (OSV.dev)
+    /// Check candidate versions against the OSV.dev vulnerability database
+    /// and skip versions with known vulnerabilities (requires network access)
+    #[arg(long, conflicts_with = "no_osv")]
+    pub osv: bool,
+
+    /// Disable OSV vulnerability check for this run (overrides global config)
+    #[arg(long = "no-osv")]
+    pub no_osv: bool,
 
     // 出力オプション
     /// Output results in JSON format
@@ -200,6 +214,9 @@ mod tests {
         assert!(args.only.is_empty());
         assert!(!args.include_pinned);
         assert!(args.age.is_none());
+        assert!(!args.no_age);
+        assert!(!args.osv);
+        assert!(!args.no_osv);
         assert!(!args.json);
         assert!(!args.diff);
         assert!(!args.install);
@@ -330,6 +347,41 @@ mod tests {
     fn test_age_months() {
         let args = CliArgs::parse_from(["depup", "--age", "1m"]);
         assert_eq!(args.age, Some(Duration::from_secs(30 * 24 * 60 * 60)));
+    }
+
+    #[test]
+    fn test_no_age_flag() {
+        let args = CliArgs::parse_from(["depup", "--no-age"]);
+        assert!(args.no_age);
+        assert!(args.age.is_none());
+    }
+
+    #[test]
+    fn test_age_and_no_age_conflict() {
+        // --age と --no-age は同時指定できない
+        let result = CliArgs::try_parse_from(["depup", "--age", "1w", "--no-age"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_osv_flag() {
+        let args = CliArgs::parse_from(["depup", "--osv"]);
+        assert!(args.osv);
+        assert!(!args.no_osv);
+    }
+
+    #[test]
+    fn test_no_osv_flag() {
+        let args = CliArgs::parse_from(["depup", "--no-osv"]);
+        assert!(args.no_osv);
+        assert!(!args.osv);
+    }
+
+    #[test]
+    fn test_osv_and_no_osv_conflict() {
+        // --osv と --no-osv は同時指定できない
+        let result = CliArgs::try_parse_from(["depup", "--osv", "--no-osv"]);
+        assert!(result.is_err());
     }
 
     #[test]

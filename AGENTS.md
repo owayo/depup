@@ -24,6 +24,8 @@ src/
   lib.rs           - ライブラリエクスポート
   cli.rs           - CLI引数定義 (clap derive)
   config.rs        - .depup 設定ファイルパーサ (モノレポ対応)
+  global_config.rs - グローバル設定ファイル (~/.config/depup/config.toml) パーサ
+  osv.rs           - OSV.dev API による脆弱性チェック
   orchestrator.rs  - ワークフロー制御 (detect → parse → fetch → judge → write)
   error.rs         - エラー型定義 (thiserror)
   progress.rs      - プログレスバー表示
@@ -166,3 +168,6 @@ make help                # Makefileヘルプ
   - **Python (uv)**: `uv sync --exclude-newer <RFC3339>` を注入し uv ネイティブの日時フィルタを利用。transitive 含めて resolve 時に age 制約が効く
   - **その他 (npm/yarn/bun/pip/poetry/rye/pipenv/bundle/composer/gradle/swift/go)**: transitive 依存へのネイティブ age サポートが無いため direct deps のみ age 制御される。verbose モードで通知
 - pnpm の fallback には既知の不具合あり: 同一 major 内の intermediate 版への fallback が失敗するケース ([pnpm/pnpm#11203](https://github.com/pnpm/pnpm/issues/11203))、`minimumReleaseAgeExclude` 除外依存の transitive が age 違反のとき `ERR_PNPM_NO_MATURE_MATCHING_VERSION` で失敗するケース ([pnpm/pnpm#11068](https://github.com/pnpm/pnpm/issues/11068)) など。transitive が基本的には守られるが、完全ではない点に注意
+- `--age` のデフォルトは `1w` (組み込みデフォルト)。グローバル設定 `~/.config/depup/config.toml` の `age = "1w"` 等で上書き可能。優先順位は `--no-age` > `--age` > グローバル設定 > 組み込みデフォルト (1w)。`--age` と `--no-age` は同時指定できない (clap の conflicts_with)
+- グローバル設定ファイル `~/.config/depup/config.toml` は初回実行時に自動生成される (claw-hooks 方式)。雛形は組み込みデフォルトと一致するキーをコメント付きで書き出す (`age = "1w"`、`osv` はコメントアウト)。生成失敗時 (権限など) は警告を出して処理を継続し、組み込みデフォルトで動作する。既存ファイルは絶対に上書きしない
+- `--osv` で OSV.dev API による脆弱性チェックを有効化。候補バージョンを `https://api.osv.dev/v1/query` に POST し、`vulns` が空でないバージョンは candidate から除外する (= 自動的に一つ前の安全なバージョンへフォールバック)。API エラー時は候補を残して `--verbose` で警告。Swift は OSV ecosystem 未対応のためスキップ。グローバル設定 `osv = true` で常時有効化可能。優先順位は `--no-osv` > `--osv` > グローバル設定 > 組み込みデフォルト (false)。OSV API は認証トークン不要
