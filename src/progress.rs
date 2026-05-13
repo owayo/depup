@@ -67,6 +67,14 @@ impl Progress {
         }
     }
 
+    /// 内部の `ProgressBar` を取得する (並列タスクから直接 `inc` / `set_message` するため)。
+    ///
+    /// プログレス表示が無効・未開始の場合は `None`。返される `ProgressBar` は
+    /// 内部で `Arc` を持つ Clone で、複数の async タスク間で安全に共有できる。
+    pub fn bar(&self) -> Option<ProgressBar> {
+        self.bar.clone()
+    }
+
     /// メッセージを更新する
     pub fn set_message(&self, message: &str) {
         if let Some(ref bar) = self.bar {

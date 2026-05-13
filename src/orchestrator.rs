@@ -25,6 +25,7 @@ use crate::registry::{
 use crate::tauri_sync::{TAURI_CRATE, TAURI_NPM_PACKAGES, TauriVersionSync};
 use crate::update::{UpdateFilter, UpdateJudge, VersionInfo, compare_versions};
 use futures::stream::{self, StreamExt};
+use indicatif::ProgressBar;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -286,6 +287,72 @@ impl Orchestrator {
         aggregated
     }
 
+    /// 1 つの依存を処理する: 早期スキップ判定 → fetch → OSV チェック → judge。
+    ///
+    /// `bar` が `Some` のとき、OSV チェック開始時に進捗メッセージを更新する。
+    async fn process_one_dependency(
+        &self,
+        dep: Dependency,
+        adapter: &(dyn RegistryAdapter + Send + Sync),
+        judge: &UpdateJudge,
+        bar: Option<&ProgressBar>,
+    ) -> OnePassResult {
+        // 早期スキップ判定
+        if let Some(reason) = judge.should_skip(&dep) {
+            return OnePassResult {
+                name: dep.name.clone(),
+                outcome: ResultOutcome::Skip(UpdateResult::skip(dep, reason)),
+                fetch_error: None,
+                osv_warnings: Vec::new(),
+            };
+        }
+
+        // git 依存は専用ロジック
+        if dep.is_git() {
+            let result = self.judge_git_dependency(&dep).await;
+            return OnePassResult {
+                name: dep.name.clone(),
+                outcome: ResultOutcome::Skip(result),
+                fetch_error: None,
+                osv_warnings: Vec::new(),
+            };
+        }
+
+        // registry 経由のフェッチ
+        match self.fetch_versions(adapter, &dep.name).await {
+            Ok(versions) => {
+                // OSV チェック: 脆弱な candidate を除外する。
+                // Swift など osv_ecosystem() == None の言語はスキップ。
+                let (versions, osv_warnings) =
+                    match (self.osv_checker.as_ref(), dep.language.osv_ecosystem()) {
+                        (Some(checker), Some(eco)) => {
+                            filter_vulnerable_versions(checker, &dep.name, eco, versions, bar).await
+                        }
+                        _ => (versions, Vec::new()),
+                    };
+                let result = judge.judge(&dep, &versions);
+                OnePassResult {
+                    name: dep.name.clone(),
+                    outcome: ResultOutcome::Skip(result),
+                    fetch_error: None,
+                    osv_warnings,
+                }
+            }
+            Err(e) => {
+                let err_msg = e.clone();
+                OnePassResult {
+                    name: dep.name.clone(),
+                    outcome: ResultOutcome::Skip(UpdateResult::skip(
+                        dep,
+                        SkipReason::FetchFailed(e),
+                    )),
+                    fetch_error: Some(err_msg),
+                    osv_warnings: Vec::new(),
+                }
+            }
+        }
+    }
+
     /// git 依存の判定を実行する
     ///
     /// - branch / DefaultBranch: リモート HEAD/ブランチ commit と現在 commit を比較し、新しければ更新
@@ -449,6 +516,9 @@ impl Orchestrator {
         // ステップ3: 各依存関係のバージョンを取得し、更新を判定
         progress.start(total_deps as u64, "Checking dependencies");
 
+        // 並列タスクから進捗を直接更新するため、ProgressBar の参照を取得
+        let progress_bar = progress.bar();
+
         for (manifest_info, dependencies) in parsed_manifests {
             let mut manifest_result =
                 ManifestUpdateResult::new(&manifest_info.path, manifest_info.language);
@@ -463,78 +533,35 @@ impl Orchestrator {
             // 出力順は安定する (`buffered`: ordered)。
             // fetch_versions は内部でレジストリ別の Semaphore を持つため、
             // crates.io のレート制限などは従来どおり尊重される。
+            //
+            // 各タスクの開始 / OSV 開始 / 完了タイミングで `ProgressBar` を直接
+            // 更新するため、collect 前から `pos` と `msg` が動く。
             let results: Vec<OnePassResult> = stream::iter(dependencies)
                 .map(|dep| {
                     let adapter = Arc::clone(&adapter);
                     let judge_ref = &judge;
+                    let bar = progress_bar.clone();
                     async move {
-                        // 早期スキップ判定
-                        if let Some(reason) = judge_ref.should_skip(&dep) {
-                            return OnePassResult {
-                                name: dep.name.clone(),
-                                outcome: ResultOutcome::Skip(UpdateResult::skip(dep, reason)),
-                                fetch_error: None,
-                                osv_warnings: Vec::new(),
-                            };
+                        if let Some(ref b) = bar {
+                            b.set_message(format!("Checking {}", dep.name));
                         }
 
-                        // git 依存は専用ロジック
-                        if dep.is_git() {
-                            let result = self.judge_git_dependency(&dep).await;
-                            return OnePassResult {
-                                name: dep.name.clone(),
-                                outcome: ResultOutcome::Skip(result),
-                                fetch_error: None,
-                                osv_warnings: Vec::new(),
-                            };
-                        }
+                        let result = self
+                            .process_one_dependency(dep, &*adapter, judge_ref, bar.as_ref())
+                            .await;
 
-                        // registry 経由のフェッチ
-                        match self.fetch_versions(&*adapter, &dep.name).await {
-                            Ok(versions) => {
-                                // OSV チェック: 脆弱な candidate を除外する。
-                                // Swift など osv_ecosystem() == None の言語はスキップ。
-                                let (versions, osv_warnings) =
-                                    match (self.osv_checker.as_ref(), dep.language.osv_ecosystem())
-                                    {
-                                        (Some(checker), Some(eco)) => {
-                                            filter_vulnerable_versions(
-                                                checker, &dep.name, eco, versions,
-                                            )
-                                            .await
-                                        }
-                                        _ => (versions, Vec::new()),
-                                    };
-                                let result = judge_ref.judge(&dep, &versions);
-                                OnePassResult {
-                                    name: dep.name.clone(),
-                                    outcome: ResultOutcome::Skip(result),
-                                    fetch_error: None,
-                                    osv_warnings,
-                                }
-                            }
-                            Err(e) => {
-                                let err_msg = e.clone();
-                                OnePassResult {
-                                    name: dep.name.clone(),
-                                    outcome: ResultOutcome::Skip(UpdateResult::skip(
-                                        dep,
-                                        SkipReason::FetchFailed(e),
-                                    )),
-                                    fetch_error: Some(err_msg),
-                                    osv_warnings: Vec::new(),
-                                }
-                            }
+                        if let Some(ref b) = bar {
+                            b.inc(1);
                         }
+                        result
                     }
                 })
                 .buffered(concurrency)
                 .collect()
                 .await;
 
-            // progress / errors / manifest_result を順序を保って反映する
+            // errors / manifest_result を順序を保って集約する (progress は既に並列タスク側で更新済み)
             for result in results {
-                progress.set_message(&format!("Checking {}", &result.name));
                 if let Some(err_msg) = result.fetch_error {
                     errors.push(OrchestratorError::RegistryError {
                         package: result.name.clone(),
@@ -550,7 +577,6 @@ impl Orchestrator {
                 match result.outcome {
                     ResultOutcome::Skip(r) => manifest_result.add_result(r),
                 }
-                progress.inc();
             }
 
             summary.add_manifest(manifest_result);
@@ -934,12 +960,28 @@ pub enum LockAgeStatus {
 /// 戻り値: `(脆弱性なし or 判定不能なバージョン一覧, 警告メッセージ一覧)`
 /// - 脆弱性が確認されたバージョンは安全リストから除外され、警告に含める
 /// - API エラー等で判定できなかったバージョンは「安全側」として残し、警告に含める
+///
+/// `bar` が `Some` のとき、チェック中の進捗メッセージを更新する。
 async fn filter_vulnerable_versions(
     checker: &OsvChecker,
     name: &str,
     ecosystem: &str,
     versions: Vec<VersionInfo>,
+    bar: Option<&ProgressBar>,
 ) -> (Vec<VersionInfo>, Vec<String>) {
+    if versions.is_empty() {
+        return (versions, Vec::new());
+    }
+
+    if let Some(b) = bar {
+        b.set_message(format!(
+            "OSV: {} ({} version{})",
+            name,
+            versions.len(),
+            if versions.len() == 1 { "" } else { "s" }
+        ));
+    }
+
     let checks = versions.iter().map(|v| {
         let checker = checker.clone();
         let name = name.to_string();
