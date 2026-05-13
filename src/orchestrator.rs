@@ -12,9 +12,10 @@ use crate::domain::{
     Dependency, GitReference, Language, ManifestUpdateResult, SkipReason, UpdateResult,
     UpdateSummary,
 };
+use crate::global_config::{DEFAULT_AGE, GlobalConfig};
 use crate::manifest::{
-    ManifestInfo, ManifestWriter, PnpmSettings, WriteResult, detect_manifests, get_parser,
-    has_pnpm_workspace, read_git_entries, read_registry_entries,
+    BunSettings, ManifestInfo, ManifestWriter, PnpmSettings, WriteResult, detect_manifests,
+    get_parser, has_bunfig, has_pnpm_workspace, read_git_entries, read_registry_entries,
 };
 use crate::osv::{OsvCheck, OsvChecker};
 use crate::progress::Progress;
@@ -58,6 +59,12 @@ const MAX_ENFORCE_LOCK_AGE_PASSES: usize = 5;
 /// バージョン情報のキャッシュ (言語, パッケージ名) をキーとする
 pub type VersionCache = Arc<Mutex<HashMap<(Language, String), Vec<VersionInfo>>>>;
 
+/// プロジェクト直下から検出した minimumReleaseAge とそのソース
+struct ProjectAge {
+    duration: Duration,
+    source: String,
+}
+
 /// 更新ワークフローを調整するオーケストレータ
 pub struct Orchestrator {
     /// 設定用CLI引数
@@ -74,6 +81,8 @@ pub struct Orchestrator {
     git_remote: GitRemote,
     /// OSV チェッカー (`args.osv` が true のときのみ初期化)
     osv_checker: Option<OsvChecker>,
+    /// グローバル設定 (~/.config/depup/config.toml)
+    global_config: Option<GlobalConfig>,
 }
 
 /// オーケストレータの実行結果
@@ -148,7 +157,14 @@ impl Orchestrator {
             version_cache: Arc::new(Mutex::new(HashMap::new())),
             git_remote: GitRemote::new(),
             osv_checker,
+            global_config: None,
         })
+    }
+
+    /// グローバル設定をセットする (CLI > プロジェクト設定 の解決に使う)
+    pub fn with_global_config(mut self, config: Option<GlobalConfig>) -> Self {
+        self.global_config = config;
+        self
     }
 
     /// Rust プロジェクトの Cargo.lock を走査し、`--age` を満たさない
@@ -644,24 +660,50 @@ impl Orchestrator {
         }
 
         // 経過日数フィルタ
-        // 優先順位: CLI --age > pnpm 設定 (--no-age 指定時も pnpm 設定は残るが警告する)
-        if let Some(age) = self.args.age {
-            filter = filter.with_min_age(age);
-        } else if has_pnpm_workspace(&self.args.path) {
-            let pnpm_settings = PnpmSettings::from_dir(&self.args.path);
-            if let Some(age) = pnpm_settings.minimum_release_age {
-                if self.args.no_age {
-                    use colored::Colorize as _;
-                    let days = age.as_secs() / 86400;
-                    let unit = if days == 1 { "day" } else { "days" };
-                    let msg = format!(
-                        "⚠ --no-age specified, but pnpm-workspace.yaml minimumReleaseAge ({} {}) is still in effect",
-                        days, unit
-                    );
-                    eprintln!("{}", msg.yellow());
-                }
-                filter = filter.with_min_age(age);
+        // 優先順位 (絶対優先案):
+        //   1. minimumReleaseAge (pnpm-workspace.yaml / bunfig.toml) — プロジェクトポリシー強制
+        //   2. CLI --age
+        //   3. --no-age (上 2 つが無い時のみ有効、age 制約なし)
+        //   4. グローバル設定 (~/.config/depup/config.toml) の age
+        //   5. 組み込みデフォルト 1w
+        let project_age = self.read_project_minimum_release_age();
+        let resolved_age: Option<Duration> = if let Some(project) = project_age.as_ref() {
+            use colored::Colorize as _;
+            let days = project.duration.as_secs() / 86400;
+            let unit = if days == 1 { "day" } else { "days" };
+            if self.args.age.is_some() || self.args.no_age {
+                // CLI 指定が project policy で上書きされる場合は警告
+                let cli_label = if self.args.no_age {
+                    "--no-age"
+                } else {
+                    "--age"
+                };
+                let msg = format!(
+                    "⚠ {} ignored: project's minimumReleaseAge ({} {} from {}) takes precedence",
+                    cli_label, days, unit, project.source
+                );
+                eprintln!("{}", msg.yellow());
+            } else {
+                // CLI 指定なしでプロジェクト設定が採用された場合は情報通知
+                let msg = format!(
+                    "ℹ Using project's minimumReleaseAge ({} {} from {})",
+                    days, unit, project.source
+                );
+                eprintln!("{}", msg.cyan());
             }
+            Some(project.duration)
+        } else if self.args.no_age {
+            None
+        } else if let Some(age) = self.args.age {
+            Some(age)
+        } else if let Some(cfg_age) = self.global_config.as_ref().and_then(|c| c.age_duration()) {
+            Some(cfg_age)
+        } else {
+            Some(DEFAULT_AGE)
+        };
+
+        if let Some(age) = resolved_age {
+            filter = filter.with_min_age(age);
         }
 
         // 変更レベル上限
@@ -670,6 +712,34 @@ impl Orchestrator {
         }
 
         filter
+    }
+
+    /// プロジェクト直下の minimumReleaseAge 設定を読む。
+    /// pnpm (`pnpm-workspace.yaml` / `.npmrc` / `package.json`) と
+    /// bun (`bunfig.toml`) の両方を見て、両方ある場合はより厳しい方 (max) を採用する。
+    fn read_project_minimum_release_age(&self) -> Option<ProjectAge> {
+        let mut candidates: Vec<(Duration, &'static str)> = Vec::new();
+
+        if has_pnpm_workspace(&self.args.path) {
+            let pnpm = PnpmSettings::from_dir(&self.args.path);
+            if let Some(age) = pnpm.minimum_release_age {
+                candidates.push((age, "pnpm-workspace.yaml"));
+            }
+        }
+        if has_bunfig(&self.args.path) {
+            let bun = BunSettings::from_dir(&self.args.path);
+            if let Some(age) = bun.minimum_release_age {
+                candidates.push((age, "bunfig.toml"));
+            }
+        }
+
+        candidates
+            .into_iter()
+            .max_by_key(|(d, _)| *d)
+            .map(|(duration, source)| ProjectAge {
+                duration,
+                source: source.to_string(),
+            })
     }
 
     /// CLI引数に基づいて言語を処理すべきかチェックする
@@ -1557,26 +1627,72 @@ mod tests {
     }
 
     #[test]
-    fn test_build_filter_cli_age_overrides_pnpm() {
+    fn test_build_filter_pnpm_overrides_cli() {
         let dir = TempDir::new().unwrap();
 
-        // minimumReleaseAge 付きの pnpm-workspace.yaml を作成
+        // minimumReleaseAge 付きの pnpm-workspace.yaml を作成 (10日 = 14400分)
         fs::write(
             dir.path().join("pnpm-workspace.yaml"),
             "packages: []\nminimumReleaseAge: 14400\n",
         )
         .unwrap();
 
-        // CLI --age が pnpm 設定を上書きすべき
+        // CLI --age 2w を指定しても、プロジェクトポリシー (pnpm 10日) が勝つ
         let args = make_args_with_path(dir.path(), &["--age", "2w"]);
         let orchestrator = Orchestrator::new(args).unwrap();
         let filter = orchestrator.build_filter();
 
-        // CLI の age (2週間) であるべきで、pnpm の age (10日) ではない
         assert!(filter.min_age.is_some());
         assert_eq!(
             filter.min_age.unwrap(),
-            std::time::Duration::from_secs(14 * 24 * 60 * 60) // 2週間
+            std::time::Duration::from_secs(10 * 24 * 60 * 60), // pnpm の 10日
+            "minimumReleaseAge は CLI --age に優先する"
+        );
+    }
+
+    #[test]
+    fn test_build_filter_bun_minimum_release_age() {
+        let dir = TempDir::new().unwrap();
+        // bunfig.toml に minimumReleaseAge (秒) を書く: 3日 = 259200 秒
+        fs::write(
+            dir.path().join("bunfig.toml"),
+            "[install]\nminimumReleaseAge = 259200\n",
+        )
+        .unwrap();
+
+        let args = make_args_with_path(dir.path(), &[]);
+        let orchestrator = Orchestrator::new(args).unwrap();
+        let filter = orchestrator.build_filter();
+
+        assert_eq!(
+            filter.min_age.unwrap(),
+            std::time::Duration::from_secs(3 * 24 * 60 * 60),
+        );
+    }
+
+    #[test]
+    fn test_build_filter_pnpm_and_bun_take_max() {
+        let dir = TempDir::new().unwrap();
+        // pnpm: 10日, bun: 3日 → max=10日
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages: []\nminimumReleaseAge: 14400\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("bunfig.toml"),
+            "[install]\nminimumReleaseAge = 259200\n",
+        )
+        .unwrap();
+
+        let args = make_args_with_path(dir.path(), &[]);
+        let orchestrator = Orchestrator::new(args).unwrap();
+        let filter = orchestrator.build_filter();
+
+        assert_eq!(
+            filter.min_age.unwrap(),
+            std::time::Duration::from_secs(10 * 24 * 60 * 60),
+            "両方ある場合はより厳しい (max) を採用"
         );
     }
 
@@ -1603,16 +1719,54 @@ mod tests {
     }
 
     #[test]
-    fn test_build_filter_no_pnpm_no_age() {
+    fn test_build_filter_no_pnpm_no_age_falls_back_to_default() {
         let dir = TempDir::new().unwrap();
 
-        // pnpmファイルなし、--ageフラグなし
+        // pnpm/bun 設定なし、CLI --age なし、global_config なし → 組み込みデフォルト (1w)
         let args = make_args_with_path(dir.path(), &[]);
         let orchestrator = Orchestrator::new(args).unwrap();
         let filter = orchestrator.build_filter();
 
-        // min_ageは設定されないべき
-        assert!(filter.min_age.is_none());
+        assert_eq!(
+            filter.min_age.unwrap(),
+            crate::global_config::DEFAULT_AGE,
+            "未指定時は組み込みデフォルト (1w) にフォールバック"
+        );
+    }
+
+    #[test]
+    fn test_build_filter_no_age_explicit_disables_when_no_project_settings() {
+        let dir = TempDir::new().unwrap();
+
+        // --no-age 指定、プロジェクト設定なし → age 制約なし
+        let args = make_args_with_path(dir.path(), &["--no-age"]);
+        let orchestrator = Orchestrator::new(args).unwrap();
+        let filter = orchestrator.build_filter();
+
+        assert!(
+            filter.min_age.is_none(),
+            "--no-age 指定 + プロジェクト設定なし → age 制約なし"
+        );
+    }
+
+    #[test]
+    fn test_build_filter_no_age_still_obeys_project_settings() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages: []\nminimumReleaseAge: 14400\n",
+        )
+        .unwrap();
+
+        // --no-age を指定してもプロジェクト設定が優先される
+        let args = make_args_with_path(dir.path(), &["--no-age"]);
+        let orchestrator = Orchestrator::new(args).unwrap();
+        let filter = orchestrator.build_filter();
+
+        assert_eq!(
+            filter.min_age.unwrap(),
+            std::time::Duration::from_secs(10 * 24 * 60 * 60)
+        );
     }
 
     #[tokio::test]

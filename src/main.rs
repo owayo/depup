@@ -13,7 +13,7 @@ use clap::Parser;
 use depup::cli::CliArgs;
 use depup::config::DepupConfig;
 use depup::domain::Language;
-use depup::global_config::{GlobalConfig, resolve_age, resolve_max_change, resolve_osv};
+use depup::global_config::{GlobalConfig, resolve_max_change, resolve_osv};
 use depup::orchestrator::{Orchestrator, OrchestratorResult};
 use depup::output::{OutputConfig, create_formatter};
 use depup::package_manager::{SystemPackageManager, run_installs};
@@ -61,7 +61,8 @@ async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
     // グローバル設定 (~/.config/depup/config.toml) を読み込み、
     // CLI > config > 組み込みデフォルトの優先順位で age / osv を確定する。
     let global_config = GlobalConfig::load();
-    args.age = resolve_age(args.age, args.no_age, global_config.as_ref());
+    // age はプロジェクト設定 (pnpm/bun の minimumReleaseAge) と統合判定するため
+    // orchestrator 側の build_filter で最終解決する。main では生の CLI 値を保持。
     args.osv = resolve_osv(args.osv, args.no_osv, global_config.as_ref());
     args.max_change = resolve_max_change(args.max_change, global_config.as_ref());
 
@@ -73,8 +74,13 @@ async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
             eprintln!("Mode: dry-run");
         }
         match args.age {
-            Some(age) => eprintln!("Age filter: {}s", age.as_secs()),
-            None => eprintln!("Age filter: disabled"),
+            Some(age) => eprintln!("Age filter (CLI): {}s", age.as_secs()),
+            None if args.no_age => eprintln!(
+                "Age filter: --no-age (still overridden by project minimumReleaseAge if present)"
+            ),
+            None => {
+                eprintln!("Age filter: (resolved by orchestrator from project / config / default)")
+            }
         }
         eprintln!(
             "OSV vulnerability check: {}",
@@ -85,8 +91,8 @@ async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
     // .depup モノレポ設定を確認
     let monorepo_config = DepupConfig::from_dir(&args.path);
 
-    // オーケストレーターを作成して実行
-    let orchestrator = Orchestrator::new(args.clone())?;
+    // オーケストレーターを作成 (global_config を渡して age 解決に利用)
+    let orchestrator = Orchestrator::new(args.clone())?.with_global_config(global_config);
 
     let (result, monorepo_dirs) = if let Some(config) = monorepo_config {
         let dirs = config.directories_with_root(&args.path);

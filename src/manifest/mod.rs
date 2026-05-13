@@ -6,6 +6,7 @@
 //! - モノレポ構造のサポート (pnpm-workspace.yaml)
 //! - Tauri プロジェクトのサポート (src-tauri/Cargo.toml)
 
+mod bun_settings;
 mod cargo_lock;
 mod cargo_toml;
 mod composer_json;
@@ -20,6 +21,7 @@ mod pnpm_settings;
 mod pyproject_toml;
 mod writer;
 
+pub use bun_settings::{BunSettings, has_bunfig};
 pub use cargo_lock::{
     GitLockEntry, RegistryLockEntries, parse_git_entries, parse_registry_entries, read_git_entries,
     read_registry_entries,
@@ -38,7 +40,6 @@ pub use writer::{ManifestWriter, WriteResult, read_manifest, write_manifest};
 
 use crate::domain::{Dependency, Language};
 use crate::error::ManifestError;
-use std::path::Path;
 
 /// マニフェストファイルをパースするためのトレイト
 pub trait ManifestParser {
@@ -80,29 +81,6 @@ pub fn get_parser(language: Language) -> Box<dyn ManifestParser> {
         Language::Java => Box::new(GradleParser),
         Language::Swift => Box::new(PackageSwiftParser),
     }
-}
-
-/// ファイルパスからマニフェストの依存関係をパースする
-pub fn parse_manifest(path: &Path) -> Result<Vec<Dependency>, ManifestError> {
-    let content = std::fs::read_to_string(path).map_err(|e| ManifestError::ReadError {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
-
-    let language = Language::all()
-        .iter()
-        .find(|lang| {
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n == lang.manifest_filename())
-                .unwrap_or(false)
-        })
-        .ok_or_else(|| ManifestError::UnsupportedFormat {
-            path: path.to_path_buf(),
-        })?;
-
-    let parser = get_parser(*language);
-    parser.parse(&content)
 }
 
 #[cfg(test)]

@@ -375,21 +375,37 @@ age = "1w"
 3. `~/.config/depup/config.toml` `age` value
 4. Built-in default (`1w`)
 
-### pnpm Integration
+### Resolution Priority
 
-depup automatically reads `minimumReleaseAge` from pnpm configuration:
+`minimumReleaseAge` declared in the project is always treated as the **project policy** and takes precedence over any CLI / config age value. The full resolution order is:
 
-**Priority order:**
-1. CLI `--age` flag (highest)
-2. `.npmrc` (`minimum-release-age=10d`)
-3. `pnpm-workspace.yaml` (`minimumReleaseAge: 14400` in minutes)
-4. `package.json` (`pnpm.settings.minimumReleaseAge`)
+1. **Project `minimumReleaseAge`** (highest — see sources below; takes the stricter value when multiple sources disagree)
+2. CLI `--age <DURATION>`
+3. `--no-age` (only effective if no project policy is set)
+4. `~/.config/depup/config.toml` `age` value
+5. Built-in default `1w`
 
-> **Note on `--no-age`**: pnpm's `minimumReleaseAge` is a project-level setting and remains in effect even when `--no-age` is passed. In that case depup prints a yellow warning so the active fallback is visible:
-> ```
-> ⚠ --no-age specified, but pnpm-workspace.yaml minimumReleaseAge (14 days) is still in effect
-> ```
-> To bypass pnpm's setting too, remove or override it in `pnpm-workspace.yaml` / `.npmrc`.
+When a project policy overrides the CLI value, depup prints a yellow warning so the active source is visible:
+```
+⚠ --age ignored: project's minimumReleaseAge (14 days from pnpm-workspace.yaml) takes precedence
+```
+
+To bypass the project setting, remove or override it in the project file.
+
+### Supported `minimumReleaseAge` Sources
+
+**pnpm** (any of the following — first non-empty value wins):
+- `.npmrc` (`minimum-release-age=10d`)
+- `pnpm-workspace.yaml` (`minimumReleaseAge: 14400` in minutes)
+- `package.json` (`pnpm.settings.minimumReleaseAge`)
+
+**bun** (`bunfig.toml`):
+```toml
+[install]
+minimumReleaseAge = 259200  # seconds (e.g. 3 days)
+```
+
+When both pnpm and bun sources exist, depup uses the **stricter** (larger) value.
 
 ### Swift and Age Filter
 

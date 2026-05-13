@@ -161,32 +161,6 @@ pub fn generate_default_at(path: &Path) -> std::io::Result<()> {
     std::fs::write(path, DEFAULT_CONFIG_CONTENT)
 }
 
-/// グローバル設定と CLI フラグから、実際に適用する age を決定する。
-///
-/// 優先順位 (高い順):
-/// 1. `--no-age` が指定されていれば `None` (age 無効)
-/// 2. `--age VALUE` が指定されていればその値
-/// 3. グローバル設定の `age` がパースできればその値
-/// 4. それ以外は組み込みデフォルト [`DEFAULT_AGE`] (1週間)
-pub fn resolve_age(
-    cli_age: Option<Duration>,
-    no_age: bool,
-    config: Option<&GlobalConfig>,
-) -> Option<Duration> {
-    if no_age {
-        return None;
-    }
-    if let Some(d) = cli_age {
-        return Some(d);
-    }
-    if let Some(cfg) = config
-        && let Some(d) = cfg.age_duration()
-    {
-        return Some(d);
-    }
-    Some(DEFAULT_AGE)
-}
-
 /// グローバル設定と CLI フラグから、許容する変更レベルの上限を決定する。
 ///
 /// 優先順位 (高い順):
@@ -341,58 +315,6 @@ mod tests {
     fn test_age_duration_none_when_unset() {
         let cfg = GlobalConfig::default();
         assert!(cfg.age_duration().is_none());
-    }
-
-    #[test]
-    fn test_resolve_age_no_age_wins_over_cli() {
-        let cli = Some(Duration::from_secs(86400));
-        let cfg = GlobalConfig {
-            age: Some("2w".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(resolve_age(cli, true, Some(&cfg)), None);
-    }
-
-    #[test]
-    fn test_resolve_age_cli_wins_over_config() {
-        let cli = Some(Duration::from_secs(86400));
-        let cfg = GlobalConfig {
-            age: Some("2w".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(resolve_age(cli, false, Some(&cfg)), cli);
-    }
-
-    #[test]
-    fn test_resolve_age_config_when_cli_absent() {
-        let cfg = GlobalConfig {
-            age: Some("2w".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(
-            resolve_age(None, false, Some(&cfg)),
-            Some(Duration::from_secs(14 * 86400))
-        );
-    }
-
-    #[test]
-    fn test_resolve_age_default_when_nothing_set() {
-        assert_eq!(resolve_age(None, false, None), Some(DEFAULT_AGE));
-    }
-
-    #[test]
-    fn test_resolve_age_default_when_config_age_unset() {
-        let cfg = GlobalConfig::default();
-        assert_eq!(resolve_age(None, false, Some(&cfg)), Some(DEFAULT_AGE));
-    }
-
-    #[test]
-    fn test_resolve_age_default_when_config_age_invalid() {
-        let cfg = GlobalConfig {
-            age: Some("garbage".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(resolve_age(None, false, Some(&cfg)), Some(DEFAULT_AGE));
     }
 
     #[test]

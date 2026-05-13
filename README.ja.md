@@ -375,21 +375,37 @@ age = "1w"
 3. `~/.config/depup/config.toml` の `age` 値
 4. 組み込みデフォルト（`1w`）
 
-### pnpm連携
+### 適用される age の優先順位
 
-depupはpnpm設定から `minimumReleaseAge` を自動的に読み取ります：
+プロジェクトに書かれた `minimumReleaseAge` は **プロジェクトポリシー** として最優先で扱われ、CLI / config の age 値を上書きします。完全な順序は以下の通り:
 
-**優先順位：**
-1. CLI `--age` フラグ（最優先）
-2. `.npmrc`（`minimum-release-age=10d`）
-3. `pnpm-workspace.yaml`（`minimumReleaseAge: 14400` 分単位）
-4. `package.json`（`pnpm.settings.minimumReleaseAge`）
+1. **プロジェクトの `minimumReleaseAge`**（最優先 — 複数ソースがあればより厳しい値）
+2. CLI `--age <DURATION>`
+3. `--no-age`（プロジェクトポリシーが無い場合のみ有効）
+4. `~/.config/depup/config.toml` の `age` 値
+5. 組み込みデフォルト `1w`
 
-> **`--no-age` の注意**: pnpm の `minimumReleaseAge` はプロジェクトレベルの設定で、`--no-age` を指定しても依然として効きます。その場合 depup は黄色で警告を出します：
-> ```
-> ⚠ --no-age specified, but pnpm-workspace.yaml minimumReleaseAge (14 days) is still in effect
-> ```
-> pnpm 設定を含めて完全に無効化したい場合は、`pnpm-workspace.yaml` / `.npmrc` の値を削除または上書きしてください。
+プロジェクトポリシーが CLI 指定を上書きする場合、depup は黄色で警告を出し、有効なソースを表示します:
+```
+⚠ --age ignored: project's minimumReleaseAge (14 days from pnpm-workspace.yaml) takes precedence
+```
+
+プロジェクトポリシーを回避したい場合は、プロジェクトファイル側で値を削除/上書きしてください。
+
+### 対応する `minimumReleaseAge` のソース
+
+**pnpm**（以下のいずれか — 最初に見つかった値）:
+- `.npmrc`（`minimum-release-age=10d`）
+- `pnpm-workspace.yaml`（`minimumReleaseAge: 14400` 分単位）
+- `package.json`（`pnpm.settings.minimumReleaseAge`）
+
+**bun**（`bunfig.toml`）:
+```toml
+[install]
+minimumReleaseAge = 259200  # 秒単位（例: 3日）
+```
+
+pnpm と bun の両方にソースがある場合は、**より厳しい**（大きい）値を採用します。
 
 ### Swift とエイジフィルター
 
