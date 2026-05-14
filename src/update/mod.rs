@@ -207,18 +207,24 @@ impl UpdateJudge {
         None
     }
 
-    /// 利用可能バージョンをもとに更新要否を判定する
+    /// 利用可能バージョンをもとに更新要否を判定する。
+    ///
+    /// 内部では候補を段階的に絞り込む:
+    ///   1. `should_skip` (前段の言語/パッケージ/pinned フィルタ)
+    ///   2. プレリリース除外 (`stable_candidates`)
+    ///   3. age 制約 (`apply_age_filter`)
+    ///   4. Range 上限 (`apply_range_upper_bound`)
+    ///   5. `--max-change` 上限 (`apply_max_change_filter`)
+    ///   6. ダウングレード防止と更新可否確定 (`select_latest_candidate`)
     pub fn judge(
         &self,
         dependency: &Dependency,
         available_versions: &[VersionInfo],
     ) -> UpdateResult {
-        // 先に前段のスキップ条件を評価する
         if let Some(reason) = self.should_skip(dependency) {
             return UpdateResult::skip(dependency.clone(), reason);
         }
 
-        // 候補バージョンがなければスキップする
         if available_versions.is_empty() {
             return UpdateResult::skip(
                 dependency.clone(),
@@ -226,132 +232,146 @@ impl UpdateJudge {
             );
         }
 
-        // 既定ではプレリリース版を除外し、現在版がプレリリースのときだけ候補に含める
-        let current_is_prerelease = is_prerelease_version(dependency.version());
-        let stable_versions: Vec<&VersionInfo> = if current_is_prerelease {
-            // 現在がプレリリースならプレリリース更新も許可する
-            available_versions.iter().collect()
-        } else {
-            // それ以外は安定版だけを候補にする
-            available_versions
-                .iter()
-                .filter(|v| !v.is_prerelease())
-                .collect()
-        };
+        let stable = self.stable_candidates(dependency, available_versions);
+        let age_filtered = self.apply_age_filter(stable);
+        let eligible = apply_range_upper_bound(dependency, age_filtered);
 
-        // age 制約があれば候補を絞る
-        let age_filtered: Vec<&VersionInfo> = if let Some(min_age) = self.filter.min_age {
-            // chrono::Duration は i64 ナノ秒 (約292年) が上限。
-            // 変換失敗時は age 制約を無視して全候補を通す。
-            if let Ok(chrono_duration) = chrono::Duration::from_std(min_age) {
-                let min_release_time = self.now - chrono_duration;
-                stable_versions
-                    .into_iter()
-                    .filter(|v| v.released_at <= min_release_time)
-                    .collect()
-            } else {
-                stable_versions
-            }
-        } else {
-            stable_versions
-        };
-
-        // Range 制約の上限がある場合は、その上限を超える候補を除外する
-        // 例: ">=3.5.0,<4.0.0" なら 4.0.0 以上を除外する
-        let eligible_versions: Vec<&VersionInfo> =
-            if dependency.version_spec.kind == VersionSpecKind::Range {
-                if let Some((upper_bound, inclusive)) =
-                    extract_upper_bound(&dependency.version_spec.raw)
-                {
-                    age_filtered
-                        .into_iter()
-                        .filter(|v| {
-                            match version_info::compare_versions(&v.version, &upper_bound) {
-                                std::cmp::Ordering::Less => true,
-                                std::cmp::Ordering::Equal => inclusive,
-                                std::cmp::Ordering::Greater => false,
-                            }
-                        })
-                        .collect()
-                } else {
-                    age_filtered
-                }
-            } else {
-                age_filtered
-            };
-
-        if eligible_versions.is_empty() {
+        if eligible.is_empty() {
             return UpdateResult::skip(dependency.clone(), SkipReason::NoSuitableVersion);
         }
 
-        // --max-change が指定されていれば、許容レベルを超える候補を除外する
-        // (現在版との semver 差分で判定。比較不能・同一は通す)
-        let allowed: Vec<&VersionInfo> = if let Some(max) = self.filter.max_change {
-            let current = dependency.version();
-            eligible_versions
-                .iter()
-                .copied()
-                .filter(|v| {
-                    crate::domain::ChangeLevel::from_versions(current, &v.version)
-                        .is_none_or(|level| level <= max)
-                })
-                .collect()
-        } else {
-            eligible_versions.clone()
-        };
-
+        let allowed = apply_max_change_filter(dependency, &eligible, self.filter.max_change);
         if allowed.is_empty() {
-            // 全候補が max_change で除外された (.unwrap() は max_change=Some の文脈でのみ到達)
+            // 全候補が max_change で除外された
             return UpdateResult::skip(
                 dependency.clone(),
                 SkipReason::ChangeLevelLimited(self.filter.max_change.unwrap()),
             );
         }
 
-        // semver 比較で最新の更新候補を選ぶ
-        let latest = allowed.iter().max().unwrap();
-
-        // 現在版が最新以上ならダウングレードを防いでスキップする
-        if version_info::compare_versions(dependency.version(), &latest.version)
-            != std::cmp::Ordering::Less
-        {
-            // max_change で除外された「より新しい候補」が存在すれば ChangeLevelLimited
-            if let Some(max) = self.filter.max_change {
-                let current = dependency.version();
-                let has_newer_excluded = eligible_versions.iter().any(|v| {
-                    version_info::compare_versions(&v.version, current)
-                        == std::cmp::Ordering::Greater
-                        && crate::domain::ChangeLevel::from_versions(current, &v.version)
-                            .is_some_and(|level| level > max)
-                });
-                if has_newer_excluded {
-                    return UpdateResult::skip(
-                        dependency.clone(),
-                        SkipReason::ChangeLevelLimited(max),
-                    );
-                }
-            }
-            return UpdateResult::skip_already_latest_with_date(
-                dependency.clone(),
-                latest.released_at,
-            );
-        }
-
-        // 更新先の文字列表現を安全に組み立てられない制約は更新対象にしない
-        if dependency
-            .version_spec
-            .try_format_updated(&latest.version)
-            .is_none()
-        {
-            return UpdateResult::skip(
-                dependency.clone(),
-                SkipReason::ParseError("constraint cannot be updated safely".to_string()),
-            );
-        }
-
-        // リリース日時付きで更新結果を返す
-        UpdateResult::update_with_date(dependency.clone(), &latest.version, latest.released_at)
+        select_latest_candidate(dependency, &eligible, &allowed, self.filter.max_change)
     }
+
+    /// 既定ではプレリリースを除外する。現在版がプレリリースなら全候補を残す。
+    fn stable_candidates<'a>(
+        &self,
+        dependency: &Dependency,
+        available_versions: &'a [VersionInfo],
+    ) -> Vec<&'a VersionInfo> {
+        if is_prerelease_version(dependency.version()) {
+            available_versions.iter().collect()
+        } else {
+            available_versions
+                .iter()
+                .filter(|v| !v.is_prerelease())
+                .collect()
+        }
+    }
+
+    /// `min_age` が設定されていれば、現在時刻から逆算したリリース時刻以前のものだけを残す。
+    fn apply_age_filter<'a>(&self, candidates: Vec<&'a VersionInfo>) -> Vec<&'a VersionInfo> {
+        let Some(min_age) = self.filter.min_age else {
+            return candidates;
+        };
+        // chrono::Duration は i64 ナノ秒 (約292年) が上限。変換失敗時は age 制約を無視して全候補を通す。
+        let Ok(chrono_duration) = chrono::Duration::from_std(min_age) else {
+            return candidates;
+        };
+        let min_release_time = self.now - chrono_duration;
+        candidates
+            .into_iter()
+            .filter(|v| v.released_at <= min_release_time)
+            .collect()
+    }
+}
+
+/// Range 制約の上限を超える候補を除外する。
+/// 例: `">=3.5.0,<4.0.0"` なら 4.0.0 以上を除外する。
+fn apply_range_upper_bound<'a>(
+    dependency: &Dependency,
+    candidates: Vec<&'a VersionInfo>,
+) -> Vec<&'a VersionInfo> {
+    if dependency.version_spec.kind != VersionSpecKind::Range {
+        return candidates;
+    }
+    let Some((upper_bound, inclusive)) = extract_upper_bound(&dependency.version_spec.raw) else {
+        return candidates;
+    };
+    candidates
+        .into_iter()
+        .filter(
+            |v| match version_info::compare_versions(&v.version, &upper_bound) {
+                std::cmp::Ordering::Less => true,
+                std::cmp::Ordering::Equal => inclusive,
+                std::cmp::Ordering::Greater => false,
+            },
+        )
+        .collect()
+}
+
+/// `--max-change` で許容レベルを超える候補を除外する。
+/// 比較不能 / 同一バージョンの候補は通す。
+fn apply_max_change_filter<'a>(
+    dependency: &Dependency,
+    eligible: &[&'a VersionInfo],
+    max_change: Option<crate::domain::ChangeLevel>,
+) -> Vec<&'a VersionInfo> {
+    let Some(max) = max_change else {
+        return eligible.to_vec();
+    };
+    let current = dependency.version();
+    eligible
+        .iter()
+        .copied()
+        .filter(|v| {
+            crate::domain::ChangeLevel::from_versions(current, &v.version)
+                .is_none_or(|level| level <= max)
+        })
+        .collect()
+}
+
+/// 最新候補を選び、ダウングレード防止・更新先制約フォーマット可否を判定して結果を返す。
+fn select_latest_candidate(
+    dependency: &Dependency,
+    eligible: &[&VersionInfo],
+    allowed: &[&VersionInfo],
+    max_change: Option<crate::domain::ChangeLevel>,
+) -> UpdateResult {
+    // semver 比較で最新の更新候補を選ぶ
+    let latest = allowed.iter().max().unwrap();
+
+    // 現在版が最新以上ならダウングレードを防いでスキップする
+    if version_info::compare_versions(dependency.version(), &latest.version)
+        != std::cmp::Ordering::Less
+    {
+        // max_change で除外された「より新しい候補」が存在すれば ChangeLevelLimited
+        if let Some(max) = max_change {
+            let current = dependency.version();
+            let has_newer_excluded = eligible.iter().any(|v| {
+                version_info::compare_versions(&v.version, current) == std::cmp::Ordering::Greater
+                    && crate::domain::ChangeLevel::from_versions(current, &v.version)
+                        .is_some_and(|level| level > max)
+            });
+            if has_newer_excluded {
+                return UpdateResult::skip(dependency.clone(), SkipReason::ChangeLevelLimited(max));
+            }
+        }
+        return UpdateResult::skip_already_latest_with_date(dependency.clone(), latest.released_at);
+    }
+
+    // 更新先の文字列表現を安全に組み立てられない制約は更新対象にしない
+    if dependency
+        .version_spec
+        .try_format_updated(&latest.version)
+        .is_none()
+    {
+        return UpdateResult::skip(
+            dependency.clone(),
+            SkipReason::ParseError("constraint cannot be updated safely".to_string()),
+        );
+    }
+
+    UpdateResult::update_with_date(dependency.clone(), &latest.version, latest.released_at)
 }
 
 #[cfg(test)]

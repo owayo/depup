@@ -163,14 +163,26 @@ pub struct CliArgs {
 impl CliArgs {
     /// 言語フィルタが指定されているかを確認する
     pub fn has_language_filter(&self) -> bool {
-        self.node
-            || self.python
-            || self.rust_lang
-            || self.go
-            || self.ruby
-            || self.php
-            || self.java
-            || self.swift
+        !self.selected_languages().is_empty()
+    }
+
+    /// CLI フラグで選択された言語の一覧を返す (順序: Node, Python, Rust, Go, Ruby, PHP, Java, Swift)
+    pub fn selected_languages(&self) -> Vec<crate::domain::Language> {
+        use crate::domain::Language;
+        let flags: [(bool, Language); 8] = [
+            (self.node, Language::Node),
+            (self.python, Language::Python),
+            (self.rust_lang, Language::Rust),
+            (self.go, Language::Go),
+            (self.ruby, Language::Ruby),
+            (self.php, Language::Php),
+            (self.java, Language::Java),
+            (self.swift, Language::Swift),
+        ];
+        flags
+            .into_iter()
+            .filter_map(|(on, lang)| on.then_some(lang))
+            .collect()
     }
 
     /// 指定された言語を処理すべきかを確認する

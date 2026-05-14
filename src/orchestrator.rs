@@ -65,6 +65,114 @@ struct ProjectAge {
     source: String,
 }
 
+/// パース済みマニフェスト (parse_phase → check_phase の受け渡し用)
+struct ParsedManifest<'a> {
+    info: &'a ManifestInfo,
+    dependencies: Vec<Dependency>,
+}
+
+/// `resolve_age_policy` が返す age 解決結果。
+/// `notice` の表示は呼び出し側で行う (副作用を解決ロジックから分離)。
+struct ResolvedAge {
+    duration: Option<Duration>,
+    notice: Option<AgeNotice>,
+}
+
+/// age 解決の過程でユーザーに伝えるべき通知。
+enum AgeNotice {
+    /// CLI 指定 (`--age` / `--no-age`) がプロジェクト minimumReleaseAge に上書きされた (警告)
+    CliOverriddenByProject {
+        cli_label: &'static str,
+        days: u64,
+        source: String,
+    },
+    /// CLI 指定なし、プロジェクト minimumReleaseAge を採用 (情報通知)
+    UsingProjectPolicy { days: u64, source: String },
+}
+
+/// age 制約を優先順位どおりに解決する (純粋関数)。
+///
+/// 優先順位:
+///   1. minimumReleaseAge (pnpm-workspace.yaml / bunfig.toml) — プロジェクトポリシー強制
+///   2. CLI `--age`
+///   3. CLI `--no-age`
+///   4. グローバル設定 (~/.config/depup/config.toml)
+///   5. 組み込みデフォルト (`DEFAULT_AGE`)
+fn resolve_age_policy(
+    project_age: Option<&ProjectAge>,
+    cli_age: Option<Duration>,
+    cli_no_age: bool,
+    config_age: Option<Duration>,
+) -> ResolvedAge {
+    if let Some(project) = project_age {
+        let days = project.duration.as_secs() / 86400;
+        let notice = if cli_age.is_some() || cli_no_age {
+            let cli_label = if cli_no_age { "--no-age" } else { "--age" };
+            AgeNotice::CliOverriddenByProject {
+                cli_label,
+                days,
+                source: project.source.clone(),
+            }
+        } else {
+            AgeNotice::UsingProjectPolicy {
+                days,
+                source: project.source.clone(),
+            }
+        };
+        return ResolvedAge {
+            duration: Some(project.duration),
+            notice: Some(notice),
+        };
+    }
+
+    let duration = if cli_no_age {
+        None
+    } else if let Some(age) = cli_age {
+        Some(age)
+    } else if let Some(cfg_age) = config_age {
+        Some(cfg_age)
+    } else {
+        Some(DEFAULT_AGE)
+    };
+    ResolvedAge {
+        duration,
+        notice: None,
+    }
+}
+
+/// `AgeNotice` を stderr に表示する。
+fn emit_age_notice(notice: &AgeNotice) {
+    use colored::Colorize as _;
+    fn unit(days: u64) -> &'static str {
+        if days == 1 { "day" } else { "days" }
+    }
+    match notice {
+        AgeNotice::CliOverriddenByProject {
+            cli_label,
+            days,
+            source,
+        } => {
+            let msg = format!(
+                "⚠ {} ignored: project's minimumReleaseAge ({} {} from {}) takes precedence",
+                cli_label,
+                days,
+                unit(*days),
+                source,
+            );
+            eprintln!("{}", msg.yellow());
+        }
+        AgeNotice::UsingProjectPolicy { days, source } => {
+            let msg = format!(
+                "ℹ Using project's minimumReleaseAge ({} {} from {})",
+                days,
+                unit(*days),
+                source,
+            );
+            eprintln!("{}", msg.cyan());
+        }
+    }
+}
+
 /// 更新ワークフローを調整するオーケストレータ
 pub struct Orchestrator {
     /// 設定用CLI引数
@@ -458,93 +566,104 @@ impl Orchestrator {
             };
         }
 
-        // CLI引数から更新フィルタを構築
-        let filter = self.build_filter();
-        let judge = UpdateJudge::new(filter);
+        let judge = UpdateJudge::new(self.build_filter());
 
-        // ステップ2: マニフェストをパースし、全依存関係を収集
+        let parsed = self.parse_phase(manifests, progress, &mut errors);
+        self.check_phase(parsed, &judge, progress, &mut summary, &mut errors)
+            .await;
+        self.sync_tauri_if_needed(manifests, progress, &mut summary, &mut errors)
+            .await;
+        let write_results = self.write_phase(&summary, progress, &mut errors);
+
+        OrchestratorResult {
+            summary,
+            write_results,
+            errors,
+        }
+    }
+
+    /// パース phase: 各マニフェストを読み、依存配列を作る。
+    /// 言語フィルタに該当しないマニフェストはスキップ、読み込み/パースエラーは `errors` に追加して継続する。
+    /// Rust プロジェクトでは Cargo.lock から git 依存の現在コミットも補完する。
+    fn parse_phase<'a>(
+        &self,
+        manifests: &'a [ManifestInfo],
+        progress: &mut Progress,
+        errors: &mut Vec<OrchestratorError>,
+    ) -> Vec<ParsedManifest<'a>> {
         progress.spinner("Parsing manifests...");
-        let mut parsed_manifests = Vec::new();
-
-        for manifest_info in manifests {
-            // 言語フィルタをチェック
-            if !self.should_process_language(manifest_info.language) {
+        let mut parsed = Vec::new();
+        for info in manifests {
+            if !self.should_process_language(info.language) {
                 continue;
             }
-
-            // マニフェストをパース
-            let parser = get_parser(manifest_info.language);
-            let content = match std::fs::read_to_string(&manifest_info.path) {
+            let parser = get_parser(info.language);
+            let content = match std::fs::read_to_string(&info.path) {
                 Ok(c) => c,
                 Err(e) => {
                     errors.push(OrchestratorError::ManifestParseError {
-                        path: manifest_info.path.display().to_string(),
+                        path: info.path.display().to_string(),
                         message: e.to_string(),
                     });
                     continue;
                 }
             };
-
             let mut dependencies = match parser.parse(&content) {
                 Ok(deps) => deps,
                 Err(e) => {
                     errors.push(OrchestratorError::ManifestParseError {
-                        path: manifest_info.path.display().to_string(),
+                        path: info.path.display().to_string(),
                         message: e.to_string(),
                     });
                     continue;
                 }
             };
-
-            // Rust プロジェクトでは Cargo.lock から git 依存の現在コミットを補完する
-            if manifest_info.language == Language::Rust {
-                enrich_with_cargo_lock(&manifest_info.path, &mut dependencies);
+            if info.language == Language::Rust {
+                enrich_with_cargo_lock(&info.path, &mut dependencies);
             }
-
-            parsed_manifests.push((manifest_info, dependencies));
+            parsed.push(ParsedManifest { info, dependencies });
         }
         progress.finish_and_clear();
+        parsed
+    }
 
-        // プログレスバー用に依存関係の合計数をカウント
-        let total_deps: usize = parsed_manifests.iter().map(|(_, deps)| deps.len()).sum();
-
-        // ステップ3: 各依存関係のバージョンを取得し、更新を判定
+    /// チェック phase: 各依存のバージョンを並列取得し、`judge` で判定して `summary` に集約する。
+    async fn check_phase<'a>(
+        &self,
+        parsed: Vec<ParsedManifest<'a>>,
+        judge: &UpdateJudge,
+        progress: &mut Progress,
+        summary: &mut UpdateSummary,
+        errors: &mut Vec<OrchestratorError>,
+    ) {
+        let total_deps: usize = parsed.iter().map(|p| p.dependencies.len()).sum();
         progress.start(total_deps as u64, "Checking dependencies");
-
-        // 並列タスクから進捗を直接更新するため、ProgressBar の参照を取得
         let progress_bar = progress.bar();
 
-        for (manifest_info, dependencies) in parsed_manifests {
-            let mut manifest_result =
-                ManifestUpdateResult::new(&manifest_info.path, manifest_info.language);
+        for ParsedManifest { info, dependencies } in parsed {
+            let mut manifest_result = ManifestUpdateResult::new(&info.path, info.language);
             // 複数 future から共有するため Arc に変換
             let adapter: Arc<dyn RegistryAdapter + Send + Sync> =
-                Arc::from(self.get_adapter(manifest_info.language));
+                Arc::from(self.get_adapter(info.language));
 
-            // 依存数に応じて並列度を調整 (1〜4)
-            let concurrency = version_check_concurrency(dependencies.len());
-
-            // 各依存関係を並列処理する。結果は入力順で返されるため
-            // 出力順は安定する (`buffered`: ordered)。
+            // 依存数に応じて並列度を調整 (1〜4)。
+            // 結果は入力順で返るため出力順は安定する (`buffered`: ordered)。
             // fetch_versions は内部でレジストリ別の Semaphore を持つため、
             // crates.io のレート制限などは従来どおり尊重される。
-            //
-            // 各タスクの開始 / OSV 開始 / 完了タイミングで `ProgressBar` を直接
-            // 更新するため、collect 前から `pos` と `msg` が動く。
+            // 各タスクの開始/OSV 開始/完了で `ProgressBar` を直接更新するため、
+            // collect 前から `pos` と `msg` が動く。
+            let concurrency = version_check_concurrency(dependencies.len());
             let results: Vec<OnePassResult> = stream::iter(dependencies)
                 .map(|dep| {
                     let adapter = Arc::clone(&adapter);
-                    let judge_ref = &judge;
                     let bar = progress_bar.clone();
                     async move {
                         if let Some(ref b) = bar {
                             b.set_message(format!("Checking {}", dep.name));
                         }
-
                         let result = self
-                            .process_one_dependency(dep, &*adapter, judge_ref, bar.as_ref())
+                            .process_one_dependency(dep, &*adapter, judge, bar.as_ref())
                             .await;
-
                         if let Some(ref b) = bar {
                             b.inc(1);
                         }
@@ -555,7 +674,7 @@ impl Orchestrator {
                 .collect()
                 .await;
 
-            // errors / manifest_result を順序を保って集約する (progress は既に並列タスク側で更新済み)
+            // errors / manifest_result を順序を保って集約 (progress は並列タスク側で更新済み)
             for result in results {
                 if let Some(err_msg) = result.fetch_error {
                     errors.push(OrchestratorError::RegistryError {
@@ -573,21 +692,34 @@ impl Orchestrator {
                     ResultOutcome::Skip(r) => manifest_result.add_result(r),
                 }
             }
-
             summary.add_manifest(manifest_result);
         }
         progress.finish_and_clear();
+    }
 
-        // ステップ3.5: Tauriプロジェクトの場合、バージョンを同期
-        let is_tauri = manifests.iter().any(|m| m.is_tauri_rust);
-        if is_tauri {
-            progress.spinner("Synchronizing Tauri versions...");
-            self.synchronize_tauri_versions(&mut summary, &mut errors)
-                .await;
-            progress.finish_and_clear();
+    /// Tauri プロジェクトが含まれていれば、npm / crate のバージョンを同期する。
+    async fn sync_tauri_if_needed(
+        &self,
+        manifests: &[ManifestInfo],
+        progress: &mut Progress,
+        summary: &mut UpdateSummary,
+        errors: &mut Vec<OrchestratorError>,
+    ) {
+        if !manifests.iter().any(|m| m.is_tauri_rust) {
+            return;
         }
+        progress.spinner("Synchronizing Tauri versions...");
+        self.synchronize_tauri_versions(summary, errors).await;
+        progress.finish_and_clear();
+    }
 
-        // ステップ4: 更新を適用 (ドライランでなければ)
+    /// 書き込み phase: 更新を適用 (`dry_run` ならプレビューのみ) し、書き込みエラーを集約する。
+    fn write_phase(
+        &self,
+        summary: &UpdateSummary,
+        progress: &mut Progress,
+        errors: &mut Vec<OrchestratorError>,
+    ) -> Vec<WriteResult> {
         if !self.args.dry_run {
             progress.spinner("Writing updates...");
         }
@@ -595,7 +727,6 @@ impl Orchestrator {
         let write_results = writer.apply_all_updates(&summary.manifests, get_parser);
         progress.finish_and_clear();
 
-        // 書き込みエラーを収集
         for result in &write_results {
             for error in &result.errors {
                 errors.push(OrchestratorError::WriteError {
@@ -604,12 +735,7 @@ impl Orchestrator {
                 });
             }
         }
-
-        OrchestratorResult {
-            summary,
-            write_results,
-            errors,
-        }
+        write_results
     }
 
     /// CLI引数からUpdateFilterを構築する
@@ -617,33 +743,9 @@ impl Orchestrator {
         let mut filter = UpdateFilter::new();
 
         // 言語フィルタ
-        if self.args.has_language_filter() {
-            let mut languages = Vec::new();
-            if self.args.node {
-                languages.push(Language::Node);
-            }
-            if self.args.python {
-                languages.push(Language::Python);
-            }
-            if self.args.rust_lang {
-                languages.push(Language::Rust);
-            }
-            if self.args.go {
-                languages.push(Language::Go);
-            }
-            if self.args.ruby {
-                languages.push(Language::Ruby);
-            }
-            if self.args.php {
-                languages.push(Language::Php);
-            }
-            if self.args.java {
-                languages.push(Language::Java);
-            }
-            if self.args.swift {
-                languages.push(Language::Swift);
-            }
-            filter = filter.with_languages(languages);
+        let selected = self.args.selected_languages();
+        if !selected.is_empty() {
+            filter = filter.with_languages(selected);
         }
 
         // パッケージフィルタ
@@ -659,50 +761,18 @@ impl Orchestrator {
             filter = filter.with_include_pinned(true);
         }
 
-        // 経過日数フィルタ
-        // 優先順位 (絶対優先案):
-        //   1. minimumReleaseAge (pnpm-workspace.yaml / bunfig.toml) — プロジェクトポリシー強制
-        //   2. CLI --age
-        //   3. --no-age (上 2 つが無い時のみ有効、age 制約なし)
-        //   4. グローバル設定 (~/.config/depup/config.toml) の age
-        //   5. 組み込みデフォルト 1w
+        // 経過日数フィルタ (解決ロジックは `resolve_age_policy` に分離)
         let project_age = self.read_project_minimum_release_age();
-        let resolved_age: Option<Duration> = if let Some(project) = project_age.as_ref() {
-            use colored::Colorize as _;
-            let days = project.duration.as_secs() / 86400;
-            let unit = if days == 1 { "day" } else { "days" };
-            if self.args.age.is_some() || self.args.no_age {
-                // CLI 指定が project policy で上書きされる場合は警告
-                let cli_label = if self.args.no_age {
-                    "--no-age"
-                } else {
-                    "--age"
-                };
-                let msg = format!(
-                    "⚠ {} ignored: project's minimumReleaseAge ({} {} from {}) takes precedence",
-                    cli_label, days, unit, project.source
-                );
-                eprintln!("{}", msg.yellow());
-            } else {
-                // CLI 指定なしでプロジェクト設定が採用された場合は情報通知
-                let msg = format!(
-                    "ℹ Using project's minimumReleaseAge ({} {} from {})",
-                    days, unit, project.source
-                );
-                eprintln!("{}", msg.cyan());
-            }
-            Some(project.duration)
-        } else if self.args.no_age {
-            None
-        } else if let Some(age) = self.args.age {
-            Some(age)
-        } else if let Some(cfg_age) = self.global_config.as_ref().and_then(|c| c.age_duration()) {
-            Some(cfg_age)
-        } else {
-            Some(DEFAULT_AGE)
-        };
-
-        if let Some(age) = resolved_age {
+        let resolved = resolve_age_policy(
+            project_age.as_ref(),
+            self.args.age,
+            self.args.no_age,
+            self.global_config.as_ref().and_then(|c| c.age_duration()),
+        );
+        if let Some(notice) = resolved.notice.as_ref() {
+            emit_age_notice(notice);
+        }
+        if let Some(age) = resolved.duration {
             filter = filter.with_min_age(age);
         }
 
