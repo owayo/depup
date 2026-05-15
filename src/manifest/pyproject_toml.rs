@@ -699,6 +699,22 @@ dependencies = [
     }
 
     #[test]
+    fn test_parse_pep508_range_version_with_trailing_comma() {
+        let content = r#"
+[project]
+dependencies = [
+    "paramiko>=3.5.0,<4.0.0,",
+]
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "paramiko");
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Range);
+        assert_eq!(deps[0].version_spec.raw, ">=3.5.0,<4.0.0,");
+    }
+
+    #[test]
     fn test_parse_pep508_parenthesized_version_spec() {
         let content = r#"
 [project]
@@ -736,6 +752,26 @@ dependencies = [
         assert!(
             !result.contains("paramiko3.9.1"),
             "Version should not be concatenated with package name"
+        );
+    }
+
+    #[test]
+    fn test_update_pep508_range_preserves_trailing_comma() {
+        let content = r#"
+[project]
+dependencies = [
+    "paramiko>=3.5.0,<4.0.0,",
+]
+"#;
+
+        let result = PyprojectTomlParser
+            .update_version(content, "paramiko", "3.9.1")
+            .unwrap();
+
+        assert!(
+            result.contains("paramiko>=3.9.1,<4.0.0,"),
+            "末尾カンマ付きの PEP 508 range を維持できていません: {}",
+            result
         );
     }
 

@@ -26,7 +26,7 @@ static OP_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 static RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-            r"^(?:\s*(?:===|==|!=|~=|>=|<=|>|<)\s*[0-9A-Za-z][0-9A-Za-z._!+-]*(?:\*)?\s*,)+\s*(?:===|==|!=|~=|>=|<=|>|<)\s*[0-9A-Za-z][0-9A-Za-z._!+-]*(?:\*)?\s*$",
+            r"^(?:\s*(?:===|==|!=|~=|>=|<=|>|<)\s*[0-9A-Za-z][0-9A-Za-z._!+-]*(?:\*)?\s*,)*\s*(?:===|==|!=|~=|>=|<=|>|<)\s*[0-9A-Za-z][0-9A-Za-z._!+-]*(?:\*)?\s*,?\s*$",
         )
         .unwrap()
 });
@@ -242,6 +242,23 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_range_with_trailing_comma() {
+        // PyPA の dependency specifier は version_many の末尾カンマを許容する
+        let spec = parse(">=1.0,<2.0,").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.raw, ">=1.0,<2.0,");
+        assert_eq!(spec.version, "1.0");
+    }
+
+    #[test]
+    fn test_parse_single_constraint_with_trailing_comma() {
+        // version_many は単一指定でも末尾カンマを許容する
+        let spec = parse(">=1.0,").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1.0");
+    }
+
+    #[test]
     fn test_parse_not_equal_as_range() {
         let spec = parse("!=1.2.3").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Range);
@@ -314,6 +331,12 @@ mod tests {
         assert!(spec.prefix.is_none());
         assert!(spec.suffix.is_none());
         assert_eq!(spec.format_updated("3.9.1"), ">=3.9.1,<4.0.0");
+    }
+
+    #[test]
+    fn test_format_updated_range_preserves_trailing_comma() {
+        let spec = parse(">=3.5.0,<4.0.0,").unwrap();
+        assert_eq!(spec.format_updated("3.9.1"), ">=3.9.1,<4.0.0,");
     }
 
     #[test]
