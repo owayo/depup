@@ -234,7 +234,8 @@ impl UpdateJudge {
 
         let stable = self.stable_candidates(dependency, available_versions);
         let age_filtered = self.apply_age_filter(stable);
-        let eligible = apply_range_upper_bound(dependency, age_filtered);
+        let range_filtered = apply_range_upper_bound(dependency, age_filtered);
+        let eligible = apply_rejected_versions(dependency, range_filtered);
 
         if eligible.is_empty() {
             return UpdateResult::skip(dependency.clone(), SkipReason::NoSuitableVersion);
@@ -306,6 +307,44 @@ fn apply_range_upper_bound<'a>(
                 std::cmp::Ordering::Greater => false,
             },
         )
+        .collect()
+}
+
+fn matches_rejected_version(candidate: &str, rejected: &str) -> bool {
+    let rejected = rejected.trim();
+    if rejected.is_empty() {
+        return false;
+    }
+
+    if rejected == "+" {
+        return true;
+    }
+
+    if let Some(prefix) = rejected.strip_suffix('+') {
+        return candidate.starts_with(prefix);
+    }
+
+    candidate == rejected
+}
+
+/// Gradle rich version の `reject` で指定された候補を除外する。
+fn apply_rejected_versions<'a>(
+    dependency: &Dependency,
+    candidates: Vec<&'a VersionInfo>,
+) -> Vec<&'a VersionInfo> {
+    if dependency.version_spec.rejected_versions.is_empty() {
+        return candidates;
+    }
+
+    candidates
+        .into_iter()
+        .filter(|candidate| {
+            !dependency
+                .version_spec
+                .rejected_versions
+                .iter()
+                .any(|rejected| matches_rejected_version(&candidate.version, rejected))
+        })
         .collect()
 }
 
@@ -1233,6 +1272,42 @@ mod tests {
         if let UpdateResult::Update { new_version, .. } = result {
             // 4.0.0 ではなく 3.9.0 に更新される
             assert_eq!(new_version, "3.9.0");
+        }
+    }
+
+    #[test]
+    fn test_judge_rejected_versions_are_excluded() {
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+        let spec = VersionSpec::new(VersionSpecKind::Range, "[1.0,2.0[", "1.5")
+            .with_rejected_versions(["1.7"]);
+        let dep = Dependency::new("org.example:demo", spec, false, Language::Java);
+        let versions = vec![make_version_info("1.6", 50), make_version_info("1.7", 20)];
+
+        let result = judge.judge(&dep, &versions);
+        match result {
+            UpdateResult::Update { new_version, .. } => {
+                assert_eq!(new_version, "1.6");
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_judge_rejected_dynamic_versions_are_excluded() {
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+        let spec = VersionSpec::new(VersionSpecKind::Range, "[1.0,3.0[", "1.5")
+            .with_rejected_versions(["2.+"]);
+        let dep = Dependency::new("org.example:demo", spec, false, Language::Java);
+        let versions = vec![make_version_info("1.9", 50), make_version_info("2.1", 20)];
+
+        let result = judge.judge(&dep, &versions);
+        match result {
+            UpdateResult::Update { new_version, .. } => {
+                assert_eq!(new_version, "1.9");
+            }
+            other => panic!("unexpected result: {other:?}"),
         }
     }
 

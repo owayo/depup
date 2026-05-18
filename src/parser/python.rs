@@ -94,6 +94,14 @@ impl VersionParser for PythonVersionParser {
                     VersionSpec::new(VersionSpecKind::Exact, trimmed, normalized).with_prefix(op)
                 }
                 "~=" => {
+                    if normalized
+                        .split('.')
+                        .filter(|part| !part.is_empty())
+                        .count()
+                        < 2
+                    {
+                        return None;
+                    }
                     VersionSpec::new(VersionSpecKind::Tilde, trimmed, normalized).with_prefix("~=")
                 }
                 ">=" => VersionSpec::new(VersionSpecKind::GreaterOrEqual, trimmed, normalized)
@@ -367,6 +375,12 @@ mod tests {
         assert_eq!(spec.kind, VersionSpecKind::Tilde);
         assert_eq!(spec.version, "1.2");
         assert_eq!(spec.prefix, Some("~=".to_string()));
+    }
+
+    #[test]
+    fn test_parse_compatible_release_single_segment_is_invalid() {
+        // PEP 440 では ~=1 のような単一セグメント指定は無効
+        assert!(parse("~=1").is_none());
     }
 
     #[test]

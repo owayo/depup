@@ -37,6 +37,7 @@ enum RichVersionMethod {
     Strictly,
     Require,
     Prefer,
+    Reject,
 }
 
 /// rich version ブロック内で見つけた 1 つの宣言
@@ -107,10 +108,15 @@ static DEP_STRING_NO_VERSION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"^\s*(\w+)\s*[\(\s]*['"]([^:'"]+):([^:'"]+)['"]\s*\)?\s*(?:\{|$)"#).unwrap()
 });
 
-// rich version 宣言: strictly("1.2.3") / require '1.2.3' / prefer "1.2.3"
+// rich version 宣言: strictly("1.2.3") / require '1.2.3' / prefer "1.2.3" / reject("1.2.3")
 static RICH_VERSION_DECL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"\b(strictly|require|prefer)\s*(?:\(\s*)?['"]([^'"]+)['"]\s*\)?"#).unwrap()
+    Regex::new(
+        r#"\b(strictly|require|prefer|reject)\s*(?:\(\s*)?((?:"[^"]+"|'[^']+')(?:\s*,\s*(?:"[^"]+"|'[^']+'))*)\s*\)?"#,
+    )
+    .unwrap()
 });
+static RICH_VERSION_VALUE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#""([^"]+)"|'([^']+)'"#).unwrap());
 
 // 開発用 configuration
 const DEV_CONFIGURATIONS: [&str; 6] = [
@@ -127,6 +133,7 @@ fn rich_version_method(name: &str) -> Option<RichVersionMethod> {
         "strictly" => Some(RichVersionMethod::Strictly),
         "require" => Some(RichVersionMethod::Require),
         "prefer" => Some(RichVersionMethod::Prefer),
+        "reject" => Some(RichVersionMethod::Reject),
         _ => None,
     }
 }
@@ -492,6 +499,7 @@ impl GradleParser {
     ) -> Option<RichVersionSelection> {
         let mut strong: Option<RichVersionMatch> = None;
         let mut prefer: Option<RichVersionMatch> = None;
+        let mut rejected_versions = Vec::new();
         let mut in_block_comment = false;
 
         for (line_offset, line) in block_lines.iter().enumerate() {
@@ -503,14 +511,36 @@ impl GradleParser {
 
             for caps in RICH_VERSION_DECL.captures_iter(&code) {
                 let method = rich_version_method(caps.get(1)?.as_str())?;
-                let version_match = caps.get(2)?;
+                let args_match = caps.get(2)?;
+                let args = args_match.as_str();
+
+                if method == RichVersionMethod::Reject {
+                    for value_caps in RICH_VERSION_VALUE.captures_iter(args) {
+                        let Some(value_match) = value_caps.get(1).or_else(|| value_caps.get(2))
+                        else {
+                            continue;
+                        };
+                        rejected_versions.push(value_match.as_str().to_string());
+                    }
+                    continue;
+                }
+
+                let Some(value_caps) = RICH_VERSION_VALUE.captures(args) else {
+                    continue;
+                };
+                let Some(version_match) = value_caps.get(1).or_else(|| value_caps.get(2)) else {
+                    continue;
+                };
                 let version = version_match.as_str();
                 let found = RichVersionMatch {
                     spec: parser.parse(version),
                     line_offset,
-                    value_start: version_match.start(),
-                    value_end: version_match.end(),
+                    value_start: args_match.start() + version_match.start(),
+                    value_end: args_match.start() + version_match.end(),
                 };
+
+                // Gradle の MutableVersionConstraint は後続の version 宣言で既存の reject を消す。
+                rejected_versions.clear();
 
                 match method {
                     RichVersionMethod::Strictly | RichVersionMethod::Require => {
@@ -520,6 +550,7 @@ impl GradleParser {
                     RichVersionMethod::Prefer => {
                         prefer = Some(found);
                     }
+                    RichVersionMethod::Reject => {}
                 }
             }
         }
@@ -537,7 +568,8 @@ impl GradleParser {
                         VersionSpecKind::Range,
                         strong_spec.raw,
                         prefer_spec.version,
-                    ),
+                    )
+                    .with_rejected_versions(rejected_versions.clone()),
                     update_line_offset: prefer_match.line_offset,
                     value_start: prefer_match.value_start,
                     value_end: prefer_match.value_end,
@@ -545,7 +577,7 @@ impl GradleParser {
             }
 
             return Some(RichVersionSelection {
-                spec: strong_spec,
+                spec: strong_spec.with_rejected_versions(rejected_versions),
                 update_line_offset: strong_match.line_offset,
                 value_start: strong_match.value_start,
                 value_end: strong_match.value_end,
@@ -554,7 +586,7 @@ impl GradleParser {
 
         let prefer_match = prefer?;
         Some(RichVersionSelection {
-            spec: prefer_match.spec?,
+            spec: prefer_match.spec?.with_rejected_versions(rejected_versions),
             update_line_offset: prefer_match.line_offset,
             value_start: prefer_match.value_start,
             value_end: prefer_match.value_end,
@@ -1235,6 +1267,73 @@ dependencies {
             }
             other => panic!("unexpected result: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_parse_rich_version_rejects() {
+        let content = r#"
+dependencies {
+    implementation("org.slf4j:slf4j-api") {
+        version {
+            strictly("[1.7, 1.8[")
+            prefer("1.7.25")
+            reject("1.7.36", "1.7.37")
+        }
+    }
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(
+            deps[0].version_spec.rejected_versions,
+            vec!["1.7.36", "1.7.37"]
+        );
+    }
+
+    #[test]
+    fn test_judge_rich_version_rejects_candidate() {
+        let content = r#"
+dependencies {
+    implementation("org.slf4j:slf4j-api") {
+        version {
+            strictly("[1.7, 1.8[")
+            prefer("1.7.25")
+            reject("1.7.36")
+        }
+    }
+}
+"#;
+        let dep = parse(content).unwrap().remove(0);
+        let released_at = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let versions = vec![
+            VersionInfo::new("1.7.35", released_at),
+            VersionInfo::new("1.7.36", released_at),
+        ];
+
+        let result = UpdateJudge::new(UpdateFilter::new()).judge(&dep, &versions);
+        match result {
+            UpdateResult::Update { new_version, .. } => {
+                assert_eq!(new_version, "1.7.35");
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rich_version_declaration_clears_previous_rejects() {
+        let content = r#"
+dependencies {
+    implementation("org.slf4j:slf4j-api") {
+        version {
+            reject("1.7.36")
+            prefer("1.7.25")
+        }
+    }
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert!(deps[0].version_spec.rejected_versions.is_empty());
     }
 
     #[test]

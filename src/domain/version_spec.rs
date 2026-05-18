@@ -57,6 +57,9 @@ pub struct VersionSpec {
     pub prefix: Option<String>,
     /// 更新時に保持する接尾辞。例: コメント
     pub suffix: Option<String>,
+    /// 更新候補から除外するバージョン。例: Gradle rich version の `reject`
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rejected_versions: Vec<String>,
 }
 
 fn extract_numeric_parts(new_version: &str) -> Option<Vec<String>> {
@@ -336,6 +339,7 @@ impl VersionSpec {
             version: version.into(),
             prefix: None,
             suffix: None,
+            rejected_versions: Vec::new(),
         }
     }
 
@@ -348,6 +352,16 @@ impl VersionSpec {
     /// 接尾辞付きの VersionSpec を作る
     pub fn with_suffix(mut self, suffix: impl Into<String>) -> Self {
         self.suffix = Some(suffix.into());
+        self
+    }
+
+    /// 拒否バージョン一覧付きの VersionSpec を作る
+    pub fn with_rejected_versions<I, S>(mut self, versions: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.rejected_versions = versions.into_iter().map(Into::into).collect();
         self
     }
 
@@ -718,6 +732,7 @@ mod tests {
             version: String::new(),
             prefix: None,
             suffix: None,
+            rejected_versions: Vec::new(),
         };
         assert_eq!(spec.try_format_updated("1.2.3").as_deref(), Some("1.2.3"));
     }
@@ -748,6 +763,15 @@ mod tests {
         let json = serde_json::to_string(&spec).unwrap();
         let parsed: VersionSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, spec);
+    }
+
+    #[test]
+    fn test_serde_version_spec_rejected_versions() {
+        let spec = VersionSpec::new(VersionSpecKind::Range, "[1.0,2.0[", "1.5")
+            .with_rejected_versions(["1.6", "1.7"]);
+        let json = serde_json::to_string(&spec).unwrap();
+        let parsed: VersionSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.rejected_versions, vec!["1.6", "1.7"]);
     }
 
     // --- Swift レンジ演算子の追加テスト ---

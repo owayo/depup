@@ -289,7 +289,9 @@ prefer("1.7.25") → prefer("1.7.36") (Gradle rich version inside a strict range
 
 Floating selectors such as `"*"`, npm dist-tags like `"latest"`, and Gradle dynamic selectors (`"latest.release"`, `"latest.integration"`, `"latest.milestone"`, and any user-defined `latest.<status>`) are skipped to avoid changing them into exact versions.
 
-Gradle rich version declarations using `strictly`, `require`, and `prefer` are parsed in dependency blocks such as `implementation("org.slf4j:slf4j-api") { version { ... } }`. When `strictly` or `require` declares a range and `prefer` declares the selected version, depup keeps the range as the upper-bound constraint and updates the `prefer` value.
+Gradle rich version declarations using `strictly`, `require`, `prefer`, and `reject` are parsed in dependency blocks such as `implementation("org.slf4j:slf4j-api") { version { ... } }`. When `strictly` or `require` declares a range and `prefer` declares the selected version, depup keeps the range as the upper-bound constraint and updates the `prefer` value. Versions listed with `reject` are excluded from update candidates, including dynamic rejects such as `2.+`.
+
+Python compatible release clauses follow PEP 440: `~=1.2` and `~=1.2.3` are valid, while the invalid single-segment form `~=1` is skipped.
 
 ### Range Constraints
 
