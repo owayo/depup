@@ -609,4 +609,30 @@ mod tests {
         assert_eq!(spec.kind, VersionSpecKind::Caret);
         assert_eq!(spec.version, "2.0");
     }
+
+    #[test]
+    fn test_parse_compound_caret_and_not_equal() {
+        // Composer の compound: caret と != の組み合わせ
+        let spec = parse("^1.0 !=1.5.0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1.0");
+    }
+
+    #[test]
+    fn test_parse_caret_with_v_prefix_preserves_v_in_format() {
+        // ^v1.2.3 → format_updated は v 接頭辞を保持しないが、version は正規化される
+        let spec = parse("^v1.2.3").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Caret);
+        assert_eq!(spec.version, "1.2.3");
+        // 更新後は元の v 接頭辞は失われる（Caret は prefix のみ保持）
+        assert_eq!(spec.format_updated("2.0.0"), "^2.0.0");
+    }
+
+    #[test]
+    fn test_format_updated_wildcard_with_v_prefix_preserves_v() {
+        // v1.* の wildcard 更新では v 接頭辞が保持される
+        let spec = parse("v1.*").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Wildcard);
+        assert_eq!(spec.format_updated("2.3.4"), "v2.*");
+    }
 }

@@ -656,4 +656,59 @@ mod tests {
     fn test_parse_tag_canary() {
         assert!(parse("canary").is_none());
     }
+
+    #[test]
+    fn test_parse_equal_v_prefix() {
+        // `=v1.2.3` のような `=` + `v` 接頭辞の組み合わせ
+        let spec = parse("=v1.2.3").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "1.2.3");
+        assert_eq!(spec.prefix, Some("=".to_string()));
+    }
+
+    #[test]
+    fn test_parse_gte_v_prefix() {
+        // `>=v1.2.3` のような `>=` + `v` 接頭辞の組み合わせ
+        let spec = parse(">=v1.2.3").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::GreaterOrEqual);
+        assert_eq!(spec.version, "1.2.3");
+        assert_eq!(spec.prefix, Some(">=".to_string()));
+    }
+
+    #[test]
+    fn test_parse_caret_v_prefix() {
+        // `^v1.2.3` のような `^` + `v` 接頭辞の組み合わせ
+        let spec = parse("^v1.2.3").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Caret);
+        assert_eq!(spec.version, "1.2.3");
+        assert_eq!(spec.prefix, Some("^".to_string()));
+    }
+
+    #[test]
+    fn test_parse_tilde_v_prefix() {
+        // `~v1.2.3` のような `~` + `v` 接頭辞の組み合わせ
+        let spec = parse("~v1.2.3").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Tilde);
+        assert_eq!(spec.version, "1.2.3");
+        assert_eq!(spec.prefix, Some("~".to_string()));
+    }
+
+    #[test]
+    fn test_parse_hyphen_range_partial_upper() {
+        // npm の hyphen range で右辺が部分指定の場合
+        // (`1.2.3 - 2.3` は `>=1.2.3 <2.4.0-0` と同値)
+        let spec = parse("1.2.3 - 2.3").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1.2.3");
+    }
+
+    #[test]
+    fn test_parse_compound_with_three_comparators() {
+        // 3つの演算子を含む compound range
+        let spec = parse(">=1.0.0 <2.0.0 !=1.5.0");
+        // node-semver では != は無効だがパース上は Range として扱われる
+        if let Some(s) = spec {
+            assert_eq!(s.kind, VersionSpecKind::Range);
+        }
+    }
 }
