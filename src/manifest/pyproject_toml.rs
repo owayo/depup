@@ -1073,6 +1073,19 @@ dependencies = [
     }
 
     #[test]
+    fn test_update_pep508_compound_not_equal_constraint_returns_err() {
+        let content = r#"
+[project]
+dependencies = [
+    "requests>=2.0, !=2.31.0, <3.0",
+]
+"#;
+
+        let result = PyprojectTomlParser.update_version(content, "requests", "2.32.0");
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_parse_dependency_group_with_extras_and_bare() {
         // extras付き・バージョンなし・通常のパッケージが混在するグループ
         let content = r#"

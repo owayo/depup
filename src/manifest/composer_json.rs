@@ -392,6 +392,18 @@ mod tests {
     }
 
     #[test]
+    fn test_update_version_compound_not_equal_constraint_returns_err() {
+        let content = r#"{
+  "require": {
+    "vendor/package": ">=1.0 !=1.5.0 <2.0"
+  }
+}"#;
+
+        let result = ComposerJsonParser.update_version(content, "vendor/package", "1.9.0");
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_update_version_not_found() {
         let content = r#"{
   "require": {}

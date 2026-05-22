@@ -266,15 +266,16 @@ fn find_inclusive_lower_bound_token(raw: &str) -> Option<(usize, usize)> {
     None
 }
 
+fn contains_not_equal_operator(raw: &str) -> bool {
+    // `!==` は各エコシステムの有効な制約ではないが、`!=` を含むので同じく拒否する
+    raw.as_bytes().windows(2).any(|window| window == b"!=")
+}
+
 fn format_range_like(raw: &str, new_version: &str) -> Option<String> {
     let trimmed = raw.trim();
     let leading_ws_len = raw.len() - raw.trim_start().len();
 
-    if trimmed.contains("||")
-        || trimmed.starts_with("!=")
-        || trimmed.contains(",!=")
-        || trimmed.contains(" !==")
-        || trimmed.starts_with("===")
+    if trimmed.contains("||") || contains_not_equal_operator(trimmed) || trimmed.starts_with("===")
     {
         return None;
     }
@@ -721,6 +722,18 @@ mod tests {
         // カンマ区切りの不等号制約は安全に書き換えられないため None を返す
         let spec = VersionSpec::new(VersionSpecKind::Range, ",!=1.2.3", "1.2.3");
         assert!(spec.try_format_updated("2.0.0").is_none());
+    }
+
+    #[test]
+    fn test_format_range_like_spaced_not_equal_rejected() {
+        // PEP 440 / Composer は `, !=` や空白区切りの `!=` を許容するが、
+        // 除外候補を選ばない保証がないため自動更新では拒否する
+        let comma_spaced =
+            VersionSpec::new(VersionSpecKind::Range, ">= 1.0, != 1.5.0, < 2.0", "1.0");
+        let space_separated = VersionSpec::new(VersionSpecKind::Range, ">=1.0 !=1.5.0 <2.0", "1.0");
+
+        assert!(comma_spaced.try_format_updated("1.9.0").is_none());
+        assert!(space_separated.try_format_updated("1.9.0").is_none());
     }
 
     #[test]
