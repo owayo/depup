@@ -256,6 +256,8 @@ Use `--include-pinned` to update pinned versions.
 >
 > **Note**: Gemfile entries that point to non-registry sources without a version (`git:`, `github:`, `bitbucket:`, `gist:`, `path:`, `source:`) are skipped instead of being converted into RubyGems registry constraints. Inline `group:` / `groups:` options are used to classify development dependencies.
 >
+> **Note**: Gemfile declarations can use either the common Ruby DSL form (`gem "rack", "~> 3.0"`) or parenthesized method-call form (`gem("rack", "~> 3.0")`). Both forms are parsed and updated while preserving the original call style.
+>
 > **Note**: Cargo renamed dependencies such as `alias = { package = "actual-crate", version = "1" }` are fetched by the real package name and written back through the manifest key. `--only` and `--exclude` accept either name.
 >
 > **Note**: When `--only` is present, it takes precedence over `--exclude`. This lets an explicit allow-list entry remain updatable even if the same package also appears in a broader exclude list.

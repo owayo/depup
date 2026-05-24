@@ -126,6 +126,7 @@ make help                # Makefileヘルプ
 - Go は常に pinned 扱い (`--include-pinned` 不要) だが、`// pinned` コメント付き依存は `--include-pinned` がないとスキップされる
 - Ruby の `group` ブロックはネストを考慮して判定され、内側の `:development` / `:test` を抜けた後の gem は開発依存として漏れない。`platforms` / `source` 等のネストされた `do...end` ブロックもブロック種別スタックで正しく追跡する。`source do` 内の `group :development do ... end` を抜けた後の gem も開発依存として漏れない。`group :development do # comment` のようにインラインコメントが付いた group 開始行も正しくグループとして認識される。`gem "rspec", group: :test` / `groups: [:development, :test]` のような行単位の group オプションも開発依存として扱う
 - Gemfile のバージョンなし `git:` / `github:` / `bitbucket:` / `gist:` / `path:` / `source:` 依存は RubyGems のレジストリ依存ではないため更新対象から除外する。バージョンが明示されている同種依存は Bundler のバージョンチェックとして解析対象にできる
+- Gemfile の `gem "rack", "~> 3.0"` 形式と `gem("rack", "~> 3.0")` の括弧付きメソッド呼び出し形式はどちらも解析・更新対象とし、更新時は元の呼び出し形式を保持する
 - Ruby のドット区切りプレリリース (例: `7.0.0.alpha.2`, `1.0.0.pre.1`) もパースと更新に対応する
 - Gemfile の複合制約・除外制約（例: `'>= 0.18', '< 2.0'`, `'!= 2.2.4'`）は解析対象だが、安全に書き換えられないため自動更新ではエラーとして扱う
 - Java/Gradle の strict 記法（例: `1.2.3!!`）は固定バージョンとして解釈され、`!!` を保持して更新される。Groovy の `group: 'x', name: 'y', version: 'z'` と Kotlin DSL の `group = "x", name = "y", version = "z"` の map 記法も解析・更新対象になる

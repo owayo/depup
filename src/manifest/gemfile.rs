@@ -23,14 +23,15 @@ enum GemfileBlock {
     Other,
 }
 
-// `gem 'name'` または `gem "name"` を解釈する正規表現
+// `gem 'name'` / `gem "name"` / `gem('name')` を解釈する正規表現
 static GEM_RE: LazyLock<Regex> = LazyLock::new(|| {
     // 例:
     // gem 'rails', '~> 7.0'
     // gem "pg", ">= 0.18", "< 2.0"
+    // gem("rack", "~> 3.0")
     // gem 'bcrypt'
     Regex::new(
-        r#"^\s*gem\s+['"]([^'"]+)['"](?:\s*,\s*['"]([^'"]+)['"])?(?:\s*,\s*['"]([^'"]+)['"])?(?:\s*,\s*['"]([^'"]+)['"])?(?:\s*,|\s*$|\s*#)"#,
+        r#"^\s*gem(?:\s+|\s*\(\s*)['"]([^'"]+)['"](?:\s*,\s*['"]([^'"]+)['"])?(?:\s*,\s*['"]([^'"]+)['"])?(?:\s*,\s*['"]([^'"]+)['"])?(?:\s*,|\s*\)?\s*$|\s*\)?\s*#)"#,
     )
     .unwrap()
 });
@@ -177,7 +178,7 @@ impl ManifestParser for GemfileParser {
         let escaped_name = regex::escape(package);
         let mut updated = false;
         let no_version_pattern = format!(
-            r#"(gem\s+)(['"])({escaped_name})(['"])(\s*(?:,\s*(?:require|group|git|path|branch|ref|tag|source|platforms?)\s*:|#|$))"#
+            r#"(gem(?:\s+|\s*\(\s*))(['"])({escaped_name})(['"])(\s*(?:(?:\)\s*)?(?:#|$)|,\s*(?:require|group|git|path|branch|ref|tag|source|platforms?)\s*:))"#
         );
 
         let no_version_re =
@@ -187,7 +188,8 @@ impl ManifestParser for GemfileParser {
                 message: format!("invalid regex pattern: {}", e),
             })?;
 
-        let simple_pattern = format!(r#"(gem\s+)(['"])({escaped_name})(['"])(\s*)$"#);
+        let simple_pattern =
+            format!(r#"(gem(?:\s+|\s*\(\s*))(['"])({escaped_name})(['"])(\s*\)?\s*)$"#);
 
         let simple_re =
             Regex::new(&simple_pattern).map_err(|e| ManifestError::InvalidVersionSpec {
@@ -348,6 +350,16 @@ gem 'rails', '~> 7.0'
         assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Tilde);
         assert_eq!(deps[0].version_spec.version, "7.0");
         assert!(!deps[0].is_dev);
+    }
+
+    #[test]
+    fn test_parse_parenthesized_gem() {
+        let content = r#"gem("rack", "~> 3.0")"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "rack");
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Tilde);
+        assert_eq!(deps[0].version_spec.version, "3.0");
     }
 
     #[test]
@@ -568,6 +580,15 @@ gem 'pg', '~> 1.1'
     }
 
     #[test]
+    fn test_update_version_parenthesized_gem() {
+        let content = r#"gem("rack", "~> 3.0")"#;
+        let result = GemfileParser
+            .update_version(content, "rack", "3.1.0")
+            .unwrap();
+        assert_eq!(result, r#"gem("rack", "~> 3.1.0")"#);
+    }
+
+    #[test]
     fn test_update_version_not_found() {
         let content = r#"gem 'rails', '~> 7.0'"#;
         let result = GemfileParser.update_version(content, "nonexistent", "1.0.0");
@@ -651,6 +672,24 @@ gem 'pg', '~> 1.5'
             .update_version(content, "my_gem", "1.0.0")
             .unwrap();
         assert!(result.contains("gem 'my_gem', '1.0.0', require: false"));
+    }
+
+    #[test]
+    fn test_update_version_add_to_parenthesized_unversioned_gem() {
+        let content = r#"gem("my_gem", require: false)"#;
+        let result = GemfileParser
+            .update_version(content, "my_gem", "1.0.0")
+            .unwrap();
+        assert_eq!(result, r#"gem("my_gem", "1.0.0", require: false)"#);
+    }
+
+    #[test]
+    fn test_update_version_add_to_parenthesized_unversioned_gem_with_comment() {
+        let content = r#"gem("my_gem") # comment"#;
+        let result = GemfileParser
+            .update_version(content, "my_gem", "1.0.0")
+            .unwrap();
+        assert_eq!(result, r#"gem("my_gem", "1.0.0") # comment"#);
     }
 
     #[test]
