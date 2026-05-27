@@ -263,6 +263,8 @@ depup --cd ./projects/myapp -n
 > **注意**: `--only` が指定されている場合は `--exclude` より優先されます。明示的に許可したパッケージは、同じ名前が広い除外リストに含まれていても更新対象に残ります。
 >
 > **注意**: Composer の platform package（`php`, `hhvm`, `ext-*`, `lib-*`, Composer API パッケージなど）は更新対象から除外します。
+>
+> **注意**: Composer/Packagist は `composer/semver` の `VersionParser` に従って 1〜4 セグメントの数値バージョンを valid 扱いします。depup も `1.2.3.4`、`^1.0.0.0`、`~3.4.5.6`、`1.0.0.*` などの 4 セグメントまでのバージョンをパース・更新でき、5 セグメント以上は invalid として除外します。
 
 ### 範囲形式の維持
 

@@ -263,6 +263,8 @@ Use `--include-pinned` to update pinned versions.
 > **Note**: When `--only` is present, it takes precedence over `--exclude`. This lets an explicit allow-list entry remain updatable even if the same package also appears in a broader exclude list.
 >
 > **Note**: Composer platform packages such as `php`, `hhvm`, `ext-*`, `lib-*`, and Composer API packages are skipped.
+>
+> **Note**: Composer/Packagist accepts 1-4 segment numeric versions per `composer/semver`'s `VersionParser`, so depup parses and updates four-segment versions like `1.2.3.4`, `^1.0.0.0`, `~3.4.5.6`, and `1.0.0.*` while rejecting 5+ segment forms as invalid.
 
 ### Range Preservation
 

@@ -19,47 +19,49 @@ pub struct PhpVersionParser;
 // PHP のバージョン指定用正規表現
 // Composer は semver の prerelease (`-...`) と build metadata (`+...`) の同時指定を許可する
 // (例: `1.2.3-rc.1+build123`)
+// また Composer/Packagist は 1〜4 セグメントの数値バージョン (`1.0.0.0` 等) を valid 扱いするため
+// `(?:\.\d+){0,3}` で 4 セグメントまで許容する (composer/semver の VersionParser に準拠)
 
-// Caret: ^1.2.3
+// Caret: ^1.2.3 / ^1.2.3.4
 static CARET_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^\^\s*(v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
+    Regex::new(r"^\^\s*(v?\d+(?:\.\d+){0,3}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
 });
 
-// Tilde: ~1.2.3
+// Tilde: ~1.2.3 / ~1.2.3.4
 static TILDE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^~\s*(v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
+    Regex::new(r"^~\s*(v?\d+(?:\.\d+){0,3}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
 });
 
-// 以上: >=1.2.3
+// 以上: >=1.2.3 / >=1.2.3.4
 static GTE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^>=\s*(v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
+    Regex::new(r"^>=\s*(v?\d+(?:\.\d+){0,3}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
 });
 
-// より大きい: >1.2.3
+// より大きい: >1.2.3 / >1.2.3.4
 static GT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^>\s*(v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
+    Regex::new(r"^>\s*(v?\d+(?:\.\d+){0,3}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
 });
 
-// 以下: <=1.2.3
+// 以下: <=1.2.3 / <=1.2.3.4
 static LTE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^<=\s*(v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
+    Regex::new(r"^<=\s*(v?\d+(?:\.\d+){0,3}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
 });
 
-// より小さい: <1.2.3
+// より小さい: <1.2.3 / <1.2.3.4
 static LT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^<\s*(v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
+    Regex::new(r"^<\s*(v?\d+(?:\.\d+){0,3}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
 });
 static NOT_EQUAL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^!=\s*(v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
+    Regex::new(r"^!=\s*(v?\d+(?:\.\d+){0,3}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
 });
 
-// ワイルドカード: 1.2.*, 1.x, *
+// ワイルドカード: 1.2.*, 1.x, 1.2.3.*, *
 static WILDCARD_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(?:v?(?:\d+|[xX*])(?:\.(?:\d+|[xX*])){0,2}|\*)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^(?:v?(?:\d+|[xX*])(?:\.(?:\d+|[xX*])){0,3}|\*)$").unwrap());
 
-// 固定バージョン: 1.2.3
+// 固定バージョン: 1.2.3 / 1.2.3.4
 static BARE_VERSION_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^(v?\d+(?:\.\d+){0,3}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap());
 
 // 複合制約用パターン
 static COMPOUND_OR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\|\|?").unwrap());
@@ -74,7 +76,7 @@ static COMPOUND_SPACE_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 static COMPOUND_COMMA_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r",").unwrap());
 static VERSION_TOKEN_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?").unwrap());
+    LazyLock::new(|| Regex::new(r"v?\d+(?:\.\d+){0,3}(?:-[\w.-]+)?(?:\+[\w.-]+)?").unwrap());
 
 fn normalize_version(version: &str) -> String {
     version.strip_prefix('v').unwrap_or(version).to_string()
@@ -634,5 +636,79 @@ mod tests {
         let spec = parse("v1.*").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Wildcard);
         assert_eq!(spec.format_updated("2.3.4"), "v2.*");
+    }
+
+    // --- Composer 4セグメントバージョン対応テスト ---
+
+    // Composer/Packagist は composer/semver の VersionParser に従って
+    // 4 セグメントまでの数値バージョン (`1.0.0.0` 等) を valid 扱いする
+
+    #[test]
+    fn test_parse_exact_four_segments() {
+        // 4セグメント完全バージョン
+        let spec = parse("1.2.3.4").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "1.2.3.4");
+        assert!(spec.is_pinned());
+    }
+
+    #[test]
+    fn test_parse_caret_four_segments() {
+        // 4セグメント caret
+        let spec = parse("^1.2.3.4").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Caret);
+        assert_eq!(spec.version, "1.2.3.4");
+        assert_eq!(spec.prefix, Some("^".to_string()));
+    }
+
+    #[test]
+    fn test_parse_tilde_four_segments() {
+        // 4セグメント tilde
+        let spec = parse("~1.2.3.4").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Tilde);
+        assert_eq!(spec.version, "1.2.3.4");
+    }
+
+    #[test]
+    fn test_parse_gte_four_segments() {
+        // 4セグメント以上
+        let spec = parse(">=1.2.3.4").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::GreaterOrEqual);
+        assert_eq!(spec.version, "1.2.3.4");
+    }
+
+    #[test]
+    fn test_parse_wildcard_four_segments() {
+        // 4セグメント末尾ワイルドカード
+        let spec = parse("1.2.3.*").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Wildcard);
+    }
+
+    #[test]
+    fn test_parse_four_segments_with_prerelease() {
+        // 4セグメント + プレリリース
+        let spec = parse("1.0.0.0-beta1").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "1.0.0.0-beta1");
+    }
+
+    #[test]
+    fn test_format_updated_exact_four_segments() {
+        // 4セグメントバージョンの更新
+        let spec = parse("1.2.3.4").unwrap();
+        assert_eq!(spec.format_updated("1.2.3.5"), "1.2.3.5");
+    }
+
+    #[test]
+    fn test_format_updated_caret_four_segments() {
+        // 4セグメント caret の更新
+        let spec = parse("^1.0.0.0").unwrap();
+        assert_eq!(spec.format_updated("1.0.0.1"), "^1.0.0.1");
+    }
+
+    #[test]
+    fn test_parse_rejects_five_segments() {
+        // 5セグメントは composer/semver の仕様上 invalid
+        assert!(parse("1.2.3.4.5").is_none());
     }
 }

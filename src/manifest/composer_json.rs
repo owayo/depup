@@ -481,4 +481,48 @@ mod tests {
         let pkg = deps.first().unwrap();
         assert_eq!(pkg.version_spec.kind, VersionSpecKind::GreaterOrEqual);
     }
+
+    // --- Composer 4セグメントバージョンの統合テスト ---
+
+    #[test]
+    fn test_parse_four_segment_versions() {
+        // composer/semver では `1.0.0.0` のような4セグメントも valid 扱い
+        let content = r#"{
+            "require": {
+                "vendor/exact-four": "1.2.3.4",
+                "vendor/caret-four": "^2.0.0.1",
+                "vendor/tilde-four": "~3.4.5.6"
+            }
+        }"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 3);
+
+        let exact = deps.iter().find(|d| d.name == "vendor/exact-four").unwrap();
+        assert_eq!(exact.version_spec.kind, VersionSpecKind::Exact);
+        assert_eq!(exact.version_spec.version, "1.2.3.4");
+
+        let caret = deps.iter().find(|d| d.name == "vendor/caret-four").unwrap();
+        assert_eq!(caret.version_spec.kind, VersionSpecKind::Caret);
+        assert_eq!(caret.version_spec.version, "2.0.0.1");
+
+        let tilde = deps.iter().find(|d| d.name == "vendor/tilde-four").unwrap();
+        assert_eq!(tilde.version_spec.kind, VersionSpecKind::Tilde);
+        assert_eq!(tilde.version_spec.version, "3.4.5.6");
+    }
+
+    #[test]
+    fn test_update_version_four_segment_caret() {
+        // 4セグメント caret の更新フォーマットを確認する
+        let content = r#"{
+  "require": {
+    "vendor/package": "^1.0.0.0"
+  }
+}"#;
+
+        let result = ComposerJsonParser
+            .update_version(content, "vendor/package", "1.0.0.1")
+            .unwrap();
+        assert!(result.contains("^1.0.0.1"));
+    }
 }
