@@ -330,9 +330,9 @@ Constraints that cannot be rewritten safely are skipped instead of being rewritt
 
 For JSON manifests, depup only rewrites dependency sections it parses. In `package.json`, `overrides` is left untouched; in `composer.json`, sections such as `replace`, `provide`, and `conflict` are left untouched.
 
-For TOML manifests, depup preserves both basic strings (`"..."`) and literal strings (`'...'`) when updating supported dependency sections. In `Cargo.toml`, dependency updates are limited to dependency tables such as `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]`, `[workspace.dependencies]`, and target-specific dependency tables; metadata tables are left untouched. Cargo comparison ranges may contain more than two comma-separated requirements, for example `>=1.0, <2.0, >=1.0.100`.
+For TOML manifests, depup preserves both basic strings (`"..."`) and literal strings (`'...'`) when updating supported dependency sections. In `Cargo.toml`, dependency updates are limited to dependency tables such as `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]`, `[workspace.dependencies]`, and target-specific dependency tables; metadata tables are left untouched. Cargo dependencies that specify a non-`crates-io` `registry` are skipped because depup only queries crates.io. Cargo comparison ranges may contain more than two comma-separated requirements, for example `>=1.0, <2.0, >=1.0.100`.
 
-Python PEP 508 version lists may include a trailing comma, such as `>=3.5,<4,`; depup parses and preserves that comma when updating the lower bound.
+Python PEP 508 version lists may include a trailing comma, such as `>=3.5,<4,`; depup parses and preserves that comma when updating the lower bound. Poetry dependencies with a non-`pypi` `source` are skipped, including PEP 621 dependencies enriched by `tool.poetry.dependencies`, because depup only queries PyPI.
 
 For Gradle string notation, depup preserves classifier and extension suffixes such as `:resources@zip` or `@aar`, and skips dependencies that appear only in `//` line comments or `/* ... */` block comments.
 

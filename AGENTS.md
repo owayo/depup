@@ -144,6 +144,7 @@ make help                # Makefileヘルプ
 - Cargo workspace の `[workspace] members` に指定されたメンバークレートの Cargo.toml も自動検出
 - Cargo.toml の `[dependencies.<name>]` テーブル形式の更新では、`serde` を更新する際に `serde_json` のような名前プレフィックスを共有するパッケージへ誤マッチしない (パッケージ名の直後は `]` か空白のみを許容)
 - Cargo.toml の `package = "actual-crate"` 付きリネーム依存では、レジストリ取得には実パッケージ名を使い、書き戻しにはマニフェスト上の依存キーを使う。`--only` / `--exclude` はどちらの名前でも一致する
+- Cargo.toml の `registry = "..."` 付き依存は、`crates-io` 以外のレジストリであれば crates.io の候補で誤更新しないよう更新対象から除外する
 - Tauriプロジェクトでは npm/crate のバージョンを自動同期
 - Swift は GitHub Tags API を使用 (`GITHUB_TOKEN`/`GH_TOKEN` で認証可能)。GitHub Tags API はリリース日を返さないため、各バージョンの `released_at` には UNIX_EPOCH を使う (= 「十分古い」として扱う)。これにより `--age` 指定時でも Swift パッケージの更新が抑制されない
 - Swift の GitHub タグは `v1.2.3` と `V1.2.3` の両方を認識する
@@ -154,6 +155,7 @@ make help                # Makefileヘルプ
 - Rust (Cargo) の演算子は `>= 1.2.3` のようにスペースを含む形式も対応し、`>=1.0, <2.0, >=1.0.100` のような3個以上の複数 comparison requirement も Range として解析する
 - Cargo.toml の通常依存・inline table・複数行テーブルの更新では TOML の単一引用符 (`'1.0.0'`) も保持する。通常依存・inline table の書き換えは `[dependencies]` / `[dev-dependencies]` / `[build-dependencies]` / `[workspace.dependencies]` / target 固有依存セクションに限定し、`[package.metadata]` 等の依存セクション外の同名キーは書き換えない
 - Python の Range 制約は単一セグメントバージョン（例: `>=3,<4`）も正しくパースする。PEP 440 の compatible release 句は `~=1.2` / `~=1.2.3` を扱い、仕様上無効な単一セグメント形式 `~=1` はスキップする。PEP 508 の括弧付き versionspec（例: `requests (>=2.28,<3); python_version < "3.12"`）、空白を含む extras（例: `coverage [toml] >=7,<8`）、末尾カンマ付き version list（例: `paramiko>=3.5,<4,`）も元の形を保って更新する。`pyproject.toml` の Poetry 形式・inline table・PEP 508 配列要素では TOML の単一引用符も保持して更新する
+- Poetry の `source = "..."` 付き依存は、`pypi` 以外の source であれば PyPI の候補で誤更新しないよう更新対象から除外する。PEP 621 の `project.dependencies` を `tool.poetry.dependencies` の source 指定で補足している場合も同様に除外する
 - Go の `replace` ディレクティブ（単一行・ブロック形式とも）はパースと更新の両方でスキップされる
 - Go の `exclude` ディレクティブ（単一行・ブロック形式とも）はパースと更新の両方でスキップされる
 - go.mod の `) // comment` のようなコメント付きブロック終端も、`require` / `replace` / `exclude` ブロックの終端として扱う

@@ -13,6 +13,7 @@ use crate::error::ManifestError;
 use crate::manifest::ManifestParser;
 use crate::parser::{VersionParser, get_parser};
 use regex::Regex;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 use toml::Value;
@@ -24,6 +25,8 @@ pub struct PyprojectTomlParser;
 // 例: `package-name>=1.0,<2.0`, `package-name==1.0`, `package-name^1.0`
 static PEP508_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^([a-zA-Z0-9][-a-zA-Z0-9._]*)\s*(.*)$").unwrap());
+static POETRY_INLINE_SOURCE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"source\s*=\s*(?:"([^"]+)"|'([^']+)')"#).unwrap());
 
 impl ManifestParser for PyprojectTomlParser {
     fn parse(&self, content: &str) -> Result<Vec<Dependency>, ManifestError> {
@@ -36,6 +39,7 @@ impl ManifestParser for PyprojectTomlParser {
 
         let mut dependencies = Vec::new();
         let parser = get_parser(Language::Python);
+        let non_pypi_source_names = poetry_non_pypi_source_names(&toml);
 
         // PEP 621 の `project.dependencies` を読む
         if let Some(deps) = toml
@@ -45,6 +49,7 @@ impl ManifestParser for PyprojectTomlParser {
         {
             for dep in deps {
                 if let Some(dep_str) = dep.as_str()
+                    && !pep508_uses_non_pypi_source(dep_str, &non_pypi_source_names)
                     && let Some(parsed) = parse_pep508_dependency(dep_str, parser.as_ref(), false)
                 {
                     dependencies.push(parsed);
@@ -62,6 +67,7 @@ impl ManifestParser for PyprojectTomlParser {
                 if let Some(deps_array) = deps.as_array() {
                     for dep in deps_array {
                         if let Some(dep_str) = dep.as_str()
+                            && !pep508_uses_non_pypi_source(dep_str, &non_pypi_source_names)
                             && let Some(parsed) =
                                 parse_pep508_dependency(dep_str, parser.as_ref(), false)
                         {
@@ -173,6 +179,17 @@ impl ManifestParser for PyprojectTomlParser {
     ) -> Result<String, ManifestError> {
         // TOML の整形を壊さないよう、単純な文字列置換で差し替える
         let parser = get_parser(Language::Python);
+        let package_has_non_pypi_source = toml::from_str::<Value>(content)
+            .map(|toml| poetry_non_pypi_source_names(&toml))
+            .unwrap_or_default()
+            .contains(&normalize_python_package_name(package));
+        if package_has_non_pypi_source {
+            return Err(ManifestError::InvalidVersionSpec {
+                path: PathBuf::from("pyproject.toml"),
+                spec: package.to_string(),
+                message: "package uses a non-PyPI Poetry source".to_string(),
+            });
+        }
 
         // バージョン文字列を見つけて更新する
         let mut result = content.to_string();
@@ -204,7 +221,7 @@ impl ManifestParser for PyprojectTomlParser {
 
         // Poetry の inline table 形式: `name = { version = "^1.0.0", ... }`
         let table_pattern = format!(
-            r#"(?m)({}\s*=\s*\{{\s*[^}}]*version\s*=\s*)(?:"([^"]+)"|'([^']+)')"#,
+            r#"(?m)({}\s*=\s*\{{\s*[^}}]*version\s*=\s*)(?:"([^"]+)"|'([^']+)')([^}}]*\}})"#,
             regex::escape(package)
         );
         if let Ok(re) = Regex::new(&table_pattern)
@@ -217,10 +234,12 @@ impl ManifestParser for PyprojectTomlParser {
             } else {
                 ("\"", "")
             };
-            if let Some(spec) = parser.parse(old_version)
+            let table_fragment = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+            if !inline_poetry_table_has_non_pypi_source(table_fragment)
+                && let Some(spec) = parser.parse(old_version)
                 && let Some(new_ver) = spec.try_format_updated(new_version)
             {
-                let replacement = format!("{}{}{}{}", &caps[1], quote, new_ver, quote);
+                let replacement = format!("{}{}{}{}{}", &caps[1], quote, new_ver, quote, &caps[4]);
                 result = re.replace(&result, replacement.as_str()).to_string();
                 updated = true;
             }
@@ -276,6 +295,98 @@ impl ManifestParser for PyprojectTomlParser {
             })
         }
     }
+}
+
+fn normalize_python_package_name(name: &str) -> String {
+    name.chars()
+        .map(|ch| match ch {
+            '_' | '.' => '-',
+            _ => ch.to_ascii_lowercase(),
+        })
+        .collect()
+}
+
+fn poetry_source_is_non_pypi(source: &str) -> bool {
+    !source.eq_ignore_ascii_case("pypi")
+}
+
+fn poetry_table_has_non_pypi_source(table: &toml::map::Map<String, Value>) -> bool {
+    table
+        .get("source")
+        .and_then(|v| v.as_str())
+        .is_some_and(poetry_source_is_non_pypi)
+}
+
+fn collect_poetry_non_pypi_source_names(
+    deps: &toml::map::Map<String, Value>,
+    names: &mut HashSet<String>,
+) {
+    for (name, value) in deps {
+        let has_non_pypi_source = match value {
+            Value::Table(table) => poetry_table_has_non_pypi_source(table),
+            Value::Array(items) => items.iter().any(|item| {
+                item.as_table()
+                    .is_some_and(poetry_table_has_non_pypi_source)
+            }),
+            _ => false,
+        };
+        if has_non_pypi_source {
+            names.insert(normalize_python_package_name(name));
+        }
+    }
+}
+
+fn poetry_non_pypi_source_names(toml: &Value) -> HashSet<String> {
+    let mut names = HashSet::new();
+
+    if let Some(poetry_deps) = toml
+        .get("tool")
+        .and_then(|t| t.get("poetry"))
+        .and_then(|p| p.get("dependencies"))
+        .and_then(|d| d.as_table())
+    {
+        collect_poetry_non_pypi_source_names(poetry_deps, &mut names);
+    }
+
+    if let Some(poetry_dev_deps) = toml
+        .get("tool")
+        .and_then(|t| t.get("poetry"))
+        .and_then(|p| p.get("dev-dependencies"))
+        .and_then(|d| d.as_table())
+    {
+        collect_poetry_non_pypi_source_names(poetry_dev_deps, &mut names);
+    }
+
+    if let Some(groups) = toml
+        .get("tool")
+        .and_then(|t| t.get("poetry"))
+        .and_then(|p| p.get("group"))
+        .and_then(|g| g.as_table())
+    {
+        for group in groups.values() {
+            if let Some(deps) = group.get("dependencies").and_then(|d| d.as_table()) {
+                collect_poetry_non_pypi_source_names(deps, &mut names);
+            }
+        }
+    }
+
+    names
+}
+
+fn pep508_uses_non_pypi_source(dep_str: &str, source_names: &HashSet<String>) -> bool {
+    PEP508_RE
+        .captures(dep_str)
+        .and_then(|caps| caps.get(1))
+        .map(|name| source_names.contains(&normalize_python_package_name(name.as_str())))
+        .unwrap_or(false)
+}
+
+fn inline_poetry_table_has_non_pypi_source(table_fragment: &str) -> bool {
+    POETRY_INLINE_SOURCE_RE
+        .captures(table_fragment)
+        .and_then(|caps| caps.get(1).or_else(|| caps.get(2)))
+        .map(|source| poetry_source_is_non_pypi(source.as_str()))
+        .unwrap_or(false)
 }
 
 fn parse_pep508_dependency(
@@ -378,7 +489,12 @@ fn parse_poetry_dependency(
 ) -> Option<Dependency> {
     let version_str = match value {
         Value::String(s) => s.clone(),
-        Value::Table(t) => t.get("version")?.as_str()?.to_string(),
+        Value::Table(t) => {
+            if poetry_table_has_non_pypi_source(t) {
+                return None;
+            }
+            t.get("version")?.as_str()?.to_string()
+        }
         _ => return None,
     };
 
@@ -962,6 +1078,53 @@ my-pkg = { git = "https://github.com/user/my-pkg.git", branch = "main" }
         let deps = parse(content).unwrap();
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].name, "requests");
+    }
+
+    #[test]
+    fn test_parse_poetry_non_pypi_source_dependency_skipped() {
+        // PyPI 以外の Poetry source は PyPI API の候補で更新できないためスキップする
+        let content = r#"
+[tool.poetry.dependencies]
+python = "^3.8"
+private-pkg = { version = "^1.0", source = "internal" }
+public-pkg = { version = "^2.0", source = "pypi" }
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "public-pkg");
+        assert_eq!(deps[0].version_spec.version, "2.0");
+    }
+
+    #[test]
+    fn test_parse_pep508_enriched_by_non_pypi_source_skipped() {
+        // Poetry 2 の source 補足がある PEP 621 依存も PyPI 候補では更新しない
+        let content = r#"
+[project]
+dependencies = [
+    "private_pkg>=1.0,<2.0",
+    "requests>=2.0,<3.0",
+]
+
+[tool.poetry.dependencies]
+private-pkg = { source = "internal" }
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "requests");
+    }
+
+    #[test]
+    fn test_update_poetry_non_pypi_source_dependency_returns_err() {
+        // source が PyPI 以外なら inline table の version も書き換えない
+        let content = r#"
+[tool.poetry.dependencies]
+private-pkg = { version = "^1.0", source = "internal" }
+"#;
+
+        let result = PyprojectTomlParser.update_version(content, "private-pkg", "1.2.0");
+        assert!(result.is_err());
     }
 
     #[test]

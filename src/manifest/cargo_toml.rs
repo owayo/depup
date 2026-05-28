@@ -323,6 +323,13 @@ fn parse_cargo_dependencies(
                     );
                     continue;
                 }
+                if t.get("registry")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|registry| registry != "crates-io")
+                {
+                    // crates.io API の候補で別レジストリの依存を書き換えると誤更新になる
+                    continue;
+                }
                 if let Some(version_str) = t.get("version").and_then(|v| v.as_str())
                     && let Some(spec) = parser.parse(version_str)
                 {
@@ -645,6 +652,20 @@ serde = { workspace = true }
         let deps = parse(content).unwrap();
         // 明示バージョンのない workspace 依存はスキップする
         assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_parse_custom_registry_dependency_skipped() {
+        let content = r#"
+[dependencies]
+private-crate = { version = "1.0", registry = "internal" }
+public-crate = { version = "2.0", registry = "crates-io" }
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "public-crate");
+        assert_eq!(deps[0].version_spec.version, "2.0");
     }
 
     #[test]
