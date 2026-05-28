@@ -1,6 +1,6 @@
 [package]
 name = "depup"
-version = "26.5.103"
+version = "26.5.104"
 edition = "2024"
 authors = ["owayo <yoheiowa@gmail.com>"]
 description = "Multi-language dependency updater CLI tool"
