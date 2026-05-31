@@ -166,108 +166,151 @@ fn trailing_number(s: &str) -> Option<u64> {
     digits.chars().rev().collect::<String>().parse().ok()
 }
 
-/// semver 風ルールでバージョン文字列を比較する。
+/// PEP 440 / semver を統合した比較用にバージョン文字列を構成要素へ分解する。
 ///
-/// - 不足パートは 0 として扱う (例: `"1.0" == "1.0.0"`)
-/// - ビルドメタデータ (`+` 以降) は semver 仕様に従い無視する
-/// - 数値コアが等しい場合、プレリリース付き (例: `1.0.0-rc.1`) は
-///   プレリリースなし (例: `1.0.0`) より小さい (semver 11.4.3)
-/// - 両方ともプレリリースの場合、プレリリース部の数値識別子で比較する
-///   (例: `canary-123 < canary-456`、`rc.1 < rc.2`)
-pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
-    let parse_parts = |s: &str| -> (Vec<u64>, Option<Vec<u64>>) {
-        // 先頭の 'v' または 'V' を除去
-        let s = s
-            .strip_prefix('v')
-            .or_else(|| s.strip_prefix('V'))
-            .unwrap_or(s);
-        // ビルドメタデータ (+...) を除去
-        let s = s.split('+').next().unwrap_or(s);
-        // 数値コアとプレリリース部に分離する。最初の '-' 以前が数値コアの候補。
-        // (Java 風 qualifier `5.0.0.RELEASE` は '-' を含まないため数値コアのみ抽出される)
-        let mut split = s.splitn(2, '-');
-        let core = split.next().unwrap_or("");
-        let hyphen_pre = split.next();
+/// 戻り値は `(epoch, core, pre, post)`:
+/// - `epoch`: PEP 440 エポック (`N!` 接頭辞)。なければ 0。
+/// - `core`: 数値コア (例: `[1, 2, 3]`)。不足パートは比較時に 0 補完する。
+/// - `pre`: プレリリース識別子の数値列。プレリリースなしは `None`。
+///   semver の `-rc.1` / セパレータなし PEP 440 の `rc1` の両方を扱う。
+/// - `post`: PEP 440 ポストリリース番号 (`.postN`)。なければ `None`。
+///
+/// 注意: `compare_versions` は全エコシステム共通のため、`1.0.0-1` のような
+/// ハイフン + 純数字は semver の数値プレリリースと衝突しうる。誤判定を避けるため
+/// post は曖昧さのない `.post` トークン形式のみを対象とする。
+fn parse_version_components(s: &str) -> (u64, Vec<u64>, Option<Vec<u64>>, Option<u64>) {
+    // 先頭の 'v' または 'V' を除去
+    let s = s
+        .strip_prefix('v')
+        .or_else(|| s.strip_prefix('V'))
+        .unwrap_or(s);
+    // ビルドメタデータ (+...) を除去
+    let s = s.split('+').next().unwrap_or(s);
+    // PEP 440 エポック (`N!`) を切り出す。なければ 0。
+    let (epoch, s) = match s.split_once('!') {
+        Some((e, rest)) => (e.parse::<u64>().unwrap_or(0), rest),
+        None => (0, s),
+    };
+    // 数値コアとプレリリース部に分離する。最初の '-' 以前が数値コアの候補。
+    let mut split = s.splitn(2, '-');
+    let core = split.next().unwrap_or("");
+    let hyphen_pre = split.next();
 
-        // 数値コアを '.' 区切りで走査する。各セグメントは先頭の数値部分のみを取り、
-        // セグメント途中から英字が始まる場合 (例: "0rc1") は PEP 440 のセパレータなし
-        // prerelease 表記とみなして、それ以降を prerelease として切り出す。
-        let mut nums = Vec::new();
-        let mut embedded_pre: Option<&str> = None;
-        for segment in core.split('.') {
-            let digit_end = segment
-                .find(|c: char| !c.is_ascii_digit())
-                .unwrap_or(segment.len());
-            if digit_end == 0 {
-                // 数字で始まらないセグメント (Java の RELEASE / Final 等) は数値コアに含めない
-                continue;
-            }
-            if let Ok(value) = segment[..digit_end].parse::<u64>() {
-                nums.push(value);
-            }
-            if digit_end < segment.len() {
-                // 例: "0rc1" の "rc1" 部分。以降は prerelease 扱いなので走査を止める
-                embedded_pre = Some(&segment[digit_end..]);
-                break;
-            }
+    // 数値コアを '.' 区切りで走査する。各セグメントは先頭の数値部分のみを取り、
+    // 数字の後 (または先頭) に英字が続くセグメントは PEP 440 のセパレータなし表記とみなす:
+    //   - "post" で始まれば ポストリリース (例: "post1")
+    //   - それ以外で数字が先行していれば prerelease (例: "0rc1" の "rc1")
+    //   - 純粋な英字 qualifier (Java の RELEASE / Final 等) は無視する
+    let mut nums = Vec::new();
+    let mut embedded_pre: Option<&str> = None;
+    let mut post: Option<u64> = None;
+    for segment in core.split('.') {
+        let digit_end = segment
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(segment.len());
+        let (digits, rest) = segment.split_at(digit_end);
+        if let Ok(value) = digits.parse::<u64>() {
+            nums.push(value);
         }
+        if rest.is_empty() {
+            continue;
+        }
+        // ポストリリース (例: ".post1" / "post1")。曖昧さがないため大文字小文字を許容。
+        if rest.len() >= 4 && rest[..4].eq_ignore_ascii_case("post") {
+            post = Some(trailing_number(rest).unwrap_or(0));
+            break;
+        }
+        // 数字が先行する英字付きセグメント (例: "0rc1") は prerelease
+        if !digits.is_empty() {
+            embedded_pre = Some(rest);
+            break;
+        }
+        // digits が空で post でもない (RELEASE / Final 等) → 数値コアにもプレ/ポストにも含めない
+    }
 
-        // プレリリース部の数値識別子を順序付けに使う。
-        // - セパレータなし表記 (embedded_pre, 例: "rc1") は末尾の数値を識別子とする
-        // - '-' 区切り表記 (hyphen_pre, 例: "canary-456" → [456], "rc.1" → [1]) は従来どおり
-        // 純粋に数値だけの '-' サフィックスは Java SNAPSHOT 等の qualifier なので prerelease 扱いしない
-        let pre_nums = if let Some(embedded) = embedded_pre {
-            Some(trailing_number(embedded).into_iter().collect())
-        } else {
-            hyphen_pre.and_then(|p| {
-                if !p.is_empty() && p.split('.').any(|part| part.parse::<u64>().is_err()) {
-                    Some(
-                        p.split(['.', '-'])
-                            .filter_map(|part| part.parse::<u64>().ok())
-                            .collect(),
-                    )
-                } else {
-                    None
-                }
-            })
-        };
-        (nums, pre_nums)
+    // プレリリース部の数値識別子を順序付けに使う。
+    // - セパレータなし表記 (embedded_pre, 例: "rc1") は末尾の数値を識別子とする
+    // - '-' 区切り表記 (hyphen_pre, 例: "canary-456" → [456], "rc.1" → [1]) は従来どおり
+    // 純粋に数値だけの '-' サフィックスは Java SNAPSHOT 等の qualifier なので prerelease 扱いしない
+    let pre = if let Some(embedded) = embedded_pre {
+        Some(trailing_number(embedded).into_iter().collect())
+    } else {
+        hyphen_pre.and_then(|p| {
+            if !p.is_empty() && p.split('.').any(|part| part.parse::<u64>().is_err()) {
+                Some(
+                    p.split(['.', '-'])
+                        .filter_map(|part| part.parse::<u64>().ok())
+                        .collect(),
+                )
+            } else {
+                None
+            }
+        })
     };
 
-    let (parts_a, pre_a) = parse_parts(a);
-    let (parts_b, pre_b) = parse_parts(b);
+    (epoch, nums, pre, post)
+}
 
-    let max_len = parts_a.len().max(parts_b.len());
+/// semver / PEP 440 風ルールでバージョン文字列を比較する。
+///
+/// 比較の優先順位:
+/// 1. PEP 440 エポック (`N!`) が大きい方が新しい (例: `0!2.0 < 1!1.0`)
+/// 2. 数値コア (不足パートは 0 として扱う。例: `"1.0" == "1.0.0"`)
+/// 3. プレリリース有無: プレリリース付き (`1.0.0-rc.1` / `2.0.0rc1`) は
+///    プレリリースなしより小さい (semver 11.4.3 / PEP 440)。
+///    両方プレリリースなら識別子の数値で比較する (`rc.1 < rc.2`)
+/// 4. ポストリリース (`1.0.post1`) は対応する release より新しい (PEP 440)
+///
+/// ビルドメタデータ (`+` 以降) は semver 仕様に従い無視する。
+pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
 
-    // 各パートを比較 (不足パートは 0 として扱う)
+    let (epoch_a, core_a, pre_a, post_a) = parse_version_components(a);
+    let (epoch_b, core_b, pre_b, post_b) = parse_version_components(b);
+
+    // 1. エポック比較
+    match epoch_a.cmp(&epoch_b) {
+        Ordering::Equal => {}
+        other => return other,
+    }
+
+    // 2. 数値コア比較 (不足パートは 0 として扱う)
+    let max_len = core_a.len().max(core_b.len());
     for i in 0..max_len {
-        let pa = parts_a.get(i).copied().unwrap_or(0);
-        let pb = parts_b.get(i).copied().unwrap_or(0);
+        let pa = core_a.get(i).copied().unwrap_or(0);
+        let pb = core_b.get(i).copied().unwrap_or(0);
         match pa.cmp(&pb) {
-            std::cmp::Ordering::Equal => continue,
+            Ordering::Equal => continue,
             other => return other,
         }
     }
 
-    // 数値コアが等しい場合のプレリリース処理:
-    // - 片方のみ prerelease なら stable > prerelease (semver 仕様)
-    // - 両方 prerelease なら prerelease 部の数値で比較
+    // 3. プレリリース比較: 片方のみ prerelease なら release/post > prerelease
     match (&pre_a, &pre_b) {
-        (None, None) => std::cmp::Ordering::Equal,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, None) => {}
+        (None, Some(_)) => return Ordering::Greater,
+        (Some(_), None) => return Ordering::Less,
         (Some(a_nums), Some(b_nums)) => {
             let pmax = a_nums.len().max(b_nums.len());
             for i in 0..pmax {
                 let pa = a_nums.get(i).copied().unwrap_or(0);
                 let pb = b_nums.get(i).copied().unwrap_or(0);
                 match pa.cmp(&pb) {
-                    std::cmp::Ordering::Equal => continue,
+                    Ordering::Equal => continue,
                     other => return other,
                 }
             }
-            std::cmp::Ordering::Equal
+            // プレリリース識別子が同一なら等価とみなす (post まで踏み込まない)
+            return Ordering::Equal;
         }
+    }
+
+    // 4. ポストリリース比較: post 付きは対応する release より新しい
+    match (post_a, post_b) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+        (Some(a_post), Some(b_post)) => a_post.cmp(&b_post),
     }
 }
 
@@ -929,6 +972,82 @@ mod tests {
         assert_eq!(
             compare_versions("4.0.0.Final", "4.0.0"),
             std::cmp::Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn test_compare_versions_pep440_post_release_is_greater_than_release() {
+        // PEP 440: ポストリリースは対応する release より新しい
+        assert_eq!(
+            compare_versions("1.0.post1", "1.0"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_versions("1.0", "1.0.post1"),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_versions("1.2.3.post2", "1.2.3"),
+            std::cmp::Ordering::Greater
+        );
+        // post は次の release より小さい
+        assert_eq!(
+            compare_versions("1.0.post1", "1.1"),
+            std::cmp::Ordering::Less
+        );
+        // post 同士は post 番号で比較する
+        assert_eq!(
+            compare_versions("1.0.post1", "1.0.post2"),
+            std::cmp::Ordering::Less
+        );
+        // post は prerelease より新しい (prerelease < release < post)
+        assert_eq!(
+            compare_versions("1.0rc1", "1.0.post1"),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn test_compare_versions_pep440_epoch() {
+        // PEP 440: エポックが大きい方が常に新しい
+        assert_eq!(
+            compare_versions("1!2.0", "2.0"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_versions("1!1.0", "9.9"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(compare_versions("2.0", "1!2.0"), std::cmp::Ordering::Less);
+        // 同一エポック内は数値コアで比較する
+        assert_eq!(compare_versions("1!2.0", "1!2.1"), std::cmp::Ordering::Less);
+        // エポックなし同士は従来どおり
+        assert_eq!(compare_versions("2.0", "2.0"), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn test_parse_version_components_breakdown() {
+        // 構成要素分解の単体確認
+        assert_eq!(
+            super::parse_version_components("1.2.3"),
+            (0, vec![1, 2, 3], None, None)
+        );
+        assert_eq!(
+            super::parse_version_components("2.0.0rc1"),
+            (0, vec![2, 0, 0], Some(vec![1]), None)
+        );
+        assert_eq!(
+            super::parse_version_components("1.0.post2"),
+            (0, vec![1, 0], None, Some(2))
+        );
+        assert_eq!(
+            super::parse_version_components("1!2.3"),
+            (1, vec![2, 3], None, None)
+        );
+        // RELEASE qualifier は数値コアにもステージにも影響しない
+        assert_eq!(
+            super::parse_version_components("5.0.0.RELEASE"),
+            (0, vec![5, 0, 0], None, None)
         );
     }
 }

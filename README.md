@@ -282,6 +282,8 @@ depup preserves the original version range format:
 "1.x.x" → "2.x.x" (all wildcard positions preserved)
 "1.2.*" → "1.3.*" (wildcard shape preserved)
 "v1.*" → "v2.*" (leading `v` preserved)
+"^1.x" → "^2.x" (npm caret + x-range, operator preserved)
+"~1.2.x" → "~2.3.x" (npm tilde + x-range, operator preserved)
 "5.3.+" → "5.4.+" (Gradle prefix preserved)
 "1.2.3!!" → "2.0.0!!" (Gradle strict preserved)
 "[1.0]" → "[2.0]" (Maven Hard requirement preserved)
@@ -297,6 +299,8 @@ Floating selectors such as `"*"`, npm dist-tags like `"latest"`, and Gradle dyna
 Gradle rich version declarations using `strictly`, `require`, `prefer`, and `reject` are parsed in dependency blocks such as `implementation("org.slf4j:slf4j-api") { version { ... } }`. String notation shorthand such as `group:name:[1.7, 1.8[!!1.7.25` is also parsed. When `strictly` or `require` declares a range and `prefer` declares the selected version, depup keeps the range as the upper-bound constraint and updates the `prefer` value. Versions listed with `reject` are excluded from update candidates, including dynamic rejects such as `2.+`.
 
 Python compatible release clauses follow PEP 440: `~=1.2` and `~=1.2.3` are valid, while the invalid single-segment form `~=1` is skipped.
+
+PEP 440 prerelease versions are detected and excluded by default even when written without a separator (e.g. `2.0.0rc1`, `1.0rc1`, `1.0.0a1`), so a stable dependency is never accidentally bumped to a release candidate. Post-releases (`1.0.post1`) compare as newer than the corresponding release, and epochs (`1!2.3`) take precedence in comparison.
 
 ### Range Constraints
 

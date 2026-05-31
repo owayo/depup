@@ -120,8 +120,8 @@ make help                # Makefileヘルプ
 
 ## Important Notes
 
-- バージョン比較は数値ベースの semver 比較を使用 (文字列比較ではない)。数値コアが等しい場合、プレリリース付き (例: `1.0.0-rc.1`) は安定版 (`1.0.0`) より小さい (semver 11.4.3)。両方ともプレリリースの場合はプレリリース部の数値識別子で比較される (例: `19.3.0-canary-123 < 19.3.0-canary-456`)
-- プレリリースバージョン (alpha/beta/canary/dev/rc) はデフォルトでフィルタされる
+- バージョン比較は数値ベースの semver 比較を使用 (文字列比較ではない)。数値コアが等しい場合、プレリリース付き (例: `1.0.0-rc.1`) は安定版 (`1.0.0`) より小さい (semver 11.4.3)。両方ともプレリリースの場合はプレリリース部の数値識別子で比較される (例: `19.3.0-canary-123 < 19.3.0-canary-456`)。PEP 440 のセパレータなしプレリリース (例: `2.0.0rc1`, `1.0rc1`, `1.0.0a1`) も安定版より小さいと比較される。ポストリリース (`1.0.post1`) は対応する安定版より新しく、エポック (`1!2.3`) は最優先キーで比較される (`0!9.9 < 1!1.0`)
+- プレリリースバージョン (alpha/beta/canary/dev/rc) はデフォルトでフィルタされる。`-rc.1` のようなセパレータ付き形式に加え、PEP 440 のセパレータなし形式 (`2.0.0rc1` / `1.0rc1` / `1.0.0a1` / `1.0.0b1`) も検出して除外する (安定版利用者が rc 版へ誤更新されるのを防ぐ)
 - 作者が非推奨を示すためにリリース末尾へ付与するマーカー (`-deprecated` / `-obsolete` / `-retired` / `-yanked` / `-unmaintained`) も prerelease として扱われ、デフォルト更新対象から除外される (例: `serde_yaml 0.9.34-deprecated` は 0.9.33 から更新されない)
 - Go は常に pinned 扱い (`--include-pinned` 不要) だが、`// pinned` コメント付き依存は `--include-pinned` がないとスキップされる
 - Ruby の `group` ブロックはネストを考慮して判定され、内側の `:development` / `:test` を抜けた後の gem は開発依存として漏れない。`platforms` / `source` 等のネストされた `do...end` ブロックもブロック種別スタックで正しく追跡する。`source do` 内の `group :development do ... end` を抜けた後の gem も開発依存として漏れない。`group :development do # comment` のようにインラインコメントが付いた group 開始行も正しくグループとして認識される。`gem "rspec", group: :test` / `groups: [:development, :test]` のような行単位の group オプションも開発依存として扱う
@@ -133,7 +133,7 @@ make help                # Makefileヘルプ
 - Gradle の rich version ブロック（例: `implementation("org.slf4j:slf4j-api") { version { strictly("[1.7, 1.8["); prefer("1.7.25"); reject("1.7.36") } }`）は `strictly` / `require` / `prefer` / `reject` を解析する。`group:name:[1.7, 1.8[!!1.7.25` のような文字列記法の strict range + prefer 短縮構文も解析する。`strictly` / `require` が範囲で `prefer` がある場合は、範囲を上限制約として保持し、更新時は `prefer` の値を書き換える。`reject` に列挙されたバージョンは更新候補から除外し、`2.+` のような動的 reject も考慮する。Gradle の仕様どおり、後続の `strictly` / `require` / `prefer` 宣言は先行する reject を消す。`//` 行コメントと `/* ... */` ブロックコメント内の rich version 宣言および直接依存宣言は無視する
 - Gradle の文字列記法では `group:name:version:classifier@extension` と `group:name:version@extension` を解析・更新でき、更新時は classifier / extension サフィックスを維持する
 - Maven の Hard requirement (例: `[1.0]`, `[1.2.3]`, `[1.2.3.Final]`) は完全一致 (Exact) として解釈され、ブラケットを保持したまま更新される (例: `[1.0]` → `[1.5]`)。`[A,B]` のようにカンマを含むレンジ記法とは区別される
-- Node/Python/Rust/PHP/Gradle の部分ワイルドカード指定（例: `1.x`, `1.x.x`, `v1.*`, `1.2.*`, `1.+`）は形を保って更新される
+- Node/Python/Rust/PHP/Gradle の部分ワイルドカード指定（例: `1.x`, `1.x.x`, `v1.*`, `1.2.*`, `1.+`）は形を保って更新される。npm の caret/tilde + x-range（例: `^1.x`, `~1.2.x`, `^1.2.*`）も演算子を保持したワイルドカードとして認識し、形を保って更新される（例: `^1.x` → `^2.x`）。`^1` / `^1.2.3` のようにワイルドカード文字を含まない指定は従来どおり Caret/Tilde として扱う
 - 完全浮動指定（例: `*`, npm dist-tag の `latest`, Gradle の `latest.release` / `latest.integration` / `latest.milestone` / ユーザ定義 status）は意味を変えないため更新対象から除外される
 - Range制約 (`>=X,<Y` / `>=X,<=Y` / `A..<B` / `A...B` / `A - B` / `[A,B)` / `[A,B]` / `[A,B[`) では上限を超えるバージョンは除外され、更新時は上限制約を維持したまま下限側のみを互換な最新バージョンへ進める (`<=` / `...` / 閉じ `]` は上限値を含む。npm/Composer の `A - B` は右辺が完全指定なら包含、`1.0 - 2.0` のような部分指定ならワイルドカード展開後の排他的上限として扱う)。上限制約が先に書かれた場合も、書き換えるのは包含下限側のみ
 - 安全に書き換えられない制約（例: npm/Composer の `^1 || ^2`、`!=` を含む除外制約 `!=1.2.3` / `>=1.0, !=1.5.0, <2.0`、上限のみの `<4.0.0` / `<=2.0`、厳密な下限の `>1.0.0`、下限なし Maven 形式 `(,2.0]`、排他的下限を持つ Maven 形式 `]1.0,2.0[` / `]1.0,2.0]`）は自動更新から除外される
