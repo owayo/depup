@@ -103,6 +103,10 @@ fn normalize_hyphen_upper_bound(version: &str) -> (String, bool) {
 /// - `<=X` と `A...B` は `(X, true)`
 fn extract_upper_bound(raw: &str) -> Option<(String, bool)> {
     let trimmed = raw.trim();
+    let trimmed = trimmed
+        .split_once("!!")
+        .map(|(range, _)| range.trim())
+        .unwrap_or(trimmed);
 
     if let Some(caps) = UPPER_BOUND_SWIFT_HALF_OPEN_RE.captures(trimmed)
         && let Some(m) = caps.get(1)
@@ -1272,6 +1276,29 @@ mod tests {
         if let UpdateResult::Update { new_version, .. } = result {
             // 4.0.0 ではなく 3.9.0 に更新される
             assert_eq!(new_version, "3.9.0");
+        }
+    }
+
+    #[test]
+    fn test_judge_gradle_strict_range_prefer_respects_upper_bound() {
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_range_dependency(
+            "org.slf4j:slf4j-api",
+            "[1.7, 1.8[!!1.7.25",
+            "1.7.25",
+            Language::Java,
+        );
+        let versions = vec![
+            make_version_info("1.7.36", 50),
+            make_version_info("1.8.0", 20),
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_update());
+        if let UpdateResult::Update { new_version, .. } = result {
+            assert_eq!(new_version, "1.7.36");
         }
     }
 

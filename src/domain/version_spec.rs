@@ -236,6 +236,16 @@ fn find_version_token_at(raw: &str, offset: usize) -> Option<(usize, usize)> {
     }
 }
 
+fn find_gradle_strict_prefer_token(raw: &str) -> Option<(usize, usize)> {
+    let bang_index = raw.find("!!")?;
+    let strict_part = raw[..bang_index].trim();
+    if !matches!(strict_part.chars().next(), Some('[' | '(' | ']')) {
+        return None;
+    }
+
+    find_version_token_at(raw, bang_index + 2)
+}
+
 fn find_inclusive_lower_bound_token(raw: &str) -> Option<(usize, usize)> {
     let operators = [">=", "~=", "==", "=", "^", "~"];
     let mut index = 0;
@@ -274,6 +284,10 @@ fn contains_not_equal_operator(raw: &str) -> bool {
 fn format_range_like(raw: &str, new_version: &str) -> Option<String> {
     let trimmed = raw.trim();
     let leading_ws_len = raw.len() - raw.trim_start().len();
+
+    if let Some((start, end)) = find_gradle_strict_prefer_token(raw) {
+        return replace_version_token(raw, start, end, new_version);
+    }
 
     if trimmed.contains("||") || contains_not_equal_operator(trimmed) || trimmed.starts_with("===")
     {

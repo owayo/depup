@@ -1210,6 +1210,21 @@ dependencies {
     }
 
     #[test]
+    fn test_parse_string_notation_strict_range_with_prefer() {
+        let content = r#"
+dependencies {
+    implementation("org.slf4j:slf4j-api:[1.7, 1.8[!!1.7.25")
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "org.slf4j:slf4j-api");
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Range);
+        assert_eq!(deps[0].version_spec.raw, "[1.7, 1.8[!!1.7.25");
+        assert_eq!(deps[0].version_spec.version, "1.7.25");
+    }
+
+    #[test]
     fn test_parse_rich_version_ignores_commented_declaration() {
         let content = r#"
 dependencies {
@@ -1251,6 +1266,29 @@ dependencies {
             prefer("1.7.25")
         }
     }
+}
+"#;
+        let dep = parse(content).unwrap().remove(0);
+        let released_at = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let versions = vec![
+            VersionInfo::new("1.7.36", released_at),
+            VersionInfo::new("1.8.0", released_at),
+        ];
+
+        let result = UpdateJudge::new(UpdateFilter::new()).judge(&dep, &versions);
+        match result {
+            UpdateResult::Update { new_version, .. } => {
+                assert_eq!(new_version, "1.7.36");
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_judge_string_notation_strict_range_with_prefer_respects_upper_bound() {
+        let content = r#"
+dependencies {
+    implementation("org.slf4j:slf4j-api:[1.7, 1.8[!!1.7.25")
 }
 "#;
         let dep = parse(content).unwrap().remove(0);
@@ -1562,6 +1600,19 @@ dependencies {
             .update_version(content, "org.springframework:spring-core", "6.0.0")
             .unwrap();
         assert!(result.contains("\"org.springframework:spring-core:6.0.0!!\""));
+    }
+
+    #[test]
+    fn test_update_string_notation_strict_range_with_prefer() {
+        let content = r#"
+dependencies {
+    implementation "org.slf4j:slf4j-api:[1.7, 1.8[!!1.7.25"
+}
+"#;
+        let result = GradleParser
+            .update_version(content, "org.slf4j:slf4j-api", "1.7.36")
+            .unwrap();
+        assert!(result.contains(r#""org.slf4j:slf4j-api:[1.7, 1.8[!!1.7.36""#));
     }
 
     #[test]

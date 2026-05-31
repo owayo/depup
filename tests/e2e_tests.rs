@@ -1,41 +1,47 @@
-//! End-to-end tests for depup CLI
+//! depup CLI のエンドツーエンドテスト。
 //!
-//! These tests verify:
-//! - Dry-run mode leaves files unchanged
-//! - CLI produces correct JSON output schema
-//! - Exit codes are correct for various scenarios
+//! このテストでは以下を検証する:
+//! - dry-run モードがファイルを変更しないこと
+//! - CLI が正しい JSON 出力スキーマを返すこと
+//! - 各種シナリオで終了コードが正しいこと
 
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::OnceLock;
 use tempfile::TempDir;
 
-/// Get the path to the compiled binary
+static BINARY_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// コンパイル済みバイナリのパスを取得する
 fn get_binary_path() -> PathBuf {
-    // Build the binary first if needed
-    let output = Command::new("cargo")
-        .args(["build", "--release"])
-        .output()
-        .expect("Failed to build project");
+    BINARY_PATH
+        .get_or_init(|| {
+            // E2E テストは既定で並列実行されるため、release build はプロセス内で1回だけ行う。
+            let output = Command::new("cargo")
+                .args(["build", "--release"])
+                .output()
+                .expect("Failed to build project");
 
-    if !output.status.success() {
-        panic!(
-            "Failed to build: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+            if !output.status.success() {
+                panic!(
+                    "Failed to build: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
 
-    // Return path to compiled binary
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("target/release/depup");
-    path
+            let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            path.push("target/release/depup");
+            path
+        })
+        .clone()
 }
 
-/// Create a test directory with sample manifest files
+/// サンプルマニフェストを持つテスト用ディレクトリを作成する
 fn create_test_project() -> TempDir {
     let temp_dir = tempfile::tempdir().expect("Failed to create temp directory");
 
-    // Create package.json
+    // package.json を作成する
     let package_json = r#"{
   "name": "test-project",
   "version": "1.0.0",
@@ -48,7 +54,7 @@ fn create_test_project() -> TempDir {
 }"#;
     fs::write(temp_dir.path().join("package.json"), package_json).unwrap();
 
-    // Create pyproject.toml
+    // pyproject.toml を作成する
     let pyproject = r#"[project]
 name = "test-project"
 version = "1.0.0"
@@ -63,7 +69,7 @@ dev = [
 "#;
     fs::write(temp_dir.path().join("pyproject.toml"), pyproject).unwrap();
 
-    // Create Cargo.toml
+    // Cargo.toml を作成する
     let cargo_toml = r#"[package]
 name = "test-project"
 version = "0.1.0"
@@ -78,7 +84,7 @@ tempfile = "3.10"
 "#;
     fs::write(temp_dir.path().join("Cargo.toml"), cargo_toml).unwrap();
 
-    // Create go.mod
+    // go.mod を作成する
     let go_mod = r#"module example.com/test
 
 go 1.21
@@ -96,13 +102,13 @@ require (
 mod dry_run_tests {
     use super::*;
 
-    /// Test that dry-run mode does not modify any files
+    /// dry-run モードがファイルを変更しないことを確認する
     #[test]
     fn test_dry_run_leaves_files_unchanged() {
         let temp_dir = create_test_project();
         let binary = get_binary_path();
 
-        // Read original file contents
+        // 元のファイル内容を読む
         let original_package_json =
             fs::read_to_string(temp_dir.path().join("package.json")).unwrap();
         let original_pyproject =
@@ -110,16 +116,16 @@ mod dry_run_tests {
         let original_cargo = fs::read_to_string(temp_dir.path().join("Cargo.toml")).unwrap();
         let original_go_mod = fs::read_to_string(temp_dir.path().join("go.mod")).unwrap();
 
-        // Run depup in dry-run mode
+        // depup を dry-run モードで実行する
         let _output = Command::new(&binary)
             .args(["--dry-run", temp_dir.path().to_str().unwrap()])
             .output()
             .expect("Failed to execute command");
 
-        // Verify command executed (might fail on network, but files should still be unchanged)
-        // The command might exit with non-zero due to network errors, but that's OK for this test
+        // ネットワークエラーで失敗しても、ファイルは変更されないはず。
+        // このテストではネットワーク起因の非ゼロ終了を許容する。
 
-        // Verify files are unchanged
+        // ファイルが変更されていないことを確認する
         let new_package_json = fs::read_to_string(temp_dir.path().join("package.json")).unwrap();
         let new_pyproject = fs::read_to_string(temp_dir.path().join("pyproject.toml")).unwrap();
         let new_cargo = fs::read_to_string(temp_dir.path().join("Cargo.toml")).unwrap();
@@ -143,7 +149,7 @@ mod dry_run_tests {
         );
     }
 
-    /// Test that dry-run with specific language filter still leaves files unchanged
+    /// 言語フィルタ付き dry-run でもファイルを変更しないことを確認する
     #[test]
     fn test_dry_run_with_language_filter() {
         let temp_dir = create_test_project();
@@ -152,7 +158,7 @@ mod dry_run_tests {
         let original_package_json =
             fs::read_to_string(temp_dir.path().join("package.json")).unwrap();
 
-        // Run depup in dry-run mode for Node.js only
+        // Node.js だけを対象に dry-run モードで実行する
         Command::new(&binary)
             .args(["--dry-run", "--node", temp_dir.path().to_str().unwrap()])
             .output()
@@ -166,7 +172,7 @@ mod dry_run_tests {
         );
     }
 
-    /// Test that dry-run mode works with quiet flag
+    /// quiet フラグ付き dry-run が動作することを確認する
     #[test]
     fn test_dry_run_with_quiet_mode() {
         let temp_dir = create_test_project();
@@ -174,7 +180,7 @@ mod dry_run_tests {
 
         let original_cargo = fs::read_to_string(temp_dir.path().join("Cargo.toml")).unwrap();
 
-        // Run depup in dry-run mode with quiet flag
+        // quiet フラグ付き dry-run モードで実行する
         let output = Command::new(&binary)
             .args([
                 "--dry-run",
@@ -185,9 +191,9 @@ mod dry_run_tests {
             .output()
             .expect("Failed to execute command");
 
-        // In quiet mode, stdout should be minimal
+        // quiet モードでは stdout が最小限になる
         let stdout = String::from_utf8_lossy(&output.stdout);
-        // Quiet mode should have less output
+        // quiet モードでは出力が少なくなる
         assert!(
             stdout.len() < 1000,
             "Quiet mode should produce minimal output"
@@ -204,13 +210,13 @@ mod dry_run_tests {
 mod json_output_tests {
     use super::*;
 
-    /// Test JSON output structure
+    /// JSON 出力構造を確認する
     #[test]
     fn test_json_output_schema() {
         let temp_dir = create_test_project();
         let binary = get_binary_path();
 
-        // Run depup with JSON output
+        // JSON 出力で depup を実行する
         let output = Command::new(&binary)
             .args(["--dry-run", "--json", temp_dir.path().to_str().unwrap()])
             .output()
@@ -218,14 +224,14 @@ mod json_output_tests {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
 
-        // Parse JSON output
+        // JSON 出力をパースする
         let json: serde_json::Value =
             serde_json::from_str(&stdout).expect("Output should be valid JSON");
 
-        // Verify top-level structure
+        // トップレベル構造を確認する
         assert!(json.is_object(), "JSON output should be an object");
 
-        // Verify required fields
+        // 必須フィールドを確認する
         assert!(
             json.get("dry_run").is_some(),
             "JSON should have 'dry_run' field"
@@ -239,24 +245,24 @@ mod json_output_tests {
             "JSON should have 'manifests' field"
         );
 
-        // Verify dry_run is true
+        // dry_run が true であることを確認する
         assert_eq!(
             json["dry_run"].as_bool(),
             Some(true),
             "dry_run should be true"
         );
 
-        // Verify summary.updates is a number
+        // summary.updates が数値であることを確認する
         assert!(
             json["summary"]["updates"].is_number(),
             "summary.updates should be a number"
         );
 
-        // Verify manifests is an array
+        // manifests が配列であることを確認する
         assert!(json["manifests"].is_array(), "manifests should be an array");
     }
 
-    /// Test JSON output contains manifest information
+    /// JSON 出力にマニフェスト情報が含まれることを確認する
     #[test]
     fn test_json_output_manifest_structure() {
         let temp_dir = create_test_project();
@@ -273,12 +279,12 @@ mod json_output_tests {
 
         let manifests = json["manifests"].as_array().unwrap();
 
-        // Should have detected at least one manifest
-        // (might not detect all if there are parsing issues)
+        // 少なくとも1つのマニフェストを検出しているはず。
+        // パース問題がある場合はすべて検出できない可能性がある。
         if !manifests.is_empty() {
             let manifest = &manifests[0];
 
-            // Verify manifest structure
+            // マニフェスト構造を確認する
             assert!(
                 manifest.get("path").is_some(),
                 "Manifest should have 'path' field"
@@ -291,9 +297,9 @@ mod json_output_tests {
                 manifest.get("updates").is_some(),
                 "Manifest should have 'updates' field"
             );
-            // Note: 'skips' field is only included in verbose mode and when non-empty
+            // skips フィールドは verbose モードかつ非空の場合だけ含まれる。
 
-            // Verify language is valid (display names)
+            // language が有効な表示名であることを確認する。
             let language = manifest["language"].as_str().unwrap();
             let valid_languages = ["Node.js", "Python", "Rust", "Go"];
             assert!(
@@ -305,7 +311,7 @@ mod json_output_tests {
         }
     }
 
-    /// Test JSON output with empty directory
+    /// 空ディレクトリでの JSON 出力を確認する
     #[test]
     fn test_json_output_empty_directory() {
         let temp_dir = tempfile::tempdir().expect("Failed to create temp directory");
@@ -320,14 +326,14 @@ mod json_output_tests {
         let json: serde_json::Value =
             serde_json::from_str(&stdout).expect("Output should be valid JSON");
 
-        // Should have empty manifests array
+        // manifests は空配列になるはず
         let manifests = json["manifests"].as_array().unwrap();
         assert!(
             manifests.is_empty(),
             "Empty directory should have no manifests"
         );
 
-        // summary.updates should be 0
+        // summary.updates は 0 になるはず
         assert_eq!(
             json["summary"]["updates"].as_i64(),
             Some(0),
@@ -339,26 +345,26 @@ mod json_output_tests {
 mod exit_code_tests {
     use super::*;
 
-    /// Test exit code for successful run with no updates
+    /// 更新なしの正常実行で終了コードを確認する
     #[test]
     fn test_exit_code_no_updates() {
         let temp_dir = tempfile::tempdir().expect("Failed to create temp directory");
         let binary = get_binary_path();
 
-        // Run on empty directory (no manifests = no updates)
+        // 空ディレクトリで実行する。マニフェストなしなので更新もない。
         let output = Command::new(&binary)
             .args(["--dry-run", temp_dir.path().to_str().unwrap()])
             .output()
             .expect("Failed to execute command");
 
-        // Should succeed with exit code 0
+        // 終了コード 0 で成功するはず
         assert!(
             output.status.success(),
             "Should exit with success for empty directory"
         );
     }
 
-    /// Test exit code with help flag
+    /// help フラグの終了コードを確認する
     #[test]
     fn test_exit_code_help() {
         let binary = get_binary_path();
@@ -377,7 +383,7 @@ mod exit_code_tests {
         );
     }
 
-    /// Test exit code with version flag
+    /// version フラグの終了コードを確認する
     #[test]
     fn test_exit_code_version() {
         let binary = get_binary_path();
@@ -396,7 +402,7 @@ mod exit_code_tests {
         );
     }
 
-    /// Test exit code with invalid path
+    /// 不正パスでの終了コードを確認する
     #[test]
     fn test_exit_code_nonexistent_path() {
         let binary = get_binary_path();
@@ -406,8 +412,8 @@ mod exit_code_tests {
             .output()
             .expect("Failed to execute command");
 
-        // Should still succeed (empty manifests case)
-        // The tool treats non-existent paths as empty directories
+        // 空マニフェスト扱いなので成功するはず。
+        // このツールは存在しないパスを空ディレクトリとして扱う。
         assert!(
             output.status.success(),
             "Should handle non-existent path gracefully"
@@ -418,17 +424,17 @@ mod exit_code_tests {
 mod monorepo_tests {
     use super::*;
 
-    /// Create a monorepo test project with .depup config
+    /// .depup 設定を持つモノレポテストプロジェクトを作成する
     fn create_monorepo_project() -> TempDir {
         let temp_dir = tempfile::tempdir().expect("Failed to create temp directory");
 
-        // Create subdirectories
+        // サブディレクトリを作成する
         let gui_dir = temp_dir.path().join("gui");
         let api_dir = temp_dir.path().join("api");
         fs::create_dir(&gui_dir).unwrap();
         fs::create_dir(&api_dir).unwrap();
 
-        // gui/package.json
+        // gui/package.json を作成する
         fs::write(
             gui_dir.join("package.json"),
             r#"{
@@ -440,7 +446,7 @@ mod monorepo_tests {
         )
         .unwrap();
 
-        // api/pyproject.toml
+        // api/pyproject.toml を作成する
         fs::write(
             api_dir.join("pyproject.toml"),
             r#"[project]
@@ -452,13 +458,13 @@ dependencies = [
         )
         .unwrap();
 
-        // .depup config
+        // .depup 設定を作成する
         fs::write(temp_dir.path().join(".depup"), "gui\napi\n").unwrap();
 
         temp_dir
     }
 
-    /// Test monorepo dry-run with JSON output processes all subdirectories
+    /// JSON 出力のモノレポ dry-run が全サブディレクトリを処理することを確認する
     #[test]
     fn test_monorepo_dry_run_json() {
         let temp_dir = create_monorepo_project();
@@ -473,7 +479,7 @@ dependencies = [
         let json: serde_json::Value =
             serde_json::from_str(&stdout).expect("Output should be valid JSON");
 
-        // Should have manifests from both subdirectories
+        // 両方のサブディレクトリからマニフェストを取得しているはず
         let manifests = json["manifests"].as_array().unwrap();
         assert!(
             manifests.len() >= 2,
@@ -481,7 +487,7 @@ dependencies = [
             manifests.len()
         );
 
-        // Verify both languages are represented
+        // 両方の言語が含まれることを確認する
         let languages: Vec<&str> = manifests
             .iter()
             .filter_map(|m| m["language"].as_str())
@@ -496,7 +502,7 @@ dependencies = [
         );
     }
 
-    /// Test monorepo dry-run leaves all files unchanged
+    /// モノレポ dry-run が全ファイルを変更しないことを確認する
     #[test]
     fn test_monorepo_dry_run_no_modification() {
         let temp_dir = create_monorepo_project();
@@ -523,13 +529,13 @@ dependencies = [
         );
     }
 
-    /// Test that without .depup, existing single-dir behavior is preserved
+    /// .depup がない場合に既存の単一ディレクトリ動作が維持されることを確認する
     #[test]
     fn test_no_depup_file_preserves_existing_behavior() {
         let temp_dir = create_test_project();
         let binary = get_binary_path();
 
-        // No .depup file - should work as before
+        // .depup がないため従来どおり動作するはず
         let output = Command::new(&binary)
             .args(["--dry-run", "--json", temp_dir.path().to_str().unwrap()])
             .output()
@@ -539,7 +545,7 @@ dependencies = [
         let json: serde_json::Value =
             serde_json::from_str(&stdout).expect("Output should be valid JSON");
 
-        // Should detect manifests in the root directory
+        // ルートディレクトリのマニフェストを検出するはず
         let manifests = json["manifests"].as_array().unwrap();
         assert!(
             !manifests.is_empty(),
@@ -547,7 +553,7 @@ dependencies = [
         );
     }
 
-    /// Test monorepo with verbose flag shows directory info
+    /// verbose フラグ付きモノレポ実行でディレクトリ情報が表示されることを確認する
     #[test]
     fn test_monorepo_verbose() {
         let temp_dir = create_monorepo_project();
@@ -570,7 +576,7 @@ dependencies = [
 mod cli_options_tests {
     use super::*;
 
-    /// Test verbose mode output
+    /// verbose モード出力を確認する
     #[test]
     fn test_verbose_mode() {
         let temp_dir = create_test_project();
@@ -583,14 +589,14 @@ mod cli_options_tests {
 
         let stderr = String::from_utf8_lossy(&output.stderr);
 
-        // Verbose mode should include version info
+        // verbose モードにはバージョン情報が含まれるはず
         assert!(
             stderr.contains("depup v") || stderr.contains("Target:"),
             "Verbose mode should include version or target info"
         );
     }
 
-    /// Test diff output mode
+    /// diff 出力モードを確認する
     #[test]
     fn test_diff_output_mode() {
         let temp_dir = create_test_project();
@@ -601,23 +607,23 @@ mod cli_options_tests {
             .output()
             .expect("Failed to execute command");
 
-        // Diff mode should produce some output if there are potential updates
-        // The output format depends on whether updates are found
+        // 更新候補がある場合、diff モードは何らかの出力を生成するはず。
+        // 出力形式は更新の有無に依存する。
         let _stdout = String::from_utf8_lossy(&output.stdout);
-        // Just verify it doesn't crash
+        // クラッシュしないことだけを確認する
         assert!(
             output.status.success() || !output.status.success(),
             "Diff mode should complete without crashing"
         );
     }
 
-    /// Test language filter options
+    /// 言語フィルタオプションを確認する
     #[test]
     fn test_language_filters() {
         let temp_dir = create_test_project();
         let binary = get_binary_path();
 
-        // Test each language filter
+        // 各言語フィルタを確認する
         for lang_flag in &["--node", "--python", "--rust", "--go"] {
             let output = Command::new(&binary)
                 .args([
@@ -633,7 +639,7 @@ mod cli_options_tests {
             let json: serde_json::Value = serde_json::from_str(&stdout)
                 .unwrap_or_else(|_| panic!("Output should be valid JSON for {}", lang_flag));
 
-            // Should have at most 1 manifest (the filtered one)
+            // フィルタされた1マニフェスト以下になるはず
             let manifests = json["manifests"].as_array().unwrap();
             assert!(
                 manifests.len() <= 1,
@@ -644,7 +650,7 @@ mod cli_options_tests {
         }
     }
 
-    /// Test exclude package option
+    /// exclude パッケージオプションを確認する
     #[test]
     fn test_exclude_package() {
         let temp_dir = create_test_project();
@@ -666,7 +672,7 @@ mod cli_options_tests {
         let json: serde_json::Value =
             serde_json::from_str(&stdout).expect("Output should be valid JSON");
 
-        // Lodash should be excluded, so it should not appear in updates
+        // lodash は除外されるため updates に現れないはず
         let manifests = json["manifests"].as_array().unwrap();
         for manifest in manifests {
             let updates = manifest["updates"].as_array().unwrap();
@@ -677,7 +683,7 @@ mod cli_options_tests {
         }
     }
 
-    /// Test only package option
+    /// only パッケージオプションを確認する
     #[test]
     fn test_only_package() {
         let temp_dir = create_test_project();
@@ -699,7 +705,7 @@ mod cli_options_tests {
         let json: serde_json::Value =
             serde_json::from_str(&stdout).expect("Output should be valid JSON");
 
-        // Only lodash should appear in updates (if any)
+        // updates がある場合、lodash だけが現れるはず
         let manifests = json["manifests"].as_array().unwrap();
         for manifest in manifests {
             let updates = manifest["updates"].as_array().unwrap();
@@ -710,7 +716,7 @@ mod cli_options_tests {
         }
     }
 
-    /// Test invalid --cd path
+    /// 不正な --cd パスを確認する
     #[test]
     fn test_invalid_cd_path() {
         let binary = get_binary_path();
@@ -720,7 +726,7 @@ mod cli_options_tests {
             .output()
             .expect("Failed to execute command");
 
-        // --cd with non-existent directory should fail
+        // 存在しないディレクトリへの --cd は失敗するはず
         assert!(
             !output.status.success(),
             "--cd with non-existent path should fail"
@@ -736,13 +742,13 @@ mod cli_options_tests {
         );
     }
 
-    /// Test mutually exclusive options
+    /// 相互排他オプションを確認する
     #[test]
     fn test_mutually_exclusive_options() {
         let temp_dir = create_test_project();
         let binary = get_binary_path();
 
-        // --json and --diff should be mutually exclusive
+        // --json と --diff は相互排他であるべき
         let output = Command::new(&binary)
             .args([
                 "--dry-run",
@@ -753,13 +759,13 @@ mod cli_options_tests {
             .output()
             .expect("Failed to execute command");
 
-        // Should either fail or produce valid output (implementation dependent)
-        // At minimum, verify it doesn't crash
+        // 実装に応じて失敗または有効な出力になる。
+        // 最低限クラッシュしないことを確認する。
         let _stdout = String::from_utf8_lossy(&output.stdout);
         let _stderr = String::from_utf8_lossy(&output.stderr);
     }
 
-    /// Test help output
+    /// help 出力を確認する
     #[test]
     fn test_help_output() {
         let binary = get_binary_path();
@@ -781,7 +787,7 @@ mod cli_options_tests {
         );
     }
 
-    /// Test age filter option
+    /// age フィルタオプションを確認する
     #[test]
     fn test_age_filter_option() {
         let temp_dir = create_test_project();
@@ -798,20 +804,20 @@ mod cli_options_tests {
             .output()
             .expect("Failed to execute command");
 
-        // Network conditions can cause partial failures (exit code 2),
-        // but --age itself should still produce valid JSON output.
+        // ネットワーク状態により部分失敗 (終了コード 2) になる場合があるが、
+        // --age 自体は有効な JSON 出力を返すはず。
         assert!(
             output.status.success() || output.status.code() == Some(2),
             "--age option should work"
         );
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        // Should produce valid JSON
+        // 有効な JSON を生成するはず
         let _: serde_json::Value =
             serde_json::from_str(&stdout).expect("Output should be valid JSON");
     }
 
-    /// Test invalid age format
+    /// 不正な age 形式を確認する
     #[test]
     fn test_invalid_age_format() {
         let temp_dir = create_test_project();
@@ -827,7 +833,7 @@ mod cli_options_tests {
             .output()
             .expect("Failed to execute command");
 
-        // Should fail with invalid age format
+        // 不正な age 形式では失敗するはず
         assert!(!output.status.success(), "Invalid --age format should fail");
     }
 }

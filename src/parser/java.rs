@@ -32,6 +32,14 @@ static VERSION_RE: LazyLock<Regex> =
 static STRICT_VERSION_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&format!("^({GRADLE_VERSION_TOKEN})!!$")).unwrap());
 
+// strict range + prefer 短縮記法: [1.7, 1.8[!!1.7.25
+static STRICT_RANGE_WITH_PREFER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r"^(?P<range>[\[\(\]]\s*(?:{GRADLE_VERSION_TOKEN})?\s*,\s*(?:{GRADLE_VERSION_TOKEN})?\s*[\]\)\[])\s*!!\s*(?P<prefer>{GRADLE_VERSION_TOKEN})$"
+    ))
+    .unwrap()
+});
+
 // プレフィックス指定: 1.2.+ / 1.+
 static PREFIX_VERSION_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(\d+(?:\.\d+)*)\.\+$").unwrap());
@@ -75,6 +83,12 @@ impl VersionParser for JavaVersionParser {
                     .with_prefix("[")
                     .with_suffix("]"),
             );
+        }
+
+        // strict range + prefer 短縮記法を判定: [1.7, 1.8[!!1.7.25
+        if let Some(caps) = STRICT_RANGE_WITH_PREFER_RE.captures(trimmed) {
+            let prefer = caps.name("prefer")?.as_str();
+            return Some(VersionSpec::new(VersionSpecKind::Range, trimmed, prefer));
         }
 
         // Maven 形式レンジを判定: [1.0,2.0], [1.0,), (,2.0]
@@ -384,6 +398,15 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_strict_range_with_prefer() {
+        let spec = parse("[1.7, 1.8[!!1.7.25").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.raw, "[1.7, 1.8[!!1.7.25");
+        assert_eq!(spec.version, "1.7.25");
+        assert_eq!(spec.format_updated("1.7.36"), "[1.7, 1.8[!!1.7.36");
+    }
+
+    #[test]
     fn test_parse_strict_version_prefix_not_supported() {
         // 先頭 !! の形式はサポートしない
         assert!(parse("!!1.2.3").is_none());
@@ -435,9 +458,12 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_strict_with_range_not_supported() {
-        // [1.7,1.8[!!1.7.25 — strict 記法とレンジの組み合わせはサポートしない
-        assert!(parse("[1.7,1.8[!!1.7.25").is_none());
+    fn test_parse_strict_range_with_prefer_no_space() {
+        // Gradle の strict range + prefer 短縮記法は空白なしでも解析できる
+        let spec = parse("[1.7,1.8[!!1.7.25").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1.7.25");
+        assert_eq!(spec.format_updated("1.7.36"), "[1.7,1.8[!!1.7.36");
     }
 
     #[test]
