@@ -82,15 +82,26 @@ fn extract_numeric_parts(new_version: &str) -> Option<Vec<String>> {
 
 fn format_wildcard_like(raw: &str, new_version: &str) -> Option<String> {
     let trimmed = raw.trim();
-    if matches!(trimmed, "*" | "x" | "X") {
-        return Some(trimmed.to_string());
+    // npm の `^1.x` / `~1.2.*` のような演算子付きワイルドカードでは、先頭の `^` / `~`
+    // 演算子を切り出して保持し、残りをワイルドカードとして再構成する。
+    // 既存のワイルドカード (`1.x` / `1.2.*` / `v1.*` / `1.+`) は演算子を持たないため
+    // op_prefix は空となり、従来どおりの挙動になる。
+    let op_len = trimmed
+        .bytes()
+        .take_while(|b| matches!(b, b'^' | b'~'))
+        .count();
+    let op_prefix = &trimmed[..op_len];
+    let body = trimmed[op_len..].trim_start();
+
+    if matches!(body, "*" | "x" | "X") {
+        return Some(format!("{op_prefix}{body}"));
     }
 
     let Some(mut parts) = extract_numeric_parts(new_version) else {
         return Some(trimmed.to_string());
     };
 
-    let segments: Vec<&str> = trimmed.split('.').collect();
+    let segments: Vec<&str> = body.split('.').collect();
     while parts.len() < segments.len() {
         parts.push("0".to_string());
     }
@@ -127,7 +138,7 @@ fn format_wildcard_like(raw: &str, new_version: &str) -> Option<String> {
         return Some(trimmed.to_string());
     }
 
-    Some(rebuilt.join("."))
+    Some(format!("{op_prefix}{}", rebuilt.join(".")))
 }
 
 fn format_partial_version_like(raw: &str, new_version: &str) -> Option<String> {
@@ -855,5 +866,26 @@ mod tests {
         // Gradle の 2セグメント + ワイルドカード
         let spec = VersionSpec::new(VersionSpecKind::Wildcard, "5.3.+", "5.3");
         assert_eq!(spec.format_updated("6.1.0"), "6.1.+");
+    }
+
+    #[test]
+    fn test_format_wildcard_like_caret_prefix() {
+        // npm の caret + x-range は `^` を保持して形を保って更新する
+        let spec = VersionSpec::new(VersionSpecKind::Wildcard, "^1.x", "1");
+        assert_eq!(spec.format_updated("2.3.4"), "^2.x");
+    }
+
+    #[test]
+    fn test_format_wildcard_like_tilde_prefix_minor() {
+        // npm の tilde + x-range は `~` を保持する
+        let spec = VersionSpec::new(VersionSpecKind::Wildcard, "~1.2.x", "1.2");
+        assert_eq!(spec.format_updated("2.3.4"), "~2.3.x");
+    }
+
+    #[test]
+    fn test_format_wildcard_like_no_operator_unchanged() {
+        // 演算子なしの既存ワイルドカードは従来どおりの挙動 (op_prefix が空)
+        let spec = VersionSpec::new(VersionSpecKind::Wildcard, "1.x", "1");
+        assert_eq!(spec.format_updated("2.3.4"), "2.x");
     }
 }

@@ -954,6 +954,47 @@ mod tests {
     }
 
     #[test]
+    fn test_judge_python_pep440_rc_without_separator_not_chosen() {
+        // 回帰テスト: PyPI が返すセパレータなし rc (例: 2.0.0rc1) を
+        // 安定版ユーザーへ誤って更新候補として選ばない
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_dependency("urllib3", "1.9.0", Language::Python, false);
+        let versions = vec![
+            make_version_info("1.9.0", 100),
+            make_version_info("2.0.0rc1", 10), // PEP 440 セパレータなし rc は prerelease
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        // 安定版候補は現状版だけなので更新されない (rc へ誤更新しない)
+        assert!(result.is_skip());
+        if let UpdateResult::Skip { reason, .. } = result {
+            assert_eq!(reason, SkipReason::AlreadyLatest);
+        }
+    }
+
+    #[test]
+    fn test_judge_python_pep440_prefers_stable_over_rc() {
+        // 安定版と rc が両方ある場合は安定版を選ぶ
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_dependency("urllib3", "1.9.0", Language::Python, false);
+        let versions = vec![
+            make_version_info("1.9.0", 100),
+            make_version_info("2.0.0rc1", 20), // prerelease なので無視する
+            make_version_info("2.0.0", 10),    // 安定版なので選ばれる
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_update());
+        if let UpdateResult::Update { new_version, .. } = result {
+            assert_eq!(new_version, "2.0.0");
+        }
+    }
+
+    #[test]
     fn test_extract_upper_bound() {
         // Range 制約から上限を抽出する補助関数の確認
         assert_eq!(

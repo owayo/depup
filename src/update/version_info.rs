@@ -107,16 +107,27 @@ pub fn is_prerelease_version(version: &str) -> bool {
     }
 
     // Python/PEP 440 形式の短縮識別子をチェック:
-    // - 26.1a1 (alpha), 21.12b0 (beta), 1.0c1 or 1.0rc1 (release candidate)
-    // パターン: 数字の後に 'a', 'b', 'c' が続き、さらに数字が続く
+    // - 26.1a1 (alpha), 21.12b0 (beta), 1.0c1 (release candidate)
+    // - 1.0rc1, 2.0.0rc1 (release candidate, セパレータなしの rc 表記)
+    // パターン: 数字の後に 'rc'+数字、または 'a'/'b'/'c'+数字 が続く
     let chars: Vec<char> = lower.chars().collect();
-    for i in 0..chars.len().saturating_sub(2) {
-        if chars[i].is_ascii_digit() {
-            let next = chars[i + 1];
-            // 'a' は alpha, 'b' は beta, 'c' は release candidate
-            if (next == 'a' || next == 'b' || next == 'c') && chars[i + 2].is_ascii_digit() {
-                return true;
-            }
+    for i in 0..chars.len() {
+        if !chars[i].is_ascii_digit() {
+            continue;
+        }
+        // 'rc' + 数字 (例: 1.0rc1, 2.0.0rc1)。PEP 440 で最も一般的な rc 表記。
+        if chars.get(i + 1) == Some(&'r')
+            && chars.get(i + 2) == Some(&'c')
+            && chars.get(i + 3).is_some_and(|c| c.is_ascii_digit())
+        {
+            return true;
+        }
+        // 'a'/'b'/'c' + 数字 (例: 26.1a1, 21.12b0, 1.0c1)
+        if let Some(&next) = chars.get(i + 1)
+            && matches!(next, 'a' | 'b' | 'c')
+            && chars.get(i + 2).is_some_and(|c| c.is_ascii_digit())
+        {
+            return true;
         }
     }
 
@@ -144,6 +155,17 @@ impl PartialOrd for VersionInfo {
     }
 }
 
+/// 文字列末尾の連続する数字を `u64` として取り出す。
+/// PEP 440 のセパレータなし prerelease (例: `rc1` → 1、`rc` → None) の
+/// 数値識別子抽出に使う。
+fn trailing_number(s: &str) -> Option<u64> {
+    let digits: String = s.chars().rev().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.chars().rev().collect::<String>().parse().ok()
+}
+
 /// semver 風ルールでバージョン文字列を比較する。
 ///
 /// - 不足パートは 0 として扱う (例: `"1.0" == "1.0.0"`)
@@ -161,28 +183,54 @@ pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
             .unwrap_or(s);
         // ビルドメタデータ (+...) を除去
         let s = s.split('+').next().unwrap_or(s);
-        // 数値コアとプレリリース部に分離する。最初の '-' 以前が数値コア。
+        // 数値コアとプレリリース部に分離する。最初の '-' 以前が数値コアの候補。
         // (Java 風 qualifier `5.0.0.RELEASE` は '-' を含まないため数値コアのみ抽出される)
         let mut split = s.splitn(2, '-');
         let core = split.next().unwrap_or("");
-        let pre = split.next();
-        // プレリリース識別子があり、かつ非数値セグメントを含む場合のみ prerelease 扱い
-        // (純粋に数値だけのサフィックスは Java SNAPSHOT 等の qualifier ではないため除外)
-        let pre_nums = pre.and_then(|s| {
-            if !s.is_empty() && s.split('.').any(|p| p.parse::<u64>().is_err()) {
-                // プレリリース内の数値識別子を順序付けに使う
-                // (例: "canary-456" → [456], "rc.1" → [1])
-                Some(
-                    s.split(['.', '-'])
-                        .filter_map(|p| p.parse::<u64>().ok())
-                        .collect(),
-                )
-            } else {
-                None
+        let hyphen_pre = split.next();
+
+        // 数値コアを '.' 区切りで走査する。各セグメントは先頭の数値部分のみを取り、
+        // セグメント途中から英字が始まる場合 (例: "0rc1") は PEP 440 のセパレータなし
+        // prerelease 表記とみなして、それ以降を prerelease として切り出す。
+        let mut nums = Vec::new();
+        let mut embedded_pre: Option<&str> = None;
+        for segment in core.split('.') {
+            let digit_end = segment
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(segment.len());
+            if digit_end == 0 {
+                // 数字で始まらないセグメント (Java の RELEASE / Final 等) は数値コアに含めない
+                continue;
             }
-        });
-        // 数値コアのみ '.' で分割して数値部分を取得 (prerelease 部の数字は含めない)
-        let nums = core.split('.').filter_map(|p| p.parse().ok()).collect();
+            if let Ok(value) = segment[..digit_end].parse::<u64>() {
+                nums.push(value);
+            }
+            if digit_end < segment.len() {
+                // 例: "0rc1" の "rc1" 部分。以降は prerelease 扱いなので走査を止める
+                embedded_pre = Some(&segment[digit_end..]);
+                break;
+            }
+        }
+
+        // プレリリース部の数値識別子を順序付けに使う。
+        // - セパレータなし表記 (embedded_pre, 例: "rc1") は末尾の数値を識別子とする
+        // - '-' 区切り表記 (hyphen_pre, 例: "canary-456" → [456], "rc.1" → [1]) は従来どおり
+        // 純粋に数値だけの '-' サフィックスは Java SNAPSHOT 等の qualifier なので prerelease 扱いしない
+        let pre_nums = if let Some(embedded) = embedded_pre {
+            Some(trailing_number(embedded).into_iter().collect())
+        } else {
+            hyphen_pre.and_then(|p| {
+                if !p.is_empty() && p.split('.').any(|part| part.parse::<u64>().is_err()) {
+                    Some(
+                        p.split(['.', '-'])
+                            .filter_map(|part| part.parse::<u64>().ok())
+                            .collect(),
+                    )
+                } else {
+                    None
+                }
+            })
+        };
         (nums, pre_nums)
     };
 
@@ -801,5 +849,86 @@ mod tests {
         assert!(is_prerelease_version("1.0.0-unmaintained"));
         // 単語境界チェック: "deprecated" を部分文字列として含む別の語は除外しない
         assert!(!is_prerelease_version("1.0.0-undeprecated"));
+    }
+
+    #[test]
+    fn test_is_prerelease_pep440_rc_without_separator() {
+        // 回帰テスト: PEP 440 のセパレータなし rc 表記 (X.Y.Zrc1) を prerelease と判定する。
+        // 以前は "数字+a/b/c+数字" しか見ておらず "rc" の先頭 'r' を取りこぼし、
+        // 安定版ユーザーが rc 版へ誤更新されていた。
+        assert!(is_prerelease_version("2.0.0rc1"));
+        assert!(is_prerelease_version("1.0rc1"));
+        assert!(is_prerelease_version("21.0rc2"));
+        assert!(is_prerelease_version("3.0.0RC1")); // 大文字でも検出する
+        // セパレータなしの a/b も従来どおり検出する
+        assert!(is_prerelease_version("2.0.0a1"));
+        assert!(is_prerelease_version("2.0.0b1"));
+        // 安定版を rc 表記と誤検出しない
+        assert!(!is_prerelease_version("2.0.0"));
+        assert!(!is_prerelease_version("1.2.3"));
+    }
+
+    #[test]
+    fn test_compare_versions_pep440_rc_without_separator_is_less_than_stable() {
+        // 回帰テスト: セパレータなし rc は対応する安定版より小さい (semver / PEP 440)
+        assert_eq!(
+            compare_versions("2.0.0rc1", "2.0.0"),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_versions("2.0.0", "2.0.0rc1"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(compare_versions("1.0rc1", "1.0"), std::cmp::Ordering::Less);
+        // セパレータなし a/b も同様
+        assert_eq!(
+            compare_versions("1.0.0a1", "1.0.0"),
+            std::cmp::Ordering::Less
+        );
+        // 数値コアが異なる場合はコアが優先される
+        assert_eq!(
+            compare_versions("2.0.0rc1", "1.9.0"),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn test_compare_versions_pep440_rc_ordering() {
+        // セパレータなし rc 同士は末尾の数値識別子で順序付けする
+        assert_eq!(
+            compare_versions("2.0.0rc1", "2.0.0rc2"),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_versions("2.0.0rc2", "2.0.0rc1"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_versions("2.0.0rc1", "2.0.0rc1"),
+            std::cmp::Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn test_trailing_number_extraction() {
+        assert_eq!(super::trailing_number("rc1"), Some(1));
+        assert_eq!(super::trailing_number("rc12"), Some(12));
+        assert_eq!(super::trailing_number("a0"), Some(0));
+        assert_eq!(super::trailing_number("rc"), None);
+        assert_eq!(super::trailing_number(""), None);
+    }
+
+    #[test]
+    fn test_compare_versions_qualifier_suffix_still_equal() {
+        // 回帰テスト: 英字のみで始まる Java qualifier は数値コアに影響せず安定版と等価のまま
+        // (embedded prerelease 導入で壊れていないことを確認)
+        assert_eq!(
+            compare_versions("5.0.0", "5.0.0.RELEASE"),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            compare_versions("4.0.0.Final", "4.0.0"),
+            std::cmp::Ordering::Equal
+        );
     }
 }

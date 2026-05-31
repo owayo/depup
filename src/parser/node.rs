@@ -5,7 +5,7 @@
 //! - Caret: `^1.2.3`, `^1.2`, `^1`
 //! - Tilde: `~1.2.3`, `~1.2`, `~1`
 //! - 比較演算子: `>=1.2.3`, `>1.2.3`, `<=1.2.3`, `<1.2.3`
-//! - ワイルドカード: `1.x`, `1.2.*`
+//! - ワイルドカード: `1.x`, `1.2.*`, `^1.x`, `~1.2.x` (caret/tilde + x-range)
 //! - レンジ: `>=1.0.0 <2.0.0`, `1.0.0 - 2.0.0`, `^1 || ^2`
 
 use crate::domain::{Language, VersionSpec, VersionSpecKind};
@@ -69,6 +69,11 @@ static EXACT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap());
 static WILDCARD_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(?:v?(?:\d+|[xX*])(?:\.(?:\d+|[xX*])){0,2}|\*)$").unwrap());
+// `^1.x` / `~1.2.*` のような caret/tilde + x-range。
+// `^1` / `^1.2.3` は先に CARET_RE / TILDE_RE が消費するため、ここに到達するのは
+// ワイルドカード文字 (x/X/*) を含むものだけ。
+static CARET_TILDE_WILDCARD_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[\^~]\s*v?(?:\d+|[xX*])(?:\.(?:\d+|[xX*])){0,2}$").unwrap());
 static RANGE_TOKEN_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?").unwrap());
 static TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -182,6 +187,20 @@ impl VersionParser for NodeVersionParser {
         // `*` は完全な浮動指定なので更新対象にしない
         if matches!(trimmed, "*" | "x" | "X") {
             return None;
+        }
+
+        // `^1.x` / `~1.2.*` のような caret/tilde + x-range は、演算子を保持しつつ
+        // ワイルドカードとして形を保って更新する (例: `^1.x` → `^2.x`)。
+        // ワイルドカード文字を含む場合のみ対象とし、`^1`/`^1.2.3` は手前の
+        // CARET_RE/TILDE_RE で既に処理されている。
+        if CARET_TILDE_WILDCARD_RE.is_match(trimmed)
+            && (trimmed.contains('x') || trimmed.contains('X') || trimmed.contains('*'))
+        {
+            return Some(VersionSpec::new(
+                VersionSpecKind::Wildcard,
+                trimmed,
+                extract_first_version(trimmed),
+            ));
         }
 
         // `1.x` や `1.2.*` は形を保ったまま更新する
@@ -700,6 +719,54 @@ mod tests {
         let spec = parse("1.2.3 - 2.3").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Range);
         assert_eq!(spec.version, "1.2.3");
+    }
+
+    #[test]
+    fn test_parse_caret_wildcard() {
+        // caret + x-range は Wildcard として認識する (以前は None で無言ドロップしていた)
+        let spec = parse("^1.x").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Wildcard);
+        assert_eq!(spec.raw, "^1.x");
+    }
+
+    #[test]
+    fn test_parse_tilde_wildcard() {
+        let spec = parse("~1.2.x").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Wildcard);
+        assert_eq!(spec.raw, "~1.2.x");
+    }
+
+    #[test]
+    fn test_parse_caret_wildcard_star() {
+        let spec = parse("^1.2.*").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Wildcard);
+        assert_eq!(spec.raw, "^1.2.*");
+    }
+
+    #[test]
+    fn test_format_updated_caret_wildcard() {
+        // caret + x-range は演算子とワイルドカードの形を保って更新する
+        let spec = parse("^1.x").unwrap();
+        assert_eq!(spec.format_updated("2.3.4"), "^2.x");
+    }
+
+    #[test]
+    fn test_format_updated_tilde_wildcard_minor() {
+        let spec = parse("~1.2.x").unwrap();
+        assert_eq!(spec.format_updated("2.3.4"), "~2.3.x");
+    }
+
+    #[test]
+    fn test_format_updated_caret_wildcard_star() {
+        let spec = parse("^1.2.*").unwrap();
+        assert_eq!(spec.format_updated("2.3.4"), "^2.3.*");
+    }
+
+    #[test]
+    fn test_parse_caret_plain_still_caret() {
+        // ワイルドカードを含まない `^1` は従来どおり Caret のまま (Wildcard にしない)
+        let spec = parse("^1").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Caret);
     }
 
     #[test]
