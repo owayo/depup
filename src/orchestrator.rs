@@ -761,14 +761,8 @@ impl Orchestrator {
             filter = filter.with_include_pinned(true);
         }
 
-        // 経過日数フィルタ (解決ロジックは `resolve_age_policy` に分離)
-        let project_age = self.read_project_minimum_release_age();
-        let resolved = resolve_age_policy(
-            project_age.as_ref(),
-            self.args.age,
-            self.args.no_age,
-            self.global_config.as_ref().and_then(|c| c.age_duration()),
-        );
+        // 経過日数フィルタ (解決ロジックは `resolve_age` / `resolve_age_policy` に分離)
+        let resolved = self.resolve_age();
         if let Some(notice) = resolved.notice.as_ref() {
             emit_age_notice(notice);
         }
@@ -782,6 +776,27 @@ impl Orchestrator {
         }
 
         filter
+    }
+
+    /// age 制約を優先順位どおりに解決する。
+    /// judge (`build_filter`) と install フェーズ (`resolved_min_age`) で同じ解決ロジックを
+    /// 共有し、direct deps と transitive deps の age ポリシーを揃える。
+    fn resolve_age(&self) -> ResolvedAge {
+        let project_age = self.read_project_minimum_release_age();
+        resolve_age_policy(
+            project_age.as_ref(),
+            self.args.age,
+            self.args.no_age,
+            self.global_config.as_ref().and_then(|c| c.age_duration()),
+        )
+    }
+
+    /// install フェーズ (PM install / Rust lock audit) に適用する解決済み age を返す。
+    /// judge と同じ優先順位で解決するため、CLI `--age` 未指定でもプロジェクト
+    /// minimumReleaseAge / グローバル設定 / 組み込みデフォルト (1w) が transitive 依存へ反映される。
+    /// notice は `build_filter` で既に発行済みのため、ここでは再発行しない。
+    pub fn resolved_min_age(&self) -> Option<Duration> {
+        self.resolve_age().duration
     }
 
     /// プロジェクト直下の minimumReleaseAge 設定を読む。
@@ -1836,6 +1851,60 @@ mod tests {
         assert_eq!(
             filter.min_age.unwrap(),
             std::time::Duration::from_secs(10 * 24 * 60 * 60)
+        );
+    }
+
+    #[test]
+    fn test_resolved_min_age_matches_build_filter_age() {
+        // install フェーズ (resolved_min_age) と judge フェーズ (build_filter) の age が
+        // 常に一致することを保証する。direct deps と install 後の transitive deps で
+        // age ポリシーを揃えるための回帰防止テスト。
+        let dir = TempDir::new().unwrap();
+        let args = make_args_with_path(dir.path(), &["--age", "2w"]);
+        let orchestrator = Orchestrator::new(args).unwrap();
+        assert_eq!(
+            orchestrator.resolved_min_age(),
+            orchestrator.build_filter().min_age
+        );
+    }
+
+    #[test]
+    fn test_resolved_min_age_falls_back_to_default_without_cli_age() {
+        // CLI --age 未指定でも install フェーズには組み込みデフォルト (1w) が反映される。
+        // 修正前は install フェーズが生の args.age=None を見ており、CLI 未指定時に
+        // transitive 依存へ age が効かない不整合があった。
+        let dir = TempDir::new().unwrap();
+        let args = make_args_with_path(dir.path(), &[]);
+        let orchestrator = Orchestrator::new(args).unwrap();
+        assert_eq!(
+            orchestrator.resolved_min_age(),
+            Some(crate::global_config::DEFAULT_AGE)
+        );
+    }
+
+    #[test]
+    fn test_resolved_min_age_none_with_no_age_and_no_project_settings() {
+        // --no-age 指定かつプロジェクト設定が無い場合は install フェーズも age なし。
+        let dir = TempDir::new().unwrap();
+        let args = make_args_with_path(dir.path(), &["--no-age"]);
+        let orchestrator = Orchestrator::new(args).unwrap();
+        assert_eq!(orchestrator.resolved_min_age(), None);
+    }
+
+    #[test]
+    fn test_resolved_min_age_obeys_project_settings() {
+        // プロジェクト minimumReleaseAge は CLI 未指定でも install フェーズへ反映される。
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages: []\nminimumReleaseAge: 14400\n",
+        )
+        .unwrap();
+        let args = make_args_with_path(dir.path(), &[]);
+        let orchestrator = Orchestrator::new(args).unwrap();
+        assert_eq!(
+            orchestrator.resolved_min_age(),
+            Some(std::time::Duration::from_secs(10 * 24 * 60 * 60))
         );
     }
 

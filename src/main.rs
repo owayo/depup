@@ -130,11 +130,15 @@ async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
 
     // dry-run でない場合、要求があればパッケージマネージャの install を実行
     if args.install && !args.dry_run {
-        run_package_installs(&args, &result, &monorepo_dirs)?;
+        // install フェーズも judge と同じ解決済み age を使う。
+        // これにより direct deps と install 後の transitive 依存で age ポリシーが揃う
+        // (CLI --age 未指定でもプロジェクト minimumReleaseAge / グローバル設定 / デフォルト 1w が反映される)。
+        let install_min_age = orchestrator.resolved_min_age();
 
-        // --age と --install が同時指定された場合、Rust の transitive 依存も
-        // age 制約を満たすよう Cargo.lock を整える。
-        if let Some(age) = args.age {
+        run_package_installs(&args, &result, &monorepo_dirs, install_min_age)?;
+
+        // Rust の transitive 依存も age 制約を満たすよう Cargo.lock を整える。
+        if let Some(age) = install_min_age {
             enforce_rust_lock_age(&args, &orchestrator, &result, &monorepo_dirs, age).await;
         }
     }
@@ -160,6 +164,7 @@ fn run_package_installs(
     args: &CliArgs,
     result: &OrchestratorResult,
     monorepo_dirs: &Option<Vec<PathBuf>>,
+    min_age: Option<std::time::Duration>,
 ) -> anyhow::Result<()> {
     // ディレクトリ -> install が必要な言語のマップを構築
     let install_map = build_install_map(result, monorepo_dirs, &args.path);
@@ -171,8 +176,8 @@ fn run_package_installs(
     if args.verbose {
         eprintln!();
         eprintln!("Running package manager install...");
-        if args.age.is_some() {
-            // age が指定されている場合、ネイティブ対応 PM とそうでないものを通知する
+        if min_age.is_some() {
+            // age が有効な場合、ネイティブ対応 PM とそうでないものを通知する
             let mut unsupported: Vec<&str> = Vec::new();
             for (_dir, langs) in &install_map {
                 for lang in langs {
@@ -209,7 +214,7 @@ fn run_package_installs(
     let mut any_install_failed = false;
 
     for (dir, languages) in &install_map {
-        let install_results = run_installs(&pm_runner, languages, dir, args.age);
+        let install_results = run_installs(&pm_runner, languages, dir, min_age);
 
         for install_result in &install_results {
             if install_result.command.is_empty() {
@@ -262,7 +267,8 @@ async fn enforce_rust_lock_age(
     // 対象となる Rust プロジェクトディレクトリを収集
     let mut rust_dirs: Vec<PathBuf> = Vec::new();
     for manifest in &result.summary.manifests {
-        if manifest.language != Language::Rust {
+        // 更新がなかった Rust manifest は cargo update も走らないため audit 不要
+        if manifest.language != Language::Rust || !manifest.has_updates() {
             continue;
         }
         let Some(parent) = manifest.path.parent() else {
