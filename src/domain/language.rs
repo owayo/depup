@@ -94,11 +94,6 @@ impl Language {
         matches!(self, Language::Go)
     }
 
-    /// この言語がレジストリとしてGitHub Tags APIを使用するかどうかを返す
-    pub fn uses_github_tags(&self) -> bool {
-        matches!(self, Language::Swift)
-    }
-
     /// この言語に対応する OSV.dev の ecosystem 名を返す。
     ///
     /// `None` の場合は OSV による脆弱性チェックの対象外。

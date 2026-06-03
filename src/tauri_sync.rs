@@ -88,19 +88,6 @@ pub fn find_common_major_minor(
     })
 }
 
-/// Tauri パッケージの現在のバージョンとターゲットバージョンの情報
-#[derive(Debug, Clone)]
-pub struct TauriPackageInfo {
-    /// パッケージ名
-    pub name: String,
-    /// 現在のバージョン (マニフェストから)
-    pub current_version: String,
-    /// ターゲットバージョン (更新結果がある場合)
-    pub target_version: Option<String>,
-    /// このパッケージに保留中の更新があるかどうか
-    pub has_update: bool,
-}
-
 /// Tauri パッケージバージョンの同期
 ///
 /// 全ての Tauri パッケージのメジャー.マイナーバージョンが一致することを保証する。
