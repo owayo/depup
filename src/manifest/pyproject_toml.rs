@@ -1081,6 +1081,29 @@ my-pkg = { git = "https://github.com/user/my-pkg.git", branch = "main" }
     }
 
     #[test]
+    fn test_parse_poetry_multiple_constraints_array_skipped() {
+        // Poetry のマルチプル制約配列形式 (Python バージョン別に異なる制約) は、
+        // depup の「1依存=1バージョン=1書き換え」モデルでは配列要素の位置を特定して
+        // 安全に更新できないため、意図的にスキップする (誤更新を防ぐ安全側の挙動)。
+        // 各要素の python マーカーごとの requires_python 互換性も judge しないため、
+        // 自動更新の対象から外す。
+        let content = r#"
+[tool.poetry.dependencies]
+python = "^3.8"
+requests = "^2.28.0"
+foo = [
+    { version = "<=1.9", python = ">=3.6,<3.8" },
+    { version = "^2.0", python = ">=3.8" },
+]
+"#;
+
+        let deps = parse(content).unwrap();
+        // 配列形式の foo はスキップされ、通常依存の requests だけがパースされる
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "requests");
+    }
+
+    #[test]
     fn test_parse_poetry_non_pypi_source_dependency_skipped() {
         // PyPI 以外の Poetry source は PyPI API の候補で更新できないためスキップする
         let content = r#"
