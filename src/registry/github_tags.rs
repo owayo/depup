@@ -19,9 +19,20 @@ use std::sync::LazyLock;
 /// GitHub API のベース URL
 const GITHUB_API_URL: &str = "https://api.github.com";
 
-/// semver タグパターン ('v' プレフィックスは任意)
-static SEMVER_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[vV]?(\d+\.\d+\.\d+)$").unwrap());
+/// semver タグパターン ('v' プレフィックスは任意、プレリリース/ビルドメタデータも許容)
+///
+/// SPM は semver 2.0.0 準拠のため、`v1.0.0-beta.1` のようなプレリリース識別子付きタグや
+/// `1.0.0+build.123` のようなビルドメタデータ付きタグを持ちうる。これらも取得対象に含め、
+/// 安定版/プレリリースの選別は他レジストリ (npm/PyPI/crates.io 等) と同様に
+/// `UpdateJudge::stable_candidates` へ委ねる。デフォルトでは安定版利用者がプレリリースへ
+/// 誤更新されないよう judge がフィルタし、現在版がプレリリースの場合のみ候補に残す。
+/// 末尾の `-` / `+` や `alpha..1` のような空の識別子は弾く。
+static SEMVER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^[vV]?(\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)$",
+    )
+    .unwrap()
+});
 
 /// GitHub Tags API アダプタ
 pub struct GitHubTagsAdapter {
@@ -217,14 +228,24 @@ mod tests {
 
     #[test]
     fn test_semver_regex_matches() {
+        // 安定版タグ
         assert!(SEMVER_RE.is_match("1.0.0"));
         assert!(SEMVER_RE.is_match("v1.0.0"));
         assert!(SEMVER_RE.is_match("V1.0.0"));
         assert!(SEMVER_RE.is_match("v10.20.30"));
+        // SPM は semver 2.0.0 準拠なのでプレリリース/ビルドメタデータ付きタグも取得対象に含める
+        // (安定版/プレリリースの選別は UpdateJudge::stable_candidates に委ねる)
+        assert!(SEMVER_RE.is_match("1.0.0-beta.1"));
+        assert!(SEMVER_RE.is_match("v1.0.0-rc.1"));
+        assert!(SEMVER_RE.is_match("V1.0.0-rc.1+sha.abc"));
+        assert!(SEMVER_RE.is_match("1.0.0+build.123"));
+        // 不正な形式は弾く
         assert!(!SEMVER_RE.is_match("1.0"));
         assert!(!SEMVER_RE.is_match("v1.0"));
         assert!(!SEMVER_RE.is_match("not-a-version"));
-        assert!(!SEMVER_RE.is_match("1.0.0-beta.1"));
+        assert!(!SEMVER_RE.is_match("1.0.0-")); // 末尾ハイフンのみは不可
+        assert!(!SEMVER_RE.is_match("1.0.0+")); // 末尾プラスのみは不可
+        assert!(!SEMVER_RE.is_match("1.0.0-alpha..1")); // 空の識別子は不可
     }
 
     #[test]
@@ -237,6 +258,13 @@ mod tests {
 
         let caps = SEMVER_RE.captures("1.2.3").unwrap();
         assert_eq!(caps.get(1).unwrap().as_str(), "1.2.3");
+
+        // プレリリース/ビルドメタデータも含めてキャプチャする ('v' プレフィックスのみ除去)
+        let caps = SEMVER_RE.captures("v1.2.3-beta.1").unwrap();
+        assert_eq!(caps.get(1).unwrap().as_str(), "1.2.3-beta.1");
+
+        let caps = SEMVER_RE.captures("1.2.3-rc.1+sha.abc").unwrap();
+        assert_eq!(caps.get(1).unwrap().as_str(), "1.2.3-rc.1+sha.abc");
     }
 
     #[test]
