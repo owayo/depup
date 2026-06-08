@@ -10,7 +10,7 @@
 
 use crate::domain::{Dependency, Language, VersionSpec, VersionSpecKind};
 use crate::error::ManifestError;
-use crate::manifest::ManifestParser;
+use crate::manifest::{ManifestParser, gradle_version_catalog};
 use crate::parser::get_parser;
 use regex::Regex;
 use std::collections::HashMap;
@@ -669,6 +669,10 @@ impl GradleParser {
 
 impl ManifestParser for GradleParser {
     fn parse(&self, content: &str) -> Result<Vec<Dependency>, ManifestError> {
+        if let Some(dependencies) = gradle_version_catalog::parse(content)? {
+            return Ok(dependencies);
+        }
+
         let mut dependencies = Vec::new();
         let parser = get_parser(Language::Java);
         let variables = self.extract_variables(content);
@@ -728,6 +732,11 @@ impl ManifestParser for GradleParser {
         package: &str,
         new_version: &str,
     ) -> Result<String, ManifestError> {
+        if let Some(result) = gradle_version_catalog::update_version(content, package, new_version)?
+        {
+            return Ok(result);
+        }
+
         let parser = get_parser(Language::Java);
         let variables = self.extract_variables(content);
 
@@ -1666,6 +1675,184 @@ dependencies {
             .update_version(content, "org.slf4j:slf4j-api", "1.7.36")
             .unwrap();
         assert!(result.contains(r#"/* 現在の推奨版 */ prefer("1.7.36")"#));
+    }
+
+    #[test]
+    fn test_parse_version_catalog_string_library() {
+        let content = r#"
+[libraries]
+junit = "junit:junit:4.13.2"
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "junit:junit");
+        assert_eq!(deps[0].version_spec.version, "4.13.2");
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Exact);
+    }
+
+    #[test]
+    fn test_parse_version_catalog_table_and_version_ref() {
+        let content = r#"
+[versions]
+groovy = "3.0.5"
+
+[libraries]
+groovy-core = { module = "org.codehaus.groovy:groovy", version.ref = "groovy" }
+commons-lang3 = { group = "org.apache.commons", name = "commons-lang3", version = "3.12.0" }
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 2);
+
+        let groovy = deps
+            .iter()
+            .find(|dep| dep.name == "org.codehaus.groovy:groovy")
+            .unwrap();
+        assert_eq!(groovy.version_spec.version, "3.0.5");
+
+        let commons = deps
+            .iter()
+            .find(|dep| dep.name == "org.apache.commons:commons-lang3")
+            .unwrap();
+        assert_eq!(commons.version_spec.version, "3.12.0");
+    }
+
+    #[test]
+    fn test_parse_version_catalog_rich_version() {
+        let content = r#"
+[libraries]
+commons-lang3 = { group = "org.apache.commons", name = "commons-lang3", version = { strictly = "[3.8, 4.0[", prefer = "3.9", reject = ["3.10"] } }
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "org.apache.commons:commons-lang3");
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Range);
+        assert_eq!(deps[0].version_spec.raw, "[3.8, 4.0[");
+        assert_eq!(deps[0].version_spec.version, "3.9");
+        assert_eq!(deps[0].version_spec.rejected_versions, vec!["3.10"]);
+    }
+
+    #[test]
+    fn test_parse_version_catalog_skips_plugins() {
+        let content = r#"
+[plugins]
+versions = { id = "com.github.ben-manes.versions", version = "0.45.0" }
+"#;
+        let deps = parse(content).unwrap();
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_parse_version_catalog_invalid_toml_returns_error() {
+        let content = r#"
+[libraries]
+junit = { module = "junit:junit", version = "4.13.2"
+"#;
+        let err = parse(content).unwrap_err();
+        assert!(matches!(err, ManifestError::TomlParseError { .. }));
+    }
+
+    #[test]
+    fn test_update_version_catalog_string_library() {
+        let content = r#"
+[libraries]
+junit = "junit:junit:4.13.2"
+"#;
+        let result = GradleParser
+            .update_version(content, "junit:junit", "4.13.3")
+            .unwrap();
+        assert!(result.contains(r#"junit = "junit:junit:4.13.3""#));
+        assert!(result.ends_with('\n'));
+    }
+
+    #[test]
+    fn test_update_version_catalog_direct_table_version() {
+        let content = r#"
+[libraries]
+commons-lang3 = { group = "org.apache.commons", name = "commons-lang3", version = "3.12.0" }
+"#;
+        let result = GradleParser
+            .update_version(content, "org.apache.commons:commons-lang3", "3.14.0")
+            .unwrap();
+        assert!(result.contains(r#"version = "3.14.0""#));
+    }
+
+    #[test]
+    fn test_update_version_catalog_version_ref() {
+        let content = r#"
+[versions]
+groovy = "3.0.5"
+
+[libraries]
+groovy-core = { module = "org.codehaus.groovy:groovy", version.ref = "groovy" }
+"#;
+        let result = GradleParser
+            .update_version(content, "org.codehaus.groovy:groovy", "3.0.6")
+            .unwrap();
+        assert!(result.contains(r#"groovy = "3.0.6""#));
+        assert!(result.contains(r#"version.ref = "groovy""#));
+    }
+
+    #[test]
+    fn test_update_version_catalog_rich_version_ref_updates_prefer() {
+        let content = r#"
+[versions]
+commons = { strictly = "[3.8, 4.0[", prefer = "3.9" }
+
+[libraries]
+commons-lang3 = { group = "org.apache.commons", name = "commons-lang3", version.ref = "commons" }
+"#;
+        let result = GradleParser
+            .update_version(content, "org.apache.commons:commons-lang3", "3.13.0")
+            .unwrap();
+        assert!(result.contains(r#"strictly = "[3.8, 4.0[""#));
+        assert!(result.contains(r#"prefer = "3.13.0""#));
+    }
+
+    #[test]
+    fn test_update_version_catalog_multiline_library_version() {
+        let content = r#"
+[libraries]
+commons-lang3 = {
+    group = "org.apache.commons",
+    name = "commons-lang3",
+    version = "3.12.0"
+}
+"#;
+        let result = GradleParser
+            .update_version(content, "org.apache.commons:commons-lang3", "3.14.0")
+            .unwrap();
+        assert!(result.contains(r#"    version = "3.14.0""#));
+    }
+
+    #[test]
+    fn test_update_version_catalog_library_table_section() {
+        let content = r#"
+[libraries.commons-lang3]
+group = "org.apache.commons"
+name = "commons-lang3"
+version = "3.12.0"
+"#;
+        let result = GradleParser
+            .update_version(content, "org.apache.commons:commons-lang3", "3.14.0")
+            .unwrap();
+        assert!(result.contains(r#"version = "3.14.0""#));
+    }
+
+    #[test]
+    fn test_update_version_catalog_version_table_section() {
+        let content = r#"
+[versions.commons]
+strictly = "[3.8, 4.0["
+prefer = "3.9"
+
+[libraries]
+commons-lang3 = { group = "org.apache.commons", name = "commons-lang3", version.ref = "commons" }
+"#;
+        let result = GradleParser
+            .update_version(content, "org.apache.commons:commons-lang3", "3.13.0")
+            .unwrap();
+        assert!(result.contains(r#"strictly = "[3.8, 4.0[""#));
+        assert!(result.contains(r#"prefer = "3.13.0""#));
     }
 
     #[test]

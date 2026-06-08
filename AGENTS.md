@@ -49,6 +49,7 @@ src/
     gemfile.rs       - Ruby パーサ
     composer_json.rs - PHP パーサ
     gradle.rs        - Java パーサ
+    gradle_version_catalog.rs - Gradle version catalog パーサ
     json_sections.rs - JSON マニフェストの依存セクション限定書き換え補助
     package_swift.rs - Swift パーサ
     pnpm_settings.rs - pnpm設定読み取り
@@ -95,7 +96,7 @@ tests/
 | Go | go.mod | Go Proxy |
 | Ruby | Gemfile | RubyGems |
 | PHP | composer.json | Packagist |
-| Java | build.gradle / build.gradle.kts | Maven Central |
+| Java | build.gradle / build.gradle.kts / gradle/*.versions.toml | Maven Central |
 | Swift | Package.swift | GitHub Tags |
 
 ## Development Commands
@@ -132,6 +133,7 @@ make help                # Makefileヘルプ
 - Java/Gradle の strict 記法（例: `1.2.3!!`）は固定バージョンとして解釈され、`!!` を保持して更新される。Groovy の `group: 'x', name: 'y', version: 'z'` と Kotlin DSL の `group = "x", name = "y", version = "z"` の map 記法も解析・更新対象になる
 - Gradle の rich version ブロック（例: `implementation("org.slf4j:slf4j-api") { version { strictly("[1.7, 1.8["); prefer("1.7.25"); reject("1.7.36") } }`）は `strictly` / `require` / `prefer` / `reject` を解析する。`group:name:[1.7, 1.8[!!1.7.25` のような文字列記法の strict range + prefer 短縮構文も解析する。`strictly` / `require` が範囲で `prefer` がある場合は、範囲を上限制約として保持し、更新時は `prefer` の値を書き換える。`reject` に列挙されたバージョンは更新候補から除外し、`2.+` のような動的 reject も考慮する。Gradle の仕様どおり、後続の `strictly` / `require` / `prefer` 宣言は先行する reject を消す。`//` 行コメントと `/* ... */` ブロックコメント内の rich version 宣言および直接依存宣言は無視する
 - Gradle の文字列記法では `group:name:version:classifier@extension` と `group:name:version@extension` を解析・更新でき、更新時は classifier / extension サフィックスを維持する
+- Gradle version catalog (`gradle/*.versions.toml`) は `[libraries]` の `alias = "group:name:version"`、`module = "group:name"`、`group` / `name` / `version`、`version.ref` を解析・更新できる。`[versions]` 参照先も更新し、rich version table の `strictly` / `require` / `prefer` / `reject` / `rejectAll` も Gradle ファイル本体と同じルールで扱う。`[plugins]` は Gradle plugin ID で Maven Central 座標と一致しないため更新対象から除外する
 - Maven の Hard requirement (例: `[1.0]`, `[1.2.3]`, `[1.2.3.Final]`) は完全一致 (Exact) として解釈され、ブラケットを保持したまま更新される (例: `[1.0]` → `[1.5]`)。`[A,B]` のようにカンマを含むレンジ記法とは区別される
 - Node/Python/Rust/PHP/Gradle の部分ワイルドカード指定（例: `1.x`, `1.x.x`, `v1.*`, `1.2.*`, `1.+`）は形を保って更新される。npm の caret/tilde + x-range（例: `^1.x`, `~1.2.x`, `^1.2.*`）も演算子を保持したワイルドカードとして認識し、形を保って更新される（例: `^1.x` → `^2.x`）。`^1` / `^1.2.3` のようにワイルドカード文字を含まない指定は従来どおり Caret/Tilde として扱う
 - 完全浮動指定（例: `*`, npm dist-tag の `latest`, Gradle の `latest.release` / `latest.integration` / `latest.milestone` / ユーザ定義 status）は意味を変えないため更新対象から除外される

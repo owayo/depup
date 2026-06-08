@@ -14,6 +14,7 @@ mod detector;
 mod gemfile;
 mod go_mod;
 mod gradle;
+mod gradle_version_catalog;
 mod json_sections;
 mod package_json;
 mod package_swift;

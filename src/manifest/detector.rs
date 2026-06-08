@@ -63,6 +63,7 @@ pub struct ManifestFile {
 /// 2. pnpm-workspace.yaml の存在をチェックしてモノレポを検出する
 /// 3. src-tauri/Cargo.toml の存在をチェックして Tauri プロジェクトを検出する
 /// 4. build.gradle.kts (Kotlin DSL) の存在をチェックして Gradle プロジェクトを検出する
+/// 5. gradle/*.versions.toml の Gradle version catalog を検出する
 pub fn detect_manifests(dir: &Path) -> Vec<ManifestInfo> {
     let mut manifests = Vec::new();
 
@@ -137,7 +138,41 @@ pub fn detect_manifests(dir: &Path) -> Vec<ManifestInfo> {
         }
     }
 
+    // Gradle version catalog は Java/Gradle 依存の別マニフェストとして扱う。
+    for catalog_path in detect_gradle_version_catalogs(dir) {
+        if !manifests.iter().any(|m| m.path == catalog_path) {
+            manifests.push(ManifestInfo::new(catalog_path, Language::Java));
+        }
+    }
+
     manifests
+}
+
+/// gradle ディレクトリ直下の version catalog を検出する
+fn detect_gradle_version_catalogs(dir: &Path) -> Vec<PathBuf> {
+    let gradle_dir = dir.join("gradle");
+    let Ok(entries) = std::fs::read_dir(&gradle_dir) else {
+        return Vec::new();
+    };
+
+    let mut catalogs = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+
+        if file_name.ends_with(".versions.toml") {
+            catalogs.push(path);
+        }
+    }
+
+    catalogs.sort();
+    catalogs
 }
 
 /// pnpm-workspace.yaml をパースしてパッケージディレクトリを返す
@@ -600,5 +635,48 @@ members = ["crates/nonexistent"]
         // 1 件だけ検出されるはず (Groovy)
         assert_eq!(java_manifests.len(), 1);
         assert!(java_manifests[0].path.ends_with("build.gradle"));
+    }
+
+    #[test]
+    fn test_detect_gradle_version_catalog() {
+        let dir = create_temp_dir();
+        fs::create_dir(dir.path().join("gradle")).unwrap();
+        fs::write(
+            dir.path().join("gradle").join("libs.versions.toml"),
+            "[libraries]\njunit = \"junit:junit:4.13.2\"\n",
+        )
+        .unwrap();
+
+        let manifests = detect_manifests(dir.path());
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(manifests[0].language, Language::Java);
+        assert!(manifests[0].path.ends_with("gradle/libs.versions.toml"));
+    }
+
+    #[test]
+    fn test_detect_multiple_gradle_version_catalogs() {
+        let dir = create_temp_dir();
+        fs::create_dir(dir.path().join("gradle")).unwrap();
+        fs::write(dir.path().join("gradle").join("libs.versions.toml"), "").unwrap();
+        fs::write(dir.path().join("gradle").join("tools.versions.toml"), "").unwrap();
+        fs::write(dir.path().join("gradle").join("not-catalog.toml"), "").unwrap();
+
+        let manifests = detect_manifests(dir.path());
+        let java_manifests: Vec<_> = manifests
+            .iter()
+            .filter(|m| m.language == Language::Java)
+            .collect();
+
+        assert_eq!(java_manifests.len(), 2);
+        assert!(
+            java_manifests
+                .iter()
+                .any(|m| m.path.ends_with("gradle/libs.versions.toml"))
+        );
+        assert!(
+            java_manifests
+                .iter()
+                .any(|m| m.path.ends_with("gradle/tools.versions.toml"))
+        );
     }
 }
