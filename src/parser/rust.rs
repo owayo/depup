@@ -5,7 +5,7 @@
 //! - Caret: `1.2.3`, `^1.2.3`
 //! - Tilde: `~1.2.3`
 //! - 比較演算子: `>=1.2.3`, `>1.2.3`, `<=1.2.3`, `<1.2.3`
-//! - ワイルドカード: `1.*`
+//! - ワイルドカード: `1.*`, `1.x`, `1.X`
 //! - レンジ: `>=1.0, <2.0`
 
 use crate::domain::{Language, VersionSpec, VersionSpecKind};
@@ -43,8 +43,15 @@ static RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
     )
     .unwrap()
 });
+// semver crate は `*` に加えて `x` / `X` もワイルドカード文字として受理する。
+// `1.x.x` のように minor/patch 連続のワイルドカードも有効 (`1.x.3` は無効)。
 static WILDCARD_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\*$|^[\d]+(?:\.[\d]+)*\.\*$").unwrap());
+    LazyLock::new(|| Regex::new(r"^[\d]+(?:\.[\d]+)*(?:\.[*xX]){1,2}$").unwrap());
+// Range の先頭 comparison requirement からバージョン部を抽出する。
+// プレリリース (`-...`) とビルドメタデータ (`+...`) も比較基準として保持する。
+static RANGE_FIRST_VERSION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?:>=|<=|>|<|=)\s*([\d]+(?:\.[\d]+)*(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
+});
 
 impl VersionParser for RustVersionParser {
     fn parse(&self, version_str: &str) -> Option<VersionSpec> {
@@ -113,15 +120,14 @@ impl VersionParser for RustVersionParser {
 
         // レンジ
         if RANGE_RE.is_match(trimmed) {
-            // 比較基準として先頭のバージョンを残す
+            // 比較基準として先頭のバージョンを残す。
+            // `>=1.0.0-rc.1, <2.0` のようなプレリリース付き下限は `-` で分割せず保持する
             let first_version = trimmed
                 .split(',')
                 .next()
-                .and_then(|s| {
-                    s.trim_start_matches(|c: char| !c.is_ascii_digit())
-                        .split(|c: char| !c.is_ascii_digit() && c != '.')
-                        .next()
-                })
+                .and_then(|s| RANGE_FIRST_VERSION_RE.captures(s.trim()))
+                .and_then(|caps| caps.get(1))
+                .map(|m| m.as_str())
                 .unwrap_or("")
                 .to_string();
             return Some(VersionSpec::new(
@@ -131,12 +137,12 @@ impl VersionParser for RustVersionParser {
             ));
         }
 
-        // `*` は完全な浮動指定なので更新対象にしない
-        if trimmed == "*" {
+        // `*` / `x` / `X` 単独は完全な浮動指定なので更新対象にしない
+        if matches!(trimmed, "*" | "x" | "X") {
             return None;
         }
 
-        // `1.*` は形を保ったまま更新する
+        // `1.*` / `1.x` / `1.X` は形を保ったまま更新する
         if WILDCARD_RE.is_match(trimmed) {
             return Some(VersionSpec::new(
                 VersionSpecKind::Wildcard,
@@ -274,6 +280,23 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_range_preserves_prerelease_lower_bound() {
+        // 回帰テスト: Range の下限がプレリリース付きでも version に保持される
+        // (旧実装は `-` で分割して "1.0.0" に落としていた)
+        let spec = parse(">=1.0.0-rc.1, <2.0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1.0.0-rc.1");
+    }
+
+    #[test]
+    fn test_parse_range_preserves_build_metadata_lower_bound() {
+        // 単一演算子 (GTE_RE) と同様に、ビルドメタデータも version に保持する
+        let spec = parse(">=1.0.0+sha.abc123, <2.0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1.0.0+sha.abc123");
+    }
+
+    #[test]
     fn test_parse_partial_version_major_minor() {
         // Cargo では部分バージョンは caret 相当
         let spec = parse("1.2").unwrap();
@@ -349,6 +372,50 @@ mod tests {
     fn test_parse_wildcard_minor() {
         let spec = parse("1.2.*").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Wildcard);
+    }
+
+    #[test]
+    fn test_parse_wildcard_x_lower() {
+        // 回帰テスト: cargo (semver crate) が受理する `1.x` を Wildcard として扱う
+        let spec = parse("1.x").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Wildcard);
+        assert_eq!(spec.format_updated("2.3.4"), "2.x");
+    }
+
+    #[test]
+    fn test_parse_wildcard_x_upper() {
+        // `1.X` も形を保って更新される
+        let spec = parse("1.X").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Wildcard);
+        assert_eq!(spec.format_updated("2.3.4"), "2.X");
+    }
+
+    #[test]
+    fn test_parse_wildcard_patch_x() {
+        let spec = parse("1.2.x").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Wildcard);
+        assert_eq!(spec.format_updated("2.3.4"), "2.3.x");
+    }
+
+    #[test]
+    fn test_parse_wildcard_double_x() {
+        // semver crate は minor/patch 連続のワイルドカード `1.x.x` も受理する
+        let spec = parse("1.x.x").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Wildcard);
+        assert_eq!(spec.format_updated("2.3.4"), "2.x.x");
+    }
+
+    #[test]
+    fn test_parse_bare_x_is_floating() {
+        // `x` / `X` 単独は `*` と同じ完全浮動指定なので更新対象にしない
+        assert!(parse("x").is_none());
+        assert!(parse("X").is_none());
+    }
+
+    #[test]
+    fn test_parse_wildcard_rejects_digit_after_x() {
+        // semver crate はワイルドカードの後の数値セグメント (`1.x.3`) を受理しない
+        assert!(parse("1.x.3").is_none());
     }
 
     #[test]

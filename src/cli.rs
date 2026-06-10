@@ -31,12 +31,16 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
         .parse()
         .map_err(|_| format!("invalid number in duration: {}", num_str))?;
 
-    let seconds = match unit {
-        'd' => num * 24 * 60 * 60,      // 日
-        'w' => num * 7 * 24 * 60 * 60,  // 週
-        'm' => num * 30 * 24 * 60 * 60, // 月 (30日)
+    // 単位ごとの秒数 (checked_mul でオーバーフローを防止)
+    let unit_secs: u64 = match unit {
+        'd' => 24 * 60 * 60,      // 日
+        'w' => 7 * 24 * 60 * 60,  // 週
+        'm' => 30 * 24 * 60 * 60, // 月 (30日)
         _ => unreachable!(),
     };
+    let seconds = num
+        .checked_mul(unit_secs)
+        .ok_or_else(|| format!("duration is too large: {}", s))?;
 
     Ok(Duration::from_secs(seconds))
 }
@@ -521,6 +525,13 @@ mod tests {
         assert!(parse_duration("abc").is_err());
         assert!(parse_duration("10").is_err());
         assert!(parse_duration("10x").is_err());
+    }
+
+    #[test]
+    fn test_parse_duration_overflow() {
+        // 乗算オーバーフローは panic せずエラーになる
+        assert!(parse_duration("213503982334602d").is_err());
+        assert!(parse_duration(&format!("{}w", u64::MAX)).is_err());
     }
 
     #[test]

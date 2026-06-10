@@ -6,10 +6,11 @@
 use crate::domain::Language;
 use crate::error::RegistryError;
 use crate::registry::{HttpClient, RegistryAdapter};
-use crate::update::{VersionInfo, compare_versions};
+use crate::update::{VersionInfo, compare_versions, is_prerelease_version};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use serde::de::IgnoredAny;
 use std::collections::HashMap;
 
 /// npm レジストリのベース URL
@@ -29,7 +30,10 @@ struct NpmPackageResponse {
     /// バージョンごとの公開時刻情報
     time: HashMap<String, String>,
     /// 利用可能なバージョン
-    versions: HashMap<String, serde_json::Value>,
+    ///
+    /// キー (バージョン文字列) のみ使用する。値は packument 全体のメタデータで
+    /// 巨大になりうるため、`IgnoredAny` で読み捨ててメモリ/CPU を節約する。
+    versions: HashMap<String, IgnoredAny>,
 }
 
 impl NpmAdapter {
@@ -41,6 +45,24 @@ impl NpmAdapter {
     /// パッケージ用の URL を構築
     fn build_url(&self, package: &str) -> String {
         format!("{}/{}", NPM_REGISTRY_URL, package)
+    }
+
+    /// dist-tags.latest との比較に基づき、このバージョンを候補から除外すべきか判定する
+    ///
+    /// npm は `is_prerelease_version` が検出できない非定型プレリリース
+    /// (例: `7.3.0-integration-x.1`) を公式の安定リリースより高いバージョン番号で
+    /// 公開していることがあるため、「latest 超かつ安定版に見える」バージョンのみ除外する。
+    ///
+    /// 一方、canary/beta 等の検出可能なプレリリースは latest 超でも保持する。
+    /// プレリリースチャネル利用者 (現在版がプレリリース) が新しいプレリリースへ
+    /// 更新できるようにするためで、安定版利用者は judge 側の `stable_candidates` が
+    /// プレリリースを除外するため引き続き保護される。
+    fn should_skip_version(version: &str, latest: Option<&str>) -> bool {
+        let Some(latest) = latest else {
+            return false;
+        };
+        compare_versions(version, latest) == std::cmp::Ordering::Greater
+            && !is_prerelease_version(version)
     }
 }
 
@@ -63,19 +85,15 @@ impl RegistryAdapter for NpmAdapter {
 
         // dist-tags から公式の "latest" バージョンを取得
         // npm が安定版とみなすバージョン
-        let latest_version = response.dist_tags.get("latest");
+        let latest_version = response.dist_tags.get("latest").map(|s| s.as_str());
 
         let mut versions = Vec::new();
 
         for (version, _) in response.versions {
-            // dist-tags.latest より新しいバージョンをスキップ
-            // npm がプレリリースバージョン (例: 7.3.0-integration-...) を
-            // 現在の安定リリース (例: 7.2.0) より高いバージョン番号で
-            // 公開しているケースに対応
-            if let Some(latest) = latest_version
-                && compare_versions(&version, latest) == std::cmp::Ordering::Greater
-            {
-                // 公式の latest より新しいバージョン — スキップ
+            // dist-tags.latest より新しい「安定版に見える」バージョンをスキップ
+            // (検出可能なプレリリース (canary/beta 等) は latest 超でも保持する。
+            //  詳細は should_skip_version のドキュメントコメントを参照)
+            if Self::should_skip_version(&version, latest_version) {
                 continue;
             }
 
@@ -157,5 +175,83 @@ mod tests {
         // 古いバージョン
         assert_eq!(compare_versions("7.1.0", latest), std::cmp::Ordering::Less);
         assert_eq!(compare_versions("6.0.0", latest), std::cmp::Ordering::Less);
+    }
+
+    /// バグ回帰テスト: latest より新しい「検出可能なプレリリース」(canary/beta 等) は
+    /// 候補に保持される。以前は latest 超のバージョンを一律除外していたため、
+    /// プレリリースチャネル利用者が新しいプレリリースへ更新できなかった。
+    /// (安定版利用者は judge 側の stable_candidates がプレリリースを除外するため保護される)
+    #[test]
+    fn test_should_skip_keeps_detectable_prerelease_above_latest() {
+        let latest = Some("19.2.0");
+        assert!(!NpmAdapter::should_skip_version(
+            "19.3.0-canary.456",
+            latest
+        ));
+        assert!(!NpmAdapter::should_skip_version("20.0.0-beta.1", latest));
+        assert!(!NpmAdapter::should_skip_version("19.3.0-rc.1", latest));
+    }
+
+    /// latest より新しい「安定版に見える」バージョンは引き続き除外される
+    /// (npm が latest タグを意図的に古い安定版へ向けているケースを尊重する)
+    #[test]
+    fn test_should_skip_drops_stable_looking_version_above_latest() {
+        let latest = Some("19.2.0");
+        assert!(NpmAdapter::should_skip_version("19.3.0", latest));
+        assert!(NpmAdapter::should_skip_version("20.0.0", latest));
+    }
+
+    /// 非定型プレリリース (is_prerelease_version が検出できない形式) は
+    /// 従来どおり latest 超で除外される (このフィルタの本来の目的)
+    #[test]
+    fn test_should_skip_drops_untypical_prerelease_above_latest() {
+        let latest = Some("7.2.0");
+        assert!(NpmAdapter::should_skip_version(
+            "7.3.0-integration-fix-6-19-0-cloudflare-accelerate-engine.1",
+            latest
+        ));
+    }
+
+    /// latest 以下のバージョンは安定版・プレリリースを問わず保持される
+    #[test]
+    fn test_should_skip_keeps_versions_at_or_below_latest() {
+        let latest = Some("19.2.0");
+        assert!(!NpmAdapter::should_skip_version("19.2.0", latest));
+        assert!(!NpmAdapter::should_skip_version("19.1.0", latest));
+        assert!(!NpmAdapter::should_skip_version("19.2.0-canary.1", latest));
+    }
+
+    /// dist-tags.latest が存在しない場合は何も除外しない
+    #[test]
+    fn test_should_skip_without_latest_tag_keeps_everything() {
+        assert!(!NpmAdapter::should_skip_version("19.3.0", None));
+        assert!(!NpmAdapter::should_skip_version("19.3.0-canary.456", None));
+    }
+
+    /// versions の値 (packument メタデータ) は IgnoredAny で読み捨てられ、
+    /// キーと dist-tags / time は正しくデシリアライズされる
+    #[test]
+    fn test_deserialize_npm_response_ignores_version_values() {
+        let json = r#"{
+            "dist-tags": {"latest": "1.1.0"},
+            "time": {
+                "created": "2023-01-01T00:00:00Z",
+                "1.0.0": "2023-01-01T00:00:00Z",
+                "1.1.0": "2023-06-01T00:00:00Z"
+            },
+            "versions": {
+                "1.0.0": {"name": "pkg", "dependencies": {"a": "^1.0.0"}, "dist": {"tarball": "..."}},
+                "1.1.0": {"name": "pkg", "dependencies": {"b": "^2.0.0"}, "dist": {"tarball": "..."}}
+            }
+        }"#;
+        let response: NpmPackageResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            response.dist_tags.get("latest").map(|s| s.as_str()),
+            Some("1.1.0")
+        );
+        assert_eq!(response.versions.len(), 2);
+        assert!(response.versions.contains_key("1.0.0"));
+        assert!(response.versions.contains_key("1.1.0"));
+        assert_eq!(response.time.len(), 3);
     }
 }

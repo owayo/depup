@@ -1,9 +1,9 @@
 //! pnpm ワークスペース設定の読み取り
 //!
 //! 以下の優先順で pnpm 設定を読み取る:
-//! - .npmrc (minimum-release-age=10d)
+//! - .npmrc (minimum-release-age=14400 / minimum-release-age = 10d) - 裸の数値は分単位
 //! - pnpm-workspace.yaml (minimumReleaseAge: 14400) - 値は分単位
-//! - package.json (pnpm.settings.minimumReleaseAge)
+//! - package.json (pnpm.minimumReleaseAge / pnpm.settings.minimumReleaseAge) - 数値は分単位
 
 use std::path::Path;
 use std::time::Duration;
@@ -21,28 +21,30 @@ impl PnpmSettings {
     /// 優先順に確認する:
     /// 1. .npmrc (minimum-release-age 設定)
     /// 2. pnpm-workspace.yaml (minimumReleaseAge、分単位)
-    /// 3. package.json (pnpm.settings.minimumReleaseAge)
+    /// 3. package.json (pnpm.minimumReleaseAge / pnpm.settings.minimumReleaseAge)
     pub fn from_dir(dir: &Path) -> Self {
         let mut settings = PnpmSettings::default();
-
-        // まず .npmrc から読み取る (最高優先)
-        if let Some(age) = read_npmrc_minimum_release_age(dir) {
-            settings.minimum_release_age = Some(age);
-            return settings;
-        }
-
-        // pnpm-workspace.yaml から読み取りを試みる
-        if let Some(age) = read_workspace_yaml_minimum_release_age(dir) {
-            settings.minimum_release_age = Some(age);
-            return settings;
-        }
-
-        // package.json から読み取りを試みる
-        if let Some(age) = read_package_json_minimum_release_age(dir) {
+        if let Some((age, _source)) = Self::minimum_release_age_with_source(dir) {
             settings.minimum_release_age = Some(age);
         }
-
         settings
+    }
+
+    /// minimumReleaseAge を値の出所 (ファイル名) 付きで読み取る
+    ///
+    /// 優先順は `from_dir` と同じ: .npmrc > pnpm-workspace.yaml > package.json。
+    /// 通知メッセージなどで「どのファイル由来の設定か」を表示する用途に使う
+    pub fn minimum_release_age_with_source(dir: &Path) -> Option<(Duration, &'static str)> {
+        if let Some(age) = read_npmrc_minimum_release_age(dir) {
+            return Some((age, ".npmrc"));
+        }
+        if let Some(age) = read_workspace_yaml_minimum_release_age(dir) {
+            return Some((age, "pnpm-workspace.yaml"));
+        }
+        if let Some(age) = read_package_json_minimum_release_age(dir) {
+            return Some((age, "package.json"));
+        }
+        None
     }
 }
 
@@ -76,7 +78,23 @@ fn parse_duration(s: &str) -> Option<Duration> {
     Some(Duration::from_secs(seconds))
 }
 
+/// minimumReleaseAge の設定値をパースする
+///
+/// pnpm ネイティブの裸の数値 (例: `14400`) は分単位として解釈し、
+/// `10d` のようなサフィックス付きは `parse_duration` に委ねる
+fn parse_release_age_value(value: &str) -> Option<Duration> {
+    let value = value.trim();
+    if let Ok(minutes) = value.parse::<u64>() {
+        // オーバーフロー防止: checked_mul で安全に変換する
+        return minutes.checked_mul(60).map(Duration::from_secs);
+    }
+    parse_duration(value)
+}
+
 /// .npmrc ファイルから minimum-release-age を読み取る
+///
+/// `key=value` に加えて `key = value` (= の前後の空白あり) も受け付ける。
+/// 裸の数値は pnpm ネイティブの分単位として解釈する
 fn read_npmrc_minimum_release_age(dir: &Path) -> Option<Duration> {
     let npmrc_path = dir.join(".npmrc");
     let content = std::fs::read_to_string(npmrc_path).ok()?;
@@ -88,13 +106,17 @@ fn read_npmrc_minimum_release_age(dir: &Path) -> Option<Duration> {
             continue;
         }
 
-        // minimum-release-age 設定を探す
-        if let Some(value) = line.strip_prefix("minimum-release-age=") {
-            // "10d" や '2w' のようなクォート付き値を処理する
-            let value = value.trim();
-            let value = value.trim_matches('"').trim_matches('\'');
-            return parse_duration(value);
+        // minimum-release-age 設定を探す (= の前後の空白を許容)
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "minimum-release-age" {
+            continue;
         }
+
+        // "10d" や '2w' のようなクォート付き値を処理する
+        let value = value.trim().trim_matches('"').trim_matches('\'');
+        return parse_release_age_value(value);
     }
 
     None
@@ -111,35 +133,39 @@ fn read_workspace_yaml_minimum_release_age(dir: &Path) -> Option<Duration> {
     for line in content.lines() {
         let line = line.trim();
         if let Some(value) = line.strip_prefix("minimumReleaseAge:") {
-            let value = value.trim();
-            // 値は分単位
-            if let Ok(minutes) = value.parse::<u64>() {
-                // オーバーフロー防止: checked_mul で安全に変換する
-                return minutes.checked_mul(60).map(Duration::from_secs);
-            }
+            // `14400 # comment` のようなインラインコメントを取り除く
+            let value = value.split('#').next().unwrap_or(value).trim();
             // "10d" のようなクォート付き文字列形式もサポートする
             let value = value.trim_matches('"').trim_matches('\'');
-            return parse_duration(value);
+            // 裸の数値は分単位、サフィックス付きは期間として解釈する
+            return parse_release_age_value(value);
         }
     }
 
     None
 }
 
-/// package.json の pnpm.settings から minimumReleaseAge を読み取る
+/// package.json の pnpm 設定から minimumReleaseAge を読み取る
+///
+/// `pnpm.minimumReleaseAge` と `pnpm.settings.minimumReleaseAge` の両方を受け付け、
+/// 数値型 (例: `14400`) は pnpm ネイティブの分単位として解釈する
 fn read_package_json_minimum_release_age(dir: &Path) -> Option<Duration> {
     let package_json_path = dir.join("package.json");
     let content = std::fs::read_to_string(package_json_path).ok()?;
     let json: serde_json::Value = serde_json::from_str(&content).ok()?;
 
-    // pnpm.settings.minimumReleaseAge を探す
-    let age_str = json
-        .get("pnpm")?
-        .get("settings")?
-        .get("minimumReleaseAge")?
-        .as_str()?;
+    let pnpm = json.get("pnpm")?;
+    let value = pnpm.get("minimumReleaseAge").or_else(|| {
+        pnpm.get("settings")
+            .and_then(|settings| settings.get("minimumReleaseAge"))
+    })?;
 
-    parse_duration(age_str)
+    // 数値型は分として解釈する
+    if let Some(minutes) = value.as_u64() {
+        // オーバーフロー防止: checked_mul で安全に変換する
+        return minutes.checked_mul(60).map(Duration::from_secs);
+    }
+    parse_release_age_value(value.as_str()?)
 }
 
 /// ディレクトリに pnpm ワークスペース設定があるかどうかを判定する
@@ -404,5 +430,189 @@ mod tests {
     fn test_parse_duration_overflow() {
         // 巨大な数値でオーバーフローしないことを確認
         assert!(parse_duration("99999999999999999999d").is_none());
+    }
+
+    #[test]
+    fn test_read_npmrc_minimum_release_age_bare_minutes() {
+        // (回帰) pnpm ネイティブの分単位数値が読み取れる (14400 分 = 10 日)
+        let dir = create_temp_dir();
+        fs::write(dir.path().join(".npmrc"), "minimum-release-age=14400\n").unwrap();
+
+        let age = read_npmrc_minimum_release_age(dir.path());
+        assert_eq!(age, Some(Duration::from_secs(14400 * 60)));
+    }
+
+    #[test]
+    fn test_read_npmrc_minimum_release_age_with_spaces_around_equals() {
+        // (回帰) `key = value` 形式 (= の前後に空白) も読み取れる
+        let dir = create_temp_dir();
+        fs::write(dir.path().join(".npmrc"), "minimum-release-age = 10d\n").unwrap();
+
+        let age = read_npmrc_minimum_release_age(dir.path());
+        assert_eq!(age, Some(Duration::from_secs(10 * 86400)));
+    }
+
+    #[test]
+    fn test_read_npmrc_minimum_release_age_spaces_and_bare_minutes() {
+        let dir = create_temp_dir();
+        fs::write(dir.path().join(".npmrc"), "minimum-release-age = 14400\n").unwrap();
+
+        let age = read_npmrc_minimum_release_age(dir.path());
+        assert_eq!(age, Some(Duration::from_secs(14400 * 60)));
+    }
+
+    #[test]
+    fn test_read_npmrc_does_not_match_prefixed_keys() {
+        // `minimum-release-age-exclude` のような別キーには一致しない
+        let dir = create_temp_dir();
+        fs::write(
+            dir.path().join(".npmrc"),
+            "minimum-release-age-exclude[]=webpack\n",
+        )
+        .unwrap();
+
+        let age = read_npmrc_minimum_release_age(dir.path());
+        assert_eq!(age, None);
+    }
+
+    #[test]
+    fn test_read_workspace_yaml_minimum_release_age_inline_comment() {
+        // (回帰) インラインコメント付きでも値が読み取れる
+        let dir = create_temp_dir();
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages: []\nminimumReleaseAge: 14400 # 10 days\n",
+        )
+        .unwrap();
+
+        let age = read_workspace_yaml_minimum_release_age(dir.path());
+        assert_eq!(age, Some(Duration::from_secs(14400 * 60)));
+    }
+
+    #[test]
+    fn test_read_package_json_minimum_release_age_numeric() {
+        // (回帰) pnpm.minimumReleaseAge の数値型 (分単位) を受け付ける
+        let dir = create_temp_dir();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{
+                "name": "test",
+                "pnpm": {
+                    "minimumReleaseAge": 14400
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let age = read_package_json_minimum_release_age(dir.path());
+        assert_eq!(age, Some(Duration::from_secs(14400 * 60)));
+    }
+
+    #[test]
+    fn test_read_package_json_minimum_release_age_settings_numeric() {
+        // pnpm.settings.minimumReleaseAge の数値型も受け付ける
+        let dir = create_temp_dir();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{
+                "pnpm": {
+                    "settings": {
+                        "minimumReleaseAge": 14400
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let age = read_package_json_minimum_release_age(dir.path());
+        assert_eq!(age, Some(Duration::from_secs(14400 * 60)));
+    }
+
+    #[test]
+    fn test_read_package_json_minimum_release_age_direct_string() {
+        // pnpm.minimumReleaseAge 直下の文字列形式も受け付ける
+        let dir = create_temp_dir();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{
+                "pnpm": {
+                    "minimumReleaseAge": "10d"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let age = read_package_json_minimum_release_age(dir.path());
+        assert_eq!(age, Some(Duration::from_secs(10 * 86400)));
+    }
+
+    #[test]
+    fn test_minimum_release_age_with_source_npmrc() {
+        let dir = create_temp_dir();
+        fs::write(dir.path().join(".npmrc"), "minimum-release-age=14400\n").unwrap();
+
+        let result = PnpmSettings::minimum_release_age_with_source(dir.path());
+        assert_eq!(result, Some((Duration::from_secs(14400 * 60), ".npmrc")));
+    }
+
+    #[test]
+    fn test_minimum_release_age_with_source_workspace_yaml() {
+        let dir = create_temp_dir();
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages: []\nminimumReleaseAge: 14400 # comment\n",
+        )
+        .unwrap();
+
+        let result = PnpmSettings::minimum_release_age_with_source(dir.path());
+        assert_eq!(
+            result,
+            Some((Duration::from_secs(14400 * 60), "pnpm-workspace.yaml"))
+        );
+    }
+
+    #[test]
+    fn test_minimum_release_age_with_source_package_json() {
+        let dir = create_temp_dir();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"pnpm": {"minimumReleaseAge": 14400}}"#,
+        )
+        .unwrap();
+
+        let result = PnpmSettings::minimum_release_age_with_source(dir.path());
+        assert_eq!(
+            result,
+            Some((Duration::from_secs(14400 * 60), "package.json"))
+        );
+    }
+
+    #[test]
+    fn test_minimum_release_age_with_source_priority() {
+        // .npmrc が pnpm-workspace.yaml / package.json より優先され、source も .npmrc になる
+        let dir = create_temp_dir();
+        fs::write(dir.path().join(".npmrc"), "minimum-release-age=10d\n").unwrap();
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages: []\nminimumReleaseAge: 14400\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"pnpm": {"minimumReleaseAge": 1440}}"#,
+        )
+        .unwrap();
+
+        let result = PnpmSettings::minimum_release_age_with_source(dir.path());
+        assert_eq!(result, Some((Duration::from_secs(10 * 86400), ".npmrc")));
+    }
+
+    #[test]
+    fn test_minimum_release_age_with_source_none() {
+        let dir = create_temp_dir();
+        assert_eq!(
+            PnpmSettings::minimum_release_age_with_source(dir.path()),
+            None
+        );
     }
 }

@@ -139,22 +139,22 @@ async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
 
         // Rust の transitive 依存も age 制約を満たすよう Cargo.lock を整える。
         if let Some(age) = install_min_age {
-            enforce_rust_lock_age(&args, &orchestrator, &result, &monorepo_dirs, age).await;
+            enforce_rust_lock_age(&args, &orchestrator, &result, age).await;
         }
     }
 
-    // 適切な終了コードを返す
-    let has_errors = !result.errors.is_empty();
-    let has_updates = result.summary.total_updates() > 0;
+    // 適切な終了コードを返す。
+    // OSV 警告は「脆弱な候補を検出して安全な版へフォールバックした」という
+    // 設計どおりの正常動作の通知なので、エラー扱い (exit code 2) にしない。
+    let has_errors = result
+        .errors
+        .iter()
+        .any(|e| !matches!(e, depup::orchestrator::OrchestratorError::OsvWarning { .. }));
 
     if has_errors {
         // 部分的な成功 - 一部エラーが発生
         Ok(ExitCode::from(2))
-    } else if has_updates || args.dry_run {
-        // 成功 - 更新が行われた (dry-run では更新予定)
-        Ok(ExitCode::SUCCESS)
     } else {
-        // 更新不要
         Ok(ExitCode::SUCCESS)
     }
 }
@@ -259,12 +259,14 @@ async fn enforce_rust_lock_age(
     args: &CliArgs,
     orchestrator: &Orchestrator,
     result: &OrchestratorResult,
-    monorepo_dirs: &Option<Vec<PathBuf>>,
     age: std::time::Duration,
 ) {
     use depup::orchestrator::LockAgeStatus;
 
-    // 対象となる Rust プロジェクトディレクトリを収集
+    // 対象となる Rust プロジェクトディレクトリを収集。
+    // workspace メンバーや Tauri (src-tauri) の Cargo.lock はマニフェストと別の
+    // 階層にあることがあるため、マニフェストのディレクトリから上方向に lock を
+    // 探し、lock が実在するディレクトリを監査対象にする。
     let mut rust_dirs: Vec<PathBuf> = Vec::new();
     for manifest in &result.summary.manifests {
         // 更新がなかった Rust manifest は cargo update も走らないため audit 不要
@@ -274,13 +276,18 @@ async fn enforce_rust_lock_age(
         let Some(parent) = manifest.path.parent() else {
             continue;
         };
-        let working_dir = if let Some(dirs) = monorepo_dirs {
-            nearest_monorepo_dir(&manifest.path, dirs, parent)
-        } else {
-            parent.to_path_buf()
+        let Some(lock_path) = depup::manifest::find_cargo_lock_upward(parent, &args.path) else {
+            if args.verbose {
+                eprintln!(
+                    "  {} — Cargo.lock not found; skipping transitive age audit",
+                    parent.display()
+                );
+            }
+            continue;
         };
-        if !rust_dirs.contains(&working_dir) {
-            rust_dirs.push(working_dir);
+        let lock_dir = lock_path.parent().unwrap_or(parent).to_path_buf();
+        if !rust_dirs.contains(&lock_dir) {
+            rust_dirs.push(lock_dir);
         }
     }
 

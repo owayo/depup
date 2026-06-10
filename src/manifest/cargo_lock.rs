@@ -12,7 +12,7 @@
 //! このモジュールは `name` -> `(url, sha)` のマップを返す。
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use toml::Value;
 
 /// git 依存のロック情報
@@ -24,12 +24,38 @@ pub struct GitLockEntry {
     pub commit: String,
 }
 
-/// 指定された `Cargo.lock` パスから git 依存をすべて読み込む
-pub fn read_git_entries(path: &Path) -> HashMap<String, GitLockEntry> {
+/// 指定された `Cargo.lock` パスから git 依存をすべて読み込む。
+///
+/// workspace ルートの lock には同一クレート名が異なる URL から
+/// lock されているケース (fork と upstream の併用等) がありうるため、
+/// 名前ごとに全エントリを保持する。
+pub fn read_git_entries(path: &Path) -> HashMap<String, Vec<GitLockEntry>> {
     let Ok(content) = std::fs::read_to_string(path) else {
         return HashMap::new();
     };
     parse_git_entries(&content)
+}
+
+/// `start` から `boundary` まで上方向に最も近い `Cargo.lock` を探す。
+///
+/// workspace メンバーの lock はワークスペースルートにのみ存在するため、
+/// マニフェストと同じディレクトリだけを見ると見つからないことがある。
+/// `boundary` (通常は実行対象のルートディレクトリ) を越えては探さない。
+pub fn find_cargo_lock_upward(start: &Path, boundary: &Path) -> Option<PathBuf> {
+    let mut dir = start;
+    loop {
+        let candidate = dir.join("Cargo.lock");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        if dir == boundary {
+            return None;
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent,
+            None => return None,
+        }
+    }
 }
 
 /// Cargo.lock の registry 依存エントリ (name -> [resolved versions])
@@ -70,11 +96,10 @@ pub fn parse_registry_entries(content: &str) -> RegistryLockEntries {
             // source 無しは path 依存 (ワークスペースメンバー含む) なのでスキップ
             continue;
         };
-        if !source.starts_with("registry+") {
-            // git+ / sparse+ 以外は除外。ただし sparse+ (crates.io 新プロトコル) は許容。
-            if !source.starts_with("sparse+") {
-                continue;
-            }
+        // registry+ と sparse+ (crates.io 新プロトコル) のみ対象。
+        // git+ や path 等のレジストリ外 source は除外する。
+        if !(source.starts_with("registry+") || source.starts_with("sparse+")) {
+            continue;
         }
         result
             .entry(name.to_string())
@@ -85,9 +110,11 @@ pub fn parse_registry_entries(content: &str) -> RegistryLockEntries {
     result
 }
 
-/// `Cargo.lock` 文字列から git 依存を抽出する
-pub fn parse_git_entries(content: &str) -> HashMap<String, GitLockEntry> {
-    let mut result = HashMap::new();
+/// `Cargo.lock` 文字列から git 依存を抽出する。
+/// 同一名の複数バリアント (別 URL / 別 ref) はすべて保持し、
+/// 呼び出し側が URL で対応付けられるようにする。
+pub fn parse_git_entries(content: &str) -> HashMap<String, Vec<GitLockEntry>> {
+    let mut result: HashMap<String, Vec<GitLockEntry>> = HashMap::new();
     let Ok(toml) = toml::from_str::<Value>(content) else {
         return result;
     };
@@ -104,9 +131,10 @@ pub fn parse_git_entries(content: &str) -> HashMap<String, GitLockEntry> {
             continue;
         };
         if let Some(entry) = parse_git_source(source) {
-            // 同一名の複数バリアント (別の ref) がある場合は最初のものを優先する。
-            // 同じ Cargo.toml には同一依存を複数回書けないため通常は問題ない。
-            result.entry(name.to_string()).or_insert(entry);
+            let entries = result.entry(name.to_string()).or_default();
+            if !entries.contains(&entry) {
+                entries.push(entry);
+            }
         }
     }
 
@@ -205,17 +233,55 @@ source = "git+https://github.com/foo/bar.git?tag=v1.0#00000000000000000000000000
         let entries = parse_git_entries(content);
         assert_eq!(entries.len(), 2);
 
-        let xojo = entries.get("tree-sitter-xojo").unwrap();
+        let xojo = &entries.get("tree-sitter-xojo").unwrap()[0];
         assert_eq!(xojo.url, "https://github.com/owayo/tree-sitter-xojo.git");
         assert_eq!(xojo.commit, "045c52a6db5390da14d96c0e4804a6208552dc8f");
 
-        let another = entries.get("another-git").unwrap();
+        let another = &entries.get("another-git").unwrap()[0];
         assert_eq!(another.url, "https://github.com/foo/bar.git");
         assert_eq!(another.commit, "0000000000000000000000000000000000000001");
 
         // registry dep / path dep は含まれない
         assert!(!entries.contains_key("serde"));
         assert!(!entries.contains_key("local"));
+    }
+
+    #[test]
+    fn test_parse_git_entries_same_name_different_urls() {
+        // workspace ルートの lock では fork と upstream が同名で共存しうる
+        let content = r#"
+[[package]]
+name = "foo"
+version = "0.1.0"
+source = "git+https://github.com/upstream/foo.git?branch=main#0000000000000000000000000000000000000001"
+
+[[package]]
+name = "foo"
+version = "0.1.0"
+source = "git+https://github.com/fork/foo.git?branch=main#0000000000000000000000000000000000000002"
+"#;
+        let entries = parse_git_entries(content);
+        let foo = entries.get("foo").unwrap();
+        assert_eq!(foo.len(), 2);
+        assert!(foo.iter().any(|e| e.url.contains("upstream")));
+        assert!(foo.iter().any(|e| e.url.contains("fork")));
+    }
+
+    #[test]
+    fn test_find_cargo_lock_upward() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let member = root.join("crates").join("core");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(root.join("Cargo.lock"), "version = 3\n").unwrap();
+
+        // メンバーディレクトリから上方向にルートの lock が見つかる
+        assert_eq!(
+            find_cargo_lock_upward(&member, root),
+            Some(root.join("Cargo.lock"))
+        );
+        // boundary より上には探しに行かない
+        assert_eq!(find_cargo_lock_upward(&member, &member), None);
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! このモジュールは更新判定のためのフィルタオプションを
 //! カプセル化する UpdateFilter 構造体を提供する。
 
-use crate::domain::{ChangeLevel, Language};
+use crate::domain::{ChangeLevel, Dependency, Language, SkipReason};
 use std::time::Duration;
 
 /// 更新判定用のフィルタ設定
@@ -74,16 +74,43 @@ impl UpdateFilter {
     }
 
     /// フィルタに基づいてパッケージを処理すべきかチェックする
+    ///
+    /// 名前のみで判定する簡易版 (後方互換 API)。Cargo のリネーム依存
+    /// (manifest_name) も考慮する判定は `package_filter_skip_reason` を使うこと。
     pub fn should_process_package(&self, name: &str) -> bool {
-        // --only が指定されている場合、それらのパッケージのみ処理
+        self.package_filter_decision(name, None).is_none()
+    }
+
+    /// 依存関係をパッケージフィルタ (only/exclude) で処理対象にすべきか判定する。
+    /// スキップすべき場合は `Some(SkipReason)`、処理する場合は `None` を返す。
+    ///
+    /// Cargo のリネーム依存では実パッケージ名とマニフェスト上のキー名の両方を
+    /// フィルタ名として受け付ける。`--only` は `--exclude` より優先される。
+    pub fn package_filter_skip_reason(&self, dependency: &Dependency) -> Option<SkipReason> {
+        let manifest_name = dependency.manifest_name();
+        let manifest_name = (manifest_name != dependency.name).then_some(manifest_name);
+        self.package_filter_decision(&dependency.name, manifest_name)
+    }
+
+    /// only/exclude 判定の共通実装。
+    /// `manifest_name` は実パッケージ名と異なる場合のみ `Some` を渡す。
+    fn package_filter_decision(
+        &self,
+        name: &str,
+        manifest_name: Option<&str>,
+    ) -> Option<SkipReason> {
+        let matches_filter = |p: &String| p == name || manifest_name.is_some_and(|m| p == m);
         if !self.only.is_empty() {
-            return self.only.iter().any(|p| p == name);
+            if !self.only.iter().any(matches_filter) {
+                return Some(SkipReason::NotInOnlyList);
+            }
+            // --only が指定されている場合は --exclude より優先される
+            return None;
         }
-        // --exclude が指定されている場合、それらのパッケージをスキップ
-        if self.exclude.iter().any(|p| p == name) {
-            return false;
+        if self.exclude.iter().any(matches_filter) {
+            return Some(SkipReason::Excluded);
         }
-        true
+        None
     }
 }
 
@@ -180,6 +207,88 @@ mod tests {
             .with_exclude(vec!["foo".to_string()]);
         // "foo"はonlyリストにあるため、excludeリストにあっても処理されるべき
         assert!(filter.should_process_package("foo"));
+    }
+
+    fn make_dep(name: &str) -> Dependency {
+        use crate::domain::{VersionSpec, VersionSpecKind};
+        let spec = VersionSpec::new(VersionSpecKind::Caret, format!("^{}", "1.0.0"), "1.0.0")
+            .with_prefix("^");
+        Dependency::new(name, spec, false, Language::Rust)
+    }
+
+    #[test]
+    fn test_package_filter_skip_reason_no_filter() {
+        let filter = UpdateFilter::new();
+        assert_eq!(filter.package_filter_skip_reason(&make_dep("serde")), None);
+    }
+
+    #[test]
+    fn test_package_filter_skip_reason_excluded() {
+        let filter = UpdateFilter::new().with_exclude(vec!["serde".to_string()]);
+        assert_eq!(
+            filter.package_filter_skip_reason(&make_dep("serde")),
+            Some(SkipReason::Excluded)
+        );
+        assert_eq!(filter.package_filter_skip_reason(&make_dep("tokio")), None);
+    }
+
+    #[test]
+    fn test_package_filter_skip_reason_not_in_only() {
+        let filter = UpdateFilter::new().with_only(vec!["serde".to_string()]);
+        assert_eq!(filter.package_filter_skip_reason(&make_dep("serde")), None);
+        assert_eq!(
+            filter.package_filter_skip_reason(&make_dep("tokio")),
+            Some(SkipReason::NotInOnlyList)
+        );
+    }
+
+    #[test]
+    fn test_package_filter_skip_reason_only_takes_precedence_over_exclude() {
+        let filter = UpdateFilter::new()
+            .with_only(vec!["serde".to_string()])
+            .with_exclude(vec!["serde".to_string()]);
+        assert_eq!(filter.package_filter_skip_reason(&make_dep("serde")), None);
+    }
+
+    /// 回帰テスト (judge との一本化): Cargo のリネーム依存では実パッケージ名と
+    /// マニフェスト上のキー名のどちらでも only / exclude に一致する。
+    /// 以前は filter 側の判定に manifest_name 一致が無く、judge 内の再実装と乖離していた。
+    #[test]
+    fn test_package_filter_skip_reason_matches_manifest_name() {
+        let dep = make_dep("tokio").with_manifest_name("tokio_v1");
+
+        // exclude はマニフェスト名でも一致する
+        let filter = UpdateFilter::new().with_exclude(vec!["tokio_v1".to_string()]);
+        assert_eq!(
+            filter.package_filter_skip_reason(&dep),
+            Some(SkipReason::Excluded)
+        );
+
+        // only はマニフェスト名でも一致する
+        let filter = UpdateFilter::new().with_only(vec!["tokio_v1".to_string()]);
+        assert_eq!(filter.package_filter_skip_reason(&dep), None);
+
+        // 実パッケージ名でも従来どおり一致する
+        let filter = UpdateFilter::new().with_only(vec!["tokio".to_string()]);
+        assert_eq!(filter.package_filter_skip_reason(&dep), None);
+    }
+
+    #[test]
+    fn test_should_process_package_consistent_with_skip_reason() {
+        // 旧 API (名前のみ) と新 API の判定が一致する
+        let filter = UpdateFilter::new().with_exclude(vec!["foo".to_string()]);
+        assert_eq!(
+            filter.should_process_package("foo"),
+            filter
+                .package_filter_skip_reason(&make_dep("foo"))
+                .is_none()
+        );
+        assert_eq!(
+            filter.should_process_package("bar"),
+            filter
+                .package_filter_skip_reason(&make_dep("bar"))
+                .is_none()
+        );
     }
 
     #[test]

@@ -9,6 +9,7 @@ mod filter;
 mod version_info;
 
 pub use filter::UpdateFilter;
+pub(crate) use version_info::numeric_core;
 pub use version_info::{VersionInfo, compare_versions, is_prerelease_version};
 
 use crate::domain::{Dependency, SkipReason, UpdateResult, VersionSpecKind};
@@ -35,8 +36,10 @@ static UPPER_BOUND_SWIFT_CLOSED_RE: LazyLock<Regex> =
 static UPPER_BOUND_SWIFT_HALF_OPEN_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&format!(r"\.\.<\s*({VERSION_TOKEN})")).unwrap());
 /// ハイフンレンジ (`A - B`) から上限を抽出する正規表現。
+/// npm / Composer の仕様どおりハイフンの前後にスペースを必須とし、
+/// Maven の qualifier 付き下限 (`[1.0-2,2.0)` の `1.0-2`) への誤マッチを防ぐ。
 static UPPER_BOUND_HYPHEN_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"{VERSION_TOKEN}\s*-\s*({VERSION_TOKEN})")).unwrap());
+    LazyLock::new(|| Regex::new(&format!(r"{VERSION_TOKEN}\s+-\s+({VERSION_TOKEN})")).unwrap());
 /// Maven 形式レンジ (`[1.0,2.0)`, `(,2.0]`) を解釈する正規表現。
 static MAVEN_RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
@@ -96,11 +99,29 @@ fn normalize_hyphen_upper_bound(version: &str) -> (String, bool) {
     (normalized, true)
 }
 
+/// 2 つの上限制約候補からより厳しい方を選ぶ。
+/// バージョンが小さい方が厳しい。同値なら排他的 (`<`) を包含 (`<=`) より優先する。
+fn stricter_upper_bound(
+    best: Option<(String, bool)>,
+    candidate: (String, bool),
+) -> Option<(String, bool)> {
+    match best {
+        None => Some(candidate),
+        Some(current) => match version_info::compare_versions(&candidate.0, &current.0) {
+            std::cmp::Ordering::Less => Some(candidate),
+            std::cmp::Ordering::Equal if current.1 && !candidate.1 => Some(candidate),
+            _ => Some(current),
+        },
+    }
+}
+
 /// Range 制約文字列から上限バージョンと包含可否を取り出す。
 ///
 /// 戻り値は `(upper_bound, inclusive)`:
 /// - `<X` と `A..<B` は `(X, false)`
 /// - `<=X` と `A...B` は `(X, true)`
+///
+/// `<` / `<=` が複数並ぶ場合 (例: `>=1,<2,<=3`) は最も厳しい上限を採用する。
 fn extract_upper_bound(raw: &str) -> Option<(String, bool)> {
     let trimmed = raw.trim();
     let trimmed = trimmed
@@ -108,22 +129,40 @@ fn extract_upper_bound(raw: &str) -> Option<(String, bool)> {
         .map(|(range, _)| range.trim())
         .unwrap_or(trimmed);
 
+    // Maven 形式レンジは完全アンカー付きなので最初に評価する。
+    // `[1.0-2,2.0)` のような qualifier 付き下限がハイフンレンジ等へ誤マッチして
+    // 誤った上限 (充足不能レンジ) を返すのを防ぐ。
+    if let Some(caps) = MAVEN_RANGE_RE.captures(trimmed) {
+        let upper = caps.get(3).map(|m| m.as_str()).unwrap_or("").trim();
+        if !upper.is_empty() {
+            let inclusive = caps.get(4).map(|m| m.as_str()) == Some("]");
+            return Some((normalize_bound_version(upper), inclusive));
+        }
+        // 上限なしの Maven レンジ (`[1.0,)`) を他形式として再解釈しない
+        return None;
+    }
+
     if let Some(caps) = UPPER_BOUND_SWIFT_HALF_OPEN_RE.captures(trimmed)
         && let Some(m) = caps.get(1)
     {
         return Some((normalize_bound_version(m.as_str()), false));
     }
 
-    if let Some(caps) = UPPER_BOUND_LTE_RE.captures(trimmed)
-        && let Some(m) = caps.get(1)
-    {
-        return Some((normalize_bound_version(m.as_str()), true));
+    // `<` / `<=` は複数並びうる (例: `>=1,<2,<=3`)。全マッチを収集し、
+    // 最も厳しい上限 (最小バージョン、同値なら排他的) を採用する。
+    let mut best: Option<(String, bool)> = None;
+    for caps in UPPER_BOUND_LTE_RE.captures_iter(trimmed) {
+        if let Some(m) = caps.get(1) {
+            best = stricter_upper_bound(best, (normalize_bound_version(m.as_str()), true));
+        }
     }
-
-    if let Some(caps) = UPPER_BOUND_LT_RE.captures(trimmed)
-        && let Some(m) = caps.get(1)
-    {
-        return Some((normalize_bound_version(m.as_str()), false));
+    for caps in UPPER_BOUND_LT_RE.captures_iter(trimmed) {
+        if let Some(m) = caps.get(1) {
+            best = stricter_upper_bound(best, (normalize_bound_version(m.as_str()), false));
+        }
+    }
+    if best.is_some() {
+        return best;
     }
 
     if let Some(caps) = UPPER_BOUND_SWIFT_CLOSED_RE.captures(trimmed)
@@ -136,14 +175,6 @@ fn extract_upper_bound(raw: &str) -> Option<(String, bool)> {
         && let Some(m) = caps.get(1)
     {
         return Some(normalize_hyphen_upper_bound(m.as_str()));
-    }
-
-    if let Some(caps) = MAVEN_RANGE_RE.captures(trimmed) {
-        let upper = caps.get(3).map(|m| m.as_str()).unwrap_or("").trim();
-        if !upper.is_empty() {
-            let inclusive = caps.get(4).map(|m| m.as_str()) == Some("]");
-            return Some((normalize_bound_version(upper), inclusive));
-        }
     }
 
     None
@@ -180,17 +211,9 @@ impl UpdateJudge {
         }
 
         // パッケージフィルタ（exclude/only）を確認する。
-        // Cargo のリネーム依存では実パッケージ名とマニフェスト上のキー名の両方を受け付ける。
-        let manifest_name = dependency.manifest_name();
-        let matches_package_filter = |p: &String| {
-            p == &dependency.name || (manifest_name != dependency.name && p == manifest_name)
-        };
-        if !self.filter.only.is_empty() {
-            if !self.filter.only.iter().any(matches_package_filter) {
-                return Some(SkipReason::NotInOnlyList);
-            }
-        } else if self.filter.exclude.iter().any(matches_package_filter) {
-            return Some(SkipReason::Excluded);
+        // Cargo のリネーム依存 (manifest_name) を考慮する判定は UpdateFilter 側へ集約している。
+        if let Some(reason) = self.filter.package_filter_skip_reason(dependency) {
+            return Some(reason);
         }
 
         // GoPinned (// pinned コメント付き) は always_pinned に関係なくスキップ
@@ -247,10 +270,21 @@ impl UpdateJudge {
 
         let allowed = apply_max_change_filter(dependency, &eligible, self.filter.max_change);
         if allowed.is_empty() {
-            // 全候補が max_change で除外された
-            return UpdateResult::skip(
+            // 全候補が max_change で除外された。除外された候補の中に現在版より新しい
+            // ものが存在する場合のみ ChangeLevelLimited とし、新しい候補がそもそも
+            // 無い場合は AlreadyLatest として扱う (max_change が原因ではないため)。
+            let current = dependency.version();
+            let has_newer_excluded = eligible.iter().any(|v| {
+                version_info::compare_versions(&v.version, current) == std::cmp::Ordering::Greater
+            });
+            if let (true, Some(max)) = (has_newer_excluded, self.filter.max_change) {
+                return UpdateResult::skip(dependency.clone(), SkipReason::ChangeLevelLimited(max));
+            }
+            // eligible は非空が保証されているため最新候補のリリース日時を添える
+            let latest = eligible.iter().max().unwrap();
+            return UpdateResult::skip_already_latest_with_date(
                 dependency.clone(),
-                SkipReason::ChangeLevelLimited(self.filter.max_change.unwrap()),
+                latest.released_at,
             );
         }
 
@@ -403,15 +437,18 @@ fn select_latest_candidate(
     }
 
     // 更新先の文字列表現を安全に組み立てられない制約は更新対象にしない
-    if dependency
-        .version_spec
-        .try_format_updated(&latest.version)
-        .is_none()
-    {
+    let Some(formatted) = dependency.version_spec.try_format_updated(&latest.version) else {
         return UpdateResult::skip(
             dependency.clone(),
             SkipReason::ParseError("constraint cannot be updated safely".to_string()),
         );
+    };
+
+    // 書き換え結果が現在の raw と同一なら、マニフェスト上は何も変わらない
+    // phantom update (例: Wildcard `1.x` の範囲内に最新版がある場合)。
+    // writer が no-op なのに毎回「更新あり」と報告し続けないよう AlreadyLatest にする。
+    if formatted == dependency.version_spec.raw {
+        return UpdateResult::skip_already_latest_with_date(dependency.clone(), latest.released_at);
     }
 
     UpdateResult::update_with_date(dependency.clone(), &latest.version, latest.released_at)
@@ -1833,6 +1870,222 @@ mod tests {
                 reason,
                 SkipReason::ParseError("constraint cannot be updated safely".to_string())
             );
+        }
+    }
+
+    /// 回帰テスト: `<=` regex が先に勝って緩い上限を返さない。
+    /// `>=1,<2,<=3` では最も厳しい `<2` (排他) を採用する。
+    #[test]
+    fn test_extract_upper_bound_multiple_bounds_picks_strictest() {
+        assert_eq!(
+            super::extract_upper_bound(">=1,<2,<=3"),
+            Some(("2".to_string(), false))
+        );
+        // 順序を入れ替えても同じ結果になる
+        assert_eq!(
+            super::extract_upper_bound(">=1,<=3,<2"),
+            Some(("2".to_string(), false))
+        );
+        // 同値の上限が `<` と `<=` で並ぶ場合は排他的 (`<`) を優先する
+        assert_eq!(
+            super::extract_upper_bound(">=1,<2,<=2"),
+            Some(("2".to_string(), false))
+        );
+        // `<=` のみ複数なら最小の包含上限
+        assert_eq!(
+            super::extract_upper_bound(">=1,<=3,<=2.5"),
+            Some(("2.5".to_string(), true))
+        );
+    }
+
+    /// 回帰テスト: Maven の qualifier 付き下限 `[1.0-2,2.0)` がハイフンレンジに
+    /// 誤マッチして誤った上限 (充足不能レンジ) を返さない。
+    /// Maven 形式 (完全アンカー付き) を最初に評価する。
+    #[test]
+    fn test_extract_upper_bound_maven_qualifier_lower_bound_not_hyphen_range() {
+        assert_eq!(
+            super::extract_upper_bound("[1.0-2,2.0)"),
+            Some(("2.0".to_string(), false))
+        );
+        assert_eq!(
+            super::extract_upper_bound("[1.0-rc1,2.0]"),
+            Some(("2.0".to_string(), true))
+        );
+    }
+
+    /// 回帰テスト: ハイフンレンジは npm/Composer 仕様どおりスペース必須。
+    /// スペースなしハイフン (`1.0-2`) はハイフンレンジとして解釈しない。
+    #[test]
+    fn test_extract_upper_bound_hyphen_requires_spaces() {
+        // スペースなしハイフンは prerelease/qualifier 付きバージョンであり、
+        // 上限制約を持たない
+        assert_eq!(super::extract_upper_bound("1.0-2"), None);
+        assert_eq!(super::extract_upper_bound(">=1.0-beta"), None);
+        // スペース付きは従来どおりハイフンレンジ
+        assert_eq!(
+            super::extract_upper_bound("1.0 - 2.0"),
+            Some(("2.1".to_string(), false))
+        );
+    }
+
+    /// 回帰テスト (phantom update): 書き換え結果が raw と同値になる場合は
+    /// 「更新あり」と報告し続けず AlreadyLatest として扱う。
+    /// 例: Wildcard `1.x` の範囲内に最新版 (1.9.3) がある場合、writer は no-op。
+    #[test]
+    fn test_judge_wildcard_phantom_update_reports_already_latest() {
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        // node パーサ同様、Wildcard spec の version には先頭の数値部分が入る
+        let spec = VersionSpec::new(VersionSpecKind::Wildcard, "1.x", "1");
+        let dep = Dependency::new("lodash", spec, false, Language::Node);
+        let versions = vec![
+            make_version_info("1.0.0", 100),
+            make_version_info("1.9.3", 10), // `1.x` 範囲内の最新 → 書き換え不要
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_skip());
+        if let UpdateResult::Skip {
+            reason,
+            released_at,
+            ..
+        } = result
+        {
+            assert_eq!(reason, SkipReason::AlreadyLatest);
+            // 最新候補のリリース日時が添えられる
+            assert!(released_at.is_some());
+        }
+    }
+
+    #[test]
+    fn test_judge_wildcard_updates_when_shape_changes() {
+        // `1.x` → `2.x` のように文字列が変わる場合は通常どおり更新される
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let spec = VersionSpec::new(VersionSpecKind::Wildcard, "1.x", "1");
+        let dep = Dependency::new("lodash", spec, false, Language::Node);
+        let versions = vec![
+            make_version_info("1.9.3", 50),
+            make_version_info("2.4.1", 10), // `2.x` へ形が変わる
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_update());
+        if let UpdateResult::Update { new_version, .. } = result {
+            assert_eq!(new_version, "2.4.1");
+        }
+    }
+
+    /// 回帰テスト: 「現在版より新しい候補がそもそも無い」場合は
+    /// `--max-change` 指定があっても ChangeLevelLimited ではなく AlreadyLatest。
+    #[test]
+    fn test_judge_max_change_all_older_candidates_already_latest() {
+        use crate::domain::ChangeLevel;
+        let filter = UpdateFilter::new().with_max_change(ChangeLevel::Patch);
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_dependency("lodash", "2.0.0", Language::Node, false);
+        // 候補は全部古い。major 差のため max_change=patch で allowed は空になるが、
+        // 新しい候補が無いだけなので AlreadyLatest が正しい
+        let versions = vec![make_version_info("1.0.0", 100)];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_skip());
+        if let UpdateResult::Skip {
+            reason,
+            released_at,
+            ..
+        } = result
+        {
+            assert_eq!(reason, SkipReason::AlreadyLatest);
+            assert!(released_at.is_some());
+        }
+    }
+
+    #[test]
+    fn test_judge_max_change_newer_excluded_reports_change_level_limited() {
+        use crate::domain::ChangeLevel;
+        // 新しい候補が max_change で除外された場合は従来どおり ChangeLevelLimited
+        let filter = UpdateFilter::new().with_max_change(ChangeLevel::Patch);
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_dependency("lodash", "2.0.0", Language::Node, false);
+        let versions = vec![make_version_info("3.0.0", 10)]; // major 差で除外
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_skip());
+        if let UpdateResult::Skip { reason, .. } = result {
+            assert_eq!(reason, SkipReason::ChangeLevelLimited(ChangeLevel::Patch));
+        }
+    }
+
+    /// 回帰テスト (Python rc 利用者の安定版昇格): 現在版が `2.0.0rc1` のとき、
+    /// 安定版 2.0.0 への更新が AlreadyLatest にならず Update と判定される。
+    /// parser/python.rs が prerelease 部を保持するようになったことと対になるテスト。
+    #[test]
+    fn test_judge_python_rc_user_upgrades_to_stable() {
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        // `>=2.0.0rc1` 相当: 比較基準は prerelease を保持した "2.0.0rc1"
+        let spec = VersionSpec::new(VersionSpecKind::GreaterOrEqual, ">=2.0.0rc1", "2.0.0rc1")
+            .with_prefix(">=");
+        let dep = Dependency::new("django", spec, false, Language::Python);
+        let versions = vec![
+            make_version_info("2.0.0rc1", 30),
+            make_version_info("2.0.0", 10), // 安定版が出ている
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_update(), "rc 利用者は安定版へ昇格できるべき");
+        if let UpdateResult::Update { new_version, .. } = result {
+            assert_eq!(new_version, "2.0.0");
+        }
+    }
+
+    #[test]
+    fn test_judge_python_rc_user_stays_when_no_stable() {
+        // 安定版が無ければ rc のまま (より新しい rc があればそちらへ)
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let spec = VersionSpec::new(VersionSpecKind::GreaterOrEqual, ">=2.0.0rc1", "2.0.0rc1")
+            .with_prefix(">=");
+        let dep = Dependency::new("django", spec, false, Language::Python);
+        let versions = vec![
+            make_version_info("2.0.0rc1", 30),
+            make_version_info("2.0.0rc2", 10),
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_update());
+        if let UpdateResult::Update { new_version, .. } = result {
+            assert_eq!(new_version, "2.0.0rc2");
+        }
+    }
+
+    /// 回帰テスト (semver 11.4): プレリリース利用者が beta → alpha へ
+    /// 実質ダウングレードされない (alpha.24 < beta.2)。
+    #[test]
+    fn test_judge_prerelease_user_not_downgraded_to_alpha() {
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let spec = VersionSpec::new(VersionSpecKind::Caret, "^6.0.0-beta.2", "6.0.0-beta.2")
+            .with_prefix("^");
+        let dep = Dependency::new("some-lib", spec, false, Language::Node);
+        let versions = vec![
+            make_version_info("6.0.0-alpha.24", 5), // beta より古い段階
+            make_version_info("6.0.0-beta.2", 10),
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        // beta.2 が最新 (alpha.24 < beta.2) なのでスキップする
+        assert!(result.is_skip());
+        if let UpdateResult::Skip { reason, .. } = result {
+            assert_eq!(reason, SkipReason::AlreadyLatest);
         }
     }
 }

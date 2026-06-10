@@ -43,8 +43,14 @@ impl Language {
     /// この言語のロックファイル名を返す
     pub fn lock_filenames(&self) -> &'static [&'static str] {
         match self {
-            Language::Node => &["package-lock.json", "pnpm-lock.yaml", "yarn.lock"],
-            Language::Python => &["uv.lock", "rye.lock", "poetry.lock"],
+            Language::Node => &[
+                "package-lock.json",
+                "pnpm-lock.yaml",
+                "yarn.lock",
+                "bun.lock",
+                "bun.lockb",
+            ],
+            Language::Python => &["uv.lock", "requirements.lock", "poetry.lock"],
             Language::Rust => &["Cargo.lock"],
             Language::Go => &["go.sum"],
             Language::Ruby => &["Gemfile.lock"],
@@ -140,11 +146,17 @@ mod tests {
     fn test_lock_filenames() {
         assert_eq!(
             Language::Node.lock_filenames(),
-            &["package-lock.json", "pnpm-lock.yaml", "yarn.lock"]
+            &[
+                "package-lock.json",
+                "pnpm-lock.yaml",
+                "yarn.lock",
+                "bun.lock",
+                "bun.lockb"
+            ]
         );
         assert_eq!(
             Language::Python.lock_filenames(),
-            &["uv.lock", "rye.lock", "poetry.lock"]
+            &["uv.lock", "requirements.lock", "poetry.lock"]
         );
         assert_eq!(Language::Rust.lock_filenames(), &["Cargo.lock"]);
         assert_eq!(Language::Go.lock_filenames(), &["go.sum"]);

@@ -76,9 +76,6 @@ static CARET_TILDE_WILDCARD_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[\^~]\s*v?(?:\d+|[xX*])(?:\.(?:\d+|[xX*])){0,2}$").unwrap());
 static RANGE_TOKEN_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?").unwrap());
-static TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^(?:latest|next|canary|beta|alpha|rc|stable|experimental)$").unwrap()
-});
 
 fn extract_first_version(raw: &str) -> String {
     RANGE_TOKEN_RE
@@ -196,6 +193,11 @@ impl VersionParser for NodeVersionParser {
         if CARET_TILDE_WILDCARD_RE.is_match(trimmed)
             && (trimmed.contains('x') || trimmed.contains('X') || trimmed.contains('*'))
         {
+            // `^x` / `~*` のような完全浮動指定は意味を変えないため更新対象にしない
+            // (version が空の Wildcard を作ると phantom update の原因になる)
+            if is_fully_floating_wildcard(trimmed) {
+                return None;
+            }
             return Some(VersionSpec::new(
                 VersionSpecKind::Wildcard,
                 trimmed,
@@ -235,11 +237,7 @@ impl VersionParser for NodeVersionParser {
             ));
         }
 
-        // npm dist-tag は常に移動する参照なので更新対象にしない
-        if TAG_RE.is_match(trimmed) {
-            return None;
-        }
-
+        // npm dist-tag (`latest` / `beta` 等) やその他解釈できない文字列は更新対象にしない
         None
     }
 
@@ -767,6 +765,20 @@ mod tests {
         // ワイルドカードを含まない `^1` は従来どおり Caret のまま (Wildcard にしない)
         let spec = parse("^1").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Caret);
+    }
+
+    #[test]
+    fn test_parse_caret_fully_floating_wildcard_is_none() {
+        // (回帰) `^x` は完全浮動指定なので version="" の Wildcard にせず None を返す
+        // (phantom update 防止)
+        assert!(parse("^x").is_none());
+    }
+
+    #[test]
+    fn test_parse_tilde_fully_floating_wildcard_is_none() {
+        // (回帰) `~*` も完全浮動指定として更新対象にしない
+        assert!(parse("~*").is_none());
+        assert!(parse("^x.x").is_none());
     }
 
     #[test]

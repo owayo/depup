@@ -177,7 +177,7 @@ impl ManifestParser for PyprojectTomlParser {
         package: &str,
         new_version: &str,
     ) -> Result<String, ManifestError> {
-        // TOML の整形を壊さないよう、単純な文字列置換で差し替える
+        // TOML の整形を壊さないよう、依存セクション内だけを文字列置換で差し替える
         let parser = get_parser(Language::Python);
         let package_has_non_pypi_source = toml::from_str::<Value>(content)
             .map(|toml| poetry_non_pypi_source_names(&toml))
@@ -191,97 +191,65 @@ impl ManifestParser for PyprojectTomlParser {
             });
         }
 
-        // バージョン文字列を見つけて更新する
-        let mut result = content.to_string();
-        let mut updated = false;
-
         // Poetry 形式: `name = "^1.0.0"` / `name = '^1.0.0'`
-        let simple_pattern = format!(
-            r#"(?m)^(\s*{}\s*=\s*)(?:"([^"]+)"|'([^']+)')"#,
+        let simple_re = Regex::new(&format!(
+            r#"^(\s*{}\s*=\s*)(?:"([^"]+)"|'([^']+)')"#,
             regex::escape(package)
-        );
-        if let Ok(re) = Regex::new(&simple_pattern)
-            && let Some(caps) = re.captures(&result)
-        {
-            let (quote, old_version) = if let Some(m) = caps.get(2) {
-                ("\"", m.as_str())
-            } else if let Some(m) = caps.get(3) {
-                ("'", m.as_str())
-            } else {
-                ("\"", "")
-            };
-            if let Some(spec) = parser.parse(old_version)
-                && let Some(new_ver) = spec.try_format_updated(new_version)
-            {
-                let replacement = format!("{}{}{}{}", &caps[1], quote, new_ver, quote);
-                result = re.replace(&result, replacement.as_str()).to_string();
-                updated = true;
-            }
-        }
+        ))
+        .ok();
 
         // Poetry の inline table 形式: `name = { version = "^1.0.0", ... }`
-        let table_pattern = format!(
-            r#"(?m)({}\s*=\s*\{{\s*[^}}]*version\s*=\s*)(?:"([^"]+)"|'([^']+)')([^}}]*\}})"#,
+        let table_re = Regex::new(&format!(
+            r#"^(\s*{}\s*=\s*\{{\s*[^}}]*version\s*=\s*)(?:"([^"]+)"|'([^']+)')([^}}]*\}})"#,
             regex::escape(package)
-        );
-        if let Ok(re) = Regex::new(&table_pattern)
-            && let Some(caps) = re.captures(&result)
-        {
-            let (quote, old_version) = if let Some(m) = caps.get(2) {
-                ("\"", m.as_str())
-            } else if let Some(m) = caps.get(3) {
-                ("'", m.as_str())
-            } else {
-                ("\"", "")
-            };
-            let table_fragment = caps.get(0).map(|m| m.as_str()).unwrap_or("");
-            if !inline_poetry_table_has_non_pypi_source(table_fragment)
-                && let Some(spec) = parser.parse(old_version)
-                && let Some(new_ver) = spec.try_format_updated(new_version)
-            {
-                let replacement = format!("{}{}{}{}{}", &caps[1], quote, new_ver, quote, &caps[4]);
-                result = re.replace(&result, replacement.as_str()).to_string();
-                updated = true;
-            }
-        }
+        ))
+        .ok();
 
         // 配列中の PEP 508 形式: `"package>=1.0,<2.0"` / `"package [extras] (>=1.0); marker"`
-        let pep508_pattern = format!(
+        let pep508_re = Regex::new(&format!(
             r#""({}(?:(?:\s*\[[^\]]*\])?\s*(?:[<>=!~^]|\()[^"]*)?)"|'({}(?:(?:\s*\[[^\]]*\])?\s*(?:[<>=!~^]|\()[^']*)?)'"#,
             regex::escape(package),
             regex::escape(package)
-        );
-        if let Ok(re) = Regex::new(&pep508_pattern) {
-            let result_clone = result.clone();
-            for caps in re.captures_iter(&result_clone) {
-                let (quote, full_dep) = if let Some(m) = caps.get(1) {
-                    ("\"", m.as_str())
-                } else if let Some(m) = caps.get(2) {
-                    ("'", m.as_str())
-                } else {
-                    ("\"", "")
-                };
-                if let Some(pep_caps) = PEP508_RE.captures(full_dep) {
-                    let pkg_name = pep_caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                    let after_name = &full_dep[pkg_name.len()..];
-                    let (extras_str, version_part) = split_pep508_extras_and_version(after_name);
+        ))
+        .ok();
 
-                    if pkg_name == package
-                        && !version_part.is_empty()
-                        && let Some(new_ver) = format_pep508_updated_version(
-                            version_part,
-                            parser.as_ref(),
-                            new_version,
-                        )
-                    {
-                        let new_dep = format!("{}{}{}", package, extras_str, new_ver);
-                        result = result.replace(
-                            &format!("{quote}{full_dep}{quote}"),
-                            &format!("{quote}{new_dep}{quote}"),
-                        );
-                        updated = true;
-                    }
+        // 行単位で現在の TOML セクションを追跡し、parse が依存として読むセクション内の
+        // 全出現だけを更新する (`[build-system]` の requires 等は書き換えない)
+        let mut result = String::with_capacity(content.len());
+        let mut updated = false;
+        let mut section = TomlSectionKind::Other;
+
+        for line in content.split_inclusive('\n') {
+            if let Some(header) = toml_section_header(line) {
+                section = classify_toml_section(header);
+                result.push_str(line);
+                continue;
+            }
+
+            let updated_line = match section {
+                TomlSectionKind::PoetryDependencies => update_poetry_dependency_line(
+                    line,
+                    simple_re.as_ref(),
+                    table_re.as_ref(),
+                    parser.as_ref(),
+                    new_version,
+                ),
+                TomlSectionKind::Pep508Dependencies => update_pep508_array_line(
+                    line,
+                    pep508_re.as_ref(),
+                    package,
+                    parser.as_ref(),
+                    new_version,
+                ),
+                TomlSectionKind::Other => None,
+            };
+
+            match updated_line {
+                Some(new_line) => {
+                    updated = true;
+                    result.push_str(&new_line);
                 }
+                None => result.push_str(line),
             }
         }
 
@@ -295,6 +263,166 @@ impl ManifestParser for PyprojectTomlParser {
             })
         }
     }
+}
+
+/// `update_version` が置換対象とする TOML セクションの種別
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TomlSectionKind {
+    /// Poetry の依存セクション (`name = "^1.0"` / inline table 置換の対象)
+    PoetryDependencies,
+    /// parse が PEP 508 配列として読む依存セクション (配列要素置換の対象)
+    Pep508Dependencies,
+    /// 依存セクション以外 (`[build-system]` 等。書き換え対象外)
+    Other,
+}
+
+/// TOML のセクションヘッダ行 (`[section]` / `[[section]]`) からドット区切りキーを取り出す
+fn toml_section_header(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('[') {
+        return None;
+    }
+    let inner = trimmed
+        .strip_prefix("[[")
+        .or_else(|| trimmed.strip_prefix('['))?;
+    let close = inner.find(']')?;
+    let key = inner[..close].trim();
+    let rest = inner[close..].trim_start_matches(']').trim_start();
+    if key.is_empty() || !(rest.is_empty() || rest.starts_with('#')) {
+        return None;
+    }
+    Some(key)
+}
+
+/// セクションヘッダのドット区切りキーから置換対象種別を判定する
+fn classify_toml_section(header: &str) -> TomlSectionKind {
+    // parse が読む Poetry の依存セクション
+    if header == "tool.poetry.dependencies"
+        || header == "tool.poetry.dev-dependencies"
+        || (header.starts_with("tool.poetry.group.") && header.ends_with(".dependencies"))
+    {
+        return TomlSectionKind::PoetryDependencies;
+    }
+    // parse が PEP 508 配列を読むセクション:
+    // - [project] 内の dependencies / optional-dependencies (PEP 621)
+    // - [project.optional-dependencies] (PEP 621)
+    // - [dependency-groups] (PEP 735)
+    // - [tool.rye] 内の dev-dependencies (Rye)
+    if header == "project"
+        || header == "project.optional-dependencies"
+        || header == "dependency-groups"
+        || header == "tool.rye"
+    {
+        return TomlSectionKind::Pep508Dependencies;
+    }
+    TomlSectionKind::Other
+}
+
+/// 正規表現キャプチャから引用符種別と旧バージョン文字列 (グループ 2/3) を取り出す
+fn captured_quote_and_version<'a>(caps: &regex::Captures<'a>) -> (&'static str, &'a str) {
+    if let Some(m) = caps.get(2) {
+        ("\"", m.as_str())
+    } else if let Some(m) = caps.get(3) {
+        ("'", m.as_str())
+    } else {
+        ("\"", "")
+    }
+}
+
+/// Poetry 依存セクション内の 1 行を更新する。更新が起きた場合のみ `Some` を返す
+fn update_poetry_dependency_line(
+    line: &str,
+    simple_re: Option<&Regex>,
+    table_re: Option<&Regex>,
+    parser: &dyn VersionParser,
+    new_version: &str,
+) -> Option<String> {
+    // Poetry 形式: `name = "^1.0.0"` / `name = '^1.0.0'`
+    if let Some(re) = simple_re
+        && let Some(caps) = re.captures(line)
+    {
+        let (quote, old_version) = captured_quote_and_version(&caps);
+        if let Some(spec) = parser.parse(old_version)
+            && let Some(new_ver) = spec.try_format_updated(new_version)
+        {
+            let matched_end = caps.get(0).map(|m| m.end()).unwrap_or(0);
+            let mut new_line = String::with_capacity(line.len() + new_ver.len());
+            new_line.push_str(&caps[1]);
+            new_line.push_str(quote);
+            new_line.push_str(&new_ver);
+            new_line.push_str(quote);
+            new_line.push_str(&line[matched_end..]);
+            return Some(new_line);
+        }
+        return None;
+    }
+
+    // Poetry の inline table 形式: `name = { version = "^1.0.0", ... }`
+    if let Some(re) = table_re
+        && let Some(caps) = re.captures(line)
+    {
+        let (quote, old_version) = captured_quote_and_version(&caps);
+        let table_fragment = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+        if !inline_poetry_table_has_non_pypi_source(table_fragment)
+            && let Some(spec) = parser.parse(old_version)
+            && let Some(new_ver) = spec.try_format_updated(new_version)
+        {
+            let matched_end = caps.get(0).map(|m| m.end()).unwrap_or(0);
+            let mut new_line = String::with_capacity(line.len() + new_ver.len());
+            new_line.push_str(&caps[1]);
+            new_line.push_str(quote);
+            new_line.push_str(&new_ver);
+            new_line.push_str(quote);
+            new_line.push_str(&caps[4]);
+            new_line.push_str(&line[matched_end..]);
+            return Some(new_line);
+        }
+    }
+
+    None
+}
+
+/// PEP 508 配列を含む依存セクション内の 1 行を更新する。更新が起きた場合のみ `Some` を返す
+fn update_pep508_array_line(
+    line: &str,
+    pep508_re: Option<&Regex>,
+    package: &str,
+    parser: &dyn VersionParser,
+    new_version: &str,
+) -> Option<String> {
+    let re = pep508_re?;
+    let mut new_line = line.to_string();
+    let mut updated = false;
+
+    for caps in re.captures_iter(line) {
+        let (quote, full_dep) = if let Some(m) = caps.get(1) {
+            ("\"", m.as_str())
+        } else if let Some(m) = caps.get(2) {
+            ("'", m.as_str())
+        } else {
+            ("\"", "")
+        };
+        if let Some(pep_caps) = PEP508_RE.captures(full_dep) {
+            let pkg_name = pep_caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            let after_name = &full_dep[pkg_name.len()..];
+            let (extras_str, version_part) = split_pep508_extras_and_version(after_name);
+
+            if pkg_name == package
+                && !version_part.is_empty()
+                && let Some(new_ver) =
+                    format_pep508_updated_version(version_part, parser, new_version)
+            {
+                let new_dep = format!("{}{}{}", package, extras_str, new_ver);
+                new_line = new_line.replace(
+                    &format!("{quote}{full_dep}{quote}"),
+                    &format!("{quote}{new_dep}{quote}"),
+                );
+                updated = true;
+            }
+        }
+    }
+
+    updated.then_some(new_line)
 }
 
 fn normalize_python_package_name(name: &str) -> String {
@@ -1445,6 +1573,177 @@ dev = [
             .update_version(content, "numpy", "2.4.2")
             .unwrap();
         assert!(result3.contains(r#""numpy>=2.4.2""#));
+    }
+
+    #[test]
+    fn test_update_poetry_inline_table_does_not_touch_prefixed_package() {
+        // (回帰) `requests` の更新が、行頭アンカーのない inline table 正規表現によって
+        // `types-requests = { version = ... }` の内部を破壊しないことを確認する
+        let content = r#"
+[tool.poetry.dependencies]
+requests = "^2.28.0"
+types-requests = { version = "^2.28.0" }
+"#;
+
+        let result = PyprojectTomlParser
+            .update_version(content, "requests", "2.31.0")
+            .unwrap();
+
+        assert!(
+            result.contains(r#"requests = "^2.31.0""#),
+            "requests 本体が更新されるべき: {}",
+            result
+        );
+        assert!(
+            result.contains(r#"types-requests = { version = "^2.28.0" }"#),
+            "types-requests は書き換えられないべき: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_update_poetry_same_package_in_main_and_group_updates_both() {
+        // (回帰) 同名依存が main と dev group の両方にある場合、両方更新される
+        // (replace-first だった旧実装では 2 箇所目が更新されなかった)
+        let content = r#"
+[tool.poetry.dependencies]
+requests = "^2.28.0"
+
+[tool.poetry.group.dev.dependencies]
+requests = "~2.20"
+"#;
+
+        let result = PyprojectTomlParser
+            .update_version(content, "requests", "2.31.0")
+            .unwrap();
+
+        assert!(
+            result.contains(r#"requests = "^2.31.0""#),
+            "main の requests が更新されるべき: {}",
+            result
+        );
+        assert!(
+            result.contains(r#"requests = "~2.31.0""#),
+            "dev group の requests も更新されるべき: {}",
+            result
+        );
+        assert!(!result.contains("2.28.0"));
+        assert!(!result.contains("~2.20"));
+    }
+
+    #[test]
+    fn test_update_poetry_same_package_in_dev_dependencies_updates_both() {
+        // tool.poetry.dev-dependencies 側の同名依存も併せて更新される
+        let content = r#"
+[tool.poetry.dependencies]
+requests = "^2.28.0"
+
+[tool.poetry.dev-dependencies]
+requests = { version = "^2.27.0", extras = ["security"] }
+"#;
+
+        let result = PyprojectTomlParser
+            .update_version(content, "requests", "2.31.0")
+            .unwrap();
+
+        assert!(result.contains(r#"requests = "^2.31.0""#));
+        assert!(
+            result.contains(r#"requests = { version = "^2.31.0", extras = ["security"] }"#),
+            "dev-dependencies の inline table も更新されるべき: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_update_does_not_rewrite_build_system_requires() {
+        // (回帰) parse が読まない [build-system] requires は書き換えない
+        // (旧実装では pep508 置換が依存セクション外にも適用されていた)
+        let content = r#"
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+dependencies = [
+    "setuptools>=68.0",
+]
+"#;
+
+        let result = PyprojectTomlParser
+            .update_version(content, "setuptools", "70.0.0")
+            .unwrap();
+
+        assert!(
+            result.contains(r#""setuptools>=70.0.0""#),
+            "project.dependencies 側は更新されるべき: {}",
+            result
+        );
+        assert!(
+            result.contains(r#"requires = ["setuptools>=61.0"]"#),
+            "[build-system] requires は書き換えられないべき: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_update_poetry_simple_only_in_dependency_sections() {
+        // Poetry 形式の単純置換は依存セクション内に限定され、無関係なセクションの
+        // 同名キーは書き換えない
+        let content = r#"
+[tool.poetry.dependencies]
+requests = "^2.28.0"
+
+[tool.mytool]
+requests = "^2.28.0"
+"#;
+
+        let result = PyprojectTomlParser
+            .update_version(content, "requests", "2.31.0")
+            .unwrap();
+
+        assert_eq!(
+            result.matches(r#"requests = "^2.31.0""#).count(),
+            1,
+            "依存セクション内の 1 箇所だけが更新されるべき: {}",
+            result
+        );
+        assert!(
+            result.contains("[tool.mytool]\nrequests = \"^2.28.0\""),
+            "[tool.mytool] の同名キーは書き換えられないべき: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_update_pep508_same_package_in_project_and_dependency_groups() {
+        // PEP 508 配列の同名依存が複数セクションにある場合、すべて更新される
+        let content = r#"
+[project]
+dependencies = [
+    "ruff>=0.11.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.10.0",
+]
+
+[tool.rye]
+dev-dependencies = [
+    "ruff>=0.9.0",
+]
+"#;
+
+        let result = PyprojectTomlParser
+            .update_version(content, "ruff", "0.12.0")
+            .unwrap();
+
+        assert!(result.contains(r#""ruff>=0.12.0""#));
+        assert!(
+            !result.contains("0.11.0") && !result.contains("0.10.0") && !result.contains("0.9.0"),
+            "全セクションの ruff が更新されるべき: {}",
+            result
+        );
     }
 
     #[test]

@@ -620,13 +620,15 @@ impl TextFormatter {
                         .released_at
                         .map(|d| format!("  ({})", d.format("%Y/%m/%d %H:%M")))
                         .unwrap_or_default();
+                    // ANSI エスケープを含む文字列に {:width$} を使うと可視幅が
+                    // ずれるため、先にパディングしてから着色する
+                    let padded_name = format!("{:width$}", pkg.name, width = max_name);
                     writeln!(
                         writer,
-                        "    {:width$} {}{}",
-                        self.maybe_dimmed(&pkg.name),
+                        "    {} {}{}",
+                        self.maybe_dimmed(&padded_name),
                         self.maybe_dimmed(&pkg.version),
                         self.maybe_dimmed(&date_str),
-                        width = max_name
                     )?;
                 }
             } else {

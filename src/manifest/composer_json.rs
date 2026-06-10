@@ -60,10 +60,12 @@ impl ManifestParser for ComposerJsonParser {
             &sections,
             package,
             |old_version| {
-                if let Some(spec) = parser.parse(old_version)
+                // 末尾の stability flag (`@dev` 等) は退避し、更新後の制約へ再付与する
+                let (constraint, stability) = split_stability_flag(old_version);
+                if let Some(spec) = parser.parse(constraint)
                     && let Some(new_ver) = spec.try_format_updated(new_version)
                 {
-                    return Some(new_ver);
+                    return Some(format!("{}{}", new_ver, stability));
                 }
                 // 解釈できない制約は元の値を維持する
                 None
@@ -89,6 +91,11 @@ impl ManifestParser for ComposerJsonParser {
 
 /// パッケージ名がプラットフォームパッケージかどうかを返す
 fn is_platform_package(name: &str) -> bool {
+    // Composer のプラットフォームパッケージはベンダーレス名のみ。
+    // `php-amqplib/php-amqplib` のようなベンダー付き名は通常のレジストリパッケージ
+    if name.contains('/') {
+        return false;
+    }
     name == "php"
         || name == "hhvm"
         || name.starts_with("php-")
@@ -97,6 +104,21 @@ fn is_platform_package(name: &str) -> bool {
         || name == "composer"
         || name == "composer-plugin-api"
         || name == "composer-runtime-api"
+}
+
+/// 制約末尾の stability flag (`@dev` / `@alpha` / `@beta` / `@RC` / `@stable`) を
+/// 制約本体とフラグに分離する。フラグがなければ第 2 要素は空文字列を返す
+fn split_stability_flag(constraint: &str) -> (&str, &str) {
+    if let Some(at_pos) = constraint.rfind('@') {
+        let flag = &constraint[at_pos + 1..];
+        if matches!(
+            flag.to_ascii_lowercase().as_str(),
+            "dev" | "alpha" | "beta" | "rc" | "stable"
+        ) {
+            return (&constraint[..at_pos], &constraint[at_pos..]);
+        }
+    }
+    (constraint, "")
 }
 
 fn parse_dependency_object(
@@ -246,6 +268,41 @@ mod tests {
         let deps = parse(content).unwrap();
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].name, "monolog/monolog");
+    }
+
+    #[test]
+    fn test_parse_php_vendor_packages_not_treated_as_platform() {
+        // 回帰テスト: `php-*` で始まるベンダー付きパッケージ名は platform package ではなく
+        // 通常のレジストリパッケージとして解析される (ベンダーレス名のみ除外)
+        let content = r#"{
+            "require": {
+                "php": ">=8.1",
+                "php-64bit": ">=8.1",
+                "ext-json": "*",
+                "php-amqplib/php-amqplib": "^3.0",
+                "php-http/discovery": "^1.19"
+            }
+        }"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 2);
+        assert!(deps.iter().any(|d| d.name == "php-amqplib/php-amqplib"));
+        assert!(deps.iter().any(|d| d.name == "php-http/discovery"));
+    }
+
+    #[test]
+    fn test_update_version_php_vendor_package() {
+        // 回帰テスト: `php-*` ベンダーのパッケージも更新対象になる
+        let content = r#"{
+  "require": {
+    "php-amqplib/php-amqplib": "^3.0"
+  }
+}"#;
+
+        let result = ComposerJsonParser
+            .update_version(content, "php-amqplib/php-amqplib", "3.7.0")
+            .unwrap();
+        assert!(result.contains(r#""php-amqplib/php-amqplib": "^3.7.0""#));
     }
 
     #[test]
@@ -401,6 +458,36 @@ mod tests {
 
         let result = ComposerJsonParser.update_version(content, "vendor/package", "1.9.0");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_update_version_preserves_stability_flag() {
+        // 回帰テスト: `@dev` のような stability flag は更新後も保持される
+        let content = r#"{
+  "require": {
+    "foo/bar": "^1.0@dev"
+  }
+}"#;
+
+        let result = ComposerJsonParser
+            .update_version(content, "foo/bar", "1.5.0")
+            .unwrap();
+        assert!(result.contains(r#""foo/bar": "^1.5.0@dev""#));
+    }
+
+    #[test]
+    fn test_update_version_preserves_stability_flag_case() {
+        // `@RC` のような大文字フラグも元の表記のまま保持される
+        let content = r#"{
+  "require": {
+    "foo/bar": "~3.0@RC"
+  }
+}"#;
+
+        let result = ComposerJsonParser
+            .update_version(content, "foo/bar", "3.4.0")
+            .unwrap();
+        assert!(result.contains(r#""foo/bar": "~3.4.0@RC""#));
     }
 
     #[test]

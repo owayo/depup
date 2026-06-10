@@ -151,6 +151,11 @@ fn normalize_node_constraint(version: &str) -> Option<(&str, Option<String>)> {
     Some((trimmed, None))
 }
 
+/// alias 接頭辞 `npm:<real>@` から実パッケージ名を取り出す
+fn real_package_name_from_alias_prefix(prefix: &str) -> Option<&str> {
+    prefix.strip_prefix("npm:")?.strip_suffix('@')
+}
+
 fn parse_dependency_object(
     deps: &Map<String, Value>,
     parser: &dyn VersionParser,
@@ -159,14 +164,21 @@ fn parse_dependency_object(
 ) {
     for (name, version_value) in deps {
         if let Some(version_str) = version_value.as_str()
-            && let Some((parse_target, _alias_prefix)) = normalize_node_constraint(version_str)
+            && let Some((parse_target, alias_prefix)) = normalize_node_constraint(version_str)
             && let Some(spec) = parser.parse(parse_target)
         {
+            // npm alias (`npm:real-package@^1.2.3`) ではレジストリ照会に実パッケージ名を
+            // 使い、書き戻しには JSON キーを使う (Cargo の rename 依存と同じパターン)
+            let package_name = alias_prefix
+                .as_deref()
+                .and_then(real_package_name_from_alias_prefix)
+                .unwrap_or(name.as_str());
             let dep = if is_dev {
-                Dependency::development(name.clone(), spec, Language::Node)
+                Dependency::development(package_name, spec, Language::Node)
             } else {
-                Dependency::production(name.clone(), spec, Language::Node)
-            };
+                Dependency::production(package_name, spec, Language::Node)
+            }
+            .with_manifest_name(name.clone());
             output.push(dep);
         }
     }
@@ -612,9 +624,51 @@ mod tests {
 
         let deps = parse(content).unwrap();
         assert_eq!(deps.len(), 1);
-        assert_eq!(deps[0].name, "ui");
+        // レジストリ照会には実パッケージ名、書き戻しには JSON キーを使う
+        assert_eq!(deps[0].name, "@mui/lab");
+        assert_eq!(deps[0].manifest_name(), "ui");
         assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Caret);
         assert_eq!(deps[0].version_spec.version, "7.0.0");
+    }
+
+    #[test]
+    fn test_parse_npm_alias_uses_real_package_name_for_registry() {
+        // (回帰) `"react": "npm:@preact/compat@^17.1.2"` で alias キー (`react`) の
+        // レジストリ情報により別パッケージとして判定されるバグの修正確認
+        let content = r#"{
+            "dependencies": {
+                "react": "npm:@preact/compat@^17.1.2",
+                "lodash": "^4.17.21"
+            }
+        }"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 2);
+
+        let aliased = deps.iter().find(|d| d.manifest_name() == "react").unwrap();
+        assert_eq!(aliased.name, "@preact/compat");
+        assert_eq!(aliased.version_spec.version, "17.1.2");
+        assert_eq!(aliased.manifest_name, Some("react".to_string()));
+
+        // alias でない依存は manifest_name を持たない (name と同一のため)
+        let lodash = deps.iter().find(|d| d.name == "lodash").unwrap();
+        assert!(lodash.manifest_name.is_none());
+        assert_eq!(lodash.manifest_name(), "lodash");
+    }
+
+    #[test]
+    fn test_parse_npm_alias_unscoped_package() {
+        let content = r#"{
+            "devDependencies": {
+                "my-lodash": "npm:lodash@^4.17.21"
+            }
+        }"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "lodash");
+        assert_eq!(deps[0].manifest_name(), "my-lodash");
+        assert!(deps[0].is_dev);
     }
 
     #[test]

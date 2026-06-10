@@ -149,7 +149,7 @@ impl ManifestWriter {
 
         // dry-run でなく、実際に変更がある場合のみ書き戻す
         if result.updates_applied > 0 && !self.dry_run {
-            fs::write(path, &current_content).map_err(|e| ManifestError::WriteError {
+            write_atomically(path, &current_content).map_err(|e| ManifestError::WriteError {
                 path: path.clone(),
                 source: e,
             })?;
@@ -199,10 +199,47 @@ pub fn read_manifest(path: &Path) -> Result<String, ManifestError> {
 
 /// マニフェストへ内容を書き込む
 pub fn write_manifest(path: &Path, content: &str) -> Result<(), ManifestError> {
-    fs::write(path, content).map_err(|e| ManifestError::WriteError {
+    write_atomically(path, content).map_err(|e| ManifestError::WriteError {
         path: path.to_path_buf(),
         source: e,
     })
+}
+
+/// 一時ファイル + rename によるアトミック書き込み。
+///
+/// `fs::write` の truncate→write は途中失敗 (ディスクフル・電源断など) で
+/// マニフェストを部分内容のまま破壊しうるため、同一ディレクトリの一時ファイルへ
+/// 書き切ってから rename で置き換える。既存ファイルのパーミッションは引き継ぐ。
+fn write_atomically(path: &Path, content: &str) -> std::io::Result<()> {
+    // 既存ファイルが書き込み不可なら従来の `fs::write` と同じくエラーにする。
+    // rename はディレクトリ権限だけで成功し、読み取り専用による保護を
+    // 迂回してしまうため、先に書き込み権限を確認する。
+    if path.exists() {
+        fs::OpenOptions::new().write(true).open(path)?;
+    }
+
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("manifest");
+    let tmp_path = dir.join(format!(".{}.depup-tmp-{}", file_name, std::process::id()));
+
+    let result = (|| {
+        fs::write(&tmp_path, content)?;
+        if let Ok(metadata) = fs::metadata(path) {
+            let _ = fs::set_permissions(&tmp_path, metadata.permissions());
+        }
+        fs::rename(&tmp_path, path)
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -212,6 +249,38 @@ mod tests {
     use crate::manifest::ManifestParser;
     use std::io::Write;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_write_manifest_is_atomic_and_cleans_tmp() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("package.json");
+        fs::write(&path, "old").unwrap();
+
+        write_manifest(&path, "new content").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new content");
+
+        // 一時ファイルが残っていないこと
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("depup-tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "一時ファイルが残留: {:?}", leftovers);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_manifest_preserves_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("Cargo.toml");
+        fs::write(&path, "old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_manifest(&path, "new").unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "既存ファイルのパーミッションを引き継ぐべき");
+    }
 
     struct NoOpParser;
 

@@ -129,11 +129,12 @@ pub fn detect_manifests(dir: &Path) -> Vec<ManifestInfo> {
     if is_pnpm_workspace && let Ok(workspace_packages) = detect_pnpm_workspace_packages(dir) {
         for package_path in workspace_packages {
             let package_json_path = package_path.join("package.json");
-            if package_json_path.exists() {
-                // ルートの package.json は重複追加しない
-                if package_json_path != dir.join("package.json") {
-                    manifests.push(ManifestInfo::new(&package_json_path, Language::Node));
-                }
+            // ルートの package.json と既出のマニフェストは重複追加しない
+            if package_json_path.exists()
+                && package_json_path != dir.join("package.json")
+                && !manifests.iter().any(|m| m.path == package_json_path)
+            {
+                manifests.push(ManifestInfo::new(&package_json_path, Language::Node));
             }
         }
     }
@@ -180,7 +181,8 @@ fn detect_pnpm_workspace_packages(dir: &Path) -> Result<Vec<PathBuf>, std::io::E
     let workspace_file = dir.join("pnpm-workspace.yaml");
     let content = std::fs::read_to_string(&workspace_file)?;
 
-    let mut packages = Vec::new();
+    let mut includes = Vec::new();
+    let mut excludes: Vec<PathBuf> = Vec::new();
 
     // packages 配列の簡易 YAML パース
     // 形式: packages:
@@ -202,65 +204,150 @@ fn detect_pnpm_workspace_packages(dir: &Path) -> Result<Vec<PathBuf>, std::io::E
             }
 
             // パッケージの glob パターンをパースする
-            if let Some(pattern) = trimmed.strip_prefix('-') {
-                let pattern = pattern.trim().trim_matches('\'').trim_matches('"');
+            if let Some(item) = trimmed.strip_prefix('-') {
+                let Some(pattern) = parse_yaml_list_value(item) else {
+                    continue;
+                };
 
-                // 'packages/*' や 'apps/**' のような glob パターンを処理する
-                if let Some(base) = pattern.strip_suffix("/*") {
-                    // ベースパス内のディレクトリを列挙する
-                    let base_path = dir.join(base);
-                    if let Ok(entries) = std::fs::read_dir(&base_path) {
-                        for entry in entries.flatten() {
-                            if entry.path().is_dir() {
-                                packages.push(entry.path());
-                            }
-                        }
-                    }
-                } else if let Some(base) = pattern.strip_suffix("/**") {
-                    // ** パターンは現時点では第 1 階層のみを対象にする
-                    let base_path = dir.join(base);
-                    if let Ok(entries) = std::fs::read_dir(&base_path) {
-                        for entry in entries.flatten() {
-                            if entry.path().is_dir() {
-                                packages.push(entry.path());
-                            }
-                        }
-                    }
-                } else if !pattern.contains('*') {
-                    // glob なしの直接パス
-                    let pkg_path = dir.join(pattern);
-                    if pkg_path.exists() {
-                        packages.push(pkg_path);
-                    }
+                // `!pattern` は除外指定 (pnpm 公式サポート)
+                if let Some(negated) = pattern.strip_prefix('!') {
+                    excludes.extend(expand_workspace_pattern(dir, negated));
+                } else {
+                    includes.extend(expand_workspace_pattern(dir, &pattern));
                 }
             }
+        }
+    }
+
+    let mut packages = Vec::new();
+    for path in includes {
+        if !excludes.contains(&path) && !packages.contains(&path) {
+            packages.push(path);
         }
     }
 
     Ok(packages)
 }
 
-/// Cargo.toml のワークスペースメンバーをパースしてディレクトリを返す
+/// YAML リスト要素からインラインコメントとクォートを取り除いた値を返す
+fn parse_yaml_list_value(item: &str) -> Option<String> {
+    let item = item.trim();
+    let mut chars = item.chars();
+    let first = chars.next()?;
+    if first == '\'' || first == '"' {
+        // クォート付き: 閉じクォートまでが値 (以降はインラインコメント扱い)
+        let rest = chars.as_str();
+        let end = rest.find(first)?;
+        Some(rest[..end].to_string())
+    } else {
+        // クォートなし: 空白 + '#' 以降はインラインコメント
+        let value = match item.find(" #") {
+            Some(pos) => &item[..pos],
+            None => item,
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value.to_string())
+        }
+    }
+}
+
+/// ワークスペースの glob パターンをディレクトリ一覧へ展開する。
+///
+/// 対応形式: 直接パス / 末尾 `/*` / 末尾 `/**` (第 1 階層のみ) /
+/// 末尾セグメントの単純ワイルドカード (`crates/util-*`)。
+fn expand_workspace_pattern(dir: &Path, pattern: &str) -> Vec<PathBuf> {
+    if let Some(base) = pattern.strip_suffix("/*") {
+        list_subdirectories(&dir.join(base))
+    } else if let Some(base) = pattern.strip_suffix("/**") {
+        // ** パターンは現時点では第 1 階層のみを対象にする
+        list_subdirectories(&dir.join(base))
+    } else if !pattern.contains('*') {
+        // glob なしの直接パス
+        let pkg_path = dir.join(pattern);
+        if pkg_path.exists() {
+            vec![pkg_path]
+        } else {
+            Vec::new()
+        }
+    } else {
+        // 末尾セグメントの単純ワイルドカード (`crates/util-*`) を展開する
+        let path = Path::new(pattern);
+        if let (Some(parent), Some(file)) =
+            (path.parent(), path.file_name().and_then(|f| f.to_str()))
+            && !parent.to_string_lossy().contains('*')
+            && let Some((prefix, suffix)) = file.split_once('*')
+            && !suffix.contains('*')
+        {
+            return list_subdirectories(&dir.join(parent))
+                .into_iter()
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with(prefix) && n.ends_with(suffix))
+                })
+                .collect();
+        }
+        Vec::new()
+    }
+}
+
+/// ベースディレクトリ直下のサブディレクトリを列挙する (順序は名前順で安定)
+fn list_subdirectories(base: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    dirs.sort();
+    dirs
+}
+
+/// Cargo.toml のワークスペースメンバーをパースしてディレクトリを返す。
+///
+/// Cargo 公式サポートの glob 形式メンバー (`members = ["crates/*"]`) を展開し、
+/// `[workspace] exclude` に挙げられたパスを除外する。
 fn detect_cargo_workspace_members(dir: &Path, content: &str) -> Vec<PathBuf> {
     let toml: toml::Value = match toml::from_str(content) {
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
 
-    let members = match toml
-        .get("workspace")
-        .and_then(|w| w.get("members"))
-        .and_then(|m| m.as_array())
-    {
+    let workspace = match toml.get("workspace") {
+        Some(w) => w,
+        None => return Vec::new(),
+    };
+
+    let members = match workspace.get("members").and_then(|m| m.as_array()) {
         Some(m) => m,
         None => return Vec::new(),
     };
 
-    members
-        .iter()
-        .filter_map(|v| v.as_str())
-        .map(|member| dir.join(member))
-        .collect()
+    let excludes: Vec<PathBuf> = workspace
+        .get("exclude")
+        .and_then(|e| e.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(|p| dir.join(p))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut result = Vec::new();
+    for member in members.iter().filter_map(|v| v.as_str()) {
+        for path in expand_workspace_pattern(dir, member) {
+            if !excludes.contains(&path) && !result.contains(&path) {
+                result.push(path);
+            }
+        }
+    }
+    result
 }
 
 /// ディレクトリが Tauri プロジェクトかどうかを判定する
@@ -466,6 +553,140 @@ mod tests {
             .find(|m| m.path == dir.path().join("package.json"))
             .unwrap();
         assert!(root.is_workspace_root);
+    }
+
+    #[test]
+    fn test_pnpm_workspace_inline_comment_and_negation() {
+        let dir = create_temp_dir();
+
+        // インラインコメント付きパターンと否定パターンを含む pnpm-workspace.yaml
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - 'packages/*' # apps\n  - '!packages/legacy'\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("package.json"), "{}").unwrap();
+
+        for name in ["pkg-a", "legacy"] {
+            let pkg_dir = dir.path().join("packages").join(name);
+            fs::create_dir_all(&pkg_dir).unwrap();
+            fs::write(pkg_dir.join("package.json"), "{}").unwrap();
+        }
+
+        let manifests = detect_manifests(dir.path());
+        let node_paths: Vec<_> = manifests
+            .iter()
+            .filter(|m| m.language == Language::Node)
+            .map(|m| m.path.clone())
+            .collect();
+
+        // インラインコメントがあっても 'packages/*' が展開される
+        assert!(
+            node_paths.contains(&dir.path().join("packages/pkg-a/package.json")),
+            "コメント付きパターンが展開されるべき: {:?}",
+            node_paths
+        );
+        // 否定パターンのパッケージは除外される
+        assert!(
+            !node_paths.contains(&dir.path().join("packages/legacy/package.json")),
+            "否定パターンは除外されるべき: {:?}",
+            node_paths
+        );
+    }
+
+    #[test]
+    fn test_pnpm_workspace_duplicate_patterns_not_duplicated() {
+        let dir = create_temp_dir();
+
+        // glob と直接パスが同じパッケージを指す場合に重複しない
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - 'packages/*'\n  - 'packages/pkg-a'\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("package.json"), "{}").unwrap();
+
+        let pkg_dir = dir.path().join("packages").join("pkg-a");
+        fs::create_dir_all(&pkg_dir).unwrap();
+        fs::write(pkg_dir.join("package.json"), "{}").unwrap();
+
+        let manifests = detect_manifests(dir.path());
+        let count = manifests
+            .iter()
+            .filter(|m| m.path == pkg_dir.join("package.json"))
+            .count();
+        assert_eq!(count, 1, "同一パッケージは1回だけ検出されるべき");
+    }
+
+    #[test]
+    fn test_detect_cargo_workspace_members_glob() {
+        let dir = create_temp_dir();
+
+        // glob 形式 members + exclude を持つワークスペース
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            r#"[workspace]
+members = ["crates/*"]
+exclude = ["crates/legacy"]
+resolver = "2"
+"#,
+        )
+        .unwrap();
+
+        for name in ["core", "cli", "legacy"] {
+            let member_dir = dir.path().join("crates").join(name);
+            fs::create_dir_all(&member_dir).unwrap();
+            fs::write(
+                member_dir.join("Cargo.toml"),
+                "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+            )
+            .unwrap();
+        }
+
+        let manifests = detect_manifests(dir.path());
+        let rust_paths: Vec<_> = manifests
+            .iter()
+            .filter(|m| m.language == Language::Rust)
+            .map(|m| m.path.clone())
+            .collect();
+
+        assert!(
+            rust_paths.contains(&dir.path().join("crates/core/Cargo.toml")),
+            "glob members が展開されるべき: {:?}",
+            rust_paths
+        );
+        assert!(rust_paths.contains(&dir.path().join("crates/cli/Cargo.toml")));
+        assert!(
+            !rust_paths.contains(&dir.path().join("crates/legacy/Cargo.toml")),
+            "exclude されたメンバーは検出されないべき"
+        );
+    }
+
+    #[test]
+    fn test_detect_cargo_workspace_members_segment_wildcard() {
+        let dir = create_temp_dir();
+
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/util-*\"]\n",
+        )
+        .unwrap();
+
+        for name in ["util-a", "other"] {
+            let member_dir = dir.path().join("crates").join(name);
+            fs::create_dir_all(&member_dir).unwrap();
+            fs::write(
+                member_dir.join("Cargo.toml"),
+                "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+            )
+            .unwrap();
+        }
+
+        let members = detect_cargo_workspace_members(
+            dir.path(),
+            &fs::read_to_string(dir.path().join("Cargo.toml")).unwrap(),
+        );
+        assert_eq!(members, vec![dir.path().join("crates/util-a")]);
     }
 
     #[test]

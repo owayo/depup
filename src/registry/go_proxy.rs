@@ -46,19 +46,29 @@ impl GoProxyAdapter {
     }
 
     /// バージョン情報用の URL を構築
+    ///
+    /// Go Module Proxy プロトコルは `$module` と `$version` の両方を case-encode するため
+    /// (https://go.dev/ref/mod#goproxy-protocol)、バージョンにも適用する。
+    /// 適用しないと `v1.0.0-RC1` のような大文字入りバージョンの `.info` 取得が
+    /// 404 になり、そのバージョンが候補から silent に欠落する。
     fn build_info_url(&self, module: &str, version: &str) -> String {
         let encoded_module = Self::encode_module_path(module);
-        format!("{}/@v/{}.info", encoded_module, version)
+        format!("{}/@v/{}.info", encoded_module, Self::case_encode(version))
     }
 
     /// Go Proxy URL 用にモジュールパスをエンコード
     fn encode_module_path(module: &str) -> String {
-        // Go Proxy は大文字を !小文字 にエンコードするケースエンコードパスを使用
-        let mut encoded = String::with_capacity(module.len() + GO_PROXY_URL.len() + 1);
-        encoded.push_str(GO_PROXY_URL);
-        encoded.push('/');
+        format!("{}/{}", GO_PROXY_URL, Self::case_encode(module))
+    }
 
-        for ch in module.chars() {
+    /// Go Module Proxy プロトコルの case-encoding (大文字 → `!` + 小文字)
+    ///
+    /// 大文字小文字を区別しないファイルシステム上での曖昧さを避けるためのエンコードで、
+    /// モジュールパスとバージョン文字列の両方に適用される。
+    fn case_encode(s: &str) -> String {
+        let mut encoded = String::with_capacity(s.len());
+
+        for ch in s.chars() {
             if ch.is_uppercase() {
                 encoded.push('!');
                 for lower in ch.to_lowercase() {
@@ -183,6 +193,43 @@ mod tests {
         assert_eq!(
             adapter.build_info_url("github.com/gin-gonic/gin", "v1.9.0"),
             "https://proxy.golang.org/github.com/gin-gonic/gin/@v/v1.9.0.info"
+        );
+    }
+
+    /// バグ回帰テスト: Go Module Proxy プロトコルは `$version` も case-encode する。
+    /// 以前はモジュールパスにしか適用していなかったため、`v1.0.0-RC1` のような
+    /// 大文字入りバージョンの `.info` 取得が 404 になり候補から silent に欠落していた。
+    #[test]
+    fn test_case_encode_version_with_uppercase() {
+        assert_eq!(GoProxyAdapter::case_encode("v1.0.0-RC1"), "v1.0.0-!r!c1");
+    }
+
+    #[test]
+    fn test_case_encode_lowercase_unchanged() {
+        assert_eq!(GoProxyAdapter::case_encode("v1.9.0"), "v1.9.0");
+        assert_eq!(
+            GoProxyAdapter::case_encode("v1.2.3-beta.1"),
+            "v1.2.3-beta.1"
+        );
+    }
+
+    #[test]
+    fn test_build_info_url_encodes_version_case() {
+        let client = HttpClient::new().unwrap();
+        let adapter = GoProxyAdapter::new(client);
+        assert_eq!(
+            adapter.build_info_url("github.com/gin-gonic/gin", "v1.0.0-RC1"),
+            "https://proxy.golang.org/github.com/gin-gonic/gin/@v/v1.0.0-!r!c1.info"
+        );
+    }
+
+    #[test]
+    fn test_build_info_url_encodes_both_module_and_version() {
+        let client = HttpClient::new().unwrap();
+        let adapter = GoProxyAdapter::new(client);
+        assert_eq!(
+            adapter.build_info_url("github.com/Azure/azure-sdk-for-go", "v1.0.0-RC1"),
+            "https://proxy.golang.org/github.com/!azure/azure-sdk-for-go/@v/v1.0.0-!r!c1.info"
         );
     }
 }

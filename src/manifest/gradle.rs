@@ -27,8 +27,6 @@ struct VariableDefinition {
     value: String,
     /// 行番号 (1-based)
     line_number: usize,
-    /// 使用されているクォート文字 (' または ")
-    quote_char: char,
 }
 
 /// Gradle rich version の宣言種別
@@ -139,46 +137,69 @@ fn rich_version_method(name: &str) -> Option<RichVersionMethod> {
 }
 
 fn strip_gradle_comments_from_line(line: &str, in_block_comment: &mut bool) -> String {
-    let mut rest = line;
-    let mut output = String::new();
+    let mut output = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    let mut in_string: Option<char> = None;
 
-    loop {
+    while let Some(ch) = chars.next() {
         if *in_block_comment {
-            if let Some(end) = rest.find("*/") {
-                let comment_len = end + 2;
-                output.push_str(&" ".repeat(comment_len));
-                rest = &rest[comment_len..];
+            if ch == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                output.push_str("  ");
                 *in_block_comment = false;
             } else {
-                output.push_str(&" ".repeat(rest.len()));
-                return output;
+                // 後段がバイト位置で元の行を参照できるよう、文字のバイト長ぶん空白に置換する
+                for _ in 0..ch.len_utf8() {
+                    output.push(' ');
+                }
             }
-        } else if let Some(start) = rest.find("/*") {
-            output.push_str(&rest[..start]);
-            let comment_rest = &rest[start + 2..];
-            if let Some(end) = comment_rest.find("*/") {
-                let comment_len = 2 + end + 2;
-                output.push_str(&" ".repeat(comment_len));
-                rest = &rest[start + comment_len..];
-            } else {
-                output.push_str(&" ".repeat(rest.len() - start));
-                *in_block_comment = true;
-                return output;
-            }
-        } else {
-            output.push_str(rest);
-            break;
+            continue;
         }
-    }
 
-    if let Some(start) = output.find("//") {
-        output.truncate(start);
+        if let Some(quote) = in_string {
+            // 文字列リテラル内の // や /* ('http://...' や 'META-INF/*' など) はコードとして残す
+            output.push(ch);
+            if ch == '\\' {
+                if let Some(escaped) = chars.next() {
+                    output.push(escaped);
+                }
+            } else if ch == quote {
+                in_string = None;
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' | '"' => {
+                in_string = Some(ch);
+                output.push(ch);
+            }
+            '/' if chars.peek() == Some(&'/') => {
+                // 文字列外の行コメント: 行末まで切り捨てる
+                return output;
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                output.push_str("  ");
+                *in_block_comment = true;
+            }
+            _ => output.push(ch),
+        }
     }
 
     output
 }
 
-fn replace_first_active_gradle_match<F>(
+/// ブロックコメント状態を行間で引き継ぎながら全行のコメントを除去する
+fn strip_gradle_comment_lines(content: &str) -> Vec<String> {
+    let mut in_block_comment = false;
+    content
+        .lines()
+        .map(|line| strip_gradle_comments_from_line(line, &mut in_block_comment))
+        .collect()
+}
+
+fn replace_all_active_gradle_matches<F>(
     content: &str,
     re: &Regex,
     mut replacement: F,
@@ -197,25 +218,33 @@ where
             (segment, "")
         };
 
-        if updated {
-            output.push_str(segment);
-            continue;
-        }
-
         let active_line = strip_gradle_comments_from_line(line, &mut in_block_comment);
-        if let Some(caps) = re.captures(&active_line)
-            && let Some(new_match) = replacement(&caps)
-            && let Some(whole) = caps.get(0)
-        {
-            output.push_str(&line[..whole.start()]);
-            output.push_str(&new_match);
-            output.push_str(&line[whole.end()..]);
-            output.push_str(newline);
+        let mut rebuilt = String::new();
+        let mut last_end = 0usize;
+
+        // 同一座標の複数宣言 (compileOnly + annotationProcessor 等) を全て更新するため、
+        // アクティブ行の全マッチを出現ごとに自身の旧値から整形して置換する。
+        // コメント除去はバイト位置を保つため、マッチ位置を元の行へそのまま適用できる。
+        for caps in re.captures_iter(&active_line) {
+            let Some(whole) = caps.get(0) else {
+                continue;
+            };
+            let Some(new_match) = replacement(&caps) else {
+                continue;
+            };
+            rebuilt.push_str(&line[last_end..whole.start()]);
+            rebuilt.push_str(&new_match);
+            last_end = whole.end();
             updated = true;
-            continue;
         }
 
-        output.push_str(segment);
+        if last_end > 0 {
+            rebuilt.push_str(&line[last_end..]);
+            rebuilt.push_str(newline);
+            output.push_str(&rebuilt);
+        } else {
+            output.push_str(segment);
+        }
     }
 
     (output, updated)
@@ -227,13 +256,17 @@ impl GradleParser {
         let mut variables = HashMap::new();
         let mut in_ext_block = false;
         let mut brace_depth = 0;
+        let mut in_block_comment = false;
 
-        for (line_idx, line) in content.lines().enumerate() {
+        for (line_idx, raw_line) in content.lines().enumerate() {
             let line_number = line_idx + 1;
+            // 行コメント・ブロックコメント内の変数定義を拾わないよう、除去済みの行で判定する
+            let line = strip_gradle_comments_from_line(raw_line, &mut in_block_comment);
+            let line = line.as_str();
             let trimmed = line.trim();
 
-            // 空行とコメントをスキップ
-            if trimmed.is_empty() || trimmed.starts_with("//") {
+            // 空行とコメント行をスキップ
+            if trimmed.is_empty() {
                 continue;
             }
 
@@ -269,7 +302,6 @@ impl GradleParser {
                         VariableDefinition {
                             value: value.to_string(),
                             line_number,
-                            quote_char: '\'',
                         },
                     );
                 }
@@ -287,7 +319,6 @@ impl GradleParser {
                         VariableDefinition {
                             value: value.to_string(),
                             line_number,
-                            quote_char: '"',
                         },
                     );
                 }
@@ -305,7 +336,6 @@ impl GradleParser {
                         VariableDefinition {
                             value: value.to_string(),
                             line_number,
-                            quote_char: '"',
                         },
                     );
                 }
@@ -330,7 +360,6 @@ impl GradleParser {
                             VariableDefinition {
                                 value: value.to_string(),
                                 line_number,
-                                quote_char: '\'',
                             },
                         );
                     }
@@ -354,7 +383,6 @@ impl GradleParser {
                             VariableDefinition {
                                 value: value.to_string(),
                                 line_number,
-                                quote_char: '"',
                             },
                         );
                     }
@@ -446,6 +474,12 @@ impl GradleParser {
         let group = caps.get(2).map(|m| m.as_str())?;
         let artifact = caps.get(3).map(|m| m.as_str())?;
         let version = caps.get(4).map(|m| m.as_str())?;
+
+        // maven { url 'http://nexus:8081' } のような URL (group が http/https 等の
+        // スキームで artifact が // 始まり) は依存座標ではないため除外する
+        if artifact.starts_with("//") {
+            return None;
+        }
 
         let spec = parser.parse(version)?;
         let is_dev = DEV_CONFIGURATIONS.contains(&config);
@@ -676,13 +710,15 @@ impl ManifestParser for GradleParser {
         let mut dependencies = Vec::new();
         let parser = get_parser(Language::Java);
         let variables = self.extract_variables(content);
-        let lines: Vec<&str> = content.lines().collect();
+        // ブロックコメント内の宣言を生きた依存として拾わないよう、除去済みの行で判定する
+        let stripped_lines = strip_gradle_comment_lines(content);
+        let lines: Vec<&str> = stripped_lines.iter().map(|line| line.as_str()).collect();
 
         for (line_index, line) in lines.iter().enumerate() {
             let trimmed = line.trim();
 
-            // 空行とコメントをスキップ
-            if trimmed.is_empty() || trimmed.starts_with("//") {
+            // 空行とコメント行をスキップ
+            if trimmed.is_empty() {
                 continue;
             }
 
@@ -739,11 +775,13 @@ impl ManifestParser for GradleParser {
 
         let parser = get_parser(Language::Java);
         let variables = self.extract_variables(content);
+        // コメントアウトされた宣言に変数バインドを誘導されないよう、除去済みの行で判定する
+        let stripped_lines = strip_gradle_comment_lines(content);
 
         // このパッケージに使われている変数名を特定
         let mut variable_for_package: Option<String> = None;
 
-        for line in content.lines() {
+        for line in &stripped_lines {
             // map 記法を確認
             if let Some((_dep, var_name)) =
                 self.parse_map_notation(line, &variables, parser.as_ref())
@@ -784,9 +822,6 @@ impl GradleParser {
         var_def: &VariableDefinition,
         new_version: &str,
     ) -> Result<String, ManifestError> {
-        let lines: Vec<&str> = content.lines().collect();
-        let mut result = Vec::new();
-        let quote = var_def.quote_char;
         let version_parser = get_parser(Language::Java);
         let Some(formatted_version) = version_parser
             .parse(&var_def.value)
@@ -799,66 +834,18 @@ impl GradleParser {
             });
         };
 
-        for (idx, line) in lines.iter().enumerate() {
-            let line_number = idx + 1;
+        let mut result = Vec::new();
+        let mut in_block_comment = false;
 
-            if line_number == var_def.line_number {
-                // 更新対象行。元の構造を保持して置換する
+        for (idx, line) in content.lines().enumerate() {
+            let active_line = strip_gradle_comments_from_line(line, &mut in_block_comment);
 
-                // def variable = 'value' (シングルクォート)
-                if let Some(caps) = VAR_DEF_GROOVY_SINGLE.captures(line) {
-                    let prefix = &line[..caps.get(0).unwrap().start()];
-                    let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                    result.push(format!(
-                        "{}def {} = {}{}{}",
-                        prefix, name, quote, formatted_version, quote
-                    ));
-                    continue;
-                }
-
-                // def variable = "value" (ダブルクォート)
-                if let Some(caps) = VAR_DEF_GROOVY_DOUBLE.captures(line) {
-                    let prefix = &line[..caps.get(0).unwrap().start()];
-                    let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                    result.push(format!(
-                        "{}def {} = {}{}{}",
-                        prefix, name, quote, formatted_version, quote
-                    ));
-                    continue;
-                }
-
-                // val variable = "value"
-                if let Some(caps) = VAR_DEF_KOTLIN.captures(line) {
-                    let prefix = &line[..caps.get(0).unwrap().start()];
-                    let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                    result.push(format!(
-                        "{}val {} = \"{}\"",
-                        prefix, name, formatted_version
-                    ));
-                    continue;
-                }
-
-                // ext ブロック変数 = 'value' (シングルクォート)
-                if let Some(caps) = EXT_VAR_SINGLE.captures(line) {
-                    let prefix = &line[..caps.get(0).unwrap().start()];
-                    let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                    result.push(format!(
-                        "{}{} = {}{}{}",
-                        prefix, name, quote, formatted_version, quote
-                    ));
-                    continue;
-                }
-
-                // ext ブロック変数 = "value" (ダブルクォート)
-                if let Some(caps) = EXT_VAR_DOUBLE.captures(line) {
-                    let prefix = &line[..caps.get(0).unwrap().start()];
-                    let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                    result.push(format!(
-                        "{}{} = {}{}{}",
-                        prefix, name, quote, formatted_version, quote
-                    ));
-                    continue;
-                }
+            if idx + 1 == var_def.line_number
+                && let Some(replaced) =
+                    replace_variable_version_value(line, &active_line, &formatted_version)
+            {
+                result.push(replaced);
+                continue;
             }
 
             result.push(line.to_string());
@@ -910,7 +897,7 @@ impl GradleParser {
         })?;
 
         let (result, mut updated) =
-            replace_first_active_gradle_match(content, &map_re, |caps: &regex::Captures| {
+            replace_all_active_gradle_matches(content, &map_re, |caps: &regex::Captures| {
                 let prefix = &caps[1];
                 let quote = &caps[2];
                 let current_version = caps.get(3).map(|m| m.as_str()).unwrap_or("");
@@ -937,7 +924,7 @@ impl GradleParser {
             })?;
 
         let (result, string_updated) =
-            replace_first_active_gradle_match(content, &string_re, |caps: &regex::Captures| {
+            replace_all_active_gradle_matches(content, &string_re, |caps: &regex::Captures| {
                 let quote = &caps[1];
                 let current_version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
                 let suffix = caps.get(3).map(|m| m.as_str()).unwrap_or("");
@@ -976,10 +963,13 @@ impl GradleParser {
         new_version: &str,
     ) -> Result<Option<String>, ManifestError> {
         let lines: Vec<&str> = content.lines().collect();
+        // ブロックコメント内のオープナーや宣言を書き換えないよう、除去済みの行で検出する
+        let stripped_lines = strip_gradle_comment_lines(content);
+        let active_lines: Vec<&str> = stripped_lines.iter().map(|line| line.as_str()).collect();
         let parser = get_parser(Language::Java);
 
-        for (line_index, line) in lines.iter().enumerate() {
-            let Some(caps) = DEP_STRING_NO_VERSION.captures(line) else {
+        for (line_index, active_line) in active_lines.iter().enumerate() {
+            let Some(caps) = DEP_STRING_NO_VERSION.captures(active_line) else {
                 continue;
             };
 
@@ -989,12 +979,13 @@ impl GradleParser {
                 continue;
             }
 
-            let Some(end_index) = self.dependency_block_end(&lines, line_index) else {
+            let Some(end_index) = self.dependency_block_end(&active_lines, line_index) else {
                 continue;
             };
-            let Some(selection) =
-                self.find_rich_version_selection(&lines[line_index..=end_index], parser.as_ref())
-            else {
+            let Some(selection) = self.find_rich_version_selection(
+                &active_lines[line_index..=end_index],
+                parser.as_ref(),
+            ) else {
                 continue;
             };
 
@@ -1033,6 +1024,36 @@ impl GradleParser {
 
 fn package_name(group: &str, artifact: &str) -> String {
     format!("{}:{}", group, artifact)
+}
+
+/// 変数定義行のバージョン値 (キャプチャ範囲) だけを差し替える。
+/// 行を再構築しないため、インデント・行末コメント・クォート文字は元のまま保持される。
+fn replace_variable_version_value(
+    line: &str,
+    active_line: &str,
+    formatted_version: &str,
+) -> Option<String> {
+    let regexes: [&Regex; 5] = [
+        &*VAR_DEF_GROOVY_SINGLE,
+        &*VAR_DEF_GROOVY_DOUBLE,
+        &*VAR_DEF_KOTLIN,
+        &*EXT_VAR_SINGLE,
+        &*EXT_VAR_DOUBLE,
+    ];
+
+    for re in regexes {
+        let Some(value) = re.captures(active_line).and_then(|caps| caps.get(2)) else {
+            continue;
+        };
+        // コメント除去はバイト位置を保つため、値の範囲を元の行へそのまま適用できる
+        let mut replaced = String::with_capacity(line.len() + formatted_version.len());
+        replaced.push_str(&line[..value.start()]);
+        replaced.push_str(formatted_version);
+        replaced.push_str(&line[value.end()..]);
+        return Some(replaced);
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -2068,5 +2089,208 @@ dependencies {
             assert_eq!(dep.version_spec.version, "26.1.0");
         }
         // パースされない場合もテスト自体は成功（実装の振る舞いを記録）
+    }
+
+    // --- コメント除去の文字列リテラル対応 (回帰テスト) ---
+
+    #[test]
+    fn test_update_after_string_containing_block_comment_marker() {
+        // 'META-INF/*.kotlin_module' の /* が閉じないブロックコメント開始と誤認されると、
+        // 以降の全依存の更新が not found で失敗していた
+        let content = r#"
+android {
+    packagingOptions {
+        exclude 'META-INF/*.kotlin_module'
+    }
+}
+
+dependencies {
+    implementation 'org.apache.wicket:wicket-core:9.12.0'
+}
+"#;
+        let result = GradleParser
+            .update_version(content, "org.apache.wicket:wicket-core", "10.0.0")
+            .unwrap();
+        assert!(result.contains("exclude 'META-INF/*.kotlin_module'"));
+        assert!(result.contains("implementation 'org.apache.wicket:wicket-core:10.0.0'"));
+    }
+
+    #[test]
+    fn test_update_preserves_url_string_with_double_slash() {
+        // 文字列リテラル内の // を行コメントとして切り詰めない
+        let content = r#"
+repositories {
+    maven { url 'https://repo.example.com/maven2' }
+}
+
+dependencies {
+    implementation 'org.apache.wicket:wicket-core:9.12.0'
+}
+"#;
+        let result = GradleParser
+            .update_version(content, "org.apache.wicket:wicket-core", "10.0.0")
+            .unwrap();
+        assert!(result.contains("maven { url 'https://repo.example.com/maven2' }"));
+        assert!(result.contains("implementation 'org.apache.wicket:wicket-core:10.0.0'"));
+    }
+
+    // --- 同一座標の複数宣言の一括更新 (回帰テスト) ---
+
+    #[test]
+    fn test_update_all_declarations_of_same_coordinate() {
+        // compileOnly + annotationProcessor のような同一座標の複数宣言を全て更新する
+        let content = r#"
+dependencies {
+    compileOnly 'org.projectlombok:lombok:1.18.30'
+    annotationProcessor 'org.projectlombok:lombok:1.18.30'
+}
+"#;
+        let result = GradleParser
+            .update_version(content, "org.projectlombok:lombok", "1.18.36")
+            .unwrap();
+        assert!(result.contains("compileOnly 'org.projectlombok:lombok:1.18.36'"));
+        assert!(result.contains("annotationProcessor 'org.projectlombok:lombok:1.18.36'"));
+        assert!(!result.contains("1.18.30"));
+    }
+
+    #[test]
+    fn test_update_all_declarations_formats_each_from_own_value() {
+        // 出現ごとに旧バージョン・クォート・strict 表記が違っても、それぞれ自身の形式を保って更新する
+        let content = r#"
+dependencies {
+    compileOnly 'org.projectlombok:lombok:1.18.28'
+    annotationProcessor "org.projectlombok:lombok:1.18.30!!"
+}
+"#;
+        let result = GradleParser
+            .update_version(content, "org.projectlombok:lombok", "1.18.36")
+            .unwrap();
+        assert!(result.contains("compileOnly 'org.projectlombok:lombok:1.18.36'"));
+        assert!(result.contains(r#"annotationProcessor "org.projectlombok:lombok:1.18.36!!""#));
+    }
+
+    // --- 変数定義更新のインデント・行末コメント保持 (回帰テスト) ---
+
+    #[test]
+    fn test_update_ext_variable_preserves_indent_and_trailing_comment() {
+        let content = r#"
+ext {
+    springVersion = '5.3.23' // managed by depup
+}
+
+dependencies {
+    implementation group: 'org.springframework', name: 'spring-core', version: springVersion
+}
+"#;
+        let result = GradleParser
+            .update_version(content, "org.springframework:spring-core", "6.0.0")
+            .unwrap();
+        assert!(result.contains("    springVersion = '6.0.0' // managed by depup"));
+    }
+
+    #[test]
+    fn test_update_def_variable_preserves_trailing_comment() {
+        let content = r#"
+def wicketVersion = '9.12.0' // keep in sync with parent
+dependencies {
+    implementation "org.apache.wicket:wicket-core:$wicketVersion"
+}
+"#;
+        let result = GradleParser
+            .update_version(content, "org.apache.wicket:wicket-core", "10.0.0")
+            .unwrap();
+        assert!(result.contains("def wicketVersion = '10.0.0' // keep in sync with parent"));
+    }
+
+    // --- /* */ ブロックコメント内の宣言の無視 (回帰テスト) ---
+
+    #[test]
+    fn test_parse_skips_block_commented_dependency_declaration() {
+        // 宣言全体がコメントアウトされた rich version ブロックは parse 対象にしない
+        let content = r#"
+dependencies {
+    /*
+    implementation("org.slf4j:slf4j-api") {
+        version {
+            prefer("1.7.25")
+        }
+    }
+    */
+    implementation 'junit:junit:4.13.2'
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "junit:junit");
+    }
+
+    #[test]
+    fn test_update_skips_block_commented_rich_version_block() {
+        // コメントアウトされたブロック内の prefer は書き換えず、生きている宣言だけを更新する
+        let content = r#"
+dependencies {
+    /*
+    implementation("org.slf4j:slf4j-api") {
+        version {
+            prefer("1.7.20")
+        }
+    }
+    */
+    implementation("org.slf4j:slf4j-api") {
+        version {
+            prefer("1.7.25")
+        }
+    }
+}
+"#;
+        let result = GradleParser
+            .update_version(content, "org.slf4j:slf4j-api", "1.7.36")
+            .unwrap();
+        assert!(result.contains(r#"prefer("1.7.20")"#));
+        assert!(result.contains(r#"prefer("1.7.36")"#));
+        assert!(!result.contains(r#"prefer("1.7.25")"#));
+    }
+
+    #[test]
+    fn test_extract_variables_ignores_block_commented_definition() {
+        // ブロックコメント内の変数定義は抽出せず、生きている定義を上書きしない
+        let content = r#"
+def wicketVersion = '9.12.0'
+/*
+def wicketVersion = '1.0.0'
+def junitVersion = '4.0.0'
+*/
+"#;
+        let parser = GradleParser;
+        let vars = parser.extract_variables(content);
+        assert_eq!(
+            vars.get("wicketVersion").map(|v| v.value.as_str()),
+            Some("9.12.0")
+        );
+        assert!(!vars.contains_key("junitVersion"));
+    }
+
+    // --- repositories の URL の誤検出防止 (回帰テスト) ---
+
+    #[test]
+    fn test_parse_skips_repository_url() {
+        // maven { url 'http://nexus:8081' } の url 行を依存として誤検出しない
+        let content = r#"
+repositories {
+    maven {
+        url 'http://nexus:8081'
+    }
+    maven {
+        url "https://repo.example.com:8443/maven2"
+    }
+}
+
+dependencies {
+    implementation 'junit:junit:4.13.2'
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "junit:junit");
     }
 }

@@ -335,7 +335,15 @@ impl ManifestParser for PackageSwiftParser {
         new_version: &str,
     ) -> Result<String, ManifestError> {
         let escaped_package = regex::escape(package);
-        let url_pattern = format!(r#"github\.com[/:]{}(?:\.git)?"#, escaped_package);
+        // URL は Swift 文字列リテラル内にあるため、リポジトリ名の直後には必ず閉じ引用符
+        // (`"`) かパス区切り等の境界文字が続く。境界文字を要求することで、
+        // `grpc/grpc-swift` の更新が先に宣言された `grpc/grpc-swift-nio` の URL へ
+        // 前方一致して別依存を書き換えるのを防ぐ (前方一致は境界で弾かれるため、
+        // 最初のマッチが境界一致した正しい宣言になる)。
+        let url_pattern = format!(
+            r#"(github\.com[/:]{}(?:\.git)?)["'/?#\s)]"#,
+            escaped_package
+        );
         let masked = mask_comments(content);
 
         let url_re = Regex::new(&url_pattern).map_err(|e| ManifestError::InvalidVersionSpec {
@@ -352,9 +360,11 @@ impl ManifestParser for PackageSwiftParser {
                 message: format!("invalid regex pattern: {}", e),
             })?;
 
-        // 全体から URL を検索する (複数行宣言に対応)
+        // 全体から URL を検索する (複数行宣言に対応)。
+        // 境界文字込みでマッチさせ、以降の位置計算には URL 本体 (グループ1) の範囲を使う
         let url_match = url_re
-            .find(&masked)
+            .captures(&masked)
+            .and_then(|caps| caps.get(1))
             .ok_or_else(|| ManifestError::InvalidVersionSpec {
                 path: PathBuf::from("Package.swift"),
                 spec: package.to_string(),
@@ -631,6 +641,77 @@ let package = Package(
         let content = r#".package(url: "https://github.com/apple/swift-nio.git", from: "2.40.0")"#;
         let result = PackageSwiftParser.update_version(content, "nonexistent/repo", "1.0.0");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_update_version_url_prefix_collision_longer_first() {
+        // 回帰テスト: 名前プレフィックスを共有する別依存 (grpc-swift-nio) が先に
+        // 宣言されていても、grpc-swift の更新が nio 側の URL に前方一致して
+        // nio 側の from を書き換えない
+        let content = r#"
+let package = Package(
+    dependencies: [
+        .package(url: "https://github.com/grpc/grpc-swift-nio.git", from: "1.0.0"),
+        .package(url: "https://github.com/grpc/grpc-swift.git", from: "1.10.0"),
+    ]
+)
+"#;
+        let result = PackageSwiftParser
+            .update_version(content, "grpc/grpc-swift", "1.11.0")
+            .unwrap();
+        assert!(
+            result.contains(
+                r#".package(url: "https://github.com/grpc/grpc-swift.git", from: "1.11.0")"#
+            ),
+            "grpc-swift should be updated, but got:\n{}",
+            result
+        );
+        assert!(
+            result.contains(
+                r#".package(url: "https://github.com/grpc/grpc-swift-nio.git", from: "1.0.0")"#
+            ),
+            "grpc-swift-nio should not be modified, but got:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_update_version_url_prefix_collision_shorter_first() {
+        // 逆順 (本体が先、nio が後) でも正しい宣言だけを更新する
+        let content = r#"
+let package = Package(
+    dependencies: [
+        .package(url: "https://github.com/grpc/grpc-swift.git", from: "1.10.0"),
+        .package(url: "https://github.com/grpc/grpc-swift-nio.git", from: "1.0.0"),
+    ]
+)
+"#;
+        let result = PackageSwiftParser
+            .update_version(content, "grpc/grpc-swift", "1.11.0")
+            .unwrap();
+        assert!(result.contains(r#"grpc-swift.git", from: "1.11.0""#));
+        assert!(result.contains(r#"grpc-swift-nio.git", from: "1.0.0""#));
+
+        // 長い方 (grpc-swift-nio) の更新も自身の宣言だけに当たる
+        let result = PackageSwiftParser
+            .update_version(content, "grpc/grpc-swift-nio", "1.2.0")
+            .unwrap();
+        assert!(result.contains(r#"grpc-swift-nio.git", from: "1.2.0""#));
+        assert!(result.contains(r#"grpc-swift.git", from: "1.10.0""#));
+    }
+
+    #[test]
+    fn test_update_version_url_prefix_collision_without_git_extension() {
+        // `.git` 拡張なしの URL (閉じ引用符が直後に続く) でも境界判定が機能する
+        let content = r#"
+        .package(url: "https://github.com/grpc/grpc-swift-nio", from: "1.0.0"),
+        .package(url: "https://github.com/grpc/grpc-swift", from: "1.10.0"),
+"#;
+        let result = PackageSwiftParser
+            .update_version(content, "grpc/grpc-swift", "1.11.0")
+            .unwrap();
+        assert!(result.contains(r#"grpc-swift", from: "1.11.0""#));
+        assert!(result.contains(r#"grpc-swift-nio", from: "1.0.0""#));
     }
 
     #[test]

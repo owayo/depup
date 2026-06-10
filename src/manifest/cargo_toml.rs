@@ -14,6 +14,7 @@ use crate::manifest::ManifestParser;
 use crate::parser::{VersionParser, get_parser};
 use regex::Regex;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 use toml::Value;
 
 /// `Cargo.toml` 用パーサ
@@ -37,6 +38,39 @@ fn is_cargo_dependency_section(section: &str) -> bool {
             || section.ends_with(".dev-dependencies")
             || section.ends_with(".build-dependencies")))
 }
+
+/// `[dependencies.<package>]` のような複数行依存テーブルのセクション名から、
+/// 末尾のパッケージ名を取り除いた親セクション名を返す。
+/// パッケージ名は完全一致のみ許容し、`serde` で `[dependencies.serde_json]` のような
+/// 名前プレフィックスを共有するテーブルへ誤マッチしない。
+fn cargo_package_table_parent<'a>(section: &'a str, package: &str) -> Option<&'a str> {
+    section.trim().strip_suffix(package)?.strip_suffix('.')
+}
+
+/// 現在のセクションが `package` の複数行依存テーブルかどうかを返す
+fn is_cargo_package_dependency_table(section: &str, package: &str) -> bool {
+    cargo_package_table_parent(section, package).is_some_and(is_cargo_dependency_section)
+}
+
+/// 現在のセクションが git tag 更新対象の複数行テーブルかどうかを返す。
+/// 依存セクションに加えて `[patch.<registry>.<package>]` も対象にする。
+fn is_cargo_package_git_tag_table(section: &str, package: &str) -> bool {
+    cargo_package_table_parent(section, package).is_some_and(|parent| {
+        is_cargo_dependency_section(parent)
+            || parent
+                .strip_prefix("patch.")
+                .is_some_and(|registry| !registry.is_empty())
+    })
+}
+
+// 複数行テーブル内の `version` キー行にマッチする。行頭のキーだけを対象にするため、
+// `#` で始まるコメント行や行末コメント内の `version = "..."` には反応しない。
+static VERSION_LINE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"^(\s*version\s*=\s*)(?:"([^"]+)"|'([^']+)')"#).unwrap());
+
+// 複数行テーブル内の `tag` キー行にマッチする (git 依存のタグ更新用)
+static TAG_LINE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"^(\s*tag\s*=\s*)(?:"([^"]+)"|'([^']+)')"#).unwrap());
 
 impl ManifestParser for CargoTomlParser {
     fn parse(&self, content: &str) -> Result<Vec<Dependency>, ManifestError> {
@@ -110,10 +144,12 @@ impl ManifestParser for CargoTomlParser {
         let new_version = new_version.split('+').next().unwrap_or(new_version);
 
         let parser = get_parser(Language::Rust);
-        let mut result = content.to_string();
         let mut updated = false;
 
-        // 単純な依存宣言と inline table は、現在の TOML セクションが依存セクションの時だけ更新する
+        // 単純な依存宣言と inline table は、現在の TOML セクションが依存セクションの時だけ更新する。
+        // 同名クレートが複数の依存セクションにある場合に備えて最初の一致では打ち切らず、
+        // 全依存セクションの全出現を置換する (各出現は自身の旧値から整形するため、
+        // 出現ごとに制約形式が異なっていても正しく更新される)。
         let simple_pattern = format!(
             r#"^(\s*{})\s*=\s*(?:"([^"]+)"|'([^']+)')"#,
             regex::escape(package)
@@ -136,7 +172,7 @@ impl ManifestParser for CargoTomlParser {
             })?;
         let mut section = String::new();
         let mut rebuilt = String::new();
-        for segment in result.split_inclusive('\n') {
+        for segment in content.split_inclusive('\n') {
             let (line, newline) = if let Some(line) = segment.strip_suffix('\n') {
                 (line, "\n")
             } else {
@@ -150,7 +186,7 @@ impl ManifestParser for CargoTomlParser {
                 continue;
             }
 
-            if !updated && is_cargo_dependency_section(&section) {
+            if is_cargo_dependency_section(&section) {
                 let replacement = if let Some(caps) = simple_re.captures(line) {
                     let (quote, old_version) = if let Some(m) = caps.get(2) {
                         ("\"", m.as_str())
@@ -194,43 +230,39 @@ impl ManifestParser for CargoTomlParser {
                     updated = true;
                     continue;
                 }
+            } else if is_cargo_package_dependency_table(&section, package) {
+                // 複数行テーブル:
+                // [dependencies.package]
+                // version = "1.0.0"
+                // [workspace.dependencies.package] や target 固有テーブルも、セクション名と
+                // パッケージ名の完全一致で追跡しながら `version` キー行だけを置換する。
+                // `features = [...]` が `version` より前にあっても更新でき、コメント行や
+                // 行末コメント内の `version = "..."` は書き換えない。
+                if let Some(caps) = VERSION_LINE_RE.captures(line) {
+                    let (quote, old_version) = if let Some(m) = caps.get(2) {
+                        ("\"", m.as_str())
+                    } else if let Some(m) = caps.get(3) {
+                        ("'", m.as_str())
+                    } else {
+                        ("\"", "")
+                    };
+                    if let Some(spec) = parser.parse(old_version)
+                        && let Some(new_ver) = spec.try_format_updated(new_version)
+                    {
+                        let replacement = format!("{}{}{}{}", &caps[1], quote, new_ver, quote);
+                        rebuilt.push_str(&VERSION_LINE_RE.replace(line, replacement.as_str()));
+                        rebuilt.push_str(newline);
+                        updated = true;
+                        continue;
+                    }
+                }
             }
 
             rebuilt.push_str(segment);
         }
-        result = rebuilt;
-
-        // 複数行テーブル:
-        // [dependencies.package]
-        // version = "1.0.0"
-        // [workspace.dependencies.package] も含めて処理する。
-        // パッケージ名の直後は終端 `]` か空白のみを許可することで、
-        // `[dependencies.serde_json]` を `serde` で誤マッチしないようにする。
-        let multiline_pattern = format!(
-            r#"(?m)(\[(?:dependencies|dev-dependencies|build-dependencies|workspace\.dependencies|target\.[^\]]+\.(?:dependencies|dev-dependencies|build-dependencies))\.{}[ \t]*\][^\[]*version\s*=\s*)(?:"([^"]+)"|'([^']+)')"#,
-            regex::escape(package)
-        );
-        if let Ok(re) = Regex::new(&multiline_pattern)
-            && let Some(caps) = re.captures(&result)
-        {
-            let (quote, old_version) = if let Some(m) = caps.get(2) {
-                ("\"", m.as_str())
-            } else if let Some(m) = caps.get(3) {
-                ("'", m.as_str())
-            } else {
-                ("\"", "")
-            };
-            if let Some(spec) = parser.parse(old_version)
-                && let Some(new_ver) = spec.try_format_updated(new_version)
-            {
-                let replacement = format!("{}{}{}{}", &caps[1], quote, new_ver, quote);
-                result = re.replace(&result, replacement.as_str()).to_string();
-                updated = true;
-            }
-        }
 
         if updated {
-            Ok(result)
+            Ok(rebuilt)
         } else {
             Err(ManifestError::InvalidVersionSpec {
                 path: PathBuf::from("Cargo.toml"),
@@ -264,20 +296,41 @@ impl ManifestParser for CargoTomlParser {
         }
 
         // 複数行テーブル: `[dependencies.package]` ブロック内の `tag = "..."` を差し替える。
-        //   `[patch]` や `[workspace.dependencies]` にも対応する。
-        //   パッケージ名の直後は終端 `]` か空白のみを許可することで、
+        //   `[patch.<registry>.package]` や `[workspace.dependencies.package]` にも対応する。
+        //   セクション名をパッケージ名の完全一致で追跡することで、
         //   `[dependencies.foo-extra]` を `foo` で誤マッチしないようにする。
-        let multiline_pattern = format!(
-            r#"(?m)(\[(?:dependencies|dev-dependencies|build-dependencies|workspace\.dependencies|target\.[^\]]+\.(?:dependencies|dev-dependencies|build-dependencies)|patch\.[A-Za-z0-9_.-]+)\.{}[ \t]*\][^\[]*?\btag\s*=\s*)"([^"]+)""#,
-            regex::escape(package)
-        );
-        if let Ok(re) = Regex::new(&multiline_pattern)
-            && let Some(caps) = re.captures(&result)
-        {
-            let replacement = format!(r#"{}"{}""#, &caps[1], new_tag);
-            result = re.replace(&result, replacement.as_str()).to_string();
-            updated = true;
+        //   行頭が `tag` キーの行だけを対象とし、コメント行内の `tag = "..."` や
+        //   `features = [...]` を挟んだ後の `tag` 行も正しく扱う。
+        let mut section = String::new();
+        let mut rebuilt = String::new();
+        for segment in result.split_inclusive('\n') {
+            let (line, newline) = if let Some(line) = segment.strip_suffix('\n') {
+                (line, "\n")
+            } else {
+                (segment, "")
+            };
+
+            if let Some(name) = cargo_section_name(line) {
+                section.clear();
+                section.push_str(name);
+                rebuilt.push_str(segment);
+                continue;
+            }
+
+            if is_cargo_package_git_tag_table(&section, package)
+                && let Some(caps) = TAG_LINE_RE.captures(line)
+            {
+                let quote = if caps.get(3).is_some() { "'" } else { "\"" };
+                let replacement = format!("{}{}{}{}", &caps[1], quote, new_tag, quote);
+                rebuilt.push_str(&TAG_LINE_RE.replace(line, replacement.as_str()));
+                rebuilt.push_str(newline);
+                updated = true;
+                continue;
+            }
+
+            rebuilt.push_str(segment);
         }
+        result = rebuilt;
 
         if updated {
             Ok(result)
@@ -851,6 +904,24 @@ serde = "1.*"
     }
 
     #[test]
+    fn test_update_wildcard_x_version_preserves_shape() {
+        // 回帰テスト: cargo (semver crate) が受理する `1.x` 形式も形を保って更新する
+        let content = r#"
+[dependencies]
+serde = "1.x"
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Wildcard);
+
+        let result = CargoTomlParser
+            .update_version(content, "serde", "2.3.4")
+            .unwrap();
+        assert!(result.contains(r#"serde = "2.x""#));
+    }
+
+    #[test]
     fn test_update_caret_version() {
         let content = r#"
 [dependencies]
@@ -1083,6 +1154,55 @@ tag = "v0.5.0"
     }
 
     #[test]
+    fn test_update_git_tag_multiline_table_tag_after_features() {
+        // 回帰テスト: `features = [...]` が `tag` より前にあるテーブルでも更新できる
+        let content = r#"[dependencies.bar]
+git = "https://github.com/owner/bar.git"
+features = ["async"]
+tag = "v1.2.3"
+"#;
+        let result = CargoTomlParser
+            .update_git_tag(content, "bar", "v1.3.0")
+            .unwrap();
+        assert!(
+            result.contains(r#"tag = "v1.3.0""#),
+            "features が先行するテーブルの tag を更新できていません: {}",
+            result
+        );
+        assert!(result.contains(r#"features = ["async"]"#));
+    }
+
+    #[test]
+    fn test_update_git_tag_multiline_table_ignores_commented_tag() {
+        // 回帰テスト: テーブル内コメントの `tag = "..."` は書き換えない
+        let content = r#"[dependencies.bar]
+git = "https://github.com/owner/bar.git"
+# tag = "v0.9.0" 以前のタグ
+tag = "v1.2.3"
+"#;
+        let result = CargoTomlParser
+            .update_git_tag(content, "bar", "v1.3.0")
+            .unwrap();
+        assert!(result.contains(r#"tag = "v1.3.0""#));
+        assert!(result.contains(r#"# tag = "v0.9.0" 以前のタグ"#));
+        assert!(!result.contains(r#"tag = "v1.2.3""#));
+    }
+
+    #[test]
+    fn test_update_git_tag_patch_section_multiline_table() {
+        // `[patch.<registry>.<package>]` 形式の複数行テーブルも更新対象
+        let content = r#"[patch.crates-io.foo]
+git = "https://example.com/foo"
+tag = "v1.0.0"
+"#;
+        let result = CargoTomlParser
+            .update_git_tag(content, "foo", "v1.1.0")
+            .unwrap();
+        assert!(result.contains(r#"tag = "v1.1.0""#));
+        assert!(result.contains(r#"git = "https://example.com/foo""#));
+    }
+
+    #[test]
     fn test_update_multiline_table_with_features() {
         let content = r#"[dependencies.serde]
 version = "1.0.0"
@@ -1095,6 +1215,105 @@ features = ["derive"]
 
         assert!(result.contains("version = \"1.1.0\""));
         assert!(result.contains("features = [\"derive\"]"));
+    }
+
+    #[test]
+    fn test_update_multiline_table_version_after_features() {
+        // 回帰テスト: `features = [...]` が `version` より前にあるテーブルでも更新できる
+        // (旧実装は `[^\[]*` が features の `[` で止まり、常に更新失敗していた)
+        let content = r#"[dependencies.serde]
+features = ["derive"]
+version = "1.0.0"
+"#;
+
+        let result = CargoTomlParser
+            .update_version(content, "serde", "1.1.0")
+            .unwrap();
+
+        assert!(
+            result.contains("version = \"1.1.0\""),
+            "features が先行するテーブルの version を更新できていません: {}",
+            result
+        );
+        assert!(result.contains("features = [\"derive\"]"));
+    }
+
+    #[test]
+    fn test_update_multiline_table_ignores_commented_version() {
+        // 回帰テスト: テーブル内コメントの `version = "..."` は書き換えず、
+        // 実際の version キー行だけを更新する (旧実装は greedy マッチで
+        // テーブル末尾コメント内の version を誤置換していた)
+        let content = r#"[dependencies.serde]
+# version = "0.9" 以前の固定値
+version = "1.0.0"
+# version = "0.8" まで利用していた
+
+[features]
+default = []
+"#;
+
+        let result = CargoTomlParser
+            .update_version(content, "serde", "1.1.0")
+            .unwrap();
+
+        assert!(result.contains("version = \"1.1.0\""));
+        assert!(result.contains("# version = \"0.9\" 以前の固定値"));
+        assert!(result.contains("# version = \"0.8\" まで利用していた"));
+        assert!(!result.contains("version = \"1.0.0\""));
+    }
+
+    #[test]
+    fn test_update_version_updates_all_dependency_sections() {
+        // 回帰テスト: 同名クレートが複数の依存セクションにある場合、
+        // 1回の update_version で全出現が更新される (旧実装は最初の1箇所のみ)
+        let content = r#"
+[dependencies]
+tokio = { version = "1.28.0", features = ["full"] }
+
+[dev-dependencies]
+tokio = "~1.28.0"
+
+[package.metadata]
+tokio = "1.0.0"
+"#;
+
+        let result = CargoTomlParser
+            .update_version(content, "tokio", "1.45.0")
+            .unwrap();
+
+        // dependencies 側 (inline table) は自身の制約形式で更新される
+        assert!(result.contains(r#"tokio = { version = "1.45.0", features = ["full"] }"#));
+        // dev-dependencies 側 (tilde) も同じ呼び出しで更新される
+        assert!(
+            result.contains(r#"tokio = "~1.45.0""#),
+            "dev-dependencies 側の同名依存が更新されていません: {}",
+            result
+        );
+        // 依存セクション外の同名キーは書き換えない
+        assert!(result.contains(r#"tokio = "1.0.0""#));
+    }
+
+    #[test]
+    fn test_update_version_updates_all_multiline_tables() {
+        // 同名クレートの複数行テーブルが複数の依存セクションにある場合も全て更新する
+        let content = r#"[dependencies.serde]
+version = "1.0.0"
+features = ["derive"]
+
+[dev-dependencies.serde]
+version = "1.0.1"
+"#;
+
+        let result = CargoTomlParser
+            .update_version(content, "serde", "1.1.0")
+            .unwrap();
+
+        assert!(result.contains("[dependencies.serde]\nversion = \"1.1.0\""));
+        assert!(
+            result.contains("[dev-dependencies.serde]\nversion = \"1.1.0\""),
+            "dev-dependencies 側の複数行テーブルが更新されていません: {}",
+            result
+        );
     }
 
     #[test]

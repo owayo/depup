@@ -870,8 +870,9 @@ let package = Package(
         let deps = parser.parse(content).unwrap();
 
         assert_eq!(deps.len(), 1);
-        // npm alias の場合、パッケージ名はキー名
-        assert_eq!(deps[0].name, "my-lodash");
+        // npm alias の場合、レジストリ照会は実パッケージ名、書き戻しはキー名
+        assert_eq!(deps[0].name, "lodash");
+        assert_eq!(deps[0].manifest_name(), "my-lodash");
         assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Caret);
 
         let updated = parser
@@ -1520,8 +1521,9 @@ mod dependency_parser_edge_cases {
 
         assert_eq!(deps.len(), 2, "npm エイリアス依存が2つパースされるべき");
 
-        // エイリアス名がパッケージ名として使われる
-        let lodash = deps.iter().find(|d| d.name == "custom-lodash").unwrap();
+        // レジストリ照会には実パッケージ名、書き戻しにはエイリアスキーを使う
+        let lodash = deps.iter().find(|d| d.name == "lodash").unwrap();
+        assert_eq!(lodash.manifest_name(), "custom-lodash");
         assert_eq!(
             lodash.version_spec.kind,
             VersionSpecKind::Caret,
@@ -1529,7 +1531,8 @@ mod dependency_parser_edge_cases {
         );
         assert_eq!(lodash.version_spec.version, "4.17.21");
 
-        let react = deps.iter().find(|d| d.name == "my-react").unwrap();
+        let react = deps.iter().find(|d| d.name == "react").unwrap();
+        assert_eq!(react.manifest_name(), "my-react");
         assert_eq!(
             react.version_spec.kind,
             VersionSpecKind::Tilde,
@@ -1759,7 +1762,7 @@ source = "git+https://github.com/owayo/tree-sitter-xojo.git?branch=main#045c52a6
 
         let entries = read_git_entries(&lock_path);
         assert_eq!(entries.len(), 1);
-        let xojo = entries.get("tree-sitter-xojo").unwrap();
+        let xojo = &entries.get("tree-sitter-xojo").unwrap()[0];
         assert_eq!(xojo.url, "https://github.com/owayo/tree-sitter-xojo.git");
         assert_eq!(xojo.commit, "045c52a6db5390da14d96c0e4804a6208552dc8f");
     }
@@ -1790,7 +1793,7 @@ source = "git+https://example.com/foo.git?tag=v1.0.0#1234567890abcdef1234567890a
 "#;
         let entries = parse_git_entries(content);
         assert_eq!(entries.len(), 1);
-        let foo = entries.get("foo").unwrap();
+        let foo = &entries.get("foo").unwrap()[0];
         assert_eq!(foo.url, "https://example.com/foo.git");
     }
 

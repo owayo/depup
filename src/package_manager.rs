@@ -94,7 +94,8 @@ impl SystemPackageManager {
         if working_dir.join("yarn.lock").exists() {
             return Some("yarn");
         }
-        if working_dir.join("bun.lockb").exists() {
+        // bun.lock はテキスト形式 (Bun 1.2+ のデフォルト)、bun.lockb は旧バイナリ形式
+        if working_dir.join("bun.lock").exists() || working_dir.join("bun.lockb").exists() {
             return Some("bun");
         }
         if working_dir.join("package-lock.json").exists() {
@@ -116,7 +117,11 @@ impl SystemPackageManager {
         if working_dir.join("poetry.lock").exists() {
             return Some("poetry");
         }
-        if working_dir.join("rye.lock").exists() {
+        // Rye が生成するロックファイルは requirements.lock / requirements-dev.lock
+        // ("rye.lock" というファイルは存在しない)
+        if working_dir.join("requirements.lock").exists()
+            || working_dir.join("requirements-dev.lock").exists()
+        {
             return Some("rye");
         }
         if working_dir.join("Pipfile.lock").exists() {
@@ -670,6 +675,28 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_node_pm_bun_text_lockfile() {
+        // Bun 1.2+ のデフォルトであるテキスト形式 bun.lock を検出する
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(temp_dir.path().join("package.json"), "{}").unwrap();
+        std::fs::write(temp_dir.path().join("bun.lock"), "{}").unwrap();
+
+        let pm = SystemPackageManager::new();
+        assert_eq!(pm.detect_node_pm(temp_dir.path()), Some("bun"));
+    }
+
+    #[test]
+    fn test_detect_python_pm_rye_requirements_lock() {
+        // Rye は rye.lock ではなく requirements.lock を生成する
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(temp_dir.path().join("pyproject.toml"), "").unwrap();
+        std::fs::write(temp_dir.path().join("requirements.lock"), "").unwrap();
+
+        let pm = SystemPackageManager::new();
+        assert_eq!(pm.detect_python_pm(temp_dir.path()), Some("rye"));
+    }
+
+    #[test]
     fn test_detect_node_pm_none() {
         let temp_dir = tempfile::tempdir().unwrap();
 
@@ -794,7 +821,7 @@ mod tests {
     #[test]
     fn test_detect_python_pm_rye() {
         let temp_dir = tempfile::tempdir().unwrap();
-        std::fs::write(temp_dir.path().join("rye.lock"), "").unwrap();
+        std::fs::write(temp_dir.path().join("requirements-dev.lock"), "").unwrap();
 
         let pm = SystemPackageManager::new();
         assert_eq!(pm.detect_python_pm(temp_dir.path()), Some("rye"));

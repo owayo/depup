@@ -15,7 +15,8 @@ use crate::domain::{
 use crate::global_config::{DEFAULT_AGE, GlobalConfig};
 use crate::manifest::{
     BunSettings, ManifestInfo, ManifestWriter, PnpmSettings, WriteResult, detect_manifests,
-    get_parser, has_bunfig, has_pnpm_workspace, read_git_entries, read_registry_entries,
+    find_cargo_lock_upward, get_parser, has_bunfig, has_pnpm_workspace, read_git_entries,
+    read_registry_entries,
 };
 use crate::osv::{OsvCheck, OsvChecker};
 use crate::progress::Progress;
@@ -360,7 +361,8 @@ impl Orchestrator {
                     };
 
                     previously_tried.insert(key.clone());
-                    let status = run_cargo_update_precise(project_dir, name, &target).await;
+                    let status =
+                        run_cargo_update_precise(project_dir, name, current, &target).await;
                     let (adjust_to, downgraded) = match &status {
                         LockAgeStatus::Downgraded => (Some(target.clone()), true),
                         _ => (None, false),
@@ -460,7 +462,7 @@ impl Orchestrator {
     ///
     /// - branch / DefaultBranch: リモート HEAD/ブランチ commit と現在 commit を比較し、新しければ更新
     /// - tag: リモートの全タグから最新 semver を選び、現在の tag より新しければ更新
-    /// - rev: `--include-pinned` が指定された場合のみ、デフォルトブランチ HEAD へ更新
+    /// - rev: 常にスキップ (pinned 扱い。`--include-pinned` でも更新しない)
     async fn judge_git_dependency(&self, dep: &Dependency) -> UpdateResult {
         let Some(git) = dep.git_source.as_ref() else {
             return UpdateResult::skip(
@@ -537,12 +539,21 @@ impl Orchestrator {
     pub async fn run_directories(&self, directories: &[PathBuf]) -> OrchestratorResult {
         let mut progress = Progress::new(!self.args.quiet);
 
-        // ステップ1: 全ディレクトリのマニフェストファイルを検出
+        // ステップ1: 全ディレクトリのマニフェストファイルを検出。
+        // `.depup` にルートとサブディレクトリが両方含まれる場合、ルート側の
+        // workspace 自動検出とサブディレクトリ側の検出で同一マニフェストが
+        // 重複するため、正規化パスで重複排除する。
         progress.spinner("Detecting manifest files...");
-        let mut all_manifests = Vec::new();
+        let mut all_manifests: Vec<ManifestInfo> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         for dir in directories {
-            let manifests = detect_manifests(dir);
-            all_manifests.extend(manifests);
+            for manifest in detect_manifests(dir) {
+                let key =
+                    std::fs::canonicalize(&manifest.path).unwrap_or_else(|_| manifest.path.clone());
+                if seen.insert(key) {
+                    all_manifests.push(manifest);
+                }
+            }
         }
         progress.finish_and_clear();
 
@@ -619,7 +630,7 @@ impl Orchestrator {
                 }
             };
             if info.language == Language::Rust {
-                enrich_with_cargo_lock(&info.path, &mut dependencies);
+                enrich_with_cargo_lock(&info.path, &self.args.path, &mut dependencies);
             }
             parsed.push(ParsedManifest { info, dependencies });
         }
@@ -805,11 +816,12 @@ impl Orchestrator {
     fn read_project_minimum_release_age(&self) -> Option<ProjectAge> {
         let mut candidates: Vec<(Duration, &'static str)> = Vec::new();
 
-        if has_pnpm_workspace(&self.args.path) {
-            let pnpm = PnpmSettings::from_dir(&self.args.path);
-            if let Some(age) = pnpm.minimum_release_age {
-                candidates.push((age, "pnpm-workspace.yaml"));
-            }
+        if has_pnpm_workspace(&self.args.path)
+            && let Some((age, source)) =
+                PnpmSettings::minimum_release_age_with_source(&self.args.path)
+        {
+            // source は実際に値が読まれたファイル (.npmrc / pnpm-workspace.yaml / package.json)
+            candidates.push((age, source));
         }
         if has_bunfig(&self.args.path) {
             let bun = BunSettings::from_dir(&self.args.path);
@@ -958,6 +970,19 @@ impl Orchestrator {
             return;
         }
 
+        // ユーザの明示的なフィルタや判定不能 (--exclude / --only / 言語フィルタ /
+        // pinned / --max-change / fetch・parse 失敗) でスキップされた側があるときは
+        // 同期しない。judge のフィルタ決定を同期が上書きして書き込むのは利用者の
+        // 意図に反するため (AlreadyLatest / NoSuitableVersion のみ上書きを許す)。
+        if npm_packages
+            .iter()
+            .map(|(_, _, r, _)| r)
+            .chain(crate_info.iter().map(|(_, _, r, _)| r))
+            .any(tauri_sync_protected)
+        {
+            return;
+        }
+
         // 最初の npm パッケージの現在バージョンを参照用に取得
         let npm_current = npm_packages.first().map(|(_, _, _, v)| v.as_str());
 
@@ -1011,6 +1036,16 @@ impl Orchestrator {
             }
         };
 
+        // 同期先の候補にも judge と同じ解決済み age を適用する
+        // (同期が age ポリシーを迂回して新しすぎるバージョンを書かないように)
+        let cutoff = self.resolved_min_age().and_then(|age| {
+            chrono::Duration::from_std(age)
+                .ok()
+                .map(|d| chrono::Utc::now() - d)
+        });
+        let npm_versions = filter_versions_by_cutoff(npm_versions, cutoff);
+        let crate_versions = filter_versions_by_cutoff(crate_versions, cutoff);
+
         // 同期ヘルパーを作成し、同期後のバージョンを取得
         let sync = TauriVersionSync::new(npm_versions, crate_versions);
 
@@ -1024,18 +1059,36 @@ impl Orchestrator {
             crate_update_result,
         );
 
-        // 全Tauri npmパッケージにnpmバージョンの調整を適用
+        // 全Tauri npmパッケージにnpmバージョンの調整を適用。
+        // @tauri-apps/api と @tauri-apps/cli はパッチバージョン集合が一致しない
+        // ことがあるため、パッケージごとに実在するバージョンを選ぶ。
         if let Some(ref target) = npm_target_version {
             for (manifest_idx, result_idx, original, _current) in &npm_packages {
+                let pkg_name = original.package_name();
+                let pkg_target = if pkg_name == npm_pkg_name {
+                    Some(target.clone())
+                } else {
+                    match self.fetch_versions(&*npm_adapter, pkg_name).await {
+                        Ok(vs) => {
+                            let vs = filter_versions_by_cutoff(vs, cutoff);
+                            pick_sync_version(&vs, target)
+                        }
+                        // フェッチできない場合はこのパッケージの同期を見送る
+                        Err(_) => None,
+                    }
+                };
+                let Some(pkg_target) = pkg_target else {
+                    continue;
+                };
                 match original {
                     UpdateResult::Update { dependency, .. } => {
                         // 既存の更新を調整
-                        let adjusted = UpdateResult::update(dependency.clone(), target);
+                        let adjusted = UpdateResult::update(dependency.clone(), pkg_target);
                         summary.manifests[*manifest_idx].results[*result_idx] = adjusted;
                     }
                     UpdateResult::Skip { dependency, .. } => {
                         // スキップから新しい更新を作成
-                        let adjusted = UpdateResult::update(dependency.clone(), target);
+                        let adjusted = UpdateResult::update(dependency.clone(), pkg_target);
                         summary.manifests[*manifest_idx].results[*result_idx] = adjusted;
                         summary.manifests[*manifest_idx].modified = true;
                     }
@@ -1264,14 +1317,24 @@ fn pick_older_within_age(
     best.map(|v| v.version.clone())
 }
 
-/// `cargo update -p <name> --precise <version>` を実行する。
+/// `cargo update -p <name>@<current> --precise <version>` を実行する。
 /// resolver 制約違反など失敗ケースでは stderr を保持した `UpdateCommandFailed` を返す。
+///
+/// 同名クレートが複数バージョン lock されている場合 (`syn 1.x` + `syn 2.x` 等) に
+/// `-p <name>` だけだと cargo が "ambiguous package spec" で失敗するため、
+/// 現在バージョン付きの完全修飾 spec で対象を一意にする。
 ///
 /// `tokio::process::Command` を使い、`cargo update` の長時間実行で tokio エグゼキュータの
 /// ワーカースレッドがブロックされて他の async タスク (HTTP リクエスト等) が止まるのを防ぐ。
-async fn run_cargo_update_precise(project_dir: &Path, name: &str, version: &str) -> LockAgeStatus {
+async fn run_cargo_update_precise(
+    project_dir: &Path,
+    name: &str,
+    current: &str,
+    version: &str,
+) -> LockAgeStatus {
+    let spec = format!("{name}@{current}");
     match Command::new("cargo")
-        .args(["update", "-p", name, "--precise", version])
+        .args(["update", "-p", &spec, "--precise", version])
         .current_dir(project_dir)
         .output()
         .await
@@ -1284,24 +1347,100 @@ async fn run_cargo_update_precise(project_dir: &Path, name: &str, version: &str)
     }
 }
 
-/// Cargo.toml と同じディレクトリの Cargo.lock を読み込み、
-/// git 依存の `current_commit` をセットする。
-fn enrich_with_cargo_lock(cargo_toml_path: &Path, dependencies: &mut [Dependency]) {
+/// Cargo.toml に対応する Cargo.lock を読み込み、git 依存の `current_commit` をセットする。
+///
+/// workspace メンバーの lock はワークスペースルートにのみ存在するため、
+/// マニフェストのディレクトリから `boundary` まで上方向に探す。
+fn enrich_with_cargo_lock(
+    cargo_toml_path: &Path,
+    boundary: &Path,
+    dependencies: &mut [Dependency],
+) {
     let Some(dir) = cargo_toml_path.parent() else {
         return;
     };
-    let lock_path = dir.join("Cargo.lock");
+    let Some(lock_path) = find_cargo_lock_upward(dir, boundary) else {
+        return;
+    };
     let git_entries = read_git_entries(&lock_path);
     if git_entries.is_empty() {
         return;
     }
     for dep in dependencies.iter_mut() {
         if let Some(git) = dep.git_source.as_mut()
-            && let Some(entry) = git_entries.get(&dep.name)
+            && let Some(entries) = git_entries.get(&dep.name)
         {
-            git.current_commit = Some(entry.commit.clone());
+            // 同名エントリが複数ある場合 (fork と upstream の併用等) は URL で
+            // 対応付ける。一致が無く候補が 1 件だけなら従来どおりそれを使う。
+            let url_matched = entries.iter().find(|e| git_urls_match(&e.url, &git.url));
+            let matched = match (url_matched, entries.as_slice()) {
+                (Some(entry), _) => Some(entry),
+                (None, [only]) => Some(only),
+                (None, _) => None,
+            };
+            if let Some(entry) = matched {
+                git.current_commit = Some(entry.commit.clone());
+            }
         }
     }
+}
+
+/// git URL 同士を末尾の `/` と `.git` の差を無視して比較する
+fn git_urls_match(a: &str, b: &str) -> bool {
+    fn normalize(url: &str) -> &str {
+        let url = url.trim_end_matches('/');
+        url.strip_suffix(".git").unwrap_or(url)
+    }
+    normalize(a) == normalize(b)
+}
+
+/// Tauri バージョン同期が judge の結果を上書きしてはならないかどうか。
+///
+/// ユーザの明示的なフィルタ (--exclude / --only / 言語フィルタ / pinned /
+/// --max-change) や判定不能 (fetch・parse 失敗) によるスキップを同期が
+/// 上書きすると、指定を破ってマニフェストへ書き込んでしまう。
+fn tauri_sync_protected(result: &UpdateResult) -> bool {
+    match result {
+        UpdateResult::Update { .. } => false,
+        UpdateResult::Skip { reason, .. } => !matches!(
+            reason,
+            SkipReason::AlreadyLatest | SkipReason::NoSuitableVersion
+        ),
+    }
+}
+
+/// cutoff (現在時刻 - age) より新しいバージョンを候補から除外する
+fn filter_versions_by_cutoff(
+    versions: Vec<VersionInfo>,
+    cutoff: Option<chrono::DateTime<chrono::Utc>>,
+) -> Vec<VersionInfo> {
+    match cutoff {
+        Some(c) => versions
+            .into_iter()
+            .filter(|v| v.released_at <= c)
+            .collect(),
+        None => versions,
+    }
+}
+
+/// 同期先バージョンをパッケージ自身のバージョン一覧から選ぶ。
+///
+/// target がそのまま存在すればそれを、無ければ同じ major.minor 系列の
+/// 最新安定版を選ぶ (`@tauri-apps/api` と `@tauri-apps/cli` でパッチ
+/// バージョン集合が異なるケースに対応)。
+fn pick_sync_version(versions: &[VersionInfo], target: &str) -> Option<String> {
+    use crate::tauri_sync::extract_major_minor;
+
+    if versions.iter().any(|v| v.version == target) {
+        return Some(target.to_string());
+    }
+    let target_mm = extract_major_minor(target)?;
+    versions
+        .iter()
+        .filter(|v| !crate::update::is_prerelease_version(&v.version))
+        .filter(|v| extract_major_minor(&v.version).is_some_and(|mm| mm == target_mm))
+        .max_by(|a, b| compare_versions(&a.version, &b.version))
+        .map(|v| v.version.clone())
 }
 
 /// リモート commit と現在 commit を比較し、差分があれば更新結果を作る
@@ -1316,16 +1455,32 @@ fn compare_and_update_commit(
     }
 }
 
+/// タグが semver 形状 (`v1.2.3` / `1.2` / `1.2.3-rc.1+build`) かどうか。
+///
+/// 日付タグ (`2024.06.01` は形状上区別できないが `20240601-hotfix` 等) や
+/// CI 用タグを「最新 semver タグ」候補から除外するための形状チェック。
+/// 数値コアは 2〜3 セグメントのみ許容する (1 セグメントは日付 `20240601` と
+/// 区別できないため除外)。
+fn looks_like_semver_tag(tag: &str) -> bool {
+    let body = tag.strip_prefix(['v', 'V']).unwrap_or(tag);
+    let core_end = body.find(['-', '+']).unwrap_or(body.len());
+    let core = &body[..core_end];
+    let segments: Vec<&str> = core.split('.').collect();
+    if !(2..=3).contains(&segments.len()) {
+        return false;
+    }
+    segments
+        .iter()
+        .all(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+}
+
 /// 指定されたタグ群から最新の semver 互換タグを選ぶ。
-/// プレリリースは除外する。
+/// プレリリースと semver 形状でないタグ (日付タグ等) は除外する。
 fn latest_semver_tag(tags: &[String]) -> Option<String> {
     let stable: Vec<&String> = tags
         .iter()
         .filter(|t| !crate::update::is_prerelease_version(t))
-        .filter(|t| {
-            // 少なくとも 1 つは数字を含むバージョンらしい文字列のみ許容
-            t.chars().any(|c| c.is_ascii_digit())
-        })
+        .filter(|t| looks_like_semver_tag(t))
         .collect();
     if stable.is_empty() {
         return None;
@@ -1380,6 +1535,106 @@ mod git_helper_tests {
     fn test_latest_semver_tag_all_prereleases() {
         let tags = vec!["v1.0.0-alpha".to_string(), "v1.0.0-beta".to_string()];
         assert_eq!(latest_semver_tag(&tags), None);
+    }
+
+    #[test]
+    fn test_latest_semver_tag_ignores_date_and_ci_tags() {
+        // 日付タグや CI 用タグが semver タグより「大きい」数値でも選ばれない
+        let tags = vec![
+            "v1.2.3".to_string(),
+            "20240601-hotfix".to_string(),
+            "20250101".to_string(),
+            "release-2025".to_string(),
+            "nightly".to_string(),
+        ];
+        assert_eq!(latest_semver_tag(&tags), Some("v1.2.3".to_string()));
+    }
+
+    #[test]
+    fn test_looks_like_semver_tag() {
+        assert!(looks_like_semver_tag("v1.2.3"));
+        assert!(looks_like_semver_tag("1.2"));
+        assert!(looks_like_semver_tag("V2.0.0"));
+        assert!(looks_like_semver_tag("1.2.3-rc.1+build"));
+        assert!(!looks_like_semver_tag("20240601"));
+        assert!(!looks_like_semver_tag("20240601-hotfix"));
+        assert!(!looks_like_semver_tag("1.2.3.4"));
+        assert!(!looks_like_semver_tag("nightly"));
+        assert!(!looks_like_semver_tag("v1"));
+    }
+
+    #[test]
+    fn test_git_urls_match_ignores_git_suffix_and_slash() {
+        assert!(git_urls_match(
+            "https://github.com/a/b.git",
+            "https://github.com/a/b"
+        ));
+        assert!(git_urls_match(
+            "https://github.com/a/b/",
+            "https://github.com/a/b"
+        ));
+        assert!(!git_urls_match(
+            "https://github.com/a/b",
+            "https://github.com/a/c"
+        ));
+    }
+
+    #[test]
+    fn test_tauri_sync_protected_reasons() {
+        let dep = git_dep("tauri", GitReference::DefaultBranch);
+
+        // 明示的フィルタ・判定不能系は保護される
+        for reason in [
+            SkipReason::Excluded,
+            SkipReason::NotInOnlyList,
+            SkipReason::LanguageFiltered,
+            SkipReason::Pinned,
+            SkipReason::ChangeLevelLimited(crate::domain::ChangeLevel::Patch),
+            SkipReason::FetchFailed("boom".to_string()),
+            SkipReason::ParseError("bad".to_string()),
+        ] {
+            assert!(
+                tauri_sync_protected(&UpdateResult::skip(dep.clone(), reason.clone())),
+                "{:?} は同期で上書きしないべき",
+                reason
+            );
+        }
+
+        // 同期による上書きを許すケース
+        assert!(!tauri_sync_protected(&UpdateResult::skip(
+            dep.clone(),
+            SkipReason::AlreadyLatest
+        )));
+        assert!(!tauri_sync_protected(&UpdateResult::skip(
+            dep.clone(),
+            SkipReason::NoSuitableVersion
+        )));
+        assert!(!tauri_sync_protected(&UpdateResult::update(dep, "2.0.0")));
+    }
+
+    #[test]
+    fn test_pick_sync_version_prefers_exact_then_same_minor() {
+        use crate::update::VersionInfo;
+        use chrono::Utc;
+
+        let versions = vec![
+            VersionInfo::new("2.9.0", Utc::now()),
+            VersionInfo::new("2.9.6", Utc::now()),
+            VersionInfo::new("2.10.0-beta.1", Utc::now()),
+        ];
+
+        // 完全一致があればそれを使う
+        assert_eq!(
+            pick_sync_version(&versions, "2.9.0"),
+            Some("2.9.0".to_string())
+        );
+        // 無ければ同じ major.minor の最新安定版 (プレリリース除外)
+        assert_eq!(
+            pick_sync_version(&versions, "2.9.3"),
+            Some("2.9.6".to_string())
+        );
+        // 系列ごと存在しなければ None (同期を見送る)
+        assert_eq!(pick_sync_version(&versions, "3.0.0"), None);
     }
 
     #[test]

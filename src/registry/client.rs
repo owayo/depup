@@ -2,11 +2,11 @@
 //!
 //! 共有 HTTP クライアントを提供する:
 //! - タイムアウトと User-Agent の設定
-//! - 指数バックオフによるリトライ (最大3回)
-//! - レート制限のエラーハンドリング
+//! - 指数バックオフによるリトライ (最大3回、トランスポートエラー / 429 / 5xx が対象)
+//! - レート制限のエラーハンドリング (429/503 の `Retry-After` ヘッダを尊重)
 
 use crate::error::RegistryError;
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use std::time::Duration;
 
 /// HTTP リクエストのデフォルトタイムアウト (30秒)
@@ -20,6 +20,44 @@ const MAX_RETRIES: u32 = 3;
 
 /// 指数バックオフの基本遅延 (ミリ秒)
 const BASE_DELAY_MS: u64 = 100;
+
+/// `Retry-After` ヘッダで待機する最大秒数 (クランプ上限)
+///
+/// サーバが極端に長い待機 (数分〜) を指示してきても CLI 全体が固まらないようにする。
+const RETRY_AFTER_MAX_SECS: u64 = 10;
+
+/// ステータスコードがリトライ対象かどうかを判定する
+///
+/// - 429 Too Many Requests: レート制限 (従来からの対象)
+/// - 5xx Server Error: npm/PyPI 等の一時障害で頻出するため指数バックオフでリトライする
+///
+/// 404 や 4xx (429 以外) は恒久的なエラーなのでリトライしない。
+fn is_retryable_status(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+/// `Retry-After` ヘッダ値からリトライ前の待機秒数を計算する
+///
+/// 秒数値 (例: `Retry-After: 5`) のみ対応し、HTTP-date 形式や不正値は `None` を返す
+/// (その場合は呼び出し側が指数バックオフへフォールバックする)。
+/// 値は `RETRY_AFTER_MAX_SECS` (10 秒) にクランプする。
+fn parse_retry_after_secs(header_value: Option<&str>) -> Option<u64> {
+    let secs: u64 = header_value?.trim().parse().ok()?;
+    Some(secs.min(RETRY_AFTER_MAX_SECS))
+}
+
+/// `Retry-After` を尊重すべきステータス (429 / 503) のレスポンスから待機秒数を取り出す
+fn retry_after_for_status(status: StatusCode, response: &reqwest::Response) -> Option<u64> {
+    if status != StatusCode::TOO_MANY_REQUESTS && status != StatusCode::SERVICE_UNAVAILABLE {
+        return None;
+    }
+    parse_retry_after_secs(
+        response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok()),
+    )
+}
 
 /// リトライロジック付き HTTP クライアントラッパー
 #[derive(Clone)]
@@ -81,33 +119,48 @@ impl HttpClient {
         for attempt in 0..=self.max_retries {
             match self.client.get(url).send().await {
                 Ok(response) => {
-                    // レート制限チェック
-                    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                        last_error = Some(RegistryError::RateLimitExceeded {
-                            registry: registry.to_string(),
+                    let status = response.status();
+
+                    // リトライ対象ステータス (429 / 5xx) のチェック
+                    if is_retryable_status(status) {
+                        last_error = Some(if status == StatusCode::TOO_MANY_REQUESTS {
+                            RegistryError::RateLimitExceeded {
+                                registry: registry.to_string(),
+                            }
+                        } else {
+                            // 5xx はレジストリの一時障害として NetworkError で報告
+                            RegistryError::NetworkError {
+                                package: package.to_string(),
+                                registry: registry.to_string(),
+                                message: format!("HTTP {}", status),
+                            }
                         });
 
                         if attempt < self.max_retries {
-                            // 指数バックオフでリトライ
-                            tokio::time::sleep(Duration::from_millis(delay)).await;
+                            // 429/503 の Retry-After ヘッダ (秒数値) があれば尊重し、
+                            // なければ指数バックオフで待機してリトライ
+                            let wait = match retry_after_for_status(status, &response) {
+                                Some(secs) => Duration::from_secs(secs),
+                                None => Duration::from_millis(delay),
+                            };
+                            tokio::time::sleep(wait).await;
                             delay *= 2;
                             continue;
                         }
-                        // 最終リトライでも 429 の場合は RateLimitExceeded を返す
+                        // 最終リトライでも失敗した場合はエラーを返す
                         return Err(last_error.unwrap());
                     }
 
                     // 404 Not Found チェック
-                    if response.status() == reqwest::StatusCode::NOT_FOUND {
+                    if status == StatusCode::NOT_FOUND {
                         return Err(RegistryError::PackageNotFound {
                             package: package.to_string(),
                             registry: registry.to_string(),
                         });
                     }
 
-                    // その他のエラーチェック
-                    if !response.status().is_success() {
-                        let status = response.status();
+                    // その他のエラーチェック (リトライしても無駄な 4xx 等)
+                    if !status.is_success() {
                         return Err(RegistryError::NetworkError {
                             package: package.to_string(),
                             registry: registry.to_string(),
@@ -233,5 +286,64 @@ mod tests {
         assert!(DEFAULT_USER_AGENT.starts_with("depup/"));
         assert_eq!(MAX_RETRIES, 3);
         assert_eq!(BASE_DELAY_MS, 100);
+        assert_eq!(RETRY_AFTER_MAX_SECS, 10);
+    }
+
+    /// バグ回帰テスト: 5xx (npm/PyPI の一時障害で頻出) もリトライ対象になる。
+    /// 以前はトランスポートエラーと 429 のみリトライし、5xx は即エラー返却していた。
+    #[test]
+    fn test_retryable_status_includes_5xx() {
+        assert!(is_retryable_status(StatusCode::INTERNAL_SERVER_ERROR)); // 500
+        assert!(is_retryable_status(StatusCode::BAD_GATEWAY)); // 502
+        assert!(is_retryable_status(StatusCode::SERVICE_UNAVAILABLE)); // 503
+        assert!(is_retryable_status(StatusCode::GATEWAY_TIMEOUT)); // 504
+    }
+
+    #[test]
+    fn test_retryable_status_includes_429() {
+        assert!(is_retryable_status(StatusCode::TOO_MANY_REQUESTS));
+    }
+
+    #[test]
+    fn test_non_retryable_statuses() {
+        // 成功・恒久的なクライアントエラーはリトライしない
+        assert!(!is_retryable_status(StatusCode::OK)); // 200
+        assert!(!is_retryable_status(StatusCode::BAD_REQUEST)); // 400
+        assert!(!is_retryable_status(StatusCode::UNAUTHORIZED)); // 401
+        assert!(!is_retryable_status(StatusCode::FORBIDDEN)); // 403
+        assert!(!is_retryable_status(StatusCode::NOT_FOUND)); // 404
+    }
+
+    #[test]
+    fn test_parse_retry_after_seconds_value() {
+        assert_eq!(parse_retry_after_secs(Some("5")), Some(5));
+        assert_eq!(parse_retry_after_secs(Some("0")), Some(0));
+        // 前後の空白は許容する
+        assert_eq!(parse_retry_after_secs(Some(" 3 ")), Some(3));
+    }
+
+    #[test]
+    fn test_parse_retry_after_clamps_to_max() {
+        // サーバが長い待機を指示してきても 10 秒にクランプする
+        assert_eq!(parse_retry_after_secs(Some("120")), Some(10));
+        assert_eq!(parse_retry_after_secs(Some("11")), Some(10));
+        assert_eq!(parse_retry_after_secs(Some("10")), Some(10));
+        assert_eq!(parse_retry_after_secs(Some("9")), Some(9));
+    }
+
+    #[test]
+    fn test_parse_retry_after_invalid_values() {
+        // ヘッダなし
+        assert_eq!(parse_retry_after_secs(None), None);
+        // HTTP-date 形式は非対応 (指数バックオフへフォールバック)
+        assert_eq!(
+            parse_retry_after_secs(Some("Wed, 21 Oct 2015 07:28:00 GMT")),
+            None
+        );
+        // 不正値
+        assert_eq!(parse_retry_after_secs(Some("abc")), None);
+        assert_eq!(parse_retry_after_secs(Some("-1")), None);
+        assert_eq!(parse_retry_after_secs(Some("1.5")), None);
+        assert_eq!(parse_retry_after_secs(Some("")), None);
     }
 }

@@ -32,33 +32,66 @@ static RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 static WILDCARD_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\*$|^\d+(?:\.\d+)*\.\*$").unwrap());
-static VERSION_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d+(?:\.\d+)*").unwrap());
 
+/// 比較用バージョン文字列へ正規化する。
+///
+/// PEP 440 のプレリリース (`2.0.0rc1`)・ポスト (`1.0.post1`)・dev (`1.0.dev1`)・
+/// エポック (`1!2.3`) は `compare_versions` が正しく順序付けできるため**保持**する。
+/// 以前はこれらを剥ぎ取っていたため、`>=2.0.0rc1` の比較基準が `2.0.0` になり
+/// rc 利用者が安定版 `2.0.0` へ昇格できない (AlreadyLatest 判定) 不具合があった。
+///
+/// 一方で次の正規化は従来どおり維持する:
+/// - 先頭の `v` / `V` 接頭辞と数字以前の文字の除去
+/// - ワイルドカード (`1.2.*` → `1.2`) と末尾セパレータの除去
+/// - ローカルバージョン (`+local` 以降) の除去 (比較では無視されるため)
 fn normalize_for_compare(version: &str) -> String {
-    let mut s = version.trim();
-    if let Some((_, rest)) = s.split_once('!') {
-        s = rest;
-    }
+    let s = version.trim();
+    let s = s
+        .strip_prefix('v')
+        .or_else(|| s.strip_prefix('V'))
+        .unwrap_or(s);
+    // PEP 440 エポック (`N!`) は比較の最優先キーなので保持する
+    let (epoch, rest) = match s.split_once('!') {
+        Some((e, r)) if !e.is_empty() && e.chars().all(|c| c.is_ascii_digit()) => (Some(e), r),
+        _ => (None, s),
+    };
     let mut buf = String::new();
     let mut seen_digit = false;
-    for ch in s.chars() {
-        if ch.is_ascii_digit() {
-            seen_digit = true;
+    for ch in rest.chars() {
+        if !seen_digit {
+            // 最初の数字までの文字 (v 接頭辞の残りや空白) は読み飛ばす
+            if ch.is_ascii_digit() {
+                seen_digit = true;
+                buf.push(ch);
+            }
+            continue;
+        }
+        // PEP 440 バージョン本体: 数字・英字 (rc/post/dev 等)・`.`・`-` を保持する。
+        // `+` (ローカルバージョン) や `*` (ワイルドカード) 以降は切り落とす。
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-') {
             buf.push(ch);
-        } else if seen_digit && ch == '.' {
-            buf.push(ch);
-        } else if seen_digit {
+        } else {
             break;
         }
     }
-    buf.trim_matches('.').to_string()
+    if buf.is_empty() {
+        return String::new();
+    }
+    let core = buf.trim_matches(['.', '-']);
+    match epoch {
+        Some(e) => format!("{e}!{core}"),
+        None => core.to_string(),
+    }
 }
 
+/// レンジ指定の先頭制約からバージョン部分を取り出す (例: `>=1.0,<2.0` → `1.0`)。
+/// エポックやプレリリースを含むバージョン (例: `>=2.0.0rc1`) も形を保って抽出する。
 fn extract_first_version(raw: &str) -> String {
-    VERSION_TOKEN_RE
-        .find(raw)
-        .map(|m| normalize_for_compare(m.as_str()))
-        .unwrap_or_default()
+    let first = raw.split(',').next().unwrap_or("");
+    let stripped = first
+        .trim()
+        .trim_start_matches(['=', '<', '>', '!', '~', ' ', '\t']);
+    normalize_for_compare(stripped)
 }
 
 impl VersionParser for PythonVersionParser {
@@ -168,9 +201,12 @@ mod tests {
 
     #[test]
     fn test_parse_exact_with_prerelease() {
+        // 仕様変更: PEP 440 の prerelease 部は比較で意味を持つ ("2.0.0rc1 < 2.0.0")
+        // ため保持する。以前は "1.2.3" へ剥ぎ取られ、rc/alpha 利用者が対応する
+        // 安定版へ昇格できない (AlreadyLatest 誤判定) 不具合があった。
         let spec = parse("==1.2.3a1").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Exact);
-        assert_eq!(spec.version, "1.2.3");
+        assert_eq!(spec.version, "1.2.3a1");
     }
 
     #[test]
@@ -349,9 +385,11 @@ mod tests {
 
     #[test]
     fn test_parse_pep440_epoch() {
+        // 仕様変更: エポックは比較の最優先キー (`0!9.9 < 1!1.0`) のため保持する。
+        // 以前は "2.3" へ剥ぎ取られ、エポック情報が比較で失われていた。
         let spec = parse(">=1!2.3").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::GreaterOrEqual);
-        assert_eq!(spec.version, "2.3");
+        assert_eq!(spec.version, "1!2.3");
     }
 
     #[test]
@@ -400,10 +438,11 @@ mod tests {
 
     #[test]
     fn test_parse_post_release() {
-        // PEP 440 ポストリリースバージョン: '.post1' は数値部分のみ抽出される
+        // 仕様変更: PEP 440 ポストリリースは対応する release より新しい
+        // (`1.0.post1 > 1.0`) ため、比較用 version に保持する (以前は "1.0" へ剥ぎ取り)。
         let spec = parse("==1.0.post1").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Exact);
-        assert_eq!(spec.version, "1.0");
+        assert_eq!(spec.version, "1.0.post1");
         assert_eq!(spec.prefix, Some("==".to_string()));
     }
 
@@ -467,10 +506,11 @@ mod tests {
 
     #[test]
     fn test_parse_dev_release() {
-        // PEP 440 開発リリース
+        // 仕様変更: PEP 440 開発リリースは対応する release より古い
+        // (`1.0.dev1 < 1.0`) ため、比較用 version に保持する (以前は "1.0" へ剥ぎ取り)。
         let spec = parse("==1.0.dev1").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Exact);
-        assert_eq!(spec.version, "1.0");
+        assert_eq!(spec.version, "1.0.dev1");
     }
 
     #[test]
@@ -486,5 +526,52 @@ mod tests {
         // ~=1.2.3 の更新フォーマット
         let spec = parse("~=1.2.3").unwrap();
         assert_eq!(spec.format_updated("1.3.0"), "~=1.3.0");
+    }
+
+    /// 回帰テスト (task: prerelease 剥ぎ取り修正): `>=2.0.0rc1` の比較基準は
+    /// "2.0.0rc1" を保持する。以前は "2.0.0" になり、`2.0.0rc1 < 2.0.0` の仕様
+    /// (CLAUDE.md) と矛盾して rc 利用者が安定版 2.0.0 へ昇格できなかった。
+    #[test]
+    fn test_parse_gte_keeps_pep440_prerelease() {
+        let spec = parse(">=2.0.0rc1").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::GreaterOrEqual);
+        assert_eq!(spec.version, "2.0.0rc1");
+        assert_eq!(spec.prefix, Some(">=".to_string()));
+        // 更新時は新しいバージョンへ置き換わる
+        assert_eq!(spec.format_updated("2.0.0"), ">=2.0.0");
+    }
+
+    #[test]
+    fn test_parse_caret_keeps_prerelease() {
+        // Poetry の caret でも prerelease を保持する
+        let spec = parse("^1.2.3rc1").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Caret);
+        assert_eq!(spec.version, "1.2.3rc1");
+    }
+
+    #[test]
+    fn test_parse_range_keeps_prerelease_in_first_version() {
+        // Range の下限が prerelease でも形を保って抽出する
+        let spec = parse(">=2.0.0rc1,<3.0.0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "2.0.0rc1");
+    }
+
+    #[test]
+    fn test_normalize_for_compare_preserves_and_strips() {
+        use super::normalize_for_compare;
+        // 保持: prerelease / post / dev / epoch
+        assert_eq!(normalize_for_compare("2.0.0rc1"), "2.0.0rc1");
+        assert_eq!(normalize_for_compare("1.0.post1"), "1.0.post1");
+        assert_eq!(normalize_for_compare("1.0.dev1"), "1.0.dev1");
+        assert_eq!(normalize_for_compare("1!2.3"), "1!2.3");
+        assert_eq!(normalize_for_compare("1!2.3rc1"), "1!2.3rc1");
+        // 維持される正規化: v 接頭辞除去 / ワイルドカード除去 / ローカルバージョン除去
+        assert_eq!(normalize_for_compare("v1.2.3"), "1.2.3");
+        assert_eq!(normalize_for_compare("1.2.*"), "1.2");
+        assert_eq!(normalize_for_compare("1.0+local1"), "1.0");
+        assert_eq!(normalize_for_compare("  1.2.3  "), "1.2.3");
+        assert_eq!(normalize_for_compare(""), "");
+        assert_eq!(normalize_for_compare("custom"), "");
     }
 }

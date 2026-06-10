@@ -44,7 +44,8 @@ impl ChangeLevel {
     /// 古いバージョンと新しいバージョンから変更レベルを算出する。
     ///
     /// 数値コア部分のみ比較する (`v` プレフィックス、`-rc.1` / `+build` などの
-    /// プレリリース・ビルドメタデータは無視)。両方ともパースできない場合や、
+    /// プレリリース・ビルドメタデータは無視)。欠落セグメントは 0 として比較する
+    /// (例: `"1"` と `"1.0.1"` の差は Patch)。どちらかがパースできない場合や、
     /// 数値部分が完全一致する場合は `None`。
     pub fn from_versions(old: &str, new: &str) -> Option<Self> {
         let old_p = split_core(old);
@@ -52,11 +53,13 @@ impl ChangeLevel {
         if old_p.is_empty() || new_p.is_empty() {
             return None;
         }
-        if old_p.first() != new_p.first() {
+        // 欠落セグメントは 0 として比較する ("1" == "1.0.0")
+        let seg = |parts: &[u64], idx: usize| parts.get(idx).copied().unwrap_or(0);
+        if seg(&old_p, 0) != seg(&new_p, 0) {
             Some(ChangeLevel::Major)
-        } else if old_p.get(1) != new_p.get(1) {
+        } else if seg(&old_p, 1) != seg(&new_p, 1) {
             Some(ChangeLevel::Minor)
-        } else if old_p.get(2) != new_p.get(2) {
+        } else if seg(&old_p, 2) != seg(&new_p, 2) {
             Some(ChangeLevel::Patch)
         } else {
             None
@@ -70,13 +73,16 @@ impl fmt::Display for ChangeLevel {
     }
 }
 
-/// `v` プレフィックスとプレリリース/ビルドメタデータを取り除き、`.` 区切りの
-/// 先頭 3 セグメントを数値としてパースする。
+/// 比較用の数値コア先頭 3 セグメントを取り出す。
+///
+/// 抽出規則は `compare_versions` と同じ `crate::update::numeric_core` を共用する:
+/// `v` プレフィックス / ビルドメタデータ / エポック / プレリリースを除き、
+/// 各セグメントは先頭の数値プレフィックスのみを取る (例: `"0rc1"` → 0)。
+/// 数値が全く無いセグメント (qualifier 等) 以降は無視するため、
+/// 非数値セグメントを読み飛ばして詰めることによる位置ずれ比較は起きない。
 fn split_core(s: &str) -> Vec<u64> {
-    let trimmed = s.trim().trim_start_matches(['v', 'V']);
-    let core = trimmed.split(['-', '+']).next().unwrap_or("");
-    core.split('.')
-        .filter_map(|p| p.parse::<u64>().ok())
+    crate::update::numeric_core(s.trim())
+        .into_iter()
         .take(3)
         .collect()
 }
@@ -187,6 +193,59 @@ mod tests {
             ChangeLevel::from_versions("1.2.3.4", "1.2.3.5"),
             None,
             "本実装は先頭 3 セグメントしか比較しない"
+        );
+    }
+
+    /// 回帰テスト: 欠落セグメントは 0 として比較する。
+    /// 以前は `from_versions("1", "1.0.1")` が `None != Some(0)` 比較で
+    /// Minor になっていた (正しくは Patch)。
+    #[test]
+    fn test_from_versions_missing_segments_compared_as_zero() {
+        assert_eq!(
+            ChangeLevel::from_versions("1", "1.0.1"),
+            Some(ChangeLevel::Patch)
+        );
+        assert_eq!(
+            ChangeLevel::from_versions("1.2", "1.3"),
+            Some(ChangeLevel::Minor)
+        );
+        assert_eq!(
+            ChangeLevel::from_versions("1", "2"),
+            Some(ChangeLevel::Major)
+        );
+        // 0 補完で完全一致するなら None
+        assert_eq!(ChangeLevel::from_versions("1", "1.0.0"), None);
+        assert_eq!(ChangeLevel::from_versions("1.0", "1"), None);
+        // 逆方向 (ダウングレード) でもレベル自体は同じ
+        assert_eq!(
+            ChangeLevel::from_versions("1.0.1", "1"),
+            Some(ChangeLevel::Patch)
+        );
+    }
+
+    /// 回帰テスト: 非数値セグメントを「読み飛ばして詰める」位置ずれ比較をしない。
+    /// セグメントは先頭の数値プレフィックスのみを取り (例: "0rc1" → 0)、
+    /// 数値が全く無いセグメント以降は無視する (`numeric_core` と共通規則)。
+    #[test]
+    fn test_from_versions_non_numeric_segments() {
+        // "0rc1" は数値プレフィックス 0 として比較される
+        assert_eq!(
+            ChangeLevel::from_versions("1.0.0rc1", "1.0.1"),
+            Some(ChangeLevel::Patch)
+        );
+        // qualifier (RELEASE / Final) 以降は無視される
+        assert_eq!(
+            ChangeLevel::from_versions("5.0.0.RELEASE", "5.0.1"),
+            Some(ChangeLevel::Patch)
+        );
+        assert_eq!(ChangeLevel::from_versions("5.0.0.RELEASE", "5.0.0"), None);
+        // 以前の filter_map 実装では "1.x.2" が [1, 2] に詰められ
+        // minor 位置に 2 が来る位置ずれ比較になっていた
+        assert_eq!(ChangeLevel::from_versions("1.x.2", "1.0.0"), None);
+        // PEP 440 の dev セグメントも数値コアには影響しない
+        assert_eq!(
+            ChangeLevel::from_versions("1.0.1.dev1", "1.0.2"),
+            Some(ChangeLevel::Patch)
         );
     }
 

@@ -32,6 +32,9 @@ struct PyPIResponse {
 struct ReleaseInfo {
     /// リリースファイルのアップロード時刻
     upload_time_iso_8601: Option<String>,
+    /// PEP 592: このファイルが yank されているか (欠損時は false)
+    #[serde(default)]
+    yanked: bool,
 }
 
 impl PyPIAdapter {
@@ -43,6 +46,16 @@ impl PyPIAdapter {
     /// パッケージ用の URL を構築
     fn build_url(&self, package: &str) -> String {
         format!("{}/{}/json", PYPI_API_URL, package)
+    }
+
+    /// リリースがインストール候補になりうるか判定する (PEP 592)
+    ///
+    /// pip の解決挙動に合わせ、「ファイルが 0 件」または「全ファイルが yanked == true」の
+    /// リリースは候補に含めない (完全に yank されたリリースは exact pin 以外で選ばれない)。
+    /// 一部のファイルのみ yank された混在リリースはインストール可能なため候補に残す。
+    /// crates.io / RubyGems アダプタの yanked 除外とも一貫する。
+    fn is_release_installable(files: &[ReleaseInfo]) -> bool {
+        !files.is_empty() && files.iter().any(|f| !f.yanked)
     }
 }
 
@@ -66,6 +79,11 @@ impl RegistryAdapter for PyPIAdapter {
         let mut versions = Vec::new();
 
         for (version, release_files) in response.releases {
+            // yank されたリリース (全ファイルが yanked / ファイル 0 件) をスキップ (PEP 592)
+            if !Self::is_release_installable(&release_files) {
+                continue;
+            }
+
             // リリースファイルの中から最も早いアップロード時刻を取得
             let mut earliest_time: Option<DateTime<Utc>> = None;
 
@@ -129,5 +147,73 @@ mod tests {
             adapter.build_url("flask-restful"),
             "https://pypi.org/pypi/flask-restful/json"
         );
+    }
+
+    #[test]
+    fn test_deserialize_release_info_with_yanked() {
+        let json = r#"{"upload_time_iso_8601": "2023-01-01T00:00:00Z", "yanked": true}"#;
+        let info: ReleaseInfo = serde_json::from_str(json).unwrap();
+        assert!(info.yanked);
+    }
+
+    #[test]
+    fn test_deserialize_release_info_yanked_defaults_to_false() {
+        // yanked フィールドが欠損している古い形式のレスポンスでも false 扱い
+        let json = r#"{"upload_time_iso_8601": "2023-01-01T00:00:00Z"}"#;
+        let info: ReleaseInfo = serde_json::from_str(json).unwrap();
+        assert!(!info.yanked);
+    }
+
+    /// バグ回帰テスト (PEP 592): 全ファイルが yanked のリリースは候補から除外する。
+    /// pip は完全に yank されたリリースを (exact pin 以外で) 選ばないため、
+    /// depup が yank 済みバージョンへ更新提案しないようにする。
+    #[test]
+    fn test_fully_yanked_release_is_not_installable() {
+        let json = r#"[
+            {"upload_time_iso_8601": "2023-01-01T00:00:00Z", "yanked": true},
+            {"upload_time_iso_8601": "2023-01-01T01:00:00Z", "yanked": true}
+        ]"#;
+        let files: Vec<ReleaseInfo> = serde_json::from_str(json).unwrap();
+        assert!(!PyPIAdapter::is_release_installable(&files));
+    }
+
+    /// 混在リリース (一部のみ yanked) はインストール可能なため候補に残す
+    #[test]
+    fn test_partially_yanked_release_is_installable() {
+        let json = r#"[
+            {"upload_time_iso_8601": "2023-01-01T00:00:00Z", "yanked": true},
+            {"upload_time_iso_8601": "2023-01-01T01:00:00Z", "yanked": false}
+        ]"#;
+        let files: Vec<ReleaseInfo> = serde_json::from_str(json).unwrap();
+        assert!(PyPIAdapter::is_release_installable(&files));
+    }
+
+    #[test]
+    fn test_release_without_files_is_not_installable() {
+        // ファイルが 0 件のリリースはインストールできないため候補に含めない
+        assert!(!PyPIAdapter::is_release_installable(&[]));
+    }
+
+    #[test]
+    fn test_release_with_no_yanked_files_is_installable() {
+        let json = r#"[{"upload_time_iso_8601": "2023-01-01T00:00:00Z", "yanked": false}]"#;
+        let files: Vec<ReleaseInfo> = serde_json::from_str(json).unwrap();
+        assert!(PyPIAdapter::is_release_installable(&files));
+    }
+
+    /// PyPI レスポンス全体のデシリアライズでも yanked フィールドが読まれることを確認
+    #[test]
+    fn test_deserialize_pypi_response_with_yanked_releases() {
+        let json = r#"{
+            "releases": {
+                "1.0.0": [{"upload_time_iso_8601": "2023-01-01T00:00:00Z", "yanked": false}],
+                "1.0.1": [{"upload_time_iso_8601": "2023-02-01T00:00:00Z", "yanked": true}]
+            }
+        }"#;
+        let response: PyPIResponse = serde_json::from_str(json).unwrap();
+        let ok_release = response.releases.get("1.0.0").unwrap();
+        let yanked_release = response.releases.get("1.0.1").unwrap();
+        assert!(PyPIAdapter::is_release_installable(ok_release));
+        assert!(!PyPIAdapter::is_release_installable(yanked_release));
     }
 }

@@ -84,6 +84,28 @@ fn has_non_registry_source(line: &str) -> bool {
         || lowered.contains("source:")
 }
 
+/// クォート外の `#` 以降 (行コメント) を取り除いた部分文字列を返す。
+/// 文字列リテラル内の `#` (例: `source 'http://x#y'`) はコメント扱いしない
+fn strip_line_comment(line: &str) -> &str {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    for (idx, ch) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_single || in_double => escaped = true,
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '#' if !in_single && !in_double => return &line[..idx],
+            _ => {}
+        }
+    }
+    line
+}
+
 impl ManifestParser for GemfileParser {
     fn parse(&self, content: &str) -> Result<Vec<Dependency>, ManifestError> {
         let mut dependencies = Vec::new();
@@ -98,21 +120,25 @@ impl ManifestParser for GemfileParser {
                 continue;
             }
 
+            // ブロック判定とオプション判定はコメント除去後の文字列で行う
+            // (行末コメントの `do` や `git:` をブロック開始・git 依存と誤認しないため)
+            let code = strip_line_comment(trimmed);
+
             // `group ... do` を積む
-            if let Some(caps) = GROUP_START_RE.captures(trimmed) {
+            if let Some(caps) = GROUP_START_RE.captures(code) {
                 let group_spec = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                 block_stack.push(GemfileBlock::Group(is_dev_group(group_spec)));
                 continue;
             }
 
             // group 以外の `do` ブロック（platforms, source 等）を追跡する
-            if DO_BLOCK_RE.is_match(trimmed) {
+            if DO_BLOCK_RE.is_match(code) {
                 block_stack.push(GemfileBlock::Other);
                 continue;
             }
 
             // 対応する `end` で適切なスタック/カウンタを戻す
-            if GROUP_END_RE.is_match(trimmed) {
+            if GROUP_END_RE.is_match(code) {
                 block_stack.pop();
                 continue;
             }
@@ -135,7 +161,7 @@ impl ManifestParser for GemfileParser {
 
                 // バージョン指定から `VersionSpec` を組み立てる
                 let spec = if version_parts.is_empty() {
-                    if has_non_registry_source(line) {
+                    if has_non_registry_source(code) {
                         continue;
                     }
                     // バージョン指定がなければ `Any`
@@ -151,7 +177,7 @@ impl ManifestParser for GemfileParser {
                 let dep = if block_stack
                     .iter()
                     .any(|block| matches!(block, GemfileBlock::Group(true)))
-                    || has_dev_group_option(line)
+                    || has_dev_group_option(code)
                 {
                     Dependency::development(name, spec, Language::Ruby)
                 } else {
@@ -178,7 +204,7 @@ impl ManifestParser for GemfileParser {
         let escaped_name = regex::escape(package);
         let mut updated = false;
         let no_version_pattern = format!(
-            r#"(gem(?:\s+|\s*\(\s*))(['"])({escaped_name})(['"])(\s*(?:(?:\)\s*)?(?:#|$)|,\s*(?:require|group|git|path|branch|ref|tag|source|platforms?)\s*:))"#
+            r#"(gem(?:\s+|\s*\(\s*))(['"])({escaped_name})(['"])(\s*(?:(?:\)\s*)?(?:#|$)|,\s*(?:require|groups?|git|path|branch|ref|tag|source|platforms?|install_if|force_ruby_platform)\s*:))"#
         );
 
         let no_version_re =
@@ -199,7 +225,16 @@ impl ManifestParser for GemfileParser {
             })?;
 
         let mut lines = Vec::new();
-        for line in content.lines() {
+        for raw_line in content.split_inclusive('\n') {
+            // 行末の改行コード (`\n` / `\r\n`) を退避し、本文のみを処理対象にする
+            let (line, line_ending) = match raw_line.strip_suffix('\n') {
+                Some(rest) => match rest.strip_suffix('\r') {
+                    Some(body) => (body, "\r\n"),
+                    None => (rest, "\n"),
+                },
+                None => (raw_line, ""),
+            };
+
             if !updated
                 && let Some(caps) = GEM_RE.captures(line)
                 && caps.get(1).map(|m| m.as_str()) == Some(package)
@@ -213,8 +248,8 @@ impl ManifestParser for GemfileParser {
 
                 match version_parts.len() {
                     0 => {
-                        if has_non_registry_source(line) {
-                            lines.push(line.to_string());
+                        if has_non_registry_source(strip_line_comment(line)) {
+                            lines.push(raw_line.to_string());
                             continue;
                         }
 
@@ -238,10 +273,11 @@ impl ManifestParser for GemfileParser {
                                 suffix
                             );
                             let mut updated_line =
-                                String::with_capacity(line.len() + inserted.len() + 8);
+                                String::with_capacity(raw_line.len() + inserted.len() + 8);
                             updated_line.push_str(&line[..matched_range.start]);
                             updated_line.push_str(&inserted);
                             updated_line.push_str(&line[matched_range.end..]);
+                            updated_line.push_str(line_ending);
                             lines.push(updated_line);
                             continue;
                         }
@@ -254,7 +290,7 @@ impl ManifestParser for GemfileParser {
                             let trailing = &caps[5];
                             updated = true;
                             lines.push(format!(
-                                "{}{}{}{}, {}{}{}{}",
+                                "{}{}{}{}, {}{}{}{}{}",
                                 gem_keyword,
                                 quote_start,
                                 name,
@@ -262,7 +298,8 @@ impl ManifestParser for GemfileParser {
                                 quote_start,
                                 new_version,
                                 quote_end,
-                                trailing
+                                trailing,
+                                line_ending
                             ));
                             continue;
                         }
@@ -288,11 +325,12 @@ impl ManifestParser for GemfileParser {
                             };
                             let version_range = version_parts[0].range();
                             let mut updated_line = String::with_capacity(
-                                line.len() - old_version.len() + new_ver.len(),
+                                raw_line.len() - old_version.len() + new_ver.len(),
                             );
                             updated_line.push_str(&line[..version_range.start]);
                             updated_line.push_str(&new_ver);
                             updated_line.push_str(&line[version_range.end..]);
+                            updated_line.push_str(line_ending);
                             updated = true;
                             lines.push(updated_line);
                             continue;
@@ -308,16 +346,12 @@ impl ManifestParser for GemfileParser {
                 }
             }
 
-            lines.push(line.to_string());
+            lines.push(raw_line.to_string());
         }
 
         if updated {
-            let mut joined = lines.join("\n");
-            // 元のファイルが末尾改行を持つ場合は保持する
-            if content.ends_with('\n') {
-                joined.push('\n');
-            }
-            return Ok(joined);
+            // 各行が元の改行コード (`\n` / `\r\n`) を保持したまま連結する
+            return Ok(lines.concat());
         }
 
         Err(ManifestError::InvalidVersionSpec {
@@ -964,5 +998,158 @@ gem 'rails', '~> 7.0'
         let content = r#"gem 'rails', git: 'https://github.com/rails/rails'"#;
         let result = GemfileParser.update_version(content, "rails", "7.1.0");
         assert!(result.is_err());
+    }
+
+    // --- 行末コメントの誤認に対する回帰テスト ---
+
+    #[test]
+    fn test_parse_gem_with_comment_ending_in_do() {
+        // 回帰テスト: 行末コメントが "do" で終わってもブロック開始と誤認せず、
+        // 通常の gem として解析されること
+        let content = r#"
+gem 'debug' # things to do
+gem 'rails', '~> 7.0' # more things to do
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 2);
+        assert_eq!(deps[0].name, "debug");
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Any);
+        assert_eq!(deps[1].name, "rails");
+        assert_eq!(deps[1].version_spec.version, "7.0");
+    }
+
+    #[test]
+    fn test_update_version_gem_with_comment_ending_in_do() {
+        // 回帰テスト: "do" で終わるコメント付きの gem 行も更新できること
+        let content = "gem 'rails', '~> 7.0' # more things to do\n";
+        let result = GemfileParser
+            .update_version(content, "rails", "7.1.0")
+            .unwrap();
+        assert_eq!(result, "gem 'rails', '~> 7.1.0' # more things to do\n");
+    }
+
+    #[test]
+    fn test_parse_comment_ending_in_do_keeps_block_stack() {
+        // 回帰テスト: コメントの "do" でブロックスタックがずれて、
+        // group 終端後の gem が開発依存と誤判定されないこと
+        let content = r#"
+group :development do
+  gem 'debug' # things to do
+end
+
+gem 'pg', '~> 1.5'
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 2);
+
+        let debug = deps.iter().find(|d| d.name == "debug").unwrap();
+        let pg = deps.iter().find(|d| d.name == "pg").unwrap();
+
+        assert!(debug.is_dev);
+        assert!(!pg.is_dev, "pg should not leak into the development group");
+    }
+
+    #[test]
+    fn test_parse_gem_with_git_mention_in_comment() {
+        // 回帰テスト: コメント中の `git:` 文言で非レジストリ依存と誤認しないこと
+        let content = "gem 'foo' # migrate to git: later\n";
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "foo");
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Any);
+    }
+
+    #[test]
+    fn test_update_version_gem_with_git_mention_in_comment() {
+        // 回帰テスト: コメント中の `git:` 文言があってもバージョンを挿入できること
+        let content = "gem 'foo' # migrate to git: later\n";
+        let result = GemfileParser
+            .update_version(content, "foo", "1.2.0")
+            .unwrap();
+        assert_eq!(result, "gem 'foo', '1.2.0' # migrate to git: later\n");
+    }
+
+    #[test]
+    fn test_parse_quoted_hash_is_not_comment() {
+        // 文字列リテラル内の `#` はコメント扱いされないこと
+        let content =
+            "source 'https://example.com#fragment' do\n  gem 'private-gem', '~> 1.0'\nend\n";
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "private-gem");
+    }
+
+    // --- バージョンなし gem のオプションキーワードに対する回帰テスト ---
+
+    #[test]
+    fn test_update_version_add_to_unversioned_gem_with_groups_option() {
+        // 回帰テスト: `groups:` オプション付きのバージョンなし gem に挿入できること
+        let content = "gem 'rubocop', groups: [:development, :test]\n";
+        let result = GemfileParser
+            .update_version(content, "rubocop", "1.60.0")
+            .unwrap();
+        assert_eq!(
+            result,
+            "gem 'rubocop', '1.60.0', groups: [:development, :test]\n"
+        );
+    }
+
+    #[test]
+    fn test_update_version_add_to_unversioned_gem_with_install_if_option() {
+        // 回帰テスト: `install_if:` オプション付きのバージョンなし gem に挿入できること
+        let content = "gem 'sidekiq', install_if: -> { ENV['WORKER'] }\n";
+        let result = GemfileParser
+            .update_version(content, "sidekiq", "7.2.0")
+            .unwrap();
+        assert_eq!(
+            result,
+            "gem 'sidekiq', '7.2.0', install_if: -> { ENV['WORKER'] }\n"
+        );
+    }
+
+    #[test]
+    fn test_update_version_add_to_unversioned_gem_with_force_ruby_platform_option() {
+        // 回帰テスト: `force_ruby_platform:` オプション付きのバージョンなし gem に挿入できること
+        let content = "gem 'grpc', force_ruby_platform: true\n";
+        let result = GemfileParser
+            .update_version(content, "grpc", "1.62.0")
+            .unwrap();
+        assert_eq!(result, "gem 'grpc', '1.62.0', force_ruby_platform: true\n");
+    }
+
+    // --- CRLF 改行コード保持の回帰テスト ---
+
+    #[test]
+    fn test_update_version_preserves_crlf_line_endings() {
+        // 回帰テスト: CRLF の Gemfile を 1 依存更新しても全行が LF 化されないこと
+        let content =
+            "source 'https://rubygems.org'\r\n\r\ngem 'rails', '~> 7.0'\r\ngem 'pg', '~> 1.1'\r\n";
+        let result = GemfileParser
+            .update_version(content, "rails", "7.1.0")
+            .unwrap();
+        assert_eq!(
+            result,
+            "source 'https://rubygems.org'\r\n\r\ngem 'rails', '~> 7.1.0'\r\ngem 'pg', '~> 1.1'\r\n"
+        );
+    }
+
+    #[test]
+    fn test_update_versionless_gem_preserves_crlf_line_endings() {
+        // 回帰テスト: CRLF ファイルへのバージョン挿入でも改行コードを保持すること
+        let content = "gem 'rmagick'\r\ngem 'nokogiri'\r\n";
+        let result = GemfileParser
+            .update_version(content, "rmagick", "5.3.0")
+            .unwrap();
+        assert_eq!(result, "gem 'rmagick', '5.3.0'\r\ngem 'nokogiri'\r\n");
+    }
+
+    #[test]
+    fn test_update_version_preserves_mixed_line_endings() {
+        // 回帰テスト: LF と CRLF が混在するファイルでも各行の改行コードを保持すること
+        let content = "gem 'rails', '~> 7.0'\r\ngem 'pg', '~> 1.1'\n";
+        let result = GemfileParser
+            .update_version(content, "pg", "1.5.0")
+            .unwrap();
+        assert_eq!(result, "gem 'rails', '~> 7.0'\r\ngem 'pg', '~> 1.5.0'\n");
     }
 }
