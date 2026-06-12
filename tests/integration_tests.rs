@@ -277,6 +277,61 @@ dependencies {
         );
     }
 
+    /// Gradle version catalog (gradle/libs.versions.toml) の検出とパースの統合テスト
+    #[test]
+    fn test_detect_and_parse_gradle_version_catalog() {
+        let temp_dir = create_test_dir();
+        fs::create_dir_all(temp_dir.path().join("gradle")).unwrap();
+
+        let catalog = r#"[versions]
+guava = "33.0.0-jre"
+
+[libraries]
+guava = { module = "com.google.guava:guava", version.ref = "guava" }
+junit = "junit:junit:4.13.2"
+commons-lang3 = { group = "org.apache.commons", name = "commons-lang3", version = "3.14.0" }
+
+[plugins]
+spotless = { id = "com.diffplug.spotless", version = "6.25.0" }
+"#;
+        let catalog_path = temp_dir.path().join("gradle").join("libs.versions.toml");
+        fs::write(&catalog_path, catalog).unwrap();
+
+        // 検出: version catalog は Java マニフェストとして扱われる
+        let manifests = depup::manifest::detect_manifests(temp_dir.path());
+        let catalog_manifest = manifests
+            .iter()
+            .find(|m| m.path == catalog_path)
+            .expect("version catalog が検出されるべき");
+        assert_eq!(catalog_manifest.language, depup::domain::Language::Java);
+
+        // パース: libraries は Maven 座標で抽出し、plugins は除外する
+        let parser = depup::manifest::get_parser(depup::domain::Language::Java);
+        let deps = parser.parse(catalog).unwrap();
+
+        assert!(
+            deps.iter()
+                .any(|d| d.name == "com.google.guava:guava"
+                    && d.version_spec.version == "33.0.0-jre")
+        );
+        assert!(
+            deps.iter()
+                .any(|d| d.name == "junit:junit" && d.version_spec.version == "4.13.2")
+        );
+        assert!(
+            deps.iter()
+                .any(|d| d.name == "org.apache.commons:commons-lang3"
+                    && d.version_spec.version == "3.14.0")
+        );
+        // plugins は Maven 座標と一致しないため更新対象から除外される
+        assert!(
+            !deps
+                .iter()
+                .any(|d| d.name.contains("spotless") || d.name.contains("com.diffplug"))
+        );
+        assert_eq!(deps.len(), 3, "libraries 3 件のみ (plugins は除外)");
+    }
+
     /// Package.swift ファイルの検出テスト
     #[test]
     fn test_detect_swift_manifest() {

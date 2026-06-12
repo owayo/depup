@@ -45,8 +45,10 @@ static RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 // semver crate は `*` に加えて `x` / `X` もワイルドカード文字として受理する。
 // `1.x.x` のように minor/patch 連続のワイルドカードも有効 (`1.x.3` は無効)。
+// 先頭の `=` / `^` / `~` 演算子付き (`=1.*` / `^1.*` / `~1.x`) も Cargo (semver crate) では
+// valid なので許容し、演算子を保持したまま形を保って更新する (npm の `^1.x` と対称)。
 static WILDCARD_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[\d]+(?:\.[\d]+)*(?:\.[*xX]){1,2}$").unwrap());
+    LazyLock::new(|| Regex::new(r"^[=^~]?[\d]+(?:\.[\d]+)*(?:\.[*xX]){1,2}$").unwrap());
 // Range の先頭 comparison requirement からバージョン部を抽出する。
 // プレリリース (`-...`) とビルドメタデータ (`+...`) も比較基準として保持する。
 static RANGE_FIRST_VERSION_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -142,12 +144,14 @@ impl VersionParser for RustVersionParser {
             return None;
         }
 
-        // `1.*` / `1.x` / `1.X` は形を保ったまま更新する
+        // `1.*` / `1.x` / `1.X` は形を保ったまま更新する。
+        // `=1.*` / `^1.*` / `~1.x` の演算子付きワイルドカードも演算子を保持して更新する
+        // (比較用 version からは演算子を除き、raw 側に残して format で復元する)。
         if WILDCARD_RE.is_match(trimmed) {
             return Some(VersionSpec::new(
                 VersionSpecKind::Wildcard,
                 trimmed,
-                trimmed,
+                trimmed.trim_start_matches(['=', '^', '~']),
             ));
         }
 
@@ -406,10 +410,37 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_wildcard_with_operator_prefix() {
+        // 回帰テスト: cargo (semver crate) が受理する演算子付きワイルドカードを
+        // 演算子を保持したまま Wildcard として扱う (`=1.*` / `^1.*` / `~1.x`)。
+        // 以前は parse が None を返し、該当依存が黙ってスキップされていた。
+        let spec = parse("=1.*").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Wildcard);
+        assert_eq!(spec.version, "1.*"); // 比較用 version は演算子を除く
+        assert_eq!(spec.format_updated("2.3.4"), "=2.*");
+
+        let spec = parse("^1.*").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Wildcard);
+        assert_eq!(spec.format_updated("2.3.4"), "^2.*");
+
+        let spec = parse("~1.x").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Wildcard);
+        assert_eq!(spec.format_updated("2.3.4"), "~2.x");
+
+        // `^1.2.*` も minor 位置のワイルドカードを保って更新する
+        let spec = parse("^1.2.*").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Wildcard);
+        assert_eq!(spec.format_updated("2.3.4"), "^2.3.*");
+    }
+
+    #[test]
     fn test_parse_bare_x_is_floating() {
         // `x` / `X` 単独は `*` と同じ完全浮動指定なので更新対象にしない
         assert!(parse("x").is_none());
         assert!(parse("X").is_none());
+        // 演算子付きの完全浮動指定 (`^*` / `=x`) も数値アンカーが無いので更新対象にしない
+        assert!(parse("^*").is_none());
+        assert!(parse("=x").is_none());
     }
 
     #[test]

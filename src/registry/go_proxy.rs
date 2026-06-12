@@ -61,19 +61,19 @@ impl GoProxyAdapter {
         format!("{}/{}", GO_PROXY_URL, Self::case_encode(module))
     }
 
-    /// Go Module Proxy プロトコルの case-encoding (大文字 → `!` + 小文字)
+    /// Go Module Proxy プロトコルの case-encoding (ASCII 大文字 → `!` + 小文字)
     ///
     /// 大文字小文字を区別しないファイルシステム上での曖昧さを避けるためのエンコードで、
     /// モジュールパスとバージョン文字列の両方に適用される。
+    /// Go の仕様では ASCII 大文字のみが対象なので `is_ascii_uppercase` で判定する
+    /// (Unicode 大文字まで変換すると仕様外のエンコードになる)。
     fn case_encode(s: &str) -> String {
         let mut encoded = String::with_capacity(s.len());
 
         for ch in s.chars() {
-            if ch.is_uppercase() {
+            if ch.is_ascii_uppercase() {
                 encoded.push('!');
-                for lower in ch.to_lowercase() {
-                    encoded.push(lower);
-                }
+                encoded.push(ch.to_ascii_lowercase());
             } else {
                 encoded.push(ch);
             }

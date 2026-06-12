@@ -30,8 +30,11 @@ static GEM_RE: LazyLock<Regex> = LazyLock::new(|| {
     // gem "pg", ">= 0.18", "< 2.0"
     // gem("rack", "~> 3.0")
     // gem 'bcrypt'
+    // 末尾コンテキストは `,` / 行末 / `)` / コメント `#` に加え、行末条件修飾子
+    // (`gem 'wdm', '>= 0.1.0' if Gem.win_platform?`) も許容する。これがないと
+    // ` if ...` でバックトラックして version 引数を取りこぼし Any と誤分類する。
     Regex::new(
-        r#"^\s*gem(?:\s+|\s*\(\s*)['"]([^'"]+)['"](?:\s*,\s*['"]([^'"]+)['"])?(?:\s*,\s*['"]([^'"]+)['"])?(?:\s*,\s*['"]([^'"]+)['"])?(?:\s*,|\s*\)?\s*$|\s*\)?\s*#)"#,
+        r#"^\s*gem(?:\s+|\s*\(\s*)['"]([^'"]+)['"](?:\s*,\s*['"]([^'"]+)['"])?(?:\s*,\s*['"]([^'"]+)['"])?(?:\s*,\s*['"]([^'"]+)['"])?(?:\s*,|\s*\)?\s*$|\s*\)?\s*#|\s*\)?\s+(?:if|unless)\b)"#,
     )
     .unwrap()
 });
@@ -425,6 +428,31 @@ gem 'rails', '~> 7.0'
     }
 
     #[test]
+    fn test_parse_gem_with_trailing_conditional_modifier() {
+        // 行末条件修飾子 (`if`/`unless`) が付いていても version 制約を取りこぼさない。
+        // Rails Gemfile で頻出する `gem 'wdm', '>= 0.1.0' if Gem.win_platform?` パターン。
+        let content = r#"
+gem 'wdm', '>= 0.1.0' if Gem.win_platform?
+gem 'tzinfo-data', '~> 1.2' unless Gem.win_platform?
+gem("sqlite3", "~> 1.4") if Gem.win_platform?
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 3);
+
+        assert_eq!(deps[0].name, "wdm");
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::GreaterOrEqual);
+        assert_eq!(deps[0].version_spec.version, "0.1.0");
+
+        assert_eq!(deps[1].name, "tzinfo-data");
+        assert_eq!(deps[1].version_spec.kind, VersionSpecKind::Tilde);
+        assert_eq!(deps[1].version_spec.version, "1.2");
+
+        assert_eq!(deps[2].name, "sqlite3");
+        assert_eq!(deps[2].version_spec.kind, VersionSpecKind::Tilde);
+        assert_eq!(deps[2].version_spec.version, "1.4");
+    }
+
+    #[test]
     fn test_parse_no_version() {
         let content = r#"gem 'some_gem'"#;
         let deps = parse(content).unwrap();
@@ -602,6 +630,18 @@ gem 'pg', '~> 1.1'
             .update_version(content, "puma", "6.0")
             .unwrap();
         assert!(result.contains("'>= 6.0'"));
+    }
+
+    #[test]
+    fn test_update_version_gem_with_conditional_modifier() {
+        // 行末条件修飾子付きの gem も version だけを更新し、修飾子を保持する
+        let content = r#"gem 'wdm', '>= 0.1.0' if Gem.win_platform?"#;
+        let result = GemfileParser
+            .update_version(content, "wdm", "0.2.0")
+            .unwrap();
+        assert!(result.contains("'>= 0.2.0'"));
+        // 修飾子は保持される
+        assert!(result.contains("if Gem.win_platform?"));
     }
 
     #[test]

@@ -82,13 +82,13 @@ fn extract_numeric_parts(new_version: &str) -> Option<Vec<String>> {
 
 fn format_wildcard_like(raw: &str, new_version: &str) -> Option<String> {
     let trimmed = raw.trim();
-    // npm の `^1.x` / `~1.2.*` のような演算子付きワイルドカードでは、先頭の `^` / `~`
-    // 演算子を切り出して保持し、残りをワイルドカードとして再構成する。
+    // npm の `^1.x` / `~1.2.*` や Cargo の `=1.*` / `^1.*` のような演算子付きワイルドカードでは、
+    // 先頭の `^` / `~` / `=` 演算子を切り出して保持し、残りをワイルドカードとして再構成する。
     // 既存のワイルドカード (`1.x` / `1.2.*` / `v1.*` / `1.+`) は演算子を持たないため
     // op_prefix は空となり、従来どおりの挙動になる。
     let op_len = trimmed
         .bytes()
-        .take_while(|b| matches!(b, b'^' | b'~'))
+        .take_while(|b| matches!(b, b'^' | b'~' | b'='))
         .count();
     let op_prefix = &trimmed[..op_len];
     let body = trimmed[op_len..].trim_start();

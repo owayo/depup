@@ -115,6 +115,10 @@ static RICH_VERSION_DECL: LazyLock<Regex> = LazyLock::new(|| {
 });
 static RICH_VERSION_VALUE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#""([^"]+)"|'([^']+)'"#).unwrap());
+// `rejectAll()` (引数なし) を検出する。`reject(...)` とは別に「全バージョン拒否」を意味し、
+// RICH_VERSION_DECL は引数必須のためこれを拾えない。version catalog の `rejectAll = true` と対になる。
+static REJECT_ALL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\brejectAll\s*\(\s*\)").unwrap());
 
 // 開発用 configuration
 const DEV_CONFIGURATIONS: [&str; 6] = [
@@ -541,6 +545,14 @@ impl GradleParser {
             let trimmed = code.trim();
             if trimmed.is_empty() {
                 continue;
+            }
+
+            // `rejectAll()` は全バージョンを拒否するため、宣言があれば更新対象から外す。
+            // version catalog 側 (`rejectAll = true`) と挙動を揃える。「拒否制約を無視して更新」を
+            // 防ぐため、ブロック内に rejectAll() が現れたら他の宣言の有無に関わらずスキップする
+            // (安全側)。
+            if REJECT_ALL_RE.is_match(&code) {
+                return None;
             }
 
             for caps in RICH_VERSION_DECL.captures_iter(&code) {
@@ -1356,6 +1368,41 @@ dependencies {
             deps[0].version_spec.rejected_versions,
             vec!["1.7.36", "1.7.37"]
         );
+    }
+
+    #[test]
+    fn test_parse_rich_version_reject_all_skips_dependency() {
+        // rejectAll() は全バージョンを拒否するため、該当依存は更新対象から外れる。
+        // version catalog の `rejectAll = true` と同じ扱いにし、拒否制約を無視した
+        // 誤更新を防ぐ。
+        let content = r#"
+dependencies {
+    implementation("org.slf4j:slf4j-api") {
+        version {
+            strictly("[1.0, 2.0[")
+            rejectAll()
+        }
+    }
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_parse_rich_version_reject_all_only_skips_dependency() {
+        // rejectAll() 単独 (strictly/prefer なし) でもスキップする
+        let content = r#"
+dependencies {
+    implementation("org.example:lib") {
+        version {
+            rejectAll()
+        }
+    }
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert!(deps.is_empty());
     }
 
     #[test]

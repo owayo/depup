@@ -189,11 +189,42 @@ fn detect_pnpm_workspace_packages(dir: &Path) -> Result<Vec<PathBuf>, std::io::E
     //          - 'packages/*'
     //          - 'apps/*'
     let mut in_packages = false;
+    // flow-style 配列 (`packages: ['a/*', 'b/*']`) を複数行に跨って蓄積するバッファ
+    let mut flow_buffer: Option<String> = None;
     for line in content.lines() {
         let trimmed = line.trim();
 
-        if trimmed.starts_with("packages:") {
-            in_packages = true;
+        // flow-style 配列を複数行で読んでいる途中なら `]` が現れるまで蓄積する
+        if let Some(buffer) = flow_buffer.as_mut() {
+            buffer.push(' ');
+            buffer.push_str(trimmed);
+            if let Some(end) = buffer.find(']') {
+                let inner = buffer[..end].to_string();
+                flow_buffer = None;
+                add_flow_workspace_patterns(&inner, dir, &mut includes, &mut excludes);
+            }
+            continue;
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("packages:") {
+            let rest = rest.trim();
+            if let Some(after_bracket) = rest.strip_prefix('[') {
+                // flow-style: `packages: ['packages/*', 'apps/*']`
+                if let Some(end) = after_bracket.find(']') {
+                    add_flow_workspace_patterns(
+                        &after_bracket[..end],
+                        dir,
+                        &mut includes,
+                        &mut excludes,
+                    );
+                } else {
+                    // `]` が次行以降にある複数行 flow-style
+                    flow_buffer = Some(after_bracket.to_string());
+                }
+            } else {
+                // block-style: 次行以降の `- 'pattern'` を読む
+                in_packages = true;
+            }
             continue;
         }
 
@@ -204,17 +235,10 @@ fn detect_pnpm_workspace_packages(dir: &Path) -> Result<Vec<PathBuf>, std::io::E
             }
 
             // パッケージの glob パターンをパースする
-            if let Some(item) = trimmed.strip_prefix('-') {
-                let Some(pattern) = parse_yaml_list_value(item) else {
-                    continue;
-                };
-
-                // `!pattern` は除外指定 (pnpm 公式サポート)
-                if let Some(negated) = pattern.strip_prefix('!') {
-                    excludes.extend(expand_workspace_pattern(dir, negated));
-                } else {
-                    includes.extend(expand_workspace_pattern(dir, &pattern));
-                }
+            if let Some(item) = trimmed.strip_prefix('-')
+                && let Some(pattern) = parse_yaml_list_value(item)
+            {
+                add_workspace_pattern(&pattern, dir, &mut includes, &mut excludes);
             }
         }
     }
@@ -250,6 +274,39 @@ fn parse_yaml_list_value(item: &str) -> Option<String> {
             None
         } else {
             Some(value.to_string())
+        }
+    }
+}
+
+/// glob パターンを include / exclude へ振り分ける (`!pattern` は除外指定)。
+fn add_workspace_pattern(
+    pattern: &str,
+    dir: &Path,
+    includes: &mut Vec<PathBuf>,
+    excludes: &mut Vec<PathBuf>,
+) {
+    // `!pattern` は除外指定 (pnpm 公式サポート)
+    if let Some(negated) = pattern.strip_prefix('!') {
+        excludes.extend(expand_workspace_pattern(dir, negated));
+    } else {
+        includes.extend(expand_workspace_pattern(dir, pattern));
+    }
+}
+
+/// flow-style 配列の中身 (`'a/*', 'b/*'`) をカンマ区切りで分解して振り分ける。
+fn add_flow_workspace_patterns(
+    inner: &str,
+    dir: &Path,
+    includes: &mut Vec<PathBuf>,
+    excludes: &mut Vec<PathBuf>,
+) {
+    for raw_item in inner.split(',') {
+        let item = raw_item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        if let Some(pattern) = parse_yaml_list_value(item) {
+            add_workspace_pattern(&pattern, dir, includes, excludes);
         }
     }
 }
@@ -417,6 +474,65 @@ mod tests {
             .find(|m| m.path == dir.path().join("package.json"))
             .unwrap();
         assert!(root.is_workspace_root);
+    }
+
+    #[test]
+    fn test_detect_pnpm_workspace_flow_style_packages() {
+        // flow-style 配列 (`packages: ['packages/*', 'apps/*']`) でもメンバーを検出する
+        let dir = create_temp_dir();
+        fs::write(dir.path().join("package.json"), "{}").unwrap();
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages: ['packages/*', 'apps/*']\n",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("packages/a")).unwrap();
+        fs::write(dir.path().join("packages/a/package.json"), "{}").unwrap();
+        fs::create_dir_all(dir.path().join("apps/web")).unwrap();
+        fs::write(dir.path().join("apps/web/package.json"), "{}").unwrap();
+
+        let manifests = detect_manifests(dir.path());
+        assert!(
+            manifests
+                .iter()
+                .any(|m| m.path.ends_with("packages/a/package.json")),
+            "flow-style の packages/* メンバーが検出されるべき"
+        );
+        assert!(
+            manifests
+                .iter()
+                .any(|m| m.path.ends_with("apps/web/package.json")),
+            "flow-style の apps/* メンバーが検出されるべき"
+        );
+    }
+
+    #[test]
+    fn test_detect_pnpm_workspace_flow_style_multiline_with_exclude() {
+        // 複数行 flow-style と否定パターン (`!`) の組み合わせ
+        let dir = create_temp_dir();
+        fs::write(dir.path().join("package.json"), "{}").unwrap();
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages: [\n  'packages/*',\n  '!packages/legacy',\n]\n",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("packages/a")).unwrap();
+        fs::write(dir.path().join("packages/a/package.json"), "{}").unwrap();
+        fs::create_dir_all(dir.path().join("packages/legacy")).unwrap();
+        fs::write(dir.path().join("packages/legacy/package.json"), "{}").unwrap();
+
+        let manifests = detect_manifests(dir.path());
+        assert!(
+            manifests
+                .iter()
+                .any(|m| m.path.ends_with("packages/a/package.json"))
+        );
+        assert!(
+            !manifests
+                .iter()
+                .any(|m| m.path.ends_with("packages/legacy/package.json")),
+            "否定パターンで除外されたメンバーは検出されないべき"
+        );
     }
 
     #[test]

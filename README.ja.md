@@ -574,7 +574,7 @@ shared    # 共有ライブラリ
 
 ### pnpmワークスペース
 
-depupは `pnpm-workspace.yaml` を検出し、全てのワークスペースパッケージを処理します。
+depupは `pnpm-workspace.yaml` を検出し、全てのワークスペースパッケージを処理します。`packages` 配列は block-style (`- 'packages/*'`) と flow-style (`packages: ['packages/*', 'apps/*']`) の両方に対応し、否定パターン (`!packages/legacy`) も扱えます。
 
 ### Tauriプロジェクト
 

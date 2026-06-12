@@ -47,6 +47,12 @@ static MAVEN_RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
     ))
     .unwrap()
 });
+/// PEP 440 の prefix-match wildcard (`==1.2.*`) を上限制約として解釈する正規表現。
+/// `==1.2.*` は `>=1.2.0, <1.3.0` 相当なので、`.*` 直前のリリースセグメントを +1 した
+/// 排他的上限を導出する。epoch (`1!2.0.*`) と `v` 接頭辞も許容する。
+/// `!=1.2.*` は除外制約であり上限ではないため、ここでは `==` のみを対象にする。
+static PEP440_PREFIX_MATCH_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^==\s*[vV]?((?:\d+!)?\d+(?:\.\d+)*)\.\*$").unwrap());
 
 fn normalize_bound_version(version: &str) -> String {
     version
@@ -99,6 +105,31 @@ fn normalize_hyphen_upper_bound(version: &str) -> (String, bool) {
     (normalized, true)
 }
 
+/// PEP 440 prefix-match wildcard (`==1.2.*`) のリリース部を +1 して排他的上限を作る。
+///
+/// 例:
+/// - `1.2` -> `1.3`
+/// - `1` -> `2`
+/// - epoch 付き `1!2.3` -> `1!2.4`
+fn increment_release_prefix(prefix: &str) -> Option<String> {
+    let (epoch, release) = prefix
+        .split_once('!')
+        .map_or((None, prefix), |(e, r)| (Some(e), r));
+    let mut parts = release
+        .split('.')
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    let last = parts.last_mut()?;
+    *last = last.checked_add(1)?;
+    let upper = parts
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(".");
+    Some(epoch.map_or_else(|| upper.clone(), |e| format!("{e}!{upper}")))
+}
+
 /// 2 つの上限制約候補からより厳しい方を選ぶ。
 /// バージョンが小さい方が厳しい。同値なら排他的 (`<`) を包含 (`<=`) より優先する。
 fn stricter_upper_bound(
@@ -140,6 +171,15 @@ fn extract_upper_bound(raw: &str) -> Option<(String, bool)> {
         }
         // 上限なしの Maven レンジ (`[1.0,)`) を他形式として再解釈しない
         return None;
+    }
+
+    // PEP 440 の prefix-match wildcard (`==1.2.*`) は `<次セグメント` 相当の排他的上限を持つ。
+    // 完全アンカー (`^==...\.\*$`) なので他言語の Range 文字列には誤マッチしない。
+    if let Some(caps) = PEP440_PREFIX_MATCH_RE.captures(trimmed)
+        && let Some(prefix) = caps.get(1)
+        && let Some(upper) = increment_release_prefix(prefix.as_str())
+    {
+        return Some((upper, false));
     }
 
     if let Some(caps) = UPPER_BOUND_SWIFT_HALF_OPEN_RE.captures(trimmed)
@@ -1161,6 +1201,39 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_upper_bound_pep440_prefix_match() {
+        // PEP 440 の prefix-match wildcard (`==1.2.*`) は `<1.3` 相当の排他的上限を持つ
+        assert_eq!(
+            super::extract_upper_bound("==1.2.*"),
+            Some(("1.3".to_string(), false))
+        );
+        // `==1.*` は `<2` 相当
+        assert_eq!(
+            super::extract_upper_bound("==1.*"),
+            Some(("2".to_string(), false))
+        );
+        // `==1.2.3.*` は `<1.2.4` 相当 (最後のリリースセグメントを +1)
+        assert_eq!(
+            super::extract_upper_bound("==1.2.3.*"),
+            Some(("1.2.4".to_string(), false))
+        );
+        // 空白付き / `v` 接頭辞付きも許容する
+        assert_eq!(
+            super::extract_upper_bound("== 1.2.*"),
+            Some(("1.3".to_string(), false))
+        );
+        // epoch 付き `1!2.3.*` は epoch を保持して上限を導出する
+        assert_eq!(
+            super::extract_upper_bound("==1!2.3.*"),
+            Some(("1!2.4".to_string(), false))
+        );
+        // `!=1.2.*` は除外制約であり上限ではないため None
+        assert_eq!(super::extract_upper_bound("!=1.2.*"), None);
+        // 末尾が `.*` でない通常の `==1.2.3` は上限を持たない
+        assert_eq!(super::extract_upper_bound("==1.2.3"), None);
+    }
+
+    #[test]
     fn test_judge_hyphen_range_respects_upper_bound() {
         // npm のハイフンレンジ `1.0.0 - 2.0.0` は `>=1.0.0 <=2.0.0` と同義
         let filter = UpdateFilter::new();
@@ -1219,6 +1292,28 @@ mod tests {
         if let UpdateResult::Update { new_version, .. } = result {
             assert_eq!(new_version, "2.0.9");
         }
+    }
+
+    #[test]
+    fn test_judge_pep440_prefix_match_respects_upper_bound() {
+        // PEP 440 の `==1.2.*` は `>=1.2.0, <1.3.0` 相当。
+        // 上限が効かないと judge が 2.5.0 を選び `==2.5.*` へ誤更新してしまうため、
+        // 1.3 以上の候補が除外され major/minor を跨がないことを確認する。
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_range_dependency("requests", "==1.2.*", "1.2", Language::Python);
+        let versions = vec![
+            make_version_info("1.2.0", 100),
+            make_version_info("1.2.5", 80), // `1.2.*` の範囲内 (書き換え後も `==1.2.*` なので phantom)
+            make_version_info("1.3.0", 50), // 排他的上限 1.3 以上なので除外
+            make_version_info("2.5.0", 10), // major 跨ぎ、除外されるべき
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        // `==1.2.*` の文字列は 1.2 系内では変化しないため AlreadyLatest (更新なし) になる。
+        // 上限が無いと 2.5.0 への Update になってしまうので、ここは更新なしが正しい。
+        assert!(!result.is_update());
     }
 
     #[test]

@@ -574,7 +574,7 @@ When `--install` is used, depup runs the package manager in the nearest matching
 
 ### pnpm Workspaces
 
-depup detects `pnpm-workspace.yaml` and processes all workspace packages.
+depup detects `pnpm-workspace.yaml` and processes all workspace packages. Both block-style (`- 'packages/*'`) and flow-style (`packages: ['packages/*', 'apps/*']`) `packages` arrays are supported, including negation patterns (`!packages/legacy`).
 
 ### Tauri Projects
 
