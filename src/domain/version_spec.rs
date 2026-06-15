@@ -305,6 +305,18 @@ fn format_range_like(raw: &str, new_version: &str) -> Option<String> {
         return None;
     }
 
+    // PEP 440 の compatible release (`~=1.2.3`) は演算子を保持しつつ、バージョンの
+    // セグメント数を維持して下限を進める。セグメント数を変えると上限の意味が変わる
+    // (`~=1.2` の上限 <2.0 が `~=1.9.0` だと <1.10.0 になる) ため、
+    // format_partial_version_like でセグメント数を保ったまま整形する。
+    if let Some(rest) = trimmed.strip_prefix("~=") {
+        let spacing_len = rest.len() - rest.trim_start().len();
+        let spacing = &rest[..spacing_len];
+        let body = rest.trim();
+        return format_partial_version_like(body, new_version)
+            .map(|formatted| format!("~={spacing}{formatted}"));
+    }
+
     if let Some(rest) = trimmed.strip_prefix("==") {
         let spacing_len = rest.len() - rest.trim_start().len();
         let spacing = &rest[..spacing_len];
@@ -349,6 +361,13 @@ fn format_range_like(raw: &str, new_version: &str) -> Option<String> {
     if trimmed.contains(" - ") || trimmed.contains("..<") || trimmed.contains("...") {
         let (start, end) = find_first_version_token(raw)?;
         return replace_version_token(raw, start, end, new_version);
+    }
+
+    // カンマ区切りの複数要件で上限 (`<` / `<=`) がない場合 (例: `>=1.2.3, ^1.3`)、
+    // 包含下限だけを進めると充足不能なレンジになり得るため安全に書き換えられない。
+    // (単一の包含下限 `>=1.0` は上限がなくても最新へ進められるので対象外)
+    if trimmed.contains(',') && !trimmed.contains('<') {
+        return None;
     }
 
     let (start, end) = find_inclusive_lower_bound_token(raw)?;
@@ -887,5 +906,15 @@ mod tests {
         // 演算子なしの既存ワイルドカードは従来どおりの挙動 (op_prefix が空)
         let spec = VersionSpec::new(VersionSpecKind::Wildcard, "1.x", "1");
         assert_eq!(spec.format_updated("2.3.4"), "2.x");
+    }
+
+    #[test]
+    fn test_format_range_like_pep440_compatible_release() {
+        // PEP 440 の `~=` はセグメント数を保って下限を進める。
+        // セグメント数を変えると上限の意味が変わる (`~=1.2` の <2.0 が `~=1.9.0` だと <1.10.0)。
+        let three = VersionSpec::new(VersionSpecKind::Range, "~=1.2.3", "1.2.3");
+        assert_eq!(three.format_updated("1.2.9"), "~=1.2.9");
+        let two = VersionSpec::new(VersionSpecKind::Range, "~=1.2", "1.2");
+        assert_eq!(two.format_updated("1.9.5"), "~=1.9");
     }
 }

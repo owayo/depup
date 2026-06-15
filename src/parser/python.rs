@@ -127,6 +127,11 @@ impl VersionParser for PythonVersionParser {
                     VersionSpec::new(VersionSpecKind::Exact, trimmed, normalized).with_prefix(op)
                 }
                 "~=" => {
+                    // PEP 440 の compatible release (`~=1.2.3` = `>=1.2.3, <1.3.0`、
+                    // `~=1.2` = `>=1.2, <2.0`) は明示的な上限を持つレンジ。
+                    // Tilde の「最新追従」ではなく Range として扱い、judge で上限を尊重する
+                    // (`==1.2.*` を Range 保護しているのと整合させる)。
+                    // 単一セグメント (`~=1`) は PEP 440 上無効なのでスキップする。
                     if normalized
                         .split('.')
                         .filter(|part| !part.is_empty())
@@ -135,7 +140,7 @@ impl VersionParser for PythonVersionParser {
                     {
                         return None;
                     }
-                    VersionSpec::new(VersionSpecKind::Tilde, trimmed, normalized).with_prefix("~=")
+                    VersionSpec::new(VersionSpecKind::Range, trimmed, normalized)
                 }
                 ">=" => VersionSpec::new(VersionSpecKind::GreaterOrEqual, trimmed, normalized)
                     .with_prefix(">="),
@@ -228,10 +233,10 @@ mod tests {
 
     #[test]
     fn test_parse_compatible_release() {
+        // PEP 440 の compatible release (~=) は明示的上限を持つレンジなので Range として扱う
         let spec = parse("~=1.2.3").unwrap();
-        assert_eq!(spec.kind, VersionSpecKind::Tilde);
+        assert_eq!(spec.kind, VersionSpecKind::Range);
         assert_eq!(spec.version, "1.2.3");
-        assert_eq!(spec.prefix, Some("~=".to_string()));
     }
 
     #[test]
@@ -408,11 +413,10 @@ mod tests {
 
     #[test]
     fn test_parse_compatible_release_two_part() {
-        // ~=1.2 は >=1.2, <2.0 と同値
+        // ~=1.2 は >=1.2, <2.0 と同値。明示的上限を持つレンジなので Range として扱う
         let spec = parse("~=1.2").unwrap();
-        assert_eq!(spec.kind, VersionSpecKind::Tilde);
+        assert_eq!(spec.kind, VersionSpecKind::Range);
         assert_eq!(spec.version, "1.2");
-        assert_eq!(spec.prefix, Some("~=".to_string()));
     }
 
     #[test]

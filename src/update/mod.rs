@@ -53,6 +53,12 @@ static MAVEN_RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// `!=1.2.*` は除外制約であり上限ではないため、ここでは `==` のみを対象にする。
 static PEP440_PREFIX_MATCH_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^==\s*[vV]?((?:\d+!)?\d+(?:\.\d+)*)\.\*$").unwrap());
+/// PEP 440 の compatible release (`~=1.2.3`) を上限制約として解釈する正規表現。
+/// `~=1.2.3` は `>=1.2.3, <1.3.0`、`~=1.2` は `>=1.2, <2.0` 相当。最後のリリースセグメントを
+/// 落とした prefix を +1 した排他的上限を導出する。epoch (`1!2.3`) と `v` 接頭辞も許容する。
+/// 2 セグメント未満 (`~=1`) は PEP 440 上無効なので parser がスキップ済み。
+static PEP440_COMPATIBLE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^~=\s*[vV]?((?:\d+!)?\d+(?:\.\d+)+)$").unwrap());
 
 fn normalize_bound_version(version: &str) -> String {
     version
@@ -130,6 +136,22 @@ fn increment_release_prefix(prefix: &str) -> Option<String> {
     Some(epoch.map_or_else(|| upper.clone(), |e| format!("{e}!{upper}")))
 }
 
+/// PEP 440 compatible release (`~=A.B.C`) の排他的上限を導出する。
+/// 最後のリリースセグメントを落とした prefix に `increment_release_prefix` を適用する。
+/// `~=1.2.3` -> `1.3`、`~=1.2` -> `2`、epoch 付き `~=1!2.3.4` -> `1!2.4`。
+fn compatible_release_upper_bound(release: &str) -> Option<String> {
+    let (epoch, core) = release
+        .split_once('!')
+        .map_or((None, release), |(e, r)| (Some(e), r));
+    let segments: Vec<&str> = core.split('.').collect();
+    if segments.len() < 2 {
+        return None;
+    }
+    let prefix_core = segments[..segments.len() - 1].join(".");
+    let prefix = epoch.map_or_else(|| prefix_core.clone(), |e| format!("{e}!{prefix_core}"));
+    increment_release_prefix(&prefix)
+}
+
 /// 2 つの上限制約候補からより厳しい方を選ぶ。
 /// バージョンが小さい方が厳しい。同値なら排他的 (`<`) を包含 (`<=`) より優先する。
 fn stricter_upper_bound(
@@ -178,6 +200,15 @@ fn extract_upper_bound(raw: &str) -> Option<(String, bool)> {
     if let Some(caps) = PEP440_PREFIX_MATCH_RE.captures(trimmed)
         && let Some(prefix) = caps.get(1)
         && let Some(upper) = increment_release_prefix(prefix.as_str())
+    {
+        return Some((upper, false));
+    }
+
+    // PEP 440 の compatible release (`~=1.2.3`) は `<次セグメント` 相当の排他的上限を持つ。
+    // 完全アンカー (`^~=...$`) なので他言語の Range 文字列には誤マッチしない。
+    if let Some(caps) = PEP440_COMPATIBLE_RE.captures(trimmed)
+        && let Some(release) = caps.get(1)
+        && let Some(upper) = compatible_release_upper_bound(release.as_str())
     {
         return Some((upper, false));
     }
@@ -1695,6 +1726,64 @@ mod tests {
         if let UpdateResult::Update { new_version, .. } = result {
             // 上限がないので最新へ更新される
             assert_eq!(new_version, "3.0");
+        }
+    }
+
+    #[test]
+    fn test_judge_pep440_compatible_release_respects_upper_bound() {
+        // PEP 440 の `~=1.2.3` は `>=1.2.3, <1.3.0` 相当。1.3.0 以上は除外される
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+        let dep = make_range_dependency("requests", "~=1.2.3", "1.2.3", Language::Python);
+        let versions = vec![
+            make_version_info("1.2.3", 100),
+            make_version_info("1.2.9", 80), // 上限内の最新
+            make_version_info("1.3.0", 50), // 排他的上限なので除外
+            make_version_info("2.0.0", 10), // major 跨ぎで除外
+        ];
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_update());
+        if let UpdateResult::Update { new_version, .. } = result {
+            assert_eq!(new_version, "1.2.9");
+        }
+    }
+
+    #[test]
+    fn test_judge_pep440_compatible_release_two_part_respects_upper_bound() {
+        // PEP 440 の `~=1.2` は `>=1.2, <2.0` 相当。2.0 以上は除外される
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+        let dep = make_range_dependency("requests", "~=1.2", "1.2", Language::Python);
+        let versions = vec![
+            make_version_info("1.2", 100),
+            make_version_info("1.9", 50), // 上限内の最新
+            make_version_info("2.0", 10), // 排他的上限なので除外
+        ];
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_update());
+        if let UpdateResult::Update { new_version, .. } = result {
+            assert_eq!(new_version, "1.9");
+        }
+    }
+
+    #[test]
+    fn test_judge_mixed_lower_bounds_without_upper_skips_safely() {
+        // `>=1.2.3, ^1.3` のように上限 (`<`) のない複数下限の混在は、
+        // 下限だけ進めると充足不能になり得るため安全に書き換えられず Skip する
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+        let dep = make_range_dependency("some_crate", ">=1.2.3, ^1.3", "1.3", Language::Rust);
+        let versions = vec![
+            make_version_info("1.3.0", 50),
+            make_version_info("1.5.0", 20),
+        ];
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_skip());
+        if let UpdateResult::Skip { reason, .. } = result {
+            assert_eq!(
+                reason,
+                SkipReason::ParseError("constraint cannot be updated safely".to_string())
+            );
         }
     }
 

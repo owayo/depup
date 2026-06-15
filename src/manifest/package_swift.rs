@@ -28,7 +28,7 @@ const NAME_OPT: &str = r#"(?:name:\s*"[^"]+"\s*,\s*)?"#;
 // .package([name:,] url: "...", from: "VERSION") にマッチする
 static FROM_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r#"\.package\(\s*{}url:\s*"([^"]+)"\s*,\s*from:\s*"([^"]+)"\s*\)"#,
+        r#"\.package\(\s*{}url:\s*"([^"]+)"\s*,\s*from:\s*"([^"]+)"\s*[,)]"#,
         NAME_OPT
     ))
     .unwrap()
@@ -37,7 +37,7 @@ static FROM_RE: LazyLock<Regex> = LazyLock::new(|| {
 // .package([name:,] url: "...", .upToNextMajor(from: "VERSION")) にマッチする
 static UP_TO_NEXT_MAJOR_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r#"\.package\(\s*{}url:\s*"([^"]+)"\s*,\s*\.upToNextMajor\(\s*from:\s*"([^"]+)"\s*\)\s*\)"#,
+        r#"\.package\(\s*{}url:\s*"([^"]+)"\s*,\s*\.upToNextMajor\(\s*from:\s*"([^"]+)"\s*\)\s*[,)]"#,
         NAME_OPT
     ))
     .unwrap()
@@ -46,7 +46,7 @@ static UP_TO_NEXT_MAJOR_RE: LazyLock<Regex> = LazyLock::new(|| {
 // .package([name:,] url: "...", .upToNextMinor(from: "VERSION")) にマッチする
 static UP_TO_NEXT_MINOR_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r#"\.package\(\s*{}url:\s*"([^"]+)"\s*,\s*\.upToNextMinor\(\s*from:\s*"([^"]+)"\s*\)\s*\)"#,
+        r#"\.package\(\s*{}url:\s*"([^"]+)"\s*,\s*\.upToNextMinor\(\s*from:\s*"([^"]+)"\s*\)\s*[,)]"#,
         NAME_OPT
     ))
     .unwrap()
@@ -55,7 +55,7 @@ static UP_TO_NEXT_MINOR_RE: LazyLock<Regex> = LazyLock::new(|| {
 // .package([name:,] url: "...", exact: "VERSION") にマッチする
 static EXACT_KEYWORD_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r#"\.package\(\s*{}url:\s*"([^"]+)"\s*,\s*exact:\s*"([^"]+)"\s*\)"#,
+        r#"\.package\(\s*{}url:\s*"([^"]+)"\s*,\s*exact:\s*"([^"]+)"\s*[,)]"#,
         NAME_OPT
     ))
     .unwrap()
@@ -64,7 +64,7 @@ static EXACT_KEYWORD_RE: LazyLock<Regex> = LazyLock::new(|| {
 // .package([name:,] url: "...", .exact("VERSION")) にマッチする
 static EXACT_METHOD_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r#"\.package\(\s*{}url:\s*"([^"]+)"\s*,\s*\.exact\(\s*"([^"]+)"\s*\)\s*\)"#,
+        r#"\.package\(\s*{}url:\s*"([^"]+)"\s*,\s*\.exact\(\s*"([^"]+)"\s*\)\s*[,)]"#,
         NAME_OPT
     ))
     .unwrap()
@@ -73,7 +73,7 @@ static EXACT_METHOD_RE: LazyLock<Regex> = LazyLock::new(|| {
 // .package([name:,] url: "...", "V1"..<"V2") にマッチする — 半開区間
 static RANGE_HALF_OPEN_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r#"\.package\(\s*{}url:\s*"([^"]+)"\s*,\s*"([^"]+)"\s*\.\.<\s*"([^"]+)"\s*\)"#,
+        r#"\.package\(\s*{}url:\s*"([^"]+)"\s*,\s*"([^"]+)"\s*\.\.<\s*"([^"]+)"\s*[,)]"#,
         NAME_OPT
     ))
     .unwrap()
@@ -82,7 +82,7 @@ static RANGE_HALF_OPEN_RE: LazyLock<Regex> = LazyLock::new(|| {
 // .package([name:,] url: "...", "V1"..."V2") にマッチする — 閉区間
 static RANGE_CLOSED_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r#"\.package\(\s*{}url:\s*"([^"]+)"\s*,\s*"([^"]+)"\s*\.\.\.\s*"([^"]+)"\s*\)"#,
+        r#"\.package\(\s*{}url:\s*"([^"]+)"\s*,\s*"([^"]+)"\s*\.\.\.\s*"([^"]+)"\s*[,)]"#,
         NAME_OPT
     ))
     .unwrap()
@@ -1214,5 +1214,36 @@ let package = Package(
             .update_version(content, "apple/swift-nio", "2.41.0+build.123")
             .unwrap();
         assert!(result.contains(r#"from: "2.41.0+build.123""#));
+    }
+
+    #[test]
+    fn test_parse_from_with_traits() {
+        // SPM 6.1 の traits: 引数が末尾に付いても version requirement を解析できる
+        let content = r#".package(url: "https://github.com/apple/swift-nio.git", from: "2.40.0", traits: ["FeatureX"])"#;
+        let deps = PackageSwiftParser.parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "apple/swift-nio");
+        assert_eq!(deps[0].version_spec.version, "2.40.0");
+    }
+
+    #[test]
+    fn test_parse_exact_with_module_aliases() {
+        // moduleAliases: 引数が末尾に付いても version requirement を解析できる
+        let content = r#".package(url: "https://github.com/apple/swift-nio.git", exact: "2.40.0", moduleAliases: ["NIO": "AppNIO"])"#;
+        let deps = PackageSwiftParser.parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "apple/swift-nio");
+        assert_eq!(deps[0].version_spec.version, "2.40.0");
+    }
+
+    #[test]
+    fn test_update_version_from_with_traits_preserved() {
+        // traits: 引数を保ったまま version requirement だけ更新する
+        let content = r#".package(url: "https://github.com/apple/swift-nio.git", from: "2.40.0", traits: ["FeatureX"])"#;
+        let result = PackageSwiftParser
+            .update_version(content, "apple/swift-nio", "2.41.0")
+            .unwrap();
+        assert!(result.contains(r#"from: "2.41.0""#));
+        assert!(result.contains(r#"traits: ["FeatureX"]"#));
     }
 }

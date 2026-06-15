@@ -54,6 +54,10 @@ static WILDCARD_RE: LazyLock<Regex> =
 static RANGE_FIRST_VERSION_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(?:>=|<=|>|<|=)\s*([\d]+(?:\.[\d]+)*(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
 });
+// caret/tilde/wildcard 混在の複数要件から先頭のバージョントークンを抽出する。
+// (`^1.2.2, <1.5` -> `1.2.2`、`>=1.2, <1.5` -> `1.2`)
+static FIRST_VERSION_TOKEN_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[\d]+(?:\.[\d]+)*(?:-[\w.-]+)?(?:\+[\w.-]+)?").unwrap());
 
 impl VersionParser for RustVersionParser {
     fn parse(&self, version_str: &str) -> Option<VersionSpec> {
@@ -132,6 +136,23 @@ impl VersionParser for RustVersionParser {
                 .map(|m| m.as_str())
                 .unwrap_or("")
                 .to_string();
+            return Some(VersionSpec::new(
+                VersionSpecKind::Range,
+                trimmed,
+                first_version,
+            ));
+        }
+
+        // caret/tilde/wildcard を comparator と混在させたカンマ区切りの複数要件
+        // (`^1.2.2, <1.5` など) は comparator のみの RANGE_RE では拾えないが、
+        // Cargo (semver crate) では valid。parse 漏れによる無言スキップを防ぐため、
+        // semver::VersionReq で valid 性を確認して Range として検出する。
+        // (`<` 上限のない複数下限などは format 側で安全に Skip される)
+        if trimmed.contains(',') && semver::VersionReq::parse(trimmed).is_ok() {
+            let first_version = FIRST_VERSION_TOKEN_RE
+                .find(trimmed)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default();
             return Some(VersionSpec::new(
                 VersionSpecKind::Range,
                 trimmed,
@@ -616,5 +637,26 @@ mod tests {
         let spec = parse("<= 2.0.0").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::LessOrEqual);
         assert_eq!(spec.version, "2.0.0");
+    }
+
+    #[test]
+    fn test_parse_mixed_caret_comparator_range() {
+        // caret/tilde と comparator を混在させた複数要件も Cargo (semver) で valid。
+        // comparator のみの RANGE_RE では拾えないが Range として検出する。
+        let spec = parse("^1.2.2, <1.5").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1.2.2");
+
+        let tilde = parse("~1.2, <1.5").unwrap();
+        assert_eq!(tilde.kind, VersionSpecKind::Range);
+        assert_eq!(tilde.version, "1.2");
+    }
+
+    #[test]
+    fn test_parse_mixed_lower_bounds_detected_as_range() {
+        // 上限のない複数下限の混在も検出はされる (無言スキップしない)。
+        // 安全な書き換え可否は format / judge 側で判定される。
+        let spec = parse(">=1.2.3, ^1.3").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
     }
 }

@@ -55,9 +55,9 @@ static NOT_EQUAL_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^!=\s*(v?\d+(?:\.\d+){0,3}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
 });
 
-// ワイルドカード: 1.2.*, 1.x, 1.2.3.*, *
+// ワイルドカード: 1.2.*, 1.x, 1.2.3.*, *, V1.* (composer/semver は v/V を大小問わず許容)
 static WILDCARD_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(?:v?(?:\d+|[xX*])(?:\.(?:\d+|[xX*])){0,3}|\*)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^(?:[vV]?(?:\d+|[xX*])(?:\.(?:\d+|[xX*])){0,3}|\*)$").unwrap());
 
 // 固定バージョン: 1.2.3 / 1.2.3.4
 static BARE_VERSION_RE: LazyLock<Regex> =
@@ -92,6 +92,11 @@ fn extract_first_version(raw: &str) -> String {
 impl PhpVersionParser {
     /// 単一制約を解釈する
     fn parse_single(&self, version_str: &str) -> Option<VersionSpec> {
+        // インラインエイリアス (`1.0.0 as 1.1.0` / `1.0.0@dev as 1.1.0`) は別バージョンへの
+        // エイリアス宣言。レジストリ最新版で上書きすると宣言が壊れるためスキップする。
+        if version_str.contains(" as ") {
+            return None;
+        }
         let trimmed = version_str.trim().split('@').next().unwrap_or("").trim();
 
         if trimmed.is_empty() {
@@ -710,5 +715,23 @@ mod tests {
     fn test_parse_rejects_five_segments() {
         // 5セグメントは composer/semver の仕様上 invalid
         assert!(parse("1.2.3.4.5").is_none());
+    }
+
+    #[test]
+    fn test_parse_wildcard_uppercase_v() {
+        // composer/semver は v/V を大小問わず許容するため V1.* も Wildcard として解釈する
+        let spec = parse("V1.*").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Wildcard);
+        assert_eq!(spec.format_updated("2.5.0"), "V2.*");
+
+        let spec_x = parse("V1.x").unwrap();
+        assert_eq!(spec_x.kind, VersionSpecKind::Wildcard);
+    }
+
+    #[test]
+    fn test_parse_inline_alias_skipped() {
+        // インラインエイリアス (`as`) はエイリアス宣言を壊さないようスキップする
+        assert!(parse("1.0.0@dev as 1.1.0").is_none());
+        assert!(parse("1.0.0 as 1.1.0").is_none());
     }
 }

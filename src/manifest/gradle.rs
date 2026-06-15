@@ -58,15 +58,17 @@ struct RichVersionSelection {
 
 // Gradle DSL 用の正規表現
 
-// 変数定義 (Groovy): def wicketVersion = '1.2.3' または "1.2.3"
+// 変数定義 (Groovy): def wicketVersion = '1.2.3' / "1.2.3"。
+// 型宣言 String wicketVersion = '...' (def を伴わない明示型) も許容する。
 static VAR_DEF_GROOVY_SINGLE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"^\s*def\s+(\w+)\s*=\s*'([^']+)'"#).unwrap());
+    LazyLock::new(|| Regex::new(r#"^\s*(?:def|String)\s+(\w+)\s*=\s*'([^']+)'"#).unwrap());
 static VAR_DEF_GROOVY_DOUBLE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"^\s*def\s+(\w+)\s*=\s*"([^"]+)""#).unwrap());
+    LazyLock::new(|| Regex::new(r#"^\s*(?:def|String)\s+(\w+)\s*=\s*"([^"]+)""#).unwrap());
 
-// 変数定義 (Kotlin): val wicketVersion = "1.2.3"
+// 変数定義 (Kotlin): val wicketVersion = "1.2.3"。
+// 型注釈付き val wicketVersion: String = "..." (Kotlin DSL の慣用形) も許容する。
 static VAR_DEF_KOTLIN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"^\s*val\s+(\w+)\s*=\s*"([^"]+)""#).unwrap());
+    LazyLock::new(|| Regex::new(r#"^\s*val\s+(\w+)\s*(?::\s*\w+)?\s*=\s*"([^"]+)""#).unwrap());
 
 // ext ブロック内変数: wicketVersion = '1.2.3' または "1.2.3"
 static EXT_VAR_SINGLE: LazyLock<Regex> =
@@ -2339,5 +2341,35 @@ dependencies {
         let deps = parse(content).unwrap();
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].name, "junit:junit");
+    }
+
+    #[test]
+    fn test_parse_kotlin_typed_variable() {
+        // Kotlin DSL の型注釈付き変数 (val x: String = "...") も解決する
+        let content = r#"
+val guavaVersion: String = "32.1.2-jre"
+dependencies {
+    implementation("com.google.guava:guava:$guavaVersion")
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "com.google.guava:guava");
+        assert_eq!(deps[0].version_spec.version, "32.1.2-jre");
+    }
+
+    #[test]
+    fn test_parse_groovy_typed_variable() {
+        // Groovy の型宣言付き変数 (String x = '...') も解決する
+        let content = r#"
+String guavaVersion = '32.1.2-jre'
+dependencies {
+    implementation "com.google.guava:guava:${guavaVersion}"
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "com.google.guava:guava");
+        assert_eq!(deps[0].version_spec.version, "32.1.2-jre");
     }
 }
