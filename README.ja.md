@@ -256,7 +256,7 @@ depup --cd ./projects/myapp -n
 >
 > **注意**: バージョンなしで `git:` / `github:` / `bitbucket:` / `gist:` / `path:` / `source:` を指定した Gemfile 依存は、RubyGems のレジストリ制約へ変換せずにスキップします。行単位の `group:` / `groups:` オプションは開発依存の判定に使います。
 >
-> **注意**: Gemfile の依存宣言は、一般的な Ruby DSL 形式（`gem "rack", "~> 3.0"`）と括弧付きメソッド呼び出し形式（`gem("rack", "~> 3.0")`）のどちらも解析・更新できます。更新時は元の呼び出し形式を保持します。
+> **注意**: Gemfile の依存宣言は、一般的な Ruby DSL 形式（`gem "rack", "~> 3.0"`）と括弧付きメソッド呼び出し形式（`gem("rack", "~> 3.0")`）のどちらも解析・更新できます。更新時は元の呼び出し形式を保持します。同じ gem が複数箇所（例: トップレベルと `group :test` ブロックの両方）に宣言されている場合は、すべての出現が更新されます。
 >
 > **注意**: `alias = { package = "actual-crate", version = "1" }` のような Cargo のリネーム依存は、実パッケージ名で取得し、マニフェスト上のキーへ書き戻します。`--only` / `--exclude` はどちらの名前でも指定できます。
 >
@@ -282,6 +282,7 @@ depupは元のバージョン範囲形式を維持します：
 "1.x.x" → "2.x.x" （複数のワイルドカード位置を維持）
 "1.2.*" → "1.3.*" （ワイルドカード形式を維持）
 "v1.*" → "v2.*" （先頭の `v` を維持）
+"V1.*" → "V2.*" （Composer の大文字 `V` を維持）
 "^1.x" → "^2.x" （npm の caret + x-range、演算子を維持）
 "~1.2.x" → "~2.3.x" （npm の tilde + x-range、演算子を維持）
 "5.3.+" → "5.4.+" （Gradle プレフィックスを維持）
@@ -302,7 +303,7 @@ Gradle の `strictly` / `require` / `prefer` / `reject` を使う rich version �
 
 `gradle/*.versions.toml` にある Gradle version catalog は Java マニフェストとして検出されます。depup は `[libraries]` の `alias = "group:name:version"`、`module = "group:name"`、`group` / `name` / `version`、`version.ref` を解析し、参照先の `[versions]` もその場で更新します。`strictly` / `require` / `prefer` / `reject` / `rejectAll` を含む rich version table は Gradle build ファイルと同じ候補選別ルールで扱います。`[plugins]` は Gradle plugin ID で Maven Central 座標と一致しないため更新対象から除外します。
 
-Python の compatible release 句は PEP 440 に従います。`~=1.2` や `~=1.2.3` は有効ですが、単一セグメントの無効な形式である `~=1` はスキップします。
+Python の compatible release 句は PEP 440 に従います。`~=1.2`（= `>=1.2,<2.0`）と `~=1.2.3`（= `>=1.2.3,<1.3.0`）は明示的な上限を持つレンジとして扱われ、互換範囲内に留まって更新されます（`~=1.2.3` は 1.2 系、`~=1.2` は 1.x 系に留まり major/minor を跨ぎません）。書き換えは元のセグメント数を維持します（`~=1.2` → `~=1.9`。`~=1.9.0` にすると上限が `<1.10.0` に変わってしまうため）。単一セグメントの無効な形式である `~=1` はスキップします。
 
 PEP 440 のプレリリースは、セパレータなしで書かれた場合（例: `2.0.0rc1`, `1.0rc1`, `1.0.0a1`）でも検出され、デフォルトで除外されます。これにより安定版の依存がリリース候補へ誤って更新されることはありません。ポストリリース（`1.0.post1`）は対応する安定版より新しいと比較され、エポック（`1!2.3`）は比較時に最優先されます。
 
@@ -339,15 +340,16 @@ npm/Composer のハイフンレンジでは、右辺が `1.0 - 2.0` のような
 
 JSON マニフェストでは、depup が解析対象にする依存セクションだけを書き換えます。`package.json` の `overrides`、`composer.json` の `replace` / `provide` / `conflict` などは変更しません。
 
-TOML マニフェストでは、基本文字列（`"..."`）とリテラル文字列（`'...'`）のどちらも、対応する依存セクション内では引用符を維持して更新します。`Cargo.toml` では `[dependencies]`、`[dev-dependencies]`、`[build-dependencies]`、`[workspace.dependencies]`、target 固有の依存テーブルだけを書き換え、metadata テーブルは変更しません。`crates-io` 以外の `registry` を指定した Cargo 依存は、depup が crates.io だけを問い合わせるためスキップします。Cargo の比較レンジは `>=1.0, <2.0, >=1.0.100` のように3個以上のカンマ区切り requirement にも対応します。
+TOML マニフェストでは、基本文字列（`"..."`）とリテラル文字列（`'...'`）のどちらも、対応する依存セクション内では引用符を維持して更新します。`Cargo.toml` では `[dependencies]`、`[dev-dependencies]`、`[build-dependencies]`、`[workspace.dependencies]`、target 固有の依存テーブルだけを書き換え、metadata テーブルは変更しません。`crates-io` 以外の `registry` を指定した Cargo 依存は、depup が crates.io だけを問い合わせるためスキップします。Cargo の比較レンジは `>=1.0, <2.0, >=1.0.100` のように3個以上のカンマ区切り requirement にも対応します。`^1.2.2, <1.5` のように caret/tilde/wildcard と comparator を混在させた複数要件も `semver::VersionReq` で valid 性を確認して Range として検出します（以前は黙ってスキップしていました）。上限のない複数下限の混在で安全に書き換えられないものは Skip として可視化します。
 
-Python の PEP 508 version list は `>=3.5,<4,` のような末尾カンマを許容します。depup は下限更新時にもこのカンマを維持します。`pypi` 以外の `source` を指定した Poetry 依存は、PEP 621 依存を `tool.poetry.dependencies` で補足している場合も含め、depup が PyPI だけを問い合わせるためスキップします。Poetry のマルチプル制約配列形式（`foo = [{version = "<=1.9", python = ">=3.6,<3.8"}, {version = "^2.0", python = ">=3.8"}]`）も、要素ごとの `requires_python` 解決を伴わずに配列要素を安全に書き換えられないためスキップします。
+`[project]` / `[tool.rye]` セクションでは `dependencies` / `dev-dependencies` 配列だけを書き換え、`name` / `description` / `keywords` 等のメタデータ文字列は PEP 508 依存指定に見えても書き換えません。Python の PEP 508 version list は `>=3.5,<4,` のような末尾カンマを許容します。depup は下限更新時にもこのカンマを維持します。`pypi` 以外の `source` を指定した Poetry 依存は、PEP 621 依存を `tool.poetry.dependencies` で補足している場合も含め、depup が PyPI だけを問い合わせるためスキップします。Poetry のマルチプル制約配列形式（`foo = [{version = "<=1.9", python = ">=3.6,<3.8"}, {version = "^2.0", python = ">=3.8"}]`）も、要素ごとの `requires_python` 解決を伴わずに配列要素を安全に書き換えられないためスキップします。
 
 Gradle の文字列記法では `:resources@zip` や `@aar` のような classifier / extension サフィックスを維持します。`//` 行コメントや `/* ... */` ブロックコメント内だけにある依存宣言は更新対象にしません。Gradle version catalog では、バージョンが宣言されている TOML の文字列形式または table 形式を維持して更新します。
 
 Swift の GitHub 依存では、タグの接頭辞 `v1.2.3` と `V1.2.3` の両方を認識します。
 また、`Package.swift` では `//` 行コメントや `/* ... */` ブロックコメント内に書かれた依存宣言は解析対象から除外します。
 SPM の semver 2.0.0 仕様に合わせ、プレリリース識別子付きバージョン（`1.0.0-beta.1`）、ビルドメタデータ付き（`1.0.0+build.123`）、両者を組み合わせた形式（`1.0.0-rc.1+sha.abc`）も解析・更新できます。
+`.package(...)` の末尾に `traits: [...]`（SPM 6.1 の Package Traits）や `moduleAliases: [...]` のような追加引数があっても、version requirement だけを置換して追加引数を保持します。Swift Package Registry の `id:` 依存（`.package(id: "scope.name", ...)`）は registry API アダプタが未実装のため現状未対応でスキップされます（GitHub URL 依存のみ対象。将来対応予定）。
 
 `go.mod` では、`) // direct deps` のようなコメント付きブロック終端も通常のブロック終端として扱い、`require` / `replace` / `exclude` ブロックのパースと更新に反映します。
 `require "golang.org/x/text" "v0.14.0"` のような quoted module path / version も解析し、引用符を維持して更新します。

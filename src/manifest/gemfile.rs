@@ -238,8 +238,9 @@ impl ManifestParser for GemfileParser {
                 None => (raw_line, ""),
             };
 
-            if !updated
-                && let Some(caps) = GEM_RE.captures(line)
+            // 同名 gem が複数箇所 (group 内外など) に宣言されている場合は全出現を更新する。
+            // Cargo / Gradle / pyproject と同じく「1 依存 = 全出現を書き換え」の不変条件を守る。
+            if let Some(caps) = GEM_RE.captures(line)
                 && caps.get(1).map(|m| m.as_str()) == Some(package)
             {
                 let mut version_parts = Vec::new();
@@ -1157,12 +1158,10 @@ gem 'pg', '~> 1.5'
         assert_eq!(result, "gem 'grpc', '1.62.0', force_ruby_platform: true\n");
     }
 
-    // --- CRLF 改行コード保持の回帰テスト ---
-
     #[test]
-    fn zzz_temp_duplicate_gem_only_first_updated() {
-        // 同名 gem が複数箇所にある Gemfile (group 内外など) を 1 回 update_version すると
-        // 最初の 1 箇所しか更新されないか検証 (codex claim #3)
+    fn test_update_version_duplicate_gem_updates_all_occurrences() {
+        // 同名 gem が複数箇所 (group 内外) にある場合は全出現が更新される。
+        // Cargo / Gradle / pyproject と同じ「1 依存 = 全出現を書き換え」の不変条件。
         let content = r#"
 gem 'rails', '~> 7.0'
 
@@ -1170,32 +1169,22 @@ group :test do
   gem 'rails', '~> 7.0'
 end
 "#;
+        // parse は同名 gem を 2 件返す
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.iter().filter(|d| d.name == "rails").count(), 2);
+        // update_version は両方の出現を更新する
         let result = GemfileParser
             .update_version(content, "rails", "7.1.0")
             .unwrap();
-        println!("DUP_RESULT:\n{}", result);
-        let count = result.matches("7.1.0").count();
         assert_eq!(
-            count, 2,
-            "BUG CONFIRMED: 同名 gem の複数出現のうち {} 箇所しか更新されない:\n{}",
-            count, result
+            result.matches("7.1.0").count(),
+            2,
+            "同名 gem の全出現が更新されるべき:\n{}",
+            result
         );
     }
 
-    #[test]
-    fn zzz_temp_duplicate_gem_parse_count() {
-        // parse が同名 gem を複数返すか (writer が複数回 update を呼ぶ前提条件)
-        let content = r#"
-gem 'rails', '~> 7.0'
-group :test do
-  gem 'rails', '~> 7.0'
-end
-"#;
-        let deps = parse(content).unwrap();
-        let rails_count = deps.iter().filter(|d| d.name == "rails").count();
-        println!("PARSE_RAILS_COUNT: {}", rails_count);
-        assert_eq!(rails_count, 2, "parse は同名 gem を 2 件返すはず");
-    }
+    // --- CRLF 改行コード保持の回帰テスト ---
 
     #[test]
     fn test_update_version_preserves_crlf_line_endings() {

@@ -218,10 +218,13 @@ impl ManifestParser for PyprojectTomlParser {
         let mut result = String::with_capacity(content.len());
         let mut updated = false;
         let mut section = TomlSectionKind::Other;
+        // `[project]` / `[tool.rye]` 内で依存配列 (`dependencies` / `dev-dependencies`) の中にいるか
+        let mut in_scoped_dep_array = false;
 
         for line in content.split_inclusive('\n') {
             if let Some(header) = toml_section_header(line) {
                 section = classify_toml_section(header);
+                in_scoped_dep_array = false;
                 result.push_str(line);
                 continue;
             }
@@ -241,6 +244,36 @@ impl ManifestParser for PyprojectTomlParser {
                     parser.as_ref(),
                     new_version,
                 ),
+                TomlSectionKind::Pep508ScopedArrays => {
+                    // 依存配列 (`dependencies = [` / `dev-dependencies = [`) の内側だけ処理する。
+                    // `name` / `keywords` / `description` 等の他キーは書き換えない。
+                    if in_scoped_dep_array {
+                        if line_has_scoped_array_close(line) {
+                            in_scoped_dep_array = false;
+                        }
+                        update_pep508_array_line(
+                            line,
+                            pep508_re.as_ref(),
+                            package,
+                            parser.as_ref(),
+                            new_version,
+                        )
+                    } else if is_scoped_dependency_array_start(line) {
+                        // 配列開始行。同一行で閉じなければ以降も配列内
+                        if !line_has_scoped_array_close(line) {
+                            in_scoped_dep_array = true;
+                        }
+                        update_pep508_array_line(
+                            line,
+                            pep508_re.as_ref(),
+                            package,
+                            parser.as_ref(),
+                            new_version,
+                        )
+                    } else {
+                        None
+                    }
+                }
                 TomlSectionKind::Other => None,
             };
 
@@ -270,8 +303,13 @@ impl ManifestParser for PyprojectTomlParser {
 enum TomlSectionKind {
     /// Poetry の依存セクション (`name = "^1.0"` / inline table 置換の対象)
     PoetryDependencies,
-    /// parse が PEP 508 配列として読む依存セクション (配列要素置換の対象)
+    /// セクション全体が PEP 508 依存配列 (の集合) で全行が置換対象
+    /// (`[project.optional-dependencies]` / `[dependency-groups]`)
     Pep508Dependencies,
+    /// セクション内の特定の依存配列 (`dependencies` / `dev-dependencies`) だけが置換対象で、
+    /// `name` / `keywords` / `description` 等の他キーは書き換えてはいけないセクション
+    /// (`[project]` / `[tool.rye]`)
+    Pep508ScopedArrays,
     /// 依存セクション以外 (`[build-system]` 等。書き換え対象外)
     Other,
 }
@@ -303,19 +341,52 @@ fn classify_toml_section(header: &str) -> TomlSectionKind {
     {
         return TomlSectionKind::PoetryDependencies;
     }
-    // parse が PEP 508 配列を読むセクション:
-    // - [project] 内の dependencies / optional-dependencies (PEP 621)
-    // - [project.optional-dependencies] (PEP 621)
-    // - [dependency-groups] (PEP 735)
-    // - [tool.rye] 内の dev-dependencies (Rye)
-    if header == "project"
-        || header == "project.optional-dependencies"
-        || header == "dependency-groups"
-        || header == "tool.rye"
-    {
+    // セクション全体が PEP 508 依存配列 (の集合) で、全行が置換対象:
+    // - [project.optional-dependencies] (PEP 621、各キー = 配列)
+    // - [dependency-groups] (PEP 735、各キー = 配列)
+    if header == "project.optional-dependencies" || header == "dependency-groups" {
         return TomlSectionKind::Pep508Dependencies;
     }
+    // セクション内の特定の依存配列だけが対象 (name/keywords/description 等は書き換えない):
+    // - [project] の dependencies 配列 (PEP 621)
+    // - [tool.rye] の dev-dependencies 配列 (Rye)
+    if header == "project" || header == "tool.rye" {
+        return TomlSectionKind::Pep508ScopedArrays;
+    }
     TomlSectionKind::Other
+}
+
+/// `[project]` / `[tool.rye]` 内で依存配列 (`dependencies = [` / `dev-dependencies = [`) の
+/// 開始行かどうかを判定する。`name = "..."` や `keywords = [...]` は対象外。
+fn is_scoped_dependency_array_start(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let after_key = if let Some(rest) = trimmed.strip_prefix("dependencies") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("dev-dependencies") {
+        rest
+    } else {
+        return false;
+    };
+    // キー名の直後は空白か `=` のみ (`dependencies-extra` のような別キーに前方一致しない)
+    let after_key = after_key.trim_start();
+    after_key.starts_with('=') && after_key[1..].trim_start().starts_with('[')
+}
+
+/// 行をクォート外でスキャンし、配列の閉じ括弧 `]` を含むか判定する。
+/// extras (`foo[extra]`) のようなクォート内の `]` は配列終了とみなさない。
+fn line_has_scoped_array_close(line: &str) -> bool {
+    let mut in_single = false;
+    let mut in_double = false;
+    for ch in line.chars() {
+        match ch {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '#' if !in_single && !in_double => return false,
+            ']' if !in_single && !in_double => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// 正規表現キャプチャから引用符種別と旧バージョン文字列 (グループ 2/3) を取り出す
@@ -1747,8 +1818,9 @@ dev-dependencies = [
     }
 
     #[test]
-    fn zzz_temp_project_metadata_false_positive() {
-        // codex claim: [project] 内の非依存メタデータ文字列が書き換わるか検証
+    fn test_update_version_skips_project_metadata_string() {
+        // [project] 内の非依存メタデータ文字列 (description) は依存として書き換えない。
+        // dependencies 配列内の同名依存だけが更新される。
         let content = r#"
 [project]
 name = "mypkg"
@@ -1760,66 +1832,47 @@ dependencies = [
         let result = PyprojectTomlParser
             .update_version(content, "requests", "2.31.0")
             .unwrap();
-        println!("RESULT:\n{}", result);
-        // description が書き換わっていないことを期待
         assert!(
             result.contains(r#"description = "requests>=2 is required for this""#),
-            "BUG CONFIRMED: description metadata was rewritten:\n{}",
+            "description メタデータが書き換わってはいけない:\n{}",
+            result
+        );
+        assert!(
+            result.contains("requests>=2.31.0"),
+            "dependencies 配列内の requests は更新されるべき:\n{}",
             result
         );
     }
 
     #[test]
-    fn zzz_temp_project_array_metadata_false_positive() {
-        // [project] 配下の別の配列キー (keywords 等) が依存配列のように書き換わるか
+    fn test_update_version_skips_project_keywords_array() {
+        // [project] 配下の別の配列キー (keywords) は依存配列ではないので書き換えない。
+        // flask は keywords にしかなく dependencies に無いので Err になる。
         let content = r#"
 [project]
 keywords = ["flask>=2.0"]
 dependencies = ["requests>=2.28.0"]
 "#;
         let result = PyprojectTomlParser.update_version(content, "flask", "9.9.9");
-        println!("RESULT_KW: {:?}", result);
-        // flask は keywords にしかない。dependencies には無いので本来 Err。
         assert!(
             result.is_err(),
-            "BUG CONFIRMED: keywords array string rewritten as dep: {:?}",
+            "keywords 配列の文字列を依存として書き換えてはいけない: {:?}",
             result
         );
     }
 
     #[test]
-    fn zzz_temp_exact_metadata_version_false_positive() {
-        // メタデータ文字列が「ちょうど有効な依存指定」と一致するケース
+    fn test_update_version_skips_exact_metadata_string() {
+        // メタデータ文字列が「ちょうど有効な依存指定」と一致しても依存として書き換えない。
         let content = r#"
 [project]
 description = "flask>=2.0"
 dependencies = ["requests>=2.28.0"]
 "#;
         let result = PyprojectTomlParser.update_version(content, "flask", "9.9.9");
-        println!("RESULT_EXACT: {:?}", result);
         assert!(
             result.is_err(),
-            "BUG CONFIRMED: exact-valid metadata string rewritten: {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn zzz_temp_dependency_groups_metadata_false_positive() {
-        // [dependency-groups] 直下に配列でないキーは通常ないが、project は name/description を持つ
-        let content = r#"
-[project]
-readme = "requests>=1 see docs"
-dependencies = ["flask>=2.0"]
-"#;
-        // flask を更新する際 readme(requests) は無関係。requests を更新するケースを試す
-        let result = PyprojectTomlParser.update_version(content, "requests", "9.9.9");
-        println!("RESULT2: {:?}", result);
-        // requests は dependencies に存在しないので本来 Err になるべき。
-        // しかし readme 行がマッチして Ok になるなら false positive。
-        assert!(
-            result.is_err(),
-            "BUG CONFIRMED: requests not in deps but readme matched: {:?}",
+            "メタデータ文字列を依存として書き換えてはいけない: {:?}",
             result
         );
     }

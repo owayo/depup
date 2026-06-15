@@ -95,11 +95,19 @@ static RANGE_CLOSED_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// - https://github.com/owner/repo
 /// - git@github.com:owner/repo.git
 fn extract_github_owner_repo(url: &str) -> Option<String> {
+    // owner/repo に `?` `#` 空白等の不正文字が混ざると、後段の GitHub API URL 構築で
+    // クエリ汚染やパストラバーサルを誘発しうるため、ここで文字種を GitHub 準拠に限定する。
+    fn is_valid_segment(s: &str) -> bool {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    }
+
     // HTTPS URL パターン
     if let Some(rest) = url.strip_prefix("https://github.com/") {
         let path = rest.trim_end_matches(".git");
         let parts: Vec<&str> = path.splitn(3, '/').collect();
-        if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+        if parts.len() >= 2 && is_valid_segment(parts[0]) && is_valid_segment(parts[1]) {
             return Some(format!("{}/{}", parts[0], parts[1]));
         }
     }
@@ -108,7 +116,7 @@ fn extract_github_owner_repo(url: &str) -> Option<String> {
     if let Some(rest) = url.strip_prefix("git@github.com:") {
         let path = rest.trim_end_matches(".git");
         let parts: Vec<&str> = path.splitn(3, '/').collect();
-        if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+        if parts.len() >= 2 && is_valid_segment(parts[0]) && is_valid_segment(parts[1]) {
             return Some(format!("{}/{}", parts[0], parts[1]));
         }
     }
@@ -1245,5 +1253,44 @@ let package = Package(
             .unwrap();
         assert!(result.contains(r#"from: "2.41.0""#));
         assert!(result.contains(r#"traits: ["FeatureX"]"#));
+    }
+
+    #[test]
+    fn test_extract_github_owner_repo_rejects_invalid_chars() {
+        // owner/repo に不正文字 (? 空白等) が混ざる URL は None を返す (URL インジェクション防止)
+        assert_eq!(
+            extract_github_owner_repo("https://github.com/owner/repo?evil=1"),
+            None
+        );
+        assert_eq!(
+            extract_github_owner_repo("https://github.com/own er/rep o"),
+            None
+        );
+        // 正常な URL は owner/repo を返す
+        assert_eq!(
+            extract_github_owner_repo("https://github.com/apple/swift-nio.git"),
+            Some("apple/swift-nio".to_string())
+        );
+        assert_eq!(
+            extract_github_owner_repo("git@github.com:apple/swift-nio.git"),
+            Some("apple/swift-nio".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_registry_id_dependency_not_yet_supported() {
+        // Swift Package Registry の id: 依存 (.package(id: "scope.name", ...)) は現状未対応で
+        // 検出されない (既知の制限、README 参照)。registry API アダプタが未実装のため、
+        // 現時点では GitHub URL 依存のみを対象とする。
+        let content = r#"
+let package = Package(
+    name: "x",
+    dependencies: [
+        .package(id: "apple.swift-nio", from: "2.40.0"),
+    ]
+)
+"#;
+        let deps = PackageSwiftParser.parse(content).unwrap();
+        assert_eq!(deps.len(), 0);
     }
 }

@@ -305,11 +305,14 @@ fn format_range_like(raw: &str, new_version: &str) -> Option<String> {
         return None;
     }
 
-    // PEP 440 の compatible release (`~=1.2.3`) は演算子を保持しつつ、バージョンの
-    // セグメント数を維持して下限を進める。セグメント数を変えると上限の意味が変わる
-    // (`~=1.2` の上限 <2.0 が `~=1.9.0` だと <1.10.0 になる) ため、
-    // format_partial_version_like でセグメント数を保ったまま整形する。
-    if let Some(rest) = trimmed.strip_prefix("~=") {
+    // 単一制約の `~=1.2.3` のみ、演算子を保持しつつセグメント数を維持して下限を進める。
+    // セグメント数を変えると上限の意味が変わる (`~=1.2` の上限 <2.0 が `~=1.9.0` だと
+    // <1.10.0 になる) ため、format_partial_version_like でセグメント数を保つ。
+    // `~=1.2, <1.5` のような複合制約は横取りせず、下の find_inclusive_lower_bound_token
+    // 経路に任せる (横取りすると body にカンマ以降が混ざり format に失敗する)。
+    if !trimmed.contains(',')
+        && let Some(rest) = trimmed.strip_prefix("~=")
+    {
         let spacing_len = rest.len() - rest.trim_start().len();
         let spacing = &rest[..spacing_len];
         let body = rest.trim();
@@ -916,5 +919,12 @@ mod tests {
         assert_eq!(three.format_updated("1.2.9"), "~=1.2.9");
         let two = VersionSpec::new(VersionSpecKind::Range, "~=1.2", "1.2");
         assert_eq!(two.format_updated("1.9.5"), "~=1.9");
+    }
+
+    #[test]
+    fn test_format_range_like_pep440_compatible_release_compound() {
+        // `~=1.2, <1.5` のような複合制約は ~= 分岐に横取りされず、下限側のみ進める (回帰防止)
+        let spec = VersionSpec::new(VersionSpecKind::Range, "~=1.2, <1.5", "1.2");
+        assert_eq!(spec.format_updated("1.4"), "~=1.4, <1.5");
     }
 }

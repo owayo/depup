@@ -256,7 +256,7 @@ Use `--include-pinned` to update pinned versions.
 >
 > **Note**: Gemfile entries that point to non-registry sources without a version (`git:`, `github:`, `bitbucket:`, `gist:`, `path:`, `source:`) are skipped instead of being converted into RubyGems registry constraints. Inline `group:` / `groups:` options are used to classify development dependencies.
 >
-> **Note**: Gemfile declarations can use either the common Ruby DSL form (`gem "rack", "~> 3.0"`) or parenthesized method-call form (`gem("rack", "~> 3.0")`). Both forms are parsed and updated while preserving the original call style.
+> **Note**: Gemfile declarations can use either the common Ruby DSL form (`gem "rack", "~> 3.0"`) or parenthesized method-call form (`gem("rack", "~> 3.0")`). Both forms are parsed and updated while preserving the original call style. When the same gem is declared in multiple places (for example both at the top level and inside a `group :test` block), all occurrences are updated.
 >
 > **Note**: Cargo renamed dependencies such as `alias = { package = "actual-crate", version = "1" }` are fetched by the real package name and written back through the manifest key. `--only` and `--exclude` accept either name.
 >
@@ -282,6 +282,7 @@ depup preserves the original version range format:
 "1.x.x" → "2.x.x" (all wildcard positions preserved)
 "1.2.*" → "1.3.*" (wildcard shape preserved)
 "v1.*" → "v2.*" (leading `v` preserved)
+"V1.*" → "V2.*" (Composer uppercase `V` preserved)
 "^1.x" → "^2.x" (npm caret + x-range, operator preserved)
 "~1.2.x" → "~2.3.x" (npm tilde + x-range, operator preserved)
 "5.3.+" → "5.4.+" (Gradle prefix preserved)
@@ -302,7 +303,7 @@ Gradle rich version declarations using `strictly`, `require`, `prefer`, and `rej
 
 Gradle version catalogs under `gradle/*.versions.toml` are detected as Java manifests. depup parses `[libraries]` entries written as `alias = "group:name:version"`, `module = "group:name"`, `group` / `name` / `version`, and `version.ref`; referenced `[versions]` entries are updated in place. Rich version tables with `strictly`, `require`, `prefer`, `reject`, and `rejectAll` follow the same candidate rules as Gradle build files. `[plugins]` entries are skipped because Gradle plugin IDs are not Maven Central coordinates.
 
-Python compatible release clauses follow PEP 440: `~=1.2` and `~=1.2.3` are valid, while the invalid single-segment form `~=1` is skipped.
+Python compatible release clauses follow PEP 440: `~=1.2` (= `>=1.2,<2.0`) and `~=1.2.3` (= `>=1.2.3,<1.3.0`) are treated as ranges with an explicit upper bound, so updates stay within the compatible range (`~=1.2.3` stays in the 1.2 series, `~=1.2` stays in the 1.x series) and preserve the original segment count (`~=1.2` → `~=1.9`). The invalid single-segment form `~=1` is skipped.
 
 PEP 440 prerelease versions are detected and excluded by default even when written without a separator (e.g. `2.0.0rc1`, `1.0rc1`, `1.0.0a1`), so a stable dependency is never accidentally bumped to a release candidate. Post-releases (`1.0.post1`) compare as newer than the corresponding release, and epochs (`1!2.3`) take precedence in comparison.
 
@@ -339,15 +340,16 @@ Constraints that cannot be rewritten safely are skipped instead of being rewritt
 
 For JSON manifests, depup only rewrites dependency sections it parses. In `package.json`, `overrides` is left untouched; in `composer.json`, sections such as `replace`, `provide`, and `conflict` are left untouched.
 
-For TOML manifests, depup preserves both basic strings (`"..."`) and literal strings (`'...'`) when updating supported dependency sections. In `Cargo.toml`, dependency updates are limited to dependency tables such as `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]`, `[workspace.dependencies]`, and target-specific dependency tables; metadata tables are left untouched. Cargo dependencies that specify a non-`crates-io` `registry` are skipped because depup only queries crates.io. Cargo comparison ranges may contain more than two comma-separated requirements, for example `>=1.0, <2.0, >=1.0.100`.
+For TOML manifests, depup preserves both basic strings (`"..."`) and literal strings (`'...'`) when updating supported dependency sections. In `Cargo.toml`, dependency updates are limited to dependency tables such as `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]`, `[workspace.dependencies]`, and target-specific dependency tables; metadata tables are left untouched. Cargo dependencies that specify a non-`crates-io` `registry` are skipped because depup only queries crates.io. Cargo comparison ranges may contain more than two comma-separated requirements, for example `>=1.0, <2.0, >=1.0.100`. Mixed multi-requirement constraints that combine caret/tilde/wildcard with comparators, such as `^1.2.2, <1.5`, are validated with `semver::VersionReq` and detected as ranges; constraints without an upper bound that cannot be rewritten safely are skipped instead of being silently dropped.
 
-Python PEP 508 version lists may include a trailing comma, such as `>=3.5,<4,`; depup parses and preserves that comma when updating the lower bound. Poetry dependencies with a non-`pypi` `source` are skipped, including PEP 621 dependencies enriched by `tool.poetry.dependencies`, because depup only queries PyPI. Poetry's multiple-constraints array form (`foo = [{version = "<=1.9", python = ">=3.6,<3.8"}, {version = "^2.0", python = ">=3.8"}]`) is also skipped, because depup cannot safely rewrite an individual array element without per-element `requires_python` resolution.
+In `[project]` and `[tool.rye]` sections, depup rewrites only the `dependencies` / `dev-dependencies` arrays; metadata strings such as `name`, `description`, and `keywords` are never modified even if they look like PEP 508 specifiers. Python PEP 508 version lists may include a trailing comma, such as `>=3.5,<4,`; depup parses and preserves that comma when updating the lower bound. Poetry dependencies with a non-`pypi` `source` are skipped, including PEP 621 dependencies enriched by `tool.poetry.dependencies`, because depup only queries PyPI. Poetry's multiple-constraints array form (`foo = [{version = "<=1.9", python = ">=3.6,<3.8"}, {version = "^2.0", python = ">=3.8"}]`) is also skipped, because depup cannot safely rewrite an individual array element without per-element `requires_python` resolution.
 
 For Gradle string notation, depup preserves classifier and extension suffixes such as `:resources@zip` or `@aar`, and skips dependencies that appear only in `//` line comments or `/* ... */` block comments. Gradle version catalog updates preserve the original TOML string or table shape where the version is declared.
 
 For Swift GitHub dependencies, depup recognizes both `v1.2.3` and `V1.2.3` tag prefixes.
 depup also skips `Package.swift` dependencies that appear inside `//` line comments or `/* ... */` block comments.
 Per the SPM semver 2.0.0 specification, depup parses and updates dependencies that include prerelease identifiers (`1.0.0-beta.1`) and build metadata (`1.0.0+build.123`), including combined forms (`1.0.0-rc.1+sha.abc`).
+depup also parses `.package(...)` declarations with trailing arguments such as `traits: [...]` (SPM 6.1) or `moduleAliases: [...]`, updating only the version requirement while preserving the extra arguments. Swift Package Registry `id:` dependencies (`.package(id: "scope.name", ...)`) are not yet supported and are skipped; only GitHub URL dependencies are processed.
 
 For `go.mod`, depup treats block endings with trailing comments such as `) // direct deps` as normal block endings when parsing and updating `require`, `replace`, and `exclude` blocks.
 Quoted `go.mod` module paths and versions, such as `require "golang.org/x/text" "v0.14.0"`, are parsed and updated while preserving the quotes.

@@ -68,14 +68,21 @@ impl GitHubTagsAdapter {
         format!("{}/repos/{}/tags?per_page=100", GITHUB_API_URL, owner_repo)
     }
 
-    /// パッケージ名が "owner/repo" 形式であることを検証
+    /// パッケージ名が "owner/repo" 形式かつ GitHub の許容文字のみであることを検証する。
+    /// owner/repo に `?` `#` `/` `..` 等が混ざると `build_url` で URL クエリ汚染や
+    /// パストラバーサルが起きうるため、Maven Central と同様に文字種を限定する。
     fn validate_package_name(&self, package: &str) -> Result<(), RegistryError> {
         let parts: Vec<&str> = package.split('/').collect();
-        if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+        let is_valid_segment = |s: &str| {
+            !s.is_empty()
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        };
+        if parts.len() != 2 || !is_valid_segment(parts[0]) || !is_valid_segment(parts[1]) {
             return Err(RegistryError::InvalidPackageName {
                 name: package.to_string(),
                 registry: self.registry_name().to_string(),
-                reason: "expected format: owner/repo".to_string(),
+                reason: "expected format: owner/repo with [A-Za-z0-9._-] characters".to_string(),
             });
         }
         Ok(())
