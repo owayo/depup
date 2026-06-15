@@ -1747,6 +1747,84 @@ dev-dependencies = [
     }
 
     #[test]
+    fn zzz_temp_project_metadata_false_positive() {
+        // codex claim: [project] 内の非依存メタデータ文字列が書き換わるか検証
+        let content = r#"
+[project]
+name = "mypkg"
+description = "requests>=2 is required for this"
+dependencies = [
+    "requests>=2.28.0",
+]
+"#;
+        let result = PyprojectTomlParser
+            .update_version(content, "requests", "2.31.0")
+            .unwrap();
+        println!("RESULT:\n{}", result);
+        // description が書き換わっていないことを期待
+        assert!(
+            result.contains(r#"description = "requests>=2 is required for this""#),
+            "BUG CONFIRMED: description metadata was rewritten:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn zzz_temp_project_array_metadata_false_positive() {
+        // [project] 配下の別の配列キー (keywords 等) が依存配列のように書き換わるか
+        let content = r#"
+[project]
+keywords = ["flask>=2.0"]
+dependencies = ["requests>=2.28.0"]
+"#;
+        let result = PyprojectTomlParser.update_version(content, "flask", "9.9.9");
+        println!("RESULT_KW: {:?}", result);
+        // flask は keywords にしかない。dependencies には無いので本来 Err。
+        assert!(
+            result.is_err(),
+            "BUG CONFIRMED: keywords array string rewritten as dep: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn zzz_temp_exact_metadata_version_false_positive() {
+        // メタデータ文字列が「ちょうど有効な依存指定」と一致するケース
+        let content = r#"
+[project]
+description = "flask>=2.0"
+dependencies = ["requests>=2.28.0"]
+"#;
+        let result = PyprojectTomlParser.update_version(content, "flask", "9.9.9");
+        println!("RESULT_EXACT: {:?}", result);
+        assert!(
+            result.is_err(),
+            "BUG CONFIRMED: exact-valid metadata string rewritten: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn zzz_temp_dependency_groups_metadata_false_positive() {
+        // [dependency-groups] 直下に配列でないキーは通常ないが、project は name/description を持つ
+        let content = r#"
+[project]
+readme = "requests>=1 see docs"
+dependencies = ["flask>=2.0"]
+"#;
+        // flask を更新する際 readme(requests) は無関係。requests を更新するケースを試す
+        let result = PyprojectTomlParser.update_version(content, "requests", "9.9.9");
+        println!("RESULT2: {:?}", result);
+        // requests は dependencies に存在しないので本来 Err になるべき。
+        // しかし readme 行がマッチして Ok になるなら false positive。
+        assert!(
+            result.is_err(),
+            "BUG CONFIRMED: requests not in deps but readme matched: {:?}",
+            result
+        );
+    }
+
+    #[test]
     fn test_parse_full_optional_dependencies_groups() {
         // `optional-dependencies` の全グループが解釈されるか確認する
         let content = r#"

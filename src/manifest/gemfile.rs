@@ -1160,6 +1160,44 @@ gem 'pg', '~> 1.5'
     // --- CRLF 改行コード保持の回帰テスト ---
 
     #[test]
+    fn zzz_temp_duplicate_gem_only_first_updated() {
+        // 同名 gem が複数箇所にある Gemfile (group 内外など) を 1 回 update_version すると
+        // 最初の 1 箇所しか更新されないか検証 (codex claim #3)
+        let content = r#"
+gem 'rails', '~> 7.0'
+
+group :test do
+  gem 'rails', '~> 7.0'
+end
+"#;
+        let result = GemfileParser
+            .update_version(content, "rails", "7.1.0")
+            .unwrap();
+        println!("DUP_RESULT:\n{}", result);
+        let count = result.matches("7.1.0").count();
+        assert_eq!(
+            count, 2,
+            "BUG CONFIRMED: 同名 gem の複数出現のうち {} 箇所しか更新されない:\n{}",
+            count, result
+        );
+    }
+
+    #[test]
+    fn zzz_temp_duplicate_gem_parse_count() {
+        // parse が同名 gem を複数返すか (writer が複数回 update を呼ぶ前提条件)
+        let content = r#"
+gem 'rails', '~> 7.0'
+group :test do
+  gem 'rails', '~> 7.0'
+end
+"#;
+        let deps = parse(content).unwrap();
+        let rails_count = deps.iter().filter(|d| d.name == "rails").count();
+        println!("PARSE_RAILS_COUNT: {}", rails_count);
+        assert_eq!(rails_count, 2, "parse は同名 gem を 2 件返すはず");
+    }
+
+    #[test]
     fn test_update_version_preserves_crlf_line_endings() {
         // 回帰テスト: CRLF の Gemfile を 1 依存更新しても全行が LF 化されないこと
         let content =
