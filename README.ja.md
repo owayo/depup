@@ -307,6 +307,8 @@ Python の compatible release 句は PEP 440 に従います。`~=1.2`（= `>=1.
 
 PEP 440 のプレリリースは、セパレータなしで書かれた場合（例: `2.0.0rc1`, `1.0rc1`, `1.0.0a1`）でも検出され、デフォルトで除外されます。これにより安定版の依存がリリース候補へ誤って更新されることはありません。ポストリリース（`1.0.post1`）は対応する安定版より新しいと比較され、エポック（`1!2.3`）は比較時に最優先されます。
 
+PEP 440 の local version は、semver の build metadata ではなく Python 固有のバージョン意味論として扱います。固定指定と除外指定では local label を保持します（`==1.0+cu121`, `!=1.0+local1`）。Python の候補選択では local version を同じ public version より新しいものとして扱い（`1.0+local > 1.0`）、local segment も PEP 440 に従って比較します（`1.0+1 > 1.0+abc`, `1.0+abc.2 > 1.0+abc.1`）。PEP 440 で local label が許可されない ordered / compatible 指定（`>=1.0+local`, `~=1.0+local`, `>=1.0+local,<2.0`）はスキップします。
+
 ### 範囲制約
 
 depupは上限付きの範囲制約（排他的・包含的の両方）を尊重します：

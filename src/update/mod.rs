@@ -12,7 +12,7 @@ pub use filter::UpdateFilter;
 pub(crate) use version_info::numeric_core;
 pub use version_info::{VersionInfo, compare_versions, is_prerelease_version};
 
-use crate::domain::{Dependency, SkipReason, UpdateResult, VersionSpecKind};
+use crate::domain::{Dependency, Language, SkipReason, UpdateResult, VersionSpecKind};
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use std::sync::LazyLock;
@@ -346,13 +346,17 @@ impl UpdateJudge {
             // 無い場合は AlreadyLatest として扱う (max_change が原因ではないため)。
             let current = dependency.version();
             let has_newer_excluded = eligible.iter().any(|v| {
-                version_info::compare_versions(&v.version, current) == std::cmp::Ordering::Greater
+                compare_dependency_versions(dependency, &v.version, current)
+                    == std::cmp::Ordering::Greater
             });
             if let (true, Some(max)) = (has_newer_excluded, self.filter.max_change) {
                 return UpdateResult::skip(dependency.clone(), SkipReason::ChangeLevelLimited(max));
             }
             // eligible は非空が保証されているため最新候補のリリース日時を添える
-            let latest = eligible.iter().max().unwrap();
+            let latest = eligible
+                .iter()
+                .max_by(|a, b| compare_dependency_versions(dependency, &a.version, &b.version))
+                .unwrap();
             return UpdateResult::skip_already_latest_with_date(
                 dependency.clone(),
                 latest.released_at,
@@ -478,6 +482,14 @@ fn apply_max_change_filter<'a>(
         .collect()
 }
 
+fn compare_dependency_versions(dependency: &Dependency, a: &str, b: &str) -> std::cmp::Ordering {
+    if dependency.language == Language::Python {
+        version_info::compare_python_versions(a, b)
+    } else {
+        version_info::compare_versions(a, b)
+    }
+}
+
 /// 最新候補を選び、ダウングレード防止・更新先制約フォーマット可否を判定して結果を返す。
 fn select_latest_candidate(
     dependency: &Dependency,
@@ -485,18 +497,22 @@ fn select_latest_candidate(
     allowed: &[&VersionInfo],
     max_change: Option<crate::domain::ChangeLevel>,
 ) -> UpdateResult {
-    // semver 比較で最新の更新候補を選ぶ
-    let latest = allowed.iter().max().unwrap();
+    // 言語ごとの比較規則で最新の更新候補を選ぶ
+    let latest = allowed
+        .iter()
+        .max_by(|a, b| compare_dependency_versions(dependency, &a.version, &b.version))
+        .unwrap();
 
     // 現在版が最新以上ならダウングレードを防いでスキップする
-    if version_info::compare_versions(dependency.version(), &latest.version)
+    if compare_dependency_versions(dependency, dependency.version(), &latest.version)
         != std::cmp::Ordering::Less
     {
         // max_change で除外された「より新しい候補」が存在すれば ChangeLevelLimited
         if let Some(max) = max_change {
             let current = dependency.version();
             let has_newer_excluded = eligible.iter().any(|v| {
-                version_info::compare_versions(&v.version, current) == std::cmp::Ordering::Greater
+                compare_dependency_versions(dependency, &v.version, current)
+                    == std::cmp::Ordering::Greater
                     && crate::domain::ChangeLevel::from_versions(current, &v.version)
                         .is_some_and(|level| level > max)
             });
@@ -2247,6 +2263,26 @@ mod tests {
         assert!(result.is_update());
         if let UpdateResult::Update { new_version, .. } = result {
             assert_eq!(new_version, "2.0.0rc2");
+        }
+    }
+
+    #[test]
+    fn test_judge_python_local_version_uses_pep440_ordering() {
+        let filter = UpdateFilter::new().with_include_pinned(true);
+        let judge = UpdateJudge::new(filter);
+
+        let spec =
+            VersionSpec::new(VersionSpecKind::Exact, "==1.0+abc", "1.0+abc").with_prefix("==");
+        let dep = Dependency::new("torch", spec, false, Language::Python);
+        let versions = vec![
+            make_version_info("1.0+abc.1", 30),
+            make_version_info("1.0+1", 10), // 数値 local セグメントは英字より新しい
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_update());
+        if let UpdateResult::Update { new_version, .. } = result {
+            assert_eq!(new_version, "1.0+1");
         }
     }
 

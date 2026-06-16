@@ -307,6 +307,8 @@ Python compatible release clauses follow PEP 440: `~=1.2` (= `>=1.2,<2.0`) and `
 
 PEP 440 prerelease versions are detected and excluded by default even when written without a separator (e.g. `2.0.0rc1`, `1.0rc1`, `1.0.0a1`), so a stable dependency is never accidentally bumped to a release candidate. Post-releases (`1.0.post1`) compare as newer than the corresponding release, and epochs (`1!2.3`) take precedence in comparison.
 
+PEP 440 local versions are handled as Python-specific version semantics rather than semver build metadata. Exact and exclusion specifiers preserve local labels (`==1.0+cu121`, `!=1.0+local1`), Python candidate ordering treats local versions as newer than the same public version (`1.0+local > 1.0`) and compares local segments per PEP 440 (`1.0+1 > 1.0+abc`, `1.0+abc.2 > 1.0+abc.1`). Ordered and compatible specifiers with local labels, which PEP 440 does not permit (`>=1.0+local`, `~=1.0+local`, `>=1.0+local,<2.0`), are skipped.
+
 ### Range Constraints
 
 depup respects upper-bound range constraints (both exclusive and inclusive):

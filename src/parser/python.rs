@@ -43,17 +43,39 @@ static WILDCARD_RE: LazyLock<Regex> =
 /// 一方で次の正規化は従来どおり維持する:
 /// - 先頭の `v` / `V` 接頭辞と数字以前の文字の除去
 /// - ワイルドカード (`1.2.*` → `1.2`) と末尾セパレータの除去
-/// - ローカルバージョン (`+local` 以降) の除去 (比較では無視されるため)
+/// - ローカルバージョン (`+local` 以降) の除去 (ordered/compatible 指定では許可されないため)
 fn normalize_for_compare(version: &str) -> String {
+    normalize_for_compare_inner(version, false)
+}
+
+/// `==` / `!=` のように PEP 440 が local version を許容する指定用の正規化。
+fn normalize_for_compare_preserving_local(version: &str) -> String {
+    normalize_for_compare_inner(version, true)
+}
+
+fn normalize_local_label(local: &str) -> String {
+    local
+        .split(['.', '-', '_'])
+        .filter(|part| !part.is_empty())
+        .map(|part| part.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn normalize_for_compare_inner(version: &str, preserve_local: bool) -> String {
     let s = version.trim();
     let s = s
         .strip_prefix('v')
         .or_else(|| s.strip_prefix('V'))
         .unwrap_or(s);
+    let (public, local) = s
+        .split_once('+')
+        .map(|(public, local)| (public, Some(local)))
+        .unwrap_or((s, None));
     // PEP 440 エポック (`N!`) は比較の最優先キーなので保持する
-    let (epoch, rest) = match s.split_once('!') {
+    let (epoch, rest) = match public.split_once('!') {
         Some((e, r)) if !e.is_empty() && e.chars().all(|c| c.is_ascii_digit()) => (Some(e), r),
-        _ => (None, s),
+        _ => (None, public),
     };
     let mut buf = String::new();
     let mut seen_digit = false;
@@ -78,10 +100,18 @@ fn normalize_for_compare(version: &str) -> String {
         return String::new();
     }
     let core = buf.trim_matches(['.', '-']);
-    match epoch {
+    let mut normalized = match epoch {
         Some(e) => format!("{e}!{core}"),
         None => core.to_string(),
+    };
+    if preserve_local && let Some(local) = local {
+        let local = normalize_local_label(local);
+        if !local.is_empty() {
+            normalized.push('+');
+            normalized.push_str(&local);
+        }
     }
+    normalized
 }
 
 /// レンジ指定の先頭制約からバージョン部分を取り出す (例: `>=1.0,<2.0` → `1.0`)。
@@ -120,7 +150,15 @@ impl VersionParser for PythonVersionParser {
         if let Some(caps) = OP_RE.captures(trimmed) {
             let op = caps.get(1)?.as_str();
             let raw_version = caps.get(2)?.as_str();
-            let normalized = normalize_for_compare(raw_version);
+            let has_local = raw_version.contains('+');
+            let normalized = if matches!(op, "==" | "===" | "!=") {
+                normalize_for_compare_preserving_local(raw_version)
+            } else {
+                if has_local {
+                    return None;
+                }
+                normalize_for_compare(raw_version)
+            };
 
             return Some(match op {
                 "===" | "==" if !raw_version.ends_with(".*") => {
@@ -158,6 +196,9 @@ impl VersionParser for PythonVersionParser {
 
         // 空白を含むレンジも許容する
         if RANGE_RE.is_match(trimmed) {
+            if trimmed.contains('+') {
+                return None;
+            }
             return Some(VersionSpec::new(
                 VersionSpecKind::Range,
                 trimmed,
@@ -436,8 +477,31 @@ mod tests {
         // PEP 440 ローカルバージョン指定: '+' 以降はローカルセグメントとして扱われる
         let spec = parse("==1.0+local1").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Exact);
-        assert_eq!(spec.version, "1.0");
+        assert_eq!(spec.version, "1.0+local1");
         assert_eq!(spec.prefix, Some("==".to_string()));
+    }
+
+    #[test]
+    fn test_parse_local_version_normalizes_separator_and_case() {
+        let spec = parse("==1.0+Cu_121").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "1.0+cu.121");
+    }
+
+    #[test]
+    fn test_parse_ordered_local_version_is_invalid() {
+        // PEP 440 では local version は ordered/compatible 指定に書けない
+        assert!(parse(">=1.0+local1").is_none());
+        assert!(parse("~=1.0+local1").is_none());
+        assert!(parse(">=1.0+local1,<2.0").is_none());
+    }
+
+    #[test]
+    fn test_parse_not_equal_local_version_preserved() {
+        // `!=` は version matching と同じ構文を使うため local version を許容する
+        let spec = parse("!=1.0+local1").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1.0+local1");
     }
 
     #[test]

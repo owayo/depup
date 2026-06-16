@@ -224,6 +224,51 @@ impl PartialOrd for PreIdentifier {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LocalIdentifier {
+    /// 英字を含む local version セグメント (小文字化済み)
+    Alpha(String),
+    /// 数値のみの local version セグメント
+    Numeric(u64),
+}
+
+impl LocalIdentifier {
+    fn from_part(part: &str) -> Self {
+        match part.parse::<u64>() {
+            Ok(n) => LocalIdentifier::Numeric(n),
+            Err(_) => LocalIdentifier::Alpha(part.to_ascii_lowercase()),
+        }
+    }
+}
+
+impl Ord for LocalIdentifier {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+
+        match (self, other) {
+            (LocalIdentifier::Numeric(a), LocalIdentifier::Numeric(b)) => a.cmp(b),
+            (LocalIdentifier::Alpha(a), LocalIdentifier::Alpha(b)) => a.cmp(b),
+            // PEP 440 local version では数値セグメントが英字セグメントより大きい。
+            (LocalIdentifier::Numeric(_), LocalIdentifier::Alpha(_)) => Ordering::Greater,
+            (LocalIdentifier::Alpha(_), LocalIdentifier::Numeric(_)) => Ordering::Less,
+        }
+    }
+}
+
+impl PartialOrd for LocalIdentifier {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+type PythonVersionComponents = (
+    u64,
+    Vec<u64>,
+    Option<Vec<PreIdentifier>>,
+    Option<u64>,
+    Option<Vec<LocalIdentifier>>,
+);
+
 /// セパレータなしの英数字混在文字列 (例: `rc1`, `dev1rc1`) を
 /// 英字部と数値部の run へ分解して識別子列にする。
 /// `rc1` → `[Alpha("rc"), Numeric(1)]` となり、`-rc.1` 形式と同値に比較できる。
@@ -377,6 +422,26 @@ fn parse_version_components(s: &str) -> (u64, Vec<u64>, Option<Vec<PreIdentifier
     (epoch, nums, pre, post)
 }
 
+fn parse_local_identifiers(local: &str) -> Option<Vec<LocalIdentifier>> {
+    let ids: Vec<LocalIdentifier> = local
+        .split(['.', '-', '_'])
+        .filter(|part| !part.is_empty())
+        .map(LocalIdentifier::from_part)
+        .collect();
+
+    if ids.is_empty() { None } else { Some(ids) }
+}
+
+fn parse_python_version_components(s: &str) -> PythonVersionComponents {
+    let (public, local) = s
+        .split_once('+')
+        .map(|(public, local)| (public, parse_local_identifiers(local)))
+        .unwrap_or((s, None));
+    let (epoch, core, pre, post) = parse_version_components(public);
+
+    (epoch, core, pre, post, local)
+}
+
 /// semver / PEP 440 風ルールでバージョン文字列を比較する。
 ///
 /// 比較の優先順位:
@@ -442,6 +507,76 @@ pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
         (None, Some(_)) => Ordering::Less,
         (Some(_), None) => Ordering::Greater,
         (Some(a_post), Some(b_post)) => a_post.cmp(&b_post),
+    }
+}
+
+/// PEP 440 の local version ordering まで含めて Python バージョンを比較する。
+///
+/// 共通の `compare_versions` は semver の build metadata として `+...` を無視する。
+/// Python では `+...` が local version で、同じ public version より新しく扱うため、
+/// Python 依存の最新候補選択ではこの関数を使う。
+pub fn compare_python_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    let (epoch_a, core_a, pre_a, post_a, local_a) = parse_python_version_components(a);
+    let (epoch_b, core_b, pre_b, post_b, local_b) = parse_python_version_components(b);
+
+    match epoch_a.cmp(&epoch_b) {
+        Ordering::Equal => {}
+        other => return other,
+    }
+
+    let max_len = core_a.len().max(core_b.len());
+    for i in 0..max_len {
+        let pa = core_a.get(i).copied().unwrap_or(0);
+        let pb = core_b.get(i).copied().unwrap_or(0);
+        match pa.cmp(&pb) {
+            Ordering::Equal => continue,
+            other => return other,
+        }
+    }
+
+    match (&pre_a, &pre_b) {
+        (None, None) => {}
+        (None, Some(_)) => return Ordering::Greater,
+        (Some(_), None) => return Ordering::Less,
+        (Some(a_ids), Some(b_ids)) => {
+            for (pa, pb) in a_ids.iter().zip(b_ids.iter()) {
+                match pa.cmp(pb) {
+                    Ordering::Equal => continue,
+                    other => return other,
+                }
+            }
+            match a_ids.len().cmp(&b_ids.len()) {
+                Ordering::Equal => {}
+                other => return other,
+            }
+        }
+    }
+
+    match (post_a, post_b) {
+        (None, None) => {}
+        (None, Some(_)) => return Ordering::Less,
+        (Some(_), None) => return Ordering::Greater,
+        (Some(a_post), Some(b_post)) => match a_post.cmp(&b_post) {
+            Ordering::Equal => {}
+            other => return other,
+        },
+    }
+
+    match (&local_a, &local_b) {
+        (None, None) => Ordering::Equal,
+        (Some(_), None) => Ordering::Greater,
+        (None, Some(_)) => Ordering::Less,
+        (Some(a_ids), Some(b_ids)) => {
+            for (pa, pb) in a_ids.iter().zip(b_ids.iter()) {
+                match pa.cmp(pb) {
+                    Ordering::Equal => continue,
+                    other => return other,
+                }
+            }
+            a_ids.len().cmp(&b_ids.len())
+        }
     }
 }
 
@@ -730,6 +865,40 @@ mod tests {
         assert_eq!(
             compare_versions("1.0.0+build", "1.0.1"),
             std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn test_compare_python_versions_local_version_ordering() {
+        use std::cmp::Ordering;
+
+        // PEP 440 local version は同じ public version より新しい
+        assert_eq!(
+            compare_python_versions("1.0+local", "1.0"),
+            Ordering::Greater
+        );
+        // public version の post release は対応する local final release より新しい
+        assert_eq!(
+            compare_python_versions("1.0+local", "1.0.post1"),
+            Ordering::Less
+        );
+        // 数値 local セグメントは英字 local セグメントより大きい
+        assert_eq!(
+            compare_python_versions("1.0+1", "1.0+abc"),
+            Ordering::Greater
+        );
+        // local セグメントは小文字化して比較し、前方一致なら長い方が大きい
+        assert_eq!(
+            compare_python_versions("1.0+ABC.1", "1.0+abc"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_python_versions("1.0+abc.2", "1.0+abc.1"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_python_versions("1.0rc1+abc.2", "1.0rc1+abc.1"),
+            Ordering::Greater
         );
     }
 
