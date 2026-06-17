@@ -481,6 +481,34 @@ depup --no-osv
 - Swift パッケージは対象外（OSV は GitHub リポジトリ URL でインデックスしており、depup が扱う Swift パッケージ名形式とは一致しないため）。
 - API エラー時は更新を止めません。該当バージョンは candidate に残し、`--verbose` で警告を表示します。
 
+### フォールバック例
+
+candidate のバージョンに既知の脆弱性が見つかった場合、depup は自動的に次に古い安全なバージョンへフォールバックします。OSV チェックを通過した更新には `✓ OSV` マークが付きます：
+
+```
+$ depup --install --include-pinned
+  ⚠ OSV: dompurify 3.4.8 vulnerable (GHSA-vxr8-fq34-vvx9)
+./package.json (Node.js) — 9 updates, 41 skips
+  @mui/icons-material   9.0.1 → 9.1.0 [minor] (2026/06/08 08:30) ✓ OSV
+  @mui/material         9.0.1 → 9.1.0 [minor] (2026/06/08 08:29) ✓ OSV
+  @tanstack/react-query 5.100.14 → 5.101.0 [minor] (2026/06/02 19:24) ✓ OSV
+  next                  16.2.6 → 16.2.9 [patch] (2026/06/09 23:02) ✓ OSV
+  openai                6.39.1 → 6.42.0 [minor] (2026/06/03 22:39) ✓ OSV
+  react                 19.2.6 → 19.2.7 [patch] (2026/06/01 18:00) ✓ OSV
+  react-dom             19.2.6 → 19.2.7 [patch] (2026/06/01 18:01) ✓ OSV
+  @types/node           25.9.1 → 25.9.2 [patch] (2026/06/05 22:33) ✓ OSV 🔧
+  @types/react          19.2.15 → 19.2.17 [patch] (2026/06/05 20:10) ✓ OSV 🔧
+
+Errors:
+  ✗ OSV check for dompurify: 3.4.8 vulnerable, falling back (GHSA-vxr8-fq34-vvx9)
+
+Summary:
+  9 package(s) updated (4 minor, 5 patch)
+  41 package(s) skipped
+```
+
+`falling back` メッセージは設計どおりの正常な動作通知であり、exit code には影響しません。
+
 ### グローバル設定
 
 自動生成された `~/.config/depup/config.toml` で OSV チェックをデフォルトで有効化できます：

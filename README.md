@@ -481,6 +481,34 @@ depup --no-osv
 - Swift packages are skipped — OSV indexes packages by GitHub repository URL rather than by GitHub Tags–style names, so Swift queries from depup would not match.
 - API errors do not block updates; affected versions remain in the candidate list and the failure is reported in `--verbose`.
 
+### Fallback Example
+
+When a candidate version has a known vulnerability, depup automatically falls back to the next older safe version. Updates that pass the OSV check are marked with `✓ OSV`:
+
+```
+$ depup --install --include-pinned
+  ⚠ OSV: dompurify 3.4.8 vulnerable (GHSA-vxr8-fq34-vvx9)
+./package.json (Node.js) — 9 updates, 41 skips
+  @mui/icons-material   9.0.1 → 9.1.0 [minor] (2026/06/08 08:30) ✓ OSV
+  @mui/material         9.0.1 → 9.1.0 [minor] (2026/06/08 08:29) ✓ OSV
+  @tanstack/react-query 5.100.14 → 5.101.0 [minor] (2026/06/02 19:24) ✓ OSV
+  next                  16.2.6 → 16.2.9 [patch] (2026/06/09 23:02) ✓ OSV
+  openai                6.39.1 → 6.42.0 [minor] (2026/06/03 22:39) ✓ OSV
+  react                 19.2.6 → 19.2.7 [patch] (2026/06/01 18:00) ✓ OSV
+  react-dom             19.2.6 → 19.2.7 [patch] (2026/06/01 18:01) ✓ OSV
+  @types/node           25.9.1 → 25.9.2 [patch] (2026/06/05 22:33) ✓ OSV 🔧
+  @types/react          19.2.15 → 19.2.17 [patch] (2026/06/05 20:10) ✓ OSV 🔧
+
+Errors:
+  ✗ OSV check for dompurify: 3.4.8 vulnerable, falling back (GHSA-vxr8-fq34-vvx9)
+
+Summary:
+  9 package(s) updated (4 minor, 5 patch)
+  41 package(s) skipped
+```
+
+The `falling back` message is an expected notification of safe behavior and does not affect the exit code.
+
 ### Global Configuration
 
 Enable OSV checking by default in the auto-generated `~/.config/depup/config.toml`:
