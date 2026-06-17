@@ -790,4 +790,20 @@ mod tests {
             assert_eq!(s.kind, VersionSpecKind::Range);
         }
     }
+
+    #[test]
+    fn test_parse_compound_extra_whitespace() {
+        // 演算子の間に複数の空白が含まれた compound range も Range として認識する
+        let spec = parse(">=1.0.0    <2.0.0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1.0.0");
+    }
+
+    #[test]
+    fn test_parse_caret_zero_zero_partial() {
+        // ^0.0 は >=0.0.0 <0.1.0 と同値
+        let spec = parse("^0.0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Caret);
+        assert_eq!(spec.version, "0.0.0");
+    }
 }

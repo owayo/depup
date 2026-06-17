@@ -582,4 +582,16 @@ mod tests {
         assert!(parse("latest.").is_none());
         assert!(parse("latest.123").is_none());
     }
+
+    #[test]
+    fn test_parse_maven_hard_requirement_with_snapshot() {
+        // Hard requirement に SNAPSHOT 等のプレリリースが付いた場合
+        let spec = parse("[1.2.3-SNAPSHOT]").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "1.2.3-SNAPSHOT");
+        assert_eq!(spec.prefix, Some("[".to_string()));
+        assert_eq!(spec.suffix, Some("]".to_string()));
+        assert!(spec.is_pinned());
+        assert_eq!(spec.format_updated("1.3.0"), "[1.3.0]");
+    }
 }

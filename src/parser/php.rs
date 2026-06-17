@@ -734,4 +734,31 @@ mod tests {
         assert!(parse("1.0.0@dev as 1.1.0").is_none());
         assert!(parse("1.0.0 as 1.1.0").is_none());
     }
+
+    #[test]
+    fn test_parse_caret_stability_flag_uppercase_rc() {
+        // 大文字の stability flag (`@RC`) も `@` 分割で除去される
+        // (composer の stability flag は dev/alpha/beta/RC/stable のうち RC が大文字慣習)
+        let spec = parse("^1.0.0@RC").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Caret);
+        assert_eq!(spec.version, "1.0.0");
+        assert_eq!(spec.format_updated("1.5.0"), "^1.5.0");
+    }
+
+    #[test]
+    fn test_parse_gte_with_prerelease() {
+        // 演算子付き + プレリリース (build metadata 無し) の単独確認
+        let spec = parse(">=1.0.0-rc.1").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::GreaterOrEqual);
+        assert_eq!(spec.version, "1.0.0-rc.1");
+        assert_eq!(spec.format_updated("1.2.0"), ">=1.2.0");
+    }
+
+    #[test]
+    fn test_parse_four_segments_with_stability_flag() {
+        // 4セグメント + stability flag の組み合わせ
+        let spec = parse("1.0.0.0@dev").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "1.0.0.0");
+    }
 }

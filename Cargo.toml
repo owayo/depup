@@ -17,7 +17,7 @@ chrono = { version = "0.4.45", features = ["serde"] }
 semver = "1.0.28"
 thiserror = "2.0.18"
 anyhow = "1.0.102"
-regex = "1.12.3"
+regex = "1.12.4"
 async-trait = "0.1.89"
 indicatif = "0.18.4"
 colored = "3.1.1"

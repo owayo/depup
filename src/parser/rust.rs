@@ -659,4 +659,25 @@ mod tests {
         let spec = parse(">=1.2.3, ^1.3").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Range);
     }
+
+    #[test]
+    fn test_parse_exact_pinned_with_prerelease() {
+        // 回帰防止: `=` 演算子 + プレリリースのみ (build metadata 無し)
+        // (test_parse_exact_pinned_with_build_metadata は build metadata 付きを確認している)
+        let spec = parse("=1.0.0-rc.1").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "1.0.0-rc.1");
+        assert_eq!(spec.prefix, Some("=".to_string()));
+        assert!(spec.is_pinned());
+        assert_eq!(spec.format_updated("1.0.0"), "=1.0.0");
+    }
+
+    #[test]
+    fn test_parse_exact_pinned_with_prerelease_and_build() {
+        // 回帰防止: `=` 演算子 + プレリリース + ビルドメタデータ
+        let spec = parse("=1.2.3-rc.1+build123").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "1.2.3-rc.1+build123");
+        assert_eq!(spec.format_updated("1.2.3"), "=1.2.3");
+    }
 }

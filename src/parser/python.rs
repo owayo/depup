@@ -642,4 +642,29 @@ mod tests {
         assert_eq!(normalize_for_compare(""), "");
         assert_eq!(normalize_for_compare("custom"), "");
     }
+
+    #[test]
+    fn test_parse_epoch_with_prerelease() {
+        // エポック + PEP 440 プレリリースの組み合わせ
+        let spec = parse(">=1!2.0.0rc1").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::GreaterOrEqual);
+        assert_eq!(spec.version, "1!2.0.0rc1");
+        assert_eq!(spec.prefix, Some(">=".to_string()));
+    }
+
+    #[test]
+    fn test_parse_epoch_with_postrelease() {
+        // エポック + ポストリリースの組み合わせ
+        let spec = parse("==1!2.0.0.post1").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "1!2.0.0.post1");
+    }
+
+    #[test]
+    fn test_parse_arbitrary_equality_with_epoch_prerelease() {
+        // === は任意のラベルを許容するが、parser では Exact + 演算子保持として扱う
+        let spec = parse("===1!2.0.0a1").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.prefix, Some("===".to_string()));
+    }
 }
