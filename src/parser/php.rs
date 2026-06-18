@@ -761,4 +761,42 @@ mod tests {
         assert_eq!(spec.kind, VersionSpecKind::Exact);
         assert_eq!(spec.version, "1.0.0.0");
     }
+
+    // --- 中間ワイルドカード関連の対応漏れチェック ---
+
+    #[test]
+    fn test_parse_wildcard_consecutive_middle_and_tail() {
+        // composer/semver は `1.*.*` のような連続ワイルドカードを valid 扱いする
+        // (depup の WILDCARD_RE は 4 セグメントまでワイルドカードを許容)
+        let spec = parse("1.*.*").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Wildcard);
+    }
+
+    #[test]
+    fn test_parse_wildcard_consecutive_xx() {
+        // `1.x.x` 形式 (4 セグメントの混在パターン)
+        let spec = parse("1.x.x").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Wildcard);
+        // x 形式は更新時もそのまま保持される
+        assert_eq!(spec.format_updated("2.3.4"), "2.x.x");
+    }
+
+    #[test]
+    fn test_parse_wildcard_four_segments_middle() {
+        // 4 セグメントでの中間ワイルドカード `1.*.*.0` も WILDCARD_RE で valid
+        let spec = parse("1.*.*.0");
+        // composer/semver の VersionParser では valid 扱いされ得るが、
+        // depup の現実装では数値混在 (末尾 `0`) の中間ワイルドカードもパース対象
+        // 受理されればワイルドカードとして扱う (誤更新を防ぐ意味で None でも問題なし)
+        if let Some(s) = spec {
+            assert_eq!(s.kind, VersionSpecKind::Wildcard);
+        }
+    }
+
+    #[test]
+    fn test_parse_compound_or_with_stability_flag() {
+        // 各分岐が stability flag を持つ OR 結合
+        let spec = parse("^1.0@dev || ^2.0@stable").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+    }
 }

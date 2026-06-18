@@ -379,6 +379,15 @@ fn parse_version_components(s: &str) -> (u64, Vec<u64>, Option<Vec<PreIdentifier
         // 英字部と数値部へ分解し `-rc.1` 形式と同値に比較できるようにする。
         if !digits.is_empty() {
             core_pre = Some(decompose_alnum_runs(rest));
+            // PEP 440 では prerelease の後ろに `.postN` / `.devN` が続くケースがある
+            // (例: `1.0a1.post1`)。post は後段の比較で別キーとして使うので
+            // 取りこぼさないように後続セグメントを走査する。
+            for follow in &segments[idx + 1..] {
+                if follow.len() >= 4 && follow[..4].eq_ignore_ascii_case("post") {
+                    post = Some(trailing_number(follow).unwrap_or(0));
+                    break;
+                }
+            }
             break;
         }
         // 英字開始セグメントが既知の prerelease 識別子 (dev / alpha / rc 等) なら、
@@ -494,8 +503,9 @@ pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
             }
             // 前方一致で等しい場合は識別子数が少ない方が小さい (semver 11.4.4)
             match a_ids.len().cmp(&b_ids.len()) {
-                // プレリリース識別子が同一なら等価とみなす (post まで踏み込まない)
-                Ordering::Equal => return Ordering::Equal,
+                // プレリリース識別子が同一なら post まで踏み込んで比較する
+                // (PEP 440: `1.0a1.post1 > 1.0a1`)
+                Ordering::Equal => {}
                 other => return other,
             }
         }
@@ -700,6 +710,37 @@ mod tests {
         let v1 = VersionInfo::now("1.0.0-alpha");
         let v2 = VersionInfo::now("1.0.0-beta");
         assert_eq!(v1.cmp(&v2), std::cmp::Ordering::Less);
+    }
+
+    // 回帰テスト: PEP 440 prerelease + post の組み合わせ比較
+    // 以前は `1.0a1.post1` を `1.0a1` と等価 (Ordering::Equal) と誤判定していたため、
+    // α版に post が出てもユーザーが更新を取りこぼす不具合があった。
+    #[test]
+    fn test_compare_versions_pep440_prerelease_with_post() {
+        // post 付きは対応する prerelease より新しい
+        assert_eq!(
+            compare_versions("1.0a1.post1", "1.0a1"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_versions("1.0a1", "1.0a1.post1"),
+            std::cmp::Ordering::Less
+        );
+        // 異なる post 番号での比較
+        assert_eq!(
+            compare_versions("1.0a1.post2", "1.0a1.post1"),
+            std::cmp::Ordering::Greater
+        );
+        // セパレータ付きハイフン形式 (`1.0-rc.1.post1`) でも同様に比較できる
+        assert_eq!(
+            compare_versions("1.0-rc.1.post1", "1.0-rc.1"),
+            std::cmp::Ordering::Greater
+        );
+        // 既存の挙動: post 付きはリリースより新しい (回帰防止)
+        assert_eq!(
+            compare_versions("1.0.post1", "1.0"),
+            std::cmp::Ordering::Greater
+        );
     }
 
     #[test]

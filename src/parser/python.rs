@@ -17,16 +17,21 @@ use std::sync::LazyLock;
 pub struct PythonVersionParser;
 
 // Python のバージョン指定用正規表現
+// PEP 440 のバージョンは少なくとも 1 つの数字を含む必要があるため、
+// version 部の先頭は `[vV]?\d` に限定する。
+// 数字を含まない無効入力 (例: `==hello`, `>=foo`) を `version=""` の
+// VersionSpec として silent に受理してしまわないための水際チェック。
+// epoch (`1!2.3`) は先頭の `\d+!` で許容される。
 static CARET_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\^\s*([0-9A-Za-z][0-9A-Za-z._!+-]*(?:\*)?)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^\^\s*([vV]?\d[0-9A-Za-z._!+-]*(?:\*)?)$").unwrap());
 static TILDE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^~\s*([0-9A-Za-z][0-9A-Za-z._!+-]*(?:\*)?)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^~\s*([vV]?\d[0-9A-Za-z._!+-]*(?:\*)?)$").unwrap());
 static OP_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(===|==|!=|~=|>=|<=|>|<)\s*([0-9A-Za-z][0-9A-Za-z._!+-]*(?:\*)?)$").unwrap()
+    Regex::new(r"^(===|==|!=|~=|>=|<=|>|<)\s*([vV]?\d[0-9A-Za-z._!+-]*(?:\*)?)$").unwrap()
 });
 static RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-            r"^(?:\s*(?:===|==|!=|~=|>=|<=|>|<)\s*[0-9A-Za-z][0-9A-Za-z._!+-]*(?:\*)?\s*,)*\s*(?:===|==|!=|~=|>=|<=|>|<)\s*[0-9A-Za-z][0-9A-Za-z._!+-]*(?:\*)?\s*,?\s*$",
+            r"^(?:\s*(?:===|==|!=|~=|>=|<=|>|<)\s*[vV]?\d[0-9A-Za-z._!+-]*(?:\*)?\s*,)*\s*(?:===|==|!=|~=|>=|<=|>|<)\s*[vV]?\d[0-9A-Za-z._!+-]*(?:\*)?\s*,?\s*$",
         )
         .unwrap()
 });
@@ -374,6 +379,25 @@ mod tests {
     #[test]
     fn test_parse_invalid() {
         assert!(parse("not-a-version").is_none());
+    }
+
+    // 回帰テスト: 数字を含まない無効な version 部を持つ入力を None で弾く。
+    // 以前は OP_RE / CARET_RE / TILDE_RE の version 部が `[0-9A-Za-z]` 始まりだったため、
+    // `==hello` / `>=foo` のような数字なし指定が `version = ""` の VersionSpec として
+    // silent に受理されてしまい、後段の比較で意図しない更新候補選択が走る可能性があった。
+    #[test]
+    fn test_parse_rejects_alpha_only_version() {
+        assert!(parse("==hello").is_none());
+        assert!(parse(">=foo").is_none());
+        assert!(parse(">=abc.def").is_none());
+        assert!(parse("^foo").is_none());
+        assert!(parse("~foo").is_none());
+        assert!(parse(">=local-only").is_none());
+        // 制御として: 数字を含む有効入力は引き続き受理する
+        assert!(parse(">=1.0").is_some());
+        assert!(parse("==1.0a1").is_some());
+        // v / V 接頭辞 + 数字は引き続き受理する (PEP 440 互換)
+        assert!(parse("==v1.0").is_some());
     }
 
     #[test]
