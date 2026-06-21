@@ -59,6 +59,14 @@ static NOT_EQUAL_RE: LazyLock<Regex> = LazyLock::new(|| {
 static WILDCARD_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(?:[vV]?(?:\d+|[xX*])(?:\.(?:\d+|[xX*])){0,3}|\*)$").unwrap());
 
+/// 入力が完全浮動ワイルドカード (`*`, `*.*`, `x.x`, `v*`, `V*` 等の数値アンカーなし) かを判定する。
+/// 数値アンカーがないとレジストリ最新版を埋め込んでも形が崩れ、書き換え結果が
+/// raw と同一になる phantom update の原因になる。Node 側の `is_fully_floating_wildcard`
+/// と同じ判定を採用する。
+fn is_fully_floating_wildcard(raw: &str) -> bool {
+    !raw.chars().any(|ch| ch.is_ascii_digit())
+}
+
 // 固定バージョン: 1.2.3 / 1.2.3.4
 static BARE_VERSION_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(v?\d+(?:\.\d+){0,3}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap());
@@ -166,6 +174,11 @@ impl PhpVersionParser {
         if WILDCARD_RE.is_match(trimmed)
             && (trimmed.contains('x') || trimmed.contains('X') || trimmed.contains('*'))
         {
+            // `*.*` / `v*` / `x.x` のような完全浮動指定は意味を変えないため更新対象にしない
+            // (version が空の Wildcard を作ると phantom update / 不正な比較の原因になる)
+            if is_fully_floating_wildcard(trimmed) {
+                return None;
+            }
             let version = extract_first_version(trimmed);
             let mut spec = VersionSpec::new(VersionSpecKind::Wildcard, trimmed, version);
             if trimmed.ends_with(".*") {
@@ -798,5 +811,18 @@ mod tests {
         // 各分岐が stability flag を持つ OR 結合
         let spec = parse("^1.0@dev || ^2.0@stable").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Range);
+    }
+
+    /// 回帰テスト: 数値アンカーを持たない完全浮動ワイルドカード (`*.*` / `v*` / `V*` / `x.x`) は
+    /// 更新対象にしない。受理すると version="" の Wildcard が作られ、phantom update や
+    /// 不正な比較の原因になる (Node 側の test_parse_fully_floating_multi_segment_wildcard と同じ判定)。
+    #[test]
+    fn test_parse_rejects_fully_floating_wildcard() {
+        assert!(parse("*.*").is_none());
+        assert!(parse("*.*.*.*").is_none());
+        assert!(parse("v*").is_none());
+        assert!(parse("V*").is_none());
+        assert!(parse("x.x").is_none());
+        assert!(parse("X.X.X").is_none());
     }
 }

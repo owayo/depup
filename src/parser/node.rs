@@ -108,6 +108,22 @@ fn is_fully_floating_wildcard(raw: &str) -> bool {
     !raw.chars().any(|ch| ch.is_ascii_digit())
 }
 
+/// ワイルドカードトークン列 (`1.x.3` のような形) で、いったんワイルドカード文字 (`x`/`X`/`*`)
+/// が現れた後に数値セグメントが続いていないかを検査する。node-semver / semver の規約では、
+/// あるセグメントがワイルドカードなら以降の minor/patch もワイルドカードでなければならない
+/// (`1.x.3` は invalid)。先頭の `^` / `~` / `=` / `v` / `V` は事前に剥がしてから呼ぶ。
+fn has_digit_after_wildcard(body: &str) -> bool {
+    let mut seen_wildcard = false;
+    for segment in body.split('.') {
+        if segment.contains(['x', 'X', '*']) {
+            seen_wildcard = true;
+        } else if seen_wildcard && segment.chars().all(|ch| ch.is_ascii_digit()) {
+            return true;
+        }
+    }
+    false
+}
+
 impl VersionParser for NodeVersionParser {
     fn parse(&self, version_str: &str) -> Option<VersionSpec> {
         let trimmed = version_str.trim();
@@ -198,6 +214,14 @@ impl VersionParser for NodeVersionParser {
             if is_fully_floating_wildcard(trimmed) {
                 return None;
             }
+            // `^x.0.0` のようにワイルドカードの後ろに数値セグメントが続く形式は
+            // node-semver 上 invalid (`1.x.3` も同様)。誤って受理して `version="0.0.0"` の
+            // ような捏造値で比較されるのを防ぐためここで弾く。
+            let body = trimmed.trim_start_matches(['^', '~']).trim_start();
+            let body = body.strip_prefix(['v', 'V']).unwrap_or(body);
+            if has_digit_after_wildcard(body) {
+                return None;
+            }
             return Some(VersionSpec::new(
                 VersionSpecKind::Wildcard,
                 trimmed,
@@ -210,6 +234,12 @@ impl VersionParser for NodeVersionParser {
             && (trimmed.contains('x') || trimmed.contains('X') || trimmed.contains('*'))
         {
             if is_fully_floating_wildcard(trimmed) {
+                return None;
+            }
+            // `1.x.3` のように一度ワイルドカードが出た後に数値セグメントが続く形は
+            // semver / node-semver の x-range 規約上 invalid (Rust の semver crate も同様に拒否)。
+            let body = trimmed.strip_prefix(['v', 'V']).unwrap_or(trimmed);
+            if has_digit_after_wildcard(body) {
                 return None;
             }
             return Some(VersionSpec::new(
@@ -805,5 +835,24 @@ mod tests {
         let spec = parse("^0.0").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Caret);
         assert_eq!(spec.version, "0.0.0");
+    }
+
+    /// 回帰テスト: ワイルドカード文字 (`x`/`X`/`*`) の後ろに数値セグメントが続く形式は
+    /// node-semver / semver の x-range 規約上 invalid。受理するとフォーマット時に
+    /// `1.x.3` → `2.x.4` のような不正出力や、捏造 version での比較が起こる。
+    #[test]
+    fn test_parse_wildcard_rejects_digit_after_wildcard() {
+        assert!(parse("1.x.3").is_none());
+        assert!(parse("1.*.3").is_none());
+        assert!(parse("v1.X.3").is_none());
+    }
+
+    /// 回帰テスト: caret/tilde + ワイルドカードでも、ワイルドカード後の数値は弾く。
+    /// `^x.0.0` は major がワイルドカードなのに minor/patch が数値という invalid 形式。
+    #[test]
+    fn test_parse_caret_tilde_wildcard_rejects_digit_after_wildcard() {
+        assert!(parse("^x.0.0").is_none());
+        assert!(parse("~x.1.0").is_none());
+        assert!(parse("^1.x.5").is_none());
     }
 }

@@ -103,7 +103,10 @@ impl VersionParser for JavaVersionParser {
                 } else if !upper.is_empty() {
                     upper
                 } else {
-                    ""
+                    // `[,]` / `(,)` のように下限・上限が両方空のレンジは意味を持たない。
+                    // version="" で受理すると compare_versions が "0.0.0" 相当として扱い、
+                    // 「常に古い」と誤判定する原因になるためスキップする。
+                    return None;
                 };
                 return Some(VersionSpec::new(VersionSpecKind::Range, trimmed, version));
             }
@@ -593,5 +596,16 @@ mod tests {
         assert_eq!(spec.suffix, Some("]".to_string()));
         assert!(spec.is_pinned());
         assert_eq!(spec.format_updated("1.3.0"), "[1.3.0]");
+    }
+
+    /// 回帰テスト: `[,]` / `(,)` のように下限・上限が両方空の Maven レンジは意味を持たない。
+    /// version="" で受理すると compare_versions が "0.0.0" 相当として扱い、
+    /// 「常に古い」と誤判定するため None で弾く。
+    #[test]
+    fn test_parse_rejects_empty_maven_range() {
+        assert!(parse("[,]").is_none());
+        assert!(parse("(,)").is_none());
+        assert!(parse("[,)").is_none());
+        assert!(parse("(,]").is_none());
     }
 }

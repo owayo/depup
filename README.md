@@ -297,7 +297,7 @@ prefer("1.7.25") → prefer("1.7.36") (Gradle rich version inside a strict range
 "group:name:1.0.0:classifier@zip" → "group:name:1.1.0:classifier@zip" (Gradle classifier/extension preserved)
 ```
 
-Floating selectors such as `"*"`, npm dist-tags like `"latest"`, and Gradle dynamic selectors (`"latest.release"`, `"latest.integration"`, `"latest.milestone"`, and any user-defined `latest.<status>`) are skipped to avoid changing them into exact versions.
+Floating selectors such as `"*"`, npm dist-tags like `"latest"`, and Gradle dynamic selectors (`"latest.release"`, `"latest.integration"`, `"latest.milestone"`, and any user-defined `latest.<status>`) are skipped to avoid changing them into exact versions. Multi-segment fully-floating wildcards without a numeric anchor (Composer's `*.*`, `v*`, `V*`, `x.x`) and empty Maven ranges (`[,]`, `(,)`) are also skipped to prevent phantom updates or "always outdated" misjudgements. Wildcard tokens (`x`/`X`/`*`) followed by numeric segments (`1.x.3`, `^x.0.0`) are rejected at parse time because they are invalid x-ranges in node-semver / semver and would produce malformed output.
 
 Gradle rich version declarations using `strictly`, `require`, `prefer`, and `reject` are parsed in dependency blocks such as `implementation("org.slf4j:slf4j-api") { version { ... } }`. String notation shorthand such as `group:name:[1.7, 1.8[!!1.7.25` is also parsed. When `strictly` or `require` declares a range and `prefer` declares the selected version, depup keeps the range as the upper-bound constraint and updates the `prefer` value. Versions listed with `reject` are excluded from update candidates, including dynamic rejects such as `2.+`.
 

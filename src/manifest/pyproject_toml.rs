@@ -389,6 +389,22 @@ fn line_has_scoped_array_close(line: &str) -> bool {
     false
 }
 
+/// TOML 行から `#` 以降の行コメントを取り除く。文字列リテラル内 (`"..."` / `'...'`)
+/// の `#` は保持する。改行コードや末尾の空白はそのまま残す。
+fn strip_toml_line_comment(line: &str) -> &str {
+    let mut in_single = false;
+    let mut in_double = false;
+    for (idx, ch) in line.char_indices() {
+        match ch {
+            '"' if !in_single => in_double = !in_double,
+            '\'' if !in_double => in_single = !in_single,
+            '#' if !in_single && !in_double => return &line[..idx],
+            _ => {}
+        }
+    }
+    line
+}
+
 /// 正規表現キャプチャから引用符種別と旧バージョン文字列 (グループ 2/3) を取り出す
 fn captured_quote_and_version<'a>(caps: &regex::Captures<'a>) -> (&'static str, &'a str) {
     if let Some(m) = caps.get(2) {
@@ -462,10 +478,14 @@ fn update_pep508_array_line(
     new_version: &str,
 ) -> Option<String> {
     let re = pep508_re?;
+    // `# "requests>=1.0",` のようにコメントアウトされた依存指定は parse 側 (TOML パーサ)
+    // でも無視されているため、書き換えも見送る。コメント前の部分だけマッチング対象とする。
+    // インラインコメント (`"requests>=2.0",  # used in prod`) の左側は引き続き処理する。
+    let scan_target = strip_toml_line_comment(line);
     let mut new_line = line.to_string();
     let mut updated = false;
 
-    for caps in re.captures_iter(line) {
+    for caps in re.captures_iter(scan_target) {
         let (quote, full_dep) = if let Some(m) = caps.get(1) {
             ("\"", m.as_str())
         } else if let Some(m) = caps.get(2) {
@@ -1986,5 +2006,63 @@ dev = [
                 .iter()
                 .any(|d| d.name == "GPUtil" || d.name == "gputil")
         );
+    }
+
+    /// 回帰テスト: PEP 508 配列内でコメントアウトされた依存指定は書き換えない。
+    /// parse 側 (TOML パーサ) もコメントを無視するため、parse/write を整合させる。
+    #[test]
+    fn test_update_pep508_skips_commented_dependency() {
+        let content = "[project]\n\
+            name = \"test\"\n\
+            dependencies = [\n    \
+            \"requests>=2.0\",\n    \
+            # \"requests>=1.0\",  # 旧版コメントアウト\n    \
+            \"flask>=2.0\",\n\
+            ]\n";
+        let parser = PyprojectTomlParser;
+        let updated = parser
+            .update_version(content, "requests", "2.31.0")
+            .unwrap();
+        assert!(updated.contains("\"requests>=2.31.0\""));
+        assert!(
+            updated.contains("# \"requests>=1.0\""),
+            "コメント内のバージョンは書き換えないこと: {updated}"
+        );
+    }
+
+    /// 行末コメントの右側に依存風文字列がある場合も、左側だけ更新する。
+    #[test]
+    fn test_update_pep508_preserves_trailing_comment() {
+        let content = "[project.optional-dependencies]\n\
+            extra = [\n    \
+            \"requests>=2.0\",  # 本番で使用 (旧: requests>=1.0)\n\
+            ]\n";
+        let parser = PyprojectTomlParser;
+        let updated = parser
+            .update_version(content, "requests", "2.31.0")
+            .unwrap();
+        assert!(updated.contains("\"requests>=2.31.0\""));
+        // コメント内の "requests>=1.0" は単なる説明文字列で引用符もないので書き換えられない
+        assert!(updated.contains("旧: requests>=1.0"));
+    }
+
+    #[test]
+    fn test_strip_toml_line_comment_respects_strings() {
+        // 文字列リテラル内の `#` は保持する
+        assert_eq!(
+            super::strip_toml_line_comment("a = \"x#y\"  # comment\n"),
+            "a = \"x#y\"  "
+        );
+        assert_eq!(
+            super::strip_toml_line_comment("a = 'x#y'  # comment"),
+            "a = 'x#y'  "
+        );
+        // 文字列外の `#` 以降を切り捨てる
+        assert_eq!(
+            super::strip_toml_line_comment("a = 1  # comment"),
+            "a = 1  "
+        );
+        // コメントなしはそのまま返る
+        assert_eq!(super::strip_toml_line_comment("a = 1\n"), "a = 1\n");
     }
 }

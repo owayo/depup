@@ -25,7 +25,9 @@ use crate::registry::{
     NpmAdapter, PackagistAdapter, PyPIAdapter, RegistryAdapter, RubyGemsAdapter,
 };
 use crate::tauri_sync::{TAURI_CRATE, TAURI_NPM_PACKAGES, TauriVersionSync};
-use crate::update::{UpdateFilter, UpdateJudge, VersionInfo, compare_versions};
+use crate::update::{
+    UpdateFilter, UpdateJudge, VersionInfo, compare_dependency_versions, compare_versions,
+};
 use futures::stream::{self, StreamExt};
 use indicatif::ProgressBar;
 use std::collections::HashMap;
@@ -1226,8 +1228,13 @@ async fn judge_with_osv(
                 fallback_chain.push(format!("{} ({})", target, detail));
                 warnings.push(format!("{} vulnerable, falling back ({})", target, detail));
                 let before = allowed.len();
-                allowed
-                    .retain(|v| compare_versions(&v.version, &target) != std::cmp::Ordering::Equal);
+                // Python の PEP 440 ローカルバージョン (`1.0+cu121` 等) は build metadata を
+                // 無視する semver 比較では区別できず、安全な候補まで除外して NoSuitableVersion に
+                // 落としてしまう。compare_dependency_versions で言語別比較に切り替える。
+                allowed.retain(|v| {
+                    compare_dependency_versions(dep, &v.version, &target)
+                        != std::cmp::Ordering::Equal
+                });
                 if allowed.len() == before {
                     // 除外できなかった (compare_versions の都合) → 無限ループ防止
                     let line = format!(

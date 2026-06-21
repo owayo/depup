@@ -11,6 +11,9 @@ mod version_info;
 pub use filter::UpdateFilter;
 pub(crate) use version_info::numeric_core;
 pub use version_info::{VersionInfo, compare_versions, is_prerelease_version};
+// Python の PEP 440 (local version / epoch 等) を含む言語別比較を OSV フォールバック等から
+// 直接呼び出せるように公開する。
+pub use version_info::compare_python_versions;
 
 use crate::domain::{Dependency, Language, SkipReason, UpdateResult, VersionSpecKind};
 use chrono::{DateTime, Utc};
@@ -482,7 +485,11 @@ fn apply_max_change_filter<'a>(
         .collect()
 }
 
-fn compare_dependency_versions(dependency: &Dependency, a: &str, b: &str) -> std::cmp::Ordering {
+pub fn compare_dependency_versions(
+    dependency: &Dependency,
+    a: &str,
+    b: &str,
+) -> std::cmp::Ordering {
     if dependency.language == Language::Python {
         version_info::compare_python_versions(a, b)
     } else {

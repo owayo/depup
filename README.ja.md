@@ -297,7 +297,7 @@ prefer("1.7.25") → prefer("1.7.36") （Gradle rich version の strict 範囲�
 "group:name:1.0.0:classifier@zip" → "group:name:1.1.0:classifier@zip" （Gradle classifier/extension を維持）
 ```
 
-`"*"`、npm の dist-tag（`"latest"` など）、Gradle の動的指定（`"latest.release"`、`"latest.integration"`、`"latest.milestone"`、ユーザ定義 `latest.<status>` など全般）のような完全浮動指定は、厳密バージョンへ変質させないため更新対象から除外されます。
+`"*"`、npm の dist-tag（`"latest"` など）、Gradle の動的指定（`"latest.release"`、`"latest.integration"`、`"latest.milestone"`、ユーザ定義 `latest.<status>` など全般）のような完全浮動指定は、厳密バージョンへ変質させないため更新対象から除外されます。Composer の `*.*` / `v*` / `V*` / `x.x` のように数値アンカーを持たない多セグメントワイルドカード、および Java/Gradle の `[,]` / `(,)` のように下限・上限とも空の Maven レンジも同様に弾かれます（phantom update や「常に古い」と誤判定する原因になるため）。`1.x.3` や `^x.0.0` のようにワイルドカード文字 (`x`/`X`/`*`) の後ろに数値セグメントが続く形式は node-semver / semver で invalid な x-range なのでパース時点で除外します。
 
 Gradle の `strictly` / `require` / `prefer` / `reject` を使う rich version 宣言は、`implementation("org.slf4j:slf4j-api") { version { ... } }` のような依存ブロック内でも解析対象になります。`group:name:[1.7, 1.8[!!1.7.25` のような文字列記法の短縮構文も解析できます。`strictly` または `require` が範囲を指定し、`prefer` が選好バージョンを指定している場合、depup は範囲を上限制約として維持しつつ `prefer` の値を更新します。`reject` に列挙されたバージョンは更新候補から除外され、`2.+` のような動的 reject も考慮します。
 
