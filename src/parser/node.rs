@@ -76,6 +76,16 @@ static CARET_TILDE_WILDCARD_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[\^~]\s*v?(?:\d+|[xX*])(?:\.(?:\d+|[xX*])){0,2}$").unwrap());
 static RANGE_TOKEN_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?").unwrap());
+// node-semver の hyphen range は両端が裸の version (partial version も可) でなければならない。
+// `^1.0 - 2.0` / `~1.0 - 2.0` / `>=1.0 - 2.0` のような演算子付き端点は node-semver 仕様上 invalid。
+// 単に `" - "` で contains 判定すると過受理して壊れた制約を Range として書き換える可能性があるため、
+// 両端が `vN(.N){0,2}(-pre)?(+meta)?` の数値トークンに限定して全体一致を要求する。
+static HYPHEN_RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^\s*v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?\s+-\s+v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?\s*$",
+    )
+    .unwrap()
+});
 static SIMPLE_RANGE_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"^(?:>=|>|<=|<|=|\^|~)?\s*v?(?:\d+|[xX*])(?:\.(?:\d+|[xX*])){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?$",
@@ -91,7 +101,7 @@ fn extract_first_version(raw: &str) -> String {
 }
 
 fn has_compound_range(raw: &str) -> bool {
-    raw.contains("||") || raw.contains(" - ")
+    raw.contains("||") || HYPHEN_RANGE_RE.is_match(raw)
 }
 
 fn is_simple_range_token(token: &str) -> bool {
@@ -172,6 +182,14 @@ impl VersionParser for NodeVersionParser {
         let trimmed = version_str.trim();
 
         if trimmed.is_empty() {
+            return None;
+        }
+
+        // ` - ` を含むが両端が裸 version になっていない `^1.0 - 2.0` / `>=1.0 - 2.0` 等は
+        // node-semver 仕様上 invalid。has_multi_comparator が `-` を独立 token として
+        // 数えないため、`>=1.0 - 2.0` のような形式は comparator set として誤受理する。
+        // 先んじてここで拒否することで過受理を防ぐ。
+        if trimmed.contains(" - ") && !HYPHEN_RANGE_RE.is_match(trimmed) {
             return None;
         }
 
@@ -913,5 +931,42 @@ mod tests {
         assert!(parse("^x.0.0").is_none());
         assert!(parse("~x.1.0").is_none());
         assert!(parse("^1.x.5").is_none());
+    }
+
+    /// 回帰テスト: node-semver の hyphen range は両端が裸の version でなければならない。
+    /// `^1.0 - 2.0` / `~1.0 - 2.0` / `>=1.0 - 2.0` のような演算子付き端点は node-semver 仕様上
+    /// invalid。以前は `has_compound_range` が単純な `contains(" - ")` で判定していたため、
+    /// 過受理して `^1.0 - 2.0` を Range として受理してしまい、`format_updated` でレジストリ
+    /// 最新版を `^X.Y.Z - 2.0` のような壊れた制約として書き戻す可能性があった
+    /// (npm install で構文エラーになる)。
+    #[test]
+    fn test_parse_rejects_operator_prefixed_hyphen_range() {
+        assert!(parse("^1.0 - 2.0").is_none());
+        assert!(parse("~1.0 - 2.0").is_none());
+        assert!(parse(">=1.0 - 2.0").is_none());
+        assert!(parse("<=1.0 - 2.0").is_none());
+        assert!(parse("1.0 - ^2.0").is_none());
+        assert!(parse("1.0 - ~2.0").is_none());
+        assert!(parse("1.0 - >=2.0").is_none());
+    }
+
+    /// 制御テスト: 通常の hyphen range は引き続き Range として受理される
+    #[test]
+    fn test_parse_hyphen_range_basic_forms_still_work() {
+        // 完全 semver 両端
+        let spec = parse("1.0.0 - 2.0.0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        // partial 両端
+        let spec = parse("1.0 - 2.0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        // 右辺 partial (test_parse_hyphen_range_partial_upper との重複だが明示)
+        let spec = parse("1.2.3 - 2.3").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        // v 接頭辞
+        let spec = parse("v1.0.0 - v2.0.0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        // プレリリース付き
+        let spec = parse("1.0.0-beta - 2.0.0-rc").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
     }
 }

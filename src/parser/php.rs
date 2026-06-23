@@ -73,7 +73,16 @@ static BARE_VERSION_RE: LazyLock<Regex> =
 
 // 複合制約用パターン
 static COMPOUND_OR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\|\|?").unwrap());
-static HYPHEN_RANGE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s-\s").unwrap());
+// Composer の hyphen range は両端が裸の version でなければならない (`1.0 - 2.0`)。
+// `^1.0 - 2.0` / `~1.0 - 2.0` / `>=1.0 - 2.0` のような演算子付き端点は Composer 仕様上 invalid。
+// 単に `\s-\s` で is_match すると過受理して壊れた制約を Range として書き換える可能性があるため、
+// 両端が `vN(.N)*(-pre)?(+meta)?` の数値トークンに限定して全体一致を要求する。
+static HYPHEN_RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^\s*v?\d+(?:\.\d+){0,3}(?:-[\w.-]+)?(?:\+[\w.-]+)?\s+-\s+v?\d+(?:\.\d+){0,3}(?:-[\w.-]+)?(?:\+[\w.-]+)?\s*$",
+    )
+    .unwrap()
+});
 
 // 空白区切りの複合制約。
 // 例: ">=1.0 <2.0", "^1.0 !=1.5"
@@ -824,5 +833,39 @@ mod tests {
         assert!(parse("V*").is_none());
         assert!(parse("x.x").is_none());
         assert!(parse("X.X.X").is_none());
+    }
+
+    /// 回帰テスト: Composer の hyphen range は両端が裸の version でなければならない。
+    /// `^1.0 - 2.0` / `~1.0 - 2.0` / `>=1.0 - 2.0` のような演算子付き端点は Composer 仕様上
+    /// invalid。以前は `\s-\s` の単純な is_match で過受理し、`^1.0 - 2.0` が Range として
+    /// 受理され、`format_updated` でレジストリ最新版を `^X.Y.Z - 2.0` のように壊れた制約として
+    /// 書き戻す可能性があった (composer install で構文エラーになる)。
+    #[test]
+    fn test_parse_rejects_operator_prefixed_hyphen_range() {
+        assert!(parse("^1.0 - 2.0").is_none());
+        assert!(parse("~1.0 - 2.0").is_none());
+        assert!(parse(">=1.0 - 2.0").is_none());
+        assert!(parse("<=1.0 - 2.0").is_none());
+        assert!(parse("1.0 - ^2.0").is_none());
+        assert!(parse("1.0 - ~2.0").is_none());
+        assert!(parse("1.0 - >=2.0").is_none());
+    }
+
+    /// 制御テスト: 通常の hyphen range は引き続き Range として受理される
+    #[test]
+    fn test_parse_hyphen_range_still_works() {
+        let spec = parse("1.0 - 2.0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        let spec = parse("1.0.0 - 2.0.0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        // v 接頭辞付き
+        let spec = parse("v1.0.0 - v2.0.0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        // 4 セグメント
+        let spec = parse("1.0.0.0 - 2.0.0.0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        // プレリリース付き
+        let spec = parse("1.0.0-beta - 2.0.0-rc").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
     }
 }
