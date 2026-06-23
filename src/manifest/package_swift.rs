@@ -15,6 +15,7 @@
 use crate::domain::{Dependency, Language, VersionSpec, VersionSpecKind};
 use crate::error::ManifestError;
 use crate::manifest::ManifestParser;
+use crate::parser::{SwiftVersionParser, VersionParser};
 use regex::Regex;
 use std::path::PathBuf;
 use std::sync::LazyLock;
@@ -122,6 +123,30 @@ fn extract_github_owner_repo(url: &str) -> Option<String> {
     }
 
     None
+}
+
+fn is_valid_swift_version(version: &str) -> bool {
+    SwiftVersionParser.parse(version).is_some()
+}
+
+fn swift_dependency(
+    url: &str,
+    kind: VersionSpecKind,
+    raw: String,
+    version: &str,
+    additional_versions: &[&str],
+) -> Option<Dependency> {
+    if !is_valid_swift_version(version)
+        || additional_versions
+            .iter()
+            .any(|candidate| !is_valid_swift_version(candidate))
+    {
+        return None;
+    }
+
+    let name = extract_github_owner_repo(url)?;
+    let spec = VersionSpec::new(kind, raw, version);
+    Some(Dependency::production(name, spec, Language::Swift))
 }
 
 /// コメントを空白に置き換え、元のバイト位置を保ったまま検索しやすくする
@@ -247,9 +272,14 @@ impl ManifestParser for PackageSwiftParser {
             let pos = caps.get(0).unwrap().start();
             let url = caps.get(1).map(|m| m.as_str()).unwrap_or("");
             let version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-            if let Some(name) = extract_github_owner_repo(url) {
-                let spec = VersionSpec::new(VersionSpecKind::Caret, version, version);
-                found.push((pos, Dependency::production(name, spec, Language::Swift)));
+            if let Some(dep) = swift_dependency(
+                url,
+                VersionSpecKind::Caret,
+                version.to_string(),
+                version,
+                &[],
+            ) {
+                found.push((pos, dep));
             }
         }
 
@@ -257,9 +287,14 @@ impl ManifestParser for PackageSwiftParser {
             let pos = caps.get(0).unwrap().start();
             let url = caps.get(1).map(|m| m.as_str()).unwrap_or("");
             let version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-            if let Some(name) = extract_github_owner_repo(url) {
-                let spec = VersionSpec::new(VersionSpecKind::Tilde, version, version);
-                found.push((pos, Dependency::production(name, spec, Language::Swift)));
+            if let Some(dep) = swift_dependency(
+                url,
+                VersionSpecKind::Tilde,
+                version.to_string(),
+                version,
+                &[],
+            ) {
+                found.push((pos, dep));
             }
         }
 
@@ -267,9 +302,14 @@ impl ManifestParser for PackageSwiftParser {
             let pos = caps.get(0).unwrap().start();
             let url = caps.get(1).map(|m| m.as_str()).unwrap_or("");
             let version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-            if let Some(name) = extract_github_owner_repo(url) {
-                let spec = VersionSpec::new(VersionSpecKind::Exact, version, version);
-                found.push((pos, Dependency::production(name, spec, Language::Swift)));
+            if let Some(dep) = swift_dependency(
+                url,
+                VersionSpecKind::Exact,
+                version.to_string(),
+                version,
+                &[],
+            ) {
+                found.push((pos, dep));
             }
         }
 
@@ -277,9 +317,14 @@ impl ManifestParser for PackageSwiftParser {
             let pos = caps.get(0).unwrap().start();
             let url = caps.get(1).map(|m| m.as_str()).unwrap_or("");
             let version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-            if let Some(name) = extract_github_owner_repo(url) {
-                let spec = VersionSpec::new(VersionSpecKind::Exact, version, version);
-                found.push((pos, Dependency::production(name, spec, Language::Swift)));
+            if let Some(dep) = swift_dependency(
+                url,
+                VersionSpecKind::Exact,
+                version.to_string(),
+                version,
+                &[],
+            ) {
+                found.push((pos, dep));
             }
         }
 
@@ -288,10 +333,9 @@ impl ManifestParser for PackageSwiftParser {
             let url = caps.get(1).map(|m| m.as_str()).unwrap_or("");
             let lower = caps.get(2).map(|m| m.as_str()).unwrap_or("");
             let upper = caps.get(3).map(|m| m.as_str()).unwrap_or("");
-            if let Some(name) = extract_github_owner_repo(url) {
-                let raw = format!("{}..<{}", lower, upper);
-                let spec = VersionSpec::new(VersionSpecKind::Range, raw, lower);
-                found.push((pos, Dependency::production(name, spec, Language::Swift)));
+            let raw = format!("{}..<{}", lower, upper);
+            if let Some(dep) = swift_dependency(url, VersionSpecKind::Range, raw, lower, &[upper]) {
+                found.push((pos, dep));
             }
         }
 
@@ -300,10 +344,9 @@ impl ManifestParser for PackageSwiftParser {
             let url = caps.get(1).map(|m| m.as_str()).unwrap_or("");
             let lower = caps.get(2).map(|m| m.as_str()).unwrap_or("");
             let upper = caps.get(3).map(|m| m.as_str()).unwrap_or("");
-            if let Some(name) = extract_github_owner_repo(url) {
-                let raw = format!("{}...{}", lower, upper);
-                let spec = VersionSpec::new(VersionSpecKind::Range, raw, lower);
-                found.push((pos, Dependency::production(name, spec, Language::Swift)));
+            let raw = format!("{}...{}", lower, upper);
+            if let Some(dep) = swift_dependency(url, VersionSpecKind::Range, raw, lower, &[upper]) {
+                found.push((pos, dep));
             }
         }
 
@@ -312,9 +355,14 @@ impl ManifestParser for PackageSwiftParser {
             let pos = caps.get(0).unwrap().start();
             let url = caps.get(1).map(|m| m.as_str()).unwrap_or("");
             let version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-            if let Some(name) = extract_github_owner_repo(url) {
-                let spec = VersionSpec::new(VersionSpecKind::Caret, version, version);
-                found.push((pos, Dependency::production(name, spec, Language::Swift)));
+            if let Some(dep) = swift_dependency(
+                url,
+                VersionSpecKind::Caret,
+                version.to_string(),
+                version,
+                &[],
+            ) {
+                found.push((pos, dep));
             }
         }
 
@@ -361,7 +409,9 @@ impl ManifestParser for PackageSwiftParser {
         })?;
 
         // SPM は semver 2.0.0 準拠のためプレリリース識別子とビルドメタデータも許容する
-        let version_re = Regex::new(r#""([vV]?\d+(?:\.\d+)*(?:-[\w.-]+)?(?:\+[\w.-]+)?)""#)
+        let version_re = Regex::new(
+            r#""((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)""#,
+        )
             .map_err(|e| ManifestError::InvalidVersionSpec {
                 path: PathBuf::from("Package.swift"),
                 spec: package.to_string(),
@@ -927,14 +977,11 @@ let package = Package(
 
     #[test]
     fn test_parse_v_prefix_in_version() {
-        // v プレフィックス付きバージョン。from: に指定された文字列がそのまま保持される
+        // Git タグ名では `v1.0.0` を認識するが、Package.swift の requirement 文字列は
+        // SPM の Version として semver 2.0.0 形式 (`1.0.0`) でなければならない。
         let content = r#".package(url: "https://github.com/owner/repo.git", from: "v1.0.0")"#;
         let deps = parse(content).unwrap();
-        // v プレフィックスはバージョン正規表現 (\d+...) にマッチしないため、
-        // パースはされるがバージョン文字列は "v1.0.0" として保持される
-        assert_eq!(deps.len(), 1);
-        assert_eq!(deps[0].name, "owner/repo");
-        assert_eq!(deps[0].version_spec.version, "v1.0.0");
+        assert!(deps.is_empty());
     }
 
     #[test]
@@ -1087,7 +1134,7 @@ let package = Package(
 
     #[test]
     fn test_update_version_v_prefix() {
-        // v プレフィックス付きバージョンが update_version で正しく更新されること
+        // v プレフィックス付き requirement は SPM の Version として無効なので更新対象外
         let content = r#"
 // swift-tools-version: 5.9
 import PackageDescription
@@ -1099,11 +1146,8 @@ let package = Package(
     ]
 )
 "#;
-        let result = PackageSwiftParser
-            .update_version(content, "owner/repo", "1.2.0")
-            .unwrap();
-        assert!(result.contains("\"1.2.0\""));
-        assert!(!result.contains("\"v1.0.0\""));
+        let result = PackageSwiftParser.update_version(content, "owner/repo", "1.2.0");
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1170,6 +1214,26 @@ let package = Package(
         assert_eq!(deps[0].name, "apple/swift-nio");
         assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Caret);
         assert_eq!(deps[0].version_spec.version, "2.40.0-beta.1");
+    }
+
+    #[test]
+    fn test_parse_rejects_non_semver_versions() {
+        // SPM の Version は semver 2.0.0 準拠なので、2/4 セグメントや先頭ゼロは対象外
+        let content = r#"
+.package(url: "https://github.com/apple/swift-nio.git", from: "2.40")
+.package(url: "https://github.com/vapor/vapor.git", from: "4.0.0.1")
+.package(url: "https://github.com/apple/swift-argument-parser.git", from: "01.2.3")
+"#;
+        let deps = parse(content).unwrap();
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_parse_rejects_non_semver_range_bound() {
+        let content =
+            r#".package(url: "https://github.com/apple/swift-nio.git", "2.40.0"..<"3.0")"#;
+        let deps = parse(content).unwrap();
+        assert!(deps.is_empty());
     }
 
     #[test]

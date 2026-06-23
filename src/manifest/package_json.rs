@@ -446,6 +446,25 @@ mod tests {
     }
 
     #[test]
+    fn test_update_version_bare_partial_range_keeps_upper_bound() {
+        let content = r#"{
+  "dependencies": {
+    "pkg": "1.2 <2.0.0"
+  }
+}"#;
+
+        let deps = parse(content).unwrap();
+        let pkg = deps.iter().find(|d| d.name == "pkg").unwrap();
+        assert_eq!(pkg.version_spec.kind, VersionSpecKind::Range);
+        assert_eq!(pkg.version_spec.version, "1.2.0");
+
+        let result = PackageJsonParser
+            .update_version(content, "pkg", "1.9.3")
+            .unwrap();
+        assert!(result.contains("\"pkg\": \"1.9 <2.0.0\""));
+    }
+
+    #[test]
     fn test_update_version_or_constraint_returns_err() {
         let content = r#"{
   "dependencies": {

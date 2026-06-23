@@ -6,7 +6,7 @@
 //! - Tilde: `~1.2.3`, `~1.2`, `~1`
 //! - 比較演算子: `>=1.2.3`, `>1.2.3`, `<=1.2.3`, `<1.2.3`
 //! - ワイルドカード: `1.x`, `1.2.*`, `^1.x`, `~1.2.x` (caret/tilde + x-range)
-//! - レンジ: `>=1.0.0 <2.0.0`, `1.0.0 - 2.0.0`, `^1 || ^2`
+//! - レンジ: `>=1.0.0 <2.0.0`, `1.2 <2.0.0`, `1.0.0 - 2.0.0`, `^1 || ^2`
 
 use crate::domain::{Language, VersionSpec, VersionSpecKind};
 use crate::parser::VersionParser;
@@ -76,6 +76,12 @@ static CARET_TILDE_WILDCARD_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[\^~]\s*v?(?:\d+|[xX*])(?:\.(?:\d+|[xX*])){0,2}$").unwrap());
 static RANGE_TOKEN_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?").unwrap());
+static SIMPLE_RANGE_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^(?:>=|>|<=|<|=|\^|~)?\s*v?(?:\d+|[xX*])(?:\.(?:\d+|[xX*])){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?$",
+    )
+    .unwrap()
+});
 
 fn extract_first_version(raw: &str) -> String {
     RANGE_TOKEN_RE
@@ -88,8 +94,35 @@ fn has_compound_range(raw: &str) -> bool {
     raw.contains("||") || raw.contains(" - ")
 }
 
+fn is_simple_range_token(token: &str) -> bool {
+    let token = token.trim();
+    if !SIMPLE_RANGE_TOKEN_RE.is_match(token) {
+        return false;
+    }
+
+    let body = token
+        .strip_prefix(">=")
+        .or_else(|| token.strip_prefix("<="))
+        .or_else(|| token.strip_prefix('>'))
+        .or_else(|| token.strip_prefix('<'))
+        .or_else(|| token.strip_prefix('='))
+        .or_else(|| token.strip_prefix('^'))
+        .or_else(|| token.strip_prefix('~'))
+        .unwrap_or(token)
+        .trim();
+    let body = body.strip_prefix(['v', 'V']).unwrap_or(body);
+
+    if body.contains(['x', 'X', '*']) {
+        !is_fully_floating_wildcard(body) && !has_digit_after_wildcard(body)
+    } else {
+        true
+    }
+}
+
 fn has_multi_comparator(raw: &str) -> bool {
     let mut count = 0usize;
+    let mut simple_count = 0usize;
+    let mut has_bound_operator = false;
     for token in raw.split_whitespace() {
         if token.starts_with(">=")
             || token.starts_with('>')
@@ -100,8 +133,18 @@ fn has_multi_comparator(raw: &str) -> bool {
         {
             count += 1;
         }
+        if token.starts_with(">=")
+            || token.starts_with('>')
+            || token.starts_with("<=")
+            || token.starts_with('<')
+        {
+            has_bound_operator = true;
+        }
+        if is_simple_range_token(token) {
+            simple_count += 1;
+        }
     }
-    count >= 2
+    count >= 2 || (has_bound_operator && simple_count >= 2)
 }
 
 fn is_fully_floating_wildcard(raw: &str) -> bool {
@@ -827,6 +870,22 @@ mod tests {
         let spec = parse(">=1.0.0    <2.0.0").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Range);
         assert_eq!(spec.version, "1.0.0");
+    }
+
+    #[test]
+    fn test_parse_compound_with_bare_partial_lower_bound() {
+        // npm の comparator set は bare partial と comparator を空白で結合できる
+        // (`1.2 <2.0.0` は `>=1.2.0 <1.3.0 <2.0.0` 相当)。
+        let spec = parse("1.2 <2.0.0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1.2.0");
+    }
+
+    #[test]
+    fn test_parse_compound_with_bare_exact_lower_bound() {
+        let spec = parse("1.2.3 <2.0.0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1.2.3");
     }
 
     #[test]

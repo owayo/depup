@@ -234,6 +234,22 @@ fn replace_version_token(raw: &str, start: usize, end: usize, new_version: &str)
     Some(format!("{}{}{}", &raw[..start], replacement, &raw[end..]))
 }
 
+fn replace_version_token_preserving_shape(
+    raw: &str,
+    start: usize,
+    end: usize,
+    new_version: &str,
+) -> Option<String> {
+    let token = &raw[start..end];
+    let replacement = if token.contains(['x', 'X', '*']) {
+        format_wildcard_like(token, new_version)?
+    } else {
+        format_partial_version_like(token, new_version)?
+    };
+
+    Some(format!("{}{}{}", &raw[..start], replacement, &raw[end..]))
+}
+
 fn find_version_token_at(raw: &str, offset: usize) -> Option<(usize, usize)> {
     let rest = raw.get(offset..)?;
     let whitespace_len = rest.len() - rest.trim_start().len();
@@ -285,6 +301,11 @@ fn find_inclusive_lower_bound_token(raw: &str) -> Option<(usize, usize)> {
     }
 
     None
+}
+
+fn find_bare_lower_bound_token(raw: &str) -> Option<(usize, usize)> {
+    let leading_ws_len = raw.len() - raw.trim_start().len();
+    find_version_token_at(raw, leading_ws_len)
 }
 
 fn contains_not_equal_operator(raw: &str) -> bool {
@@ -373,9 +394,13 @@ fn format_range_like(raw: &str, new_version: &str) -> Option<String> {
         return None;
     }
 
-    let (start, end) = find_inclusive_lower_bound_token(raw)?;
+    if let Some((start, end)) = find_inclusive_lower_bound_token(raw) {
+        return replace_version_token(raw, start, end, new_version);
+    }
 
-    replace_version_token(raw, start, end, new_version)
+    let (start, end) = find_bare_lower_bound_token(raw)?;
+
+    replace_version_token_preserving_shape(raw, start, end, new_version)
 }
 
 impl VersionSpec {
@@ -610,6 +635,15 @@ mod tests {
         assert_eq!(
             spec.try_format_updated("1.9.3").as_deref(),
             Some(">=1.9.3,<2.0")
+        );
+    }
+
+    #[test]
+    fn test_try_format_updated_range_replaces_bare_lower_bound() {
+        let spec = VersionSpec::new(VersionSpecKind::Range, "1.2 <2.0.0", "1.2.0");
+        assert_eq!(
+            spec.try_format_updated("1.9.3").as_deref(),
+            Some("1.9 <2.0.0")
         );
     }
 

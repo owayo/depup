@@ -63,6 +63,15 @@ fn is_cargo_package_git_tag_table(section: &str, package: &str) -> bool {
     })
 }
 
+/// inline table 形式の git tag を更新してよい親セクションかどうかを返す。
+/// 通常の依存セクションに加えて `[patch.<registry>]` の inline table も対象にする。
+fn is_cargo_git_tag_inline_section(section: &str) -> bool {
+    is_cargo_dependency_section(section)
+        || section
+            .strip_prefix("patch.")
+            .is_some_and(|registry| !registry.is_empty())
+}
+
 // 複数行テーブル内の `version` キー行にマッチする。行頭のキーだけを対象にするため、
 // `#` で始まるコメント行や行末コメント内の `version = "..."` には反応しない。
 static VERSION_LINE_RE: LazyLock<Regex> =
@@ -278,32 +287,24 @@ impl ManifestParser for CargoTomlParser {
         package: &str,
         new_tag: &str,
     ) -> Result<String, ManifestError> {
-        let mut result = content.to_string();
         let mut updated = false;
 
-        // inline table: `package = { git = "...", tag = "v1.2.3", ... }`
-        //   行内の tag フィールドだけを差し替える
         let inline_pattern = format!(
-            r#"(?m)^(\s*{})(\s*=\s*\{{[^{{}}]*\btag\s*=\s*")([^"]+)"#,
+            r#"^(\s*{}\s*=\s*\{{[^\n}}]*?\btag\s*=\s*)(?:"([^"]+)"|'([^']+)')"#,
             regex::escape(package)
         );
-        if let Ok(re) = Regex::new(&inline_pattern)
-            && let Some(caps) = re.captures(&result)
-        {
-            let replacement = format!("{}{}{}", &caps[1], &caps[2], new_tag);
-            result = re.replace(&result, replacement.as_str()).to_string();
-            updated = true;
-        }
+        let inline_re =
+            Regex::new(&inline_pattern).map_err(|e| ManifestError::InvalidVersionSpec {
+                path: PathBuf::from("Cargo.toml"),
+                spec: package.to_string(),
+                message: format!("invalid regex pattern: {}", e),
+            })?;
 
-        // 複数行テーブル: `[dependencies.package]` ブロック内の `tag = "..."` を差し替える。
-        //   `[patch.<registry>.package]` や `[workspace.dependencies.package]` にも対応する。
-        //   セクション名をパッケージ名の完全一致で追跡することで、
-        //   `[dependencies.foo-extra]` を `foo` で誤マッチしないようにする。
-        //   行頭が `tag` キーの行だけを対象とし、コメント行内の `tag = "..."` や
-        //   `features = [...]` を挟んだ後の `tag` 行も正しく扱う。
+        // inline table と複数行テーブルの両方をセクション追跡しながら更新する。
+        // 依存セクション外の同名キーを誤って書き換えず、TOML の単一引用符も保持する。
         let mut section = String::new();
         let mut rebuilt = String::new();
-        for segment in result.split_inclusive('\n') {
+        for segment in content.split_inclusive('\n') {
             let (line, newline) = if let Some(line) = segment.strip_suffix('\n') {
                 (line, "\n")
             } else {
@@ -314,6 +315,17 @@ impl ManifestParser for CargoTomlParser {
                 section.clear();
                 section.push_str(name);
                 rebuilt.push_str(segment);
+                continue;
+            }
+
+            if is_cargo_git_tag_inline_section(&section)
+                && let Some(caps) = inline_re.captures(line)
+            {
+                let quote = if caps.get(3).is_some() { "'" } else { "\"" };
+                let replacement = format!("{}{}{}{}", &caps[1], quote, new_tag, quote);
+                rebuilt.push_str(&inline_re.replace(line, replacement.as_str()));
+                rebuilt.push_str(newline);
+                updated = true;
                 continue;
             }
 
@@ -330,10 +342,9 @@ impl ManifestParser for CargoTomlParser {
 
             rebuilt.push_str(segment);
         }
-        result = rebuilt;
 
         if updated {
-            Ok(result)
+            Ok(rebuilt)
         } else {
             Err(ManifestError::InvalidVersionSpec {
                 path: PathBuf::from("Cargo.toml"),
@@ -648,6 +659,51 @@ serde = "1.0.0"
         assert!(!result.contains(r#"tag = "v1.2.3""#));
         // 他の行が保持される
         assert!(result.contains(r#"serde = "1.0.0""#));
+    }
+
+    #[test]
+    fn test_update_git_tag_inline_table_single_quoted_tag() {
+        let content = r#"[dependencies]
+bar = { git = "https://github.com/owner/bar.git", tag = 'v1.2.3' }
+"#;
+        let result = CargoTomlParser
+            .update_git_tag(content, "bar", "v1.3.0")
+            .unwrap();
+        assert!(result.contains("tag = 'v1.3.0'"));
+        assert!(!result.contains("tag = 'v1.2.3'"));
+    }
+
+    #[test]
+    fn test_update_git_tag_inline_table_scoped_to_dependency_sections() {
+        let content = r#"[package.metadata]
+bar = { tag = "keep" }
+
+[dependencies]
+bar = { git = "https://github.com/owner/bar.git", tag = "v1.2.3" }
+"#;
+        let result = CargoTomlParser
+            .update_git_tag(content, "bar", "v1.3.0")
+            .unwrap();
+
+        assert!(result.contains(
+            r#"[package.metadata]
+bar = { tag = "keep" }"#
+        ));
+        assert!(
+            result
+                .contains(r#"bar = { git = "https://github.com/owner/bar.git", tag = "v1.3.0" }"#)
+        );
+    }
+
+    #[test]
+    fn test_update_git_tag_patch_inline_table() {
+        let content = r#"[patch.crates-io]
+foo = { git = "https://example.com/foo", tag = "v1.0.0" }
+"#;
+        let result = CargoTomlParser
+            .update_git_tag(content, "foo", "v1.1.0")
+            .unwrap();
+        assert!(result.contains(r#"foo = { git = "https://example.com/foo", tag = "v1.1.0" }"#));
     }
 
     #[test]

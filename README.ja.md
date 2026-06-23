@@ -342,14 +342,15 @@ npm/Composer のハイフンレンジでは、右辺が `1.0 - 2.0` のような
 
 JSON マニフェストでは、depup が解析対象にする依存セクションだけを書き換えます。`package.json` の `overrides`、`composer.json` の `replace` / `provide` / `conflict` などは変更しません。
 
-TOML マニフェストでは、基本文字列（`"..."`）とリテラル文字列（`'...'`）のどちらも、対応する依存セクション内では引用符を維持して更新します。`Cargo.toml` では `[dependencies]`、`[dev-dependencies]`、`[build-dependencies]`、`[workspace.dependencies]`、target 固有の依存テーブルだけを書き換え、metadata テーブルは変更しません。`crates-io` 以外の `registry` を指定した Cargo 依存は、depup が crates.io だけを問い合わせるためスキップします。Cargo の比較レンジは `>=1.0, <2.0, >=1.0.100` のように3個以上のカンマ区切り requirement にも対応します。`^1.2.2, <1.5` のように caret/tilde/wildcard と comparator を混在させた複数要件も `semver::VersionReq` で valid 性を確認して Range として検出します（以前は黙ってスキップしていました）。上限のない複数下限の混在で安全に書き換えられないものは Skip として可視化します。
+TOML マニフェストでは、基本文字列（`"..."`）とリテラル文字列（`'...'`）のどちらも、対応する依存セクション内では引用符を維持して更新します。`Cargo.toml` では `[dependencies]`、`[dev-dependencies]`、`[build-dependencies]`、`[workspace.dependencies]`、target 固有の依存テーブルだけを書き換え、metadata テーブルは変更しません。Cargo git tag 更新も inline table と複数行テーブルの両方で同じセクション制限に従い、単一引用符・二重引用符を保持します。`[patch.<registry>]` / `[patch.<registry>.<package>]` も更新対象です。`crates-io` 以外の `registry` を指定した Cargo 依存は、depup が crates.io だけを問い合わせるためスキップします。Cargo の比較レンジは `>=1.0, <2.0, >=1.0.100` のように3個以上のカンマ区切り requirement にも対応します。`^1.2.2, <1.5` のように caret/tilde/wildcard と comparator を混在させた複数要件も `semver::VersionReq` で valid 性を確認して Range として検出します（以前は黙ってスキップしていました）。上限のない複数下限の混在で安全に書き換えられないものは Skip として可視化します。
 
 `[project]` / `[tool.rye]` セクションでは `dependencies` / `dev-dependencies` 配列だけを書き換え、`name` / `description` / `keywords` 等のメタデータ文字列は PEP 508 依存指定に見えても書き換えません。Python の PEP 508 version list は `>=3.5,<4,` のような末尾カンマを許容します。depup は下限更新時にもこのカンマを維持します。`pypi` 以外の `source` を指定した Poetry 依存は、PEP 621 依存を `tool.poetry.dependencies` で補足している場合も含め、depup が PyPI だけを問い合わせるためスキップします。Poetry のマルチプル制約配列形式（`foo = [{version = "<=1.9", python = ">=3.6,<3.8"}, {version = "^2.0", python = ">=3.8"}]`）も、要素ごとの `requires_python` 解決を伴わずに配列要素を安全に書き換えられないためスキップします。
 
 Gradle の文字列記法では `:resources@zip` や `@aar` のような classifier / extension サフィックスを維持します。`//` 行コメントや `/* ... */` ブロックコメント内だけにある依存宣言は更新対象にしません。Gradle version catalog では、バージョンが宣言されている TOML の文字列形式または table 形式を維持して更新します。
 
-Swift の GitHub 依存では、タグの接頭辞 `v1.2.3` と `V1.2.3` の両方を認識します。
-また、`Package.swift` では `//` 行コメントや `/* ... */` ブロックコメント内に書かれた依存宣言は解析対象から除外します。
+npm の comparator set では、`1.2 <2.0.0` のような bare partial lower bound も扱い、下限側を更新するときは partial の形を維持します。
+
+Swift の GitHub 依存では、GitHub タグとして `v1.2.3` と `V1.2.3` の両方を認識します。一方、`Package.swift` の version requirement 文字列は厳格な SemVer (`X.Y.Z`、先頭ゼロなし) として検証します。また、`Package.swift` では `//` 行コメントや `/* ... */` ブロックコメント内に書かれた依存宣言は解析対象から除外します。
 SPM の semver 2.0.0 仕様に合わせ、プレリリース識別子付きバージョン（`1.0.0-beta.1`）、ビルドメタデータ付き（`1.0.0+build.123`）、両者を組み合わせた形式（`1.0.0-rc.1+sha.abc`）も解析・更新できます。
 `.package(...)` の末尾に `traits: [...]`（SPM 6.1 の Package Traits）や `moduleAliases: [...]` のような追加引数があっても、version requirement だけを置換して追加引数を保持します。Swift Package Registry の `id:` 依存（`.package(id: "scope.name", ...)`）は registry API アダプタが未実装のため現状未対応でスキップされます（GitHub URL 依存のみ対象。将来対応予定）。
 

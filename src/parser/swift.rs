@@ -15,10 +15,14 @@ use std::sync::LazyLock;
 /// Swift バージョン指定パーサ
 pub struct SwiftVersionParser;
 
-/// 裸の semver バージョン: 1.2.3 / 1.2 / 1.0.0-beta.1 / 1.0.0+build / 1.0.0-rc.1+build
-/// SPM は semver 2.0.0 準拠のためプレリリース識別子とビルドメタデータを許容する
-static BARE_VERSION_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(\d+(?:\.\d+)*(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap());
+/// 裸の semver バージョン: 1.2.3 / 1.0.0-beta.1 / 1.0.0+build / 1.0.0-rc.1+build
+/// SPM は semver 2.0.0 準拠なので 3 セグメント必須で、数値識別子の先頭ゼロは拒否する
+static BARE_VERSION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)$",
+    )
+    .unwrap()
+});
 
 impl VersionParser for SwiftVersionParser {
     fn parse(&self, version_str: &str) -> Option<VersionSpec> {
@@ -58,16 +62,12 @@ mod tests {
 
     #[test]
     fn test_parse_major_minor() {
-        let spec = parse("1.2").unwrap();
-        assert_eq!(spec.kind, VersionSpecKind::Exact);
-        assert_eq!(spec.version, "1.2");
+        assert!(parse("1.2").is_none());
     }
 
     #[test]
     fn test_parse_major_only() {
-        let spec = parse("1").unwrap();
-        assert_eq!(spec.kind, VersionSpecKind::Exact);
-        assert_eq!(spec.version, "1");
+        assert!(parse("1").is_none());
     }
 
     #[test]
@@ -105,9 +105,7 @@ mod tests {
 
     #[test]
     fn test_parse_four_part_version() {
-        let spec = parse("1.2.3.4").unwrap();
-        assert_eq!(spec.kind, VersionSpecKind::Exact);
-        assert_eq!(spec.version, "1.2.3.4");
+        assert!(parse("1.2.3.4").is_none());
     }
 
     #[test]
@@ -126,18 +124,17 @@ mod tests {
 
     #[test]
     fn test_parse_two_segment_version() {
-        // 2セグメントバージョンが正しくパースされる
-        let spec = parse("1.0").unwrap();
-        assert_eq!(spec.kind, VersionSpecKind::Exact);
-        assert_eq!(spec.version, "1.0");
+        // SPM の Version は semver 2.0.0 準拠なので 2 セグメントは拒否する
+        assert!(parse("1.0").is_none());
     }
 
     #[test]
-    fn test_parse_leading_zeros_accepted() {
-        // 先頭ゼロ付きバージョンも数字列として許容される
-        let spec = parse("01.02.03").unwrap();
-        assert_eq!(spec.kind, VersionSpecKind::Exact);
-        assert_eq!(spec.version, "01.02.03");
+    fn test_parse_leading_zeros_rejected() {
+        // semver 2.0.0 では数値識別子の先頭ゼロは invalid
+        assert!(parse("01.02.03").is_none());
+        assert!(parse("1.02.3").is_none());
+        assert!(parse("1.2.03").is_none());
+        assert!(parse("1.2.3-01").is_none());
     }
 
     #[test]
@@ -189,8 +186,7 @@ mod tests {
 
     #[test]
     fn test_format_updated_two_segment() {
-        // 2セグメントバージョンの更新フォーマット
-        let spec = parse("1.0").unwrap();
-        assert_eq!(spec.format_updated("2.1"), "2.1");
+        // SPM の Version は semver 2.0.0 準拠なので 2 セグメントは更新対象にしない
+        assert!(parse("1.0").is_none());
     }
 }
