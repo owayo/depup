@@ -11,6 +11,7 @@
 use crate::domain::{Language, VersionSpec, VersionSpecKind};
 use crate::parser::VersionParser;
 use regex::Regex;
+use semver::Version;
 use std::sync::LazyLock;
 
 /// Node.js バージョン指定パーサ
@@ -40,33 +41,54 @@ fn normalize_version(version: &str) -> String {
     }
 }
 
+fn has_leading_zero_numeric_prerelease_identifier(version: &str) -> bool {
+    let Some(prerelease_start) = version.find('-') else {
+        return false;
+    };
+    let prerelease_and_build = &version[prerelease_start + 1..];
+    let prerelease = prerelease_and_build
+        .split_once('+')
+        .map(|(pre, _)| pre)
+        .unwrap_or(prerelease_and_build);
+
+    prerelease.split('.').any(|identifier| {
+        identifier.len() > 1
+            && identifier.starts_with('0')
+            && identifier.chars().all(|ch| ch.is_ascii_digit())
+    })
+}
+
+fn normalize_valid_version(version: &str) -> Option<String> {
+    let normalized = normalize_version(version);
+    Version::parse(&normalized).ok()?;
+    if has_leading_zero_numeric_prerelease_identifier(&normalized) {
+        return None;
+    }
+    Some(normalized)
+}
+
 // Node.js のバージョン指定用正規表現
 // ^2 や ~2.1 のような部分指定も受け付ける
 // node-semver の prerelease (`-...`) と build metadata (`+...`) は同時に出現することがある
 // (例: `1.2.3-rc.1+build123`)
-static CARET_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^\^\s*(v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
-});
-static TILDE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^~\s*(v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
-});
-static GTE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^>=\s*(v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
-});
-static GT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^>\s*(v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
-});
-static LTE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^<=\s*(v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
-});
-static LT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^<\s*(v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
-});
-static EQUAL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^=\s*(v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
-});
+const NODE_VERSION_PATTERN: &str = r"v?\d+(?:\.\d+){0,2}(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?";
+const NODE_VERSION_OR_X_PATTERN: &str = r"v?(?:\d+|[xX*])(?:\.(?:\d+|[xX*])){0,2}(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?";
+static CARET_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!(r"^\^\s*({NODE_VERSION_PATTERN})$")).unwrap());
+static TILDE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!(r"^~\s*({NODE_VERSION_PATTERN})$")).unwrap());
+static GTE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!(r"^>=\s*({NODE_VERSION_PATTERN})$")).unwrap());
+static GT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!(r"^>\s*({NODE_VERSION_PATTERN})$")).unwrap());
+static LTE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!(r"^<=\s*({NODE_VERSION_PATTERN})$")).unwrap());
+static LT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!(r"^<\s*({NODE_VERSION_PATTERN})$")).unwrap());
+static EQUAL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!(r"^=\s*({NODE_VERSION_PATTERN})$")).unwrap());
 static EXACT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(&format!(r"^({NODE_VERSION_PATTERN})$")).unwrap());
 static WILDCARD_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(?:v?(?:\d+|[xX*])(?:\.(?:\d+|[xX*])){0,2}|\*)$").unwrap());
 // `^1.x` / `~1.2.*` のような caret/tilde + x-range。
@@ -75,33 +97,74 @@ static WILDCARD_RE: LazyLock<Regex> =
 static CARET_TILDE_WILDCARD_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[\^~]\s*v?(?:\d+|[xX*])(?:\.(?:\d+|[xX*])){0,2}$").unwrap());
 static RANGE_TOKEN_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?").unwrap());
+    LazyLock::new(|| Regex::new(NODE_VERSION_PATTERN).unwrap());
 // node-semver の hyphen range は両端が裸の version (partial version も可) でなければならない。
 // `^1.0 - 2.0` / `~1.0 - 2.0` / `>=1.0 - 2.0` のような演算子付き端点は node-semver 仕様上 invalid。
 // 単に `" - "` で contains 判定すると過受理して壊れた制約を Range として書き換える可能性があるため、
 // 両端が `vN(.N){0,2}(-pre)?(+meta)?` の数値トークンに限定して全体一致を要求する。
 static HYPHEN_RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"^\s*v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?\s+-\s+v?\d+(?:\.\d+){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?\s*$",
-    )
+    Regex::new(&format!(
+        r"^\s*{NODE_VERSION_PATTERN}\s+-\s+{NODE_VERSION_PATTERN}\s*$"
+    ))
     .unwrap()
 });
 static SIMPLE_RANGE_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"^(?:>=|>|<=|<|=|\^|~)?\s*v?(?:\d+|[xX*])(?:\.(?:\d+|[xX*])){0,2}(?:-[\w.-]+)?(?:\+[\w.-]+)?$",
-    )
+    Regex::new(&format!(
+        r"^(?:>=|>|<=|<|=|\^|~)?\s*{NODE_VERSION_OR_X_PATTERN}$"
+    ))
     .unwrap()
 });
 
 fn extract_first_version(raw: &str) -> String {
     RANGE_TOKEN_RE
         .find(raw)
-        .map(|m| normalize_version(m.as_str()))
+        .and_then(|m| normalize_valid_version(m.as_str()))
         .unwrap_or_default()
 }
 
+fn range_versions_are_valid(raw: &str) -> bool {
+    RANGE_TOKEN_RE
+        .find_iter(raw)
+        .all(|m| normalize_valid_version(m.as_str()).is_some())
+}
+
+fn has_hyphen_range(raw: &str) -> bool {
+    HYPHEN_RANGE_RE.is_match(raw) && range_versions_are_valid(raw)
+}
+
+fn normalize_comparator_tokens(raw: &str) -> Option<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut iter = raw.split_whitespace();
+
+    while let Some(token) = iter.next() {
+        if matches!(token, ">=" | ">" | "<=" | "<" | "=" | "^" | "~") {
+            let version = iter.next()?;
+            tokens.push(format!("{token}{version}"));
+        } else {
+            tokens.push(token.to_string());
+        }
+    }
+
+    Some(tokens)
+}
+
+fn comparator_set_is_valid(raw: &str) -> bool {
+    let Some(tokens) = normalize_comparator_tokens(raw) else {
+        return false;
+    };
+
+    !tokens.is_empty() && tokens.iter().all(|token| is_simple_range_token(token))
+}
+
+fn has_or_range(raw: &str) -> bool {
+    raw.contains("||")
+        && raw
+            .split("||")
+            .all(|part| comparator_set_is_valid(part.trim()))
+}
+
 fn has_compound_range(raw: &str) -> bool {
-    raw.contains("||") || HYPHEN_RANGE_RE.is_match(raw)
+    has_or_range(raw) || has_hyphen_range(raw)
 }
 
 fn is_simple_range_token(token: &str) -> bool {
@@ -125,15 +188,24 @@ fn is_simple_range_token(token: &str) -> bool {
     if body.contains(['x', 'X', '*']) {
         !is_fully_floating_wildcard(body) && !has_digit_after_wildcard(body)
     } else {
-        true
+        normalize_valid_version(body).is_some()
     }
 }
 
 fn has_multi_comparator(raw: &str) -> bool {
-    let mut count = 0usize;
+    let Some(tokens) = normalize_comparator_tokens(raw) else {
+        return false;
+    };
+
+    if !tokens.iter().all(|token| is_simple_range_token(token)) {
+        return false;
+    }
+
+    let mut comparator_count = 0usize;
     let mut simple_count = 0usize;
     let mut has_bound_operator = false;
-    for token in raw.split_whitespace() {
+
+    for token in tokens {
         if token.starts_with(">=")
             || token.starts_with('>')
             || token.starts_with("<=")
@@ -141,7 +213,7 @@ fn has_multi_comparator(raw: &str) -> bool {
             || token.starts_with('^')
             || token.starts_with('~')
         {
-            count += 1;
+            comparator_count += 1;
         }
         if token.starts_with(">=")
             || token.starts_with('>')
@@ -150,11 +222,12 @@ fn has_multi_comparator(raw: &str) -> bool {
         {
             has_bound_operator = true;
         }
-        if is_simple_range_token(token) {
+        if is_simple_range_token(&token) {
             simple_count += 1;
         }
     }
-    count >= 2 || (has_bound_operator && simple_count >= 2)
+
+    comparator_count >= 2 || (has_bound_operator && simple_count >= 2)
 }
 
 fn is_fully_floating_wildcard(raw: &str) -> bool {
@@ -204,7 +277,7 @@ impl VersionParser for NodeVersionParser {
 
         // Caret レンジ
         if let Some(caps) = CARET_RE.captures(trimmed) {
-            let version = normalize_version(caps.get(1)?.as_str());
+            let version = normalize_valid_version(caps.get(1)?.as_str())?;
             return Some(
                 VersionSpec::new(VersionSpecKind::Caret, trimmed, version).with_prefix("^"),
             );
@@ -212,7 +285,7 @@ impl VersionParser for NodeVersionParser {
 
         // Tilde レンジ
         if let Some(caps) = TILDE_RE.captures(trimmed) {
-            let version = normalize_version(caps.get(1)?.as_str());
+            let version = normalize_valid_version(caps.get(1)?.as_str())?;
             return Some(
                 VersionSpec::new(VersionSpecKind::Tilde, trimmed, version).with_prefix("~"),
             );
@@ -220,7 +293,7 @@ impl VersionParser for NodeVersionParser {
 
         // 以上
         if let Some(caps) = GTE_RE.captures(trimmed) {
-            let version = normalize_version(caps.get(1)?.as_str());
+            let version = normalize_valid_version(caps.get(1)?.as_str())?;
             return Some(
                 VersionSpec::new(VersionSpecKind::GreaterOrEqual, trimmed, version)
                     .with_prefix(">="),
@@ -229,7 +302,7 @@ impl VersionParser for NodeVersionParser {
 
         // より大きい
         if let Some(caps) = GT_RE.captures(trimmed) {
-            let version = normalize_version(caps.get(1)?.as_str());
+            let version = normalize_valid_version(caps.get(1)?.as_str())?;
             return Some(
                 VersionSpec::new(VersionSpecKind::Greater, trimmed, version).with_prefix(">"),
             );
@@ -237,7 +310,7 @@ impl VersionParser for NodeVersionParser {
 
         // 以下
         if let Some(caps) = LTE_RE.captures(trimmed) {
-            let version = normalize_version(caps.get(1)?.as_str());
+            let version = normalize_valid_version(caps.get(1)?.as_str())?;
             return Some(
                 VersionSpec::new(VersionSpecKind::LessOrEqual, trimmed, version).with_prefix("<="),
             );
@@ -245,14 +318,14 @@ impl VersionParser for NodeVersionParser {
 
         // より小さい
         if let Some(caps) = LT_RE.captures(trimmed) {
-            let version = normalize_version(caps.get(1)?.as_str());
+            let version = normalize_valid_version(caps.get(1)?.as_str())?;
             return Some(
                 VersionSpec::new(VersionSpecKind::Less, trimmed, version).with_prefix("<"),
             );
         }
 
         if let Some(caps) = EQUAL_RE.captures(trimmed) {
-            let version = normalize_version(caps.get(1)?.as_str());
+            let version = normalize_valid_version(caps.get(1)?.as_str())?;
             return Some(
                 VersionSpec::new(VersionSpecKind::Exact, trimmed, version).with_prefix("="),
             );
@@ -313,7 +386,7 @@ impl VersionParser for NodeVersionParser {
         // 固定バージョンまたは部分指定
         if let Some(caps) = EXACT_RE.captures(trimmed) {
             let raw_version = caps.get(1)?.as_str();
-            let normalized = normalize_version(raw_version);
+            let normalized = normalize_valid_version(raw_version)?;
             if raw_version.matches('.').count() >= 2 {
                 return Some(VersionSpec::new(
                     VersionSpecKind::Exact,
@@ -546,6 +619,20 @@ mod tests {
     #[test]
     fn test_parse_invalid() {
         assert!(parse("not-a-version").is_none());
+    }
+
+    #[test]
+    fn test_parse_rejects_invalid_semver_identifiers() {
+        // SemVer の prerelease/build 識別子は ASCII 英数字とハイフンのみ。
+        // 空識別子や prerelease の数値識別子の先頭ゼロも invalid として弾く。
+        assert!(parse("1.2.3-rc_1").is_none());
+        assert!(parse("^1.2.3-alpha..1").is_none());
+        assert!(parse("~1.2.3+build_1").is_none());
+        assert!(parse(">=1.2.3-01").is_none());
+        assert!(parse(">=1.2.3-alpha.01").is_none());
+        assert!(parse("1.2.3 - 2.0.0-rc_1").is_none());
+        assert!(parse(">= 1.2.3-alpha..1 < 2.0.0").is_none());
+        assert!(parse("^1.0.0 || ^2.0.0-01").is_none());
     }
 
     #[test]
@@ -874,18 +961,22 @@ mod tests {
 
     #[test]
     fn test_parse_compound_with_three_comparators() {
-        // 3つの演算子を含む compound range
-        let spec = parse(">=1.0.0 <2.0.0 !=1.5.0");
-        // node-semver では != は無効だがパース上は Range として扱われる
-        if let Some(s) = spec {
-            assert_eq!(s.kind, VersionSpecKind::Range);
-        }
+        // node-semver では `!=` comparator は無効なので更新対象にしない
+        assert!(parse(">=1.0.0 <2.0.0 !=1.5.0").is_none());
     }
 
     #[test]
     fn test_parse_compound_extra_whitespace() {
         // 演算子の間に複数の空白が含まれた compound range も Range として認識する
         let spec = parse(">=1.0.0    <2.0.0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1.0.0");
+    }
+
+    #[test]
+    fn test_parse_compound_with_spaced_operators() {
+        // node-semver の comparator set は演算子とバージョンの間に空白を置ける。
+        let spec = parse(">= 1.0.0 < 2.0.0").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Range);
         assert_eq!(spec.version, "1.0.0");
     }

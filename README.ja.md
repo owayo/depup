@@ -299,6 +299,8 @@ prefer("1.7.25") → prefer("1.7.36") （Gradle rich version の strict 範囲�
 
 `"*"`、npm の dist-tag（`"latest"` など）、Gradle の動的指定（`"latest.release"`、`"latest.integration"`、`"latest.milestone"`、ユーザ定義 `latest.<status>` など全般）のような完全浮動指定は、厳密バージョンへ変質させないため更新対象から除外されます。Composer の `*.*` / `v*` / `V*` / `x.x` のように数値アンカーを持たない多セグメントワイルドカード、および Java/Gradle の `[,]` / `(,)` のように下限・上限とも空の Maven レンジも同様に弾かれます（phantom update や「常に古い」と誤判定する原因になるため）。`1.x.3` や `^x.0.0` のようにワイルドカード文字 (`x`/`X`/`*`) の後ろに数値セグメントが続く形式は node-semver / semver で invalid な x-range なのでパース時点で除外します。
 
+npm の semver トークンは、更新対象として解析する前に prerelease / build metadata 識別子を検証します。アンダースコアを含む識別子（`1.2.3-rc_1`）、空識別子を含む形式（`1.2.3-alpha..1`）、先頭ゼロを持つ数値 prerelease 識別子（`1.2.3-01`）は、不正な package.json 制約へ正規化せずスキップします。
+
 Gradle の `strictly` / `require` / `prefer` / `reject` を使う rich version 宣言は、`implementation("org.slf4j:slf4j-api") { version { ... } }` のような依存ブロック内でも解析対象になります。`group:name:[1.7, 1.8[!!1.7.25` のような文字列記法の短縮構文も解析できます。`strictly` または `require` が範囲を指定し、`prefer` が選好バージョンを指定している場合、depup は範囲を上限制約として維持しつつ `prefer` の値を更新します。`reject` に列挙されたバージョンは更新候補から除外され、`2.+` のような動的 reject も考慮します。
 
 `gradle/*.versions.toml` にある Gradle version catalog は Java マニフェストとして検出されます。depup は `[libraries]` の `alias = "group:name:version"`、`module = "group:name"`、`group` / `name` / `version`、`version.ref` を解析し、参照先の `[versions]` もその場で更新します。`strictly` / `require` / `prefer` / `reject` / `rejectAll` を含む rich version table は Gradle build ファイルと同じ候補選別ルールで扱います。`[plugins]` は Gradle plugin ID で Maven Central 座標と一致しないため更新対象から除外します。
