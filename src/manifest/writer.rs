@@ -211,18 +211,37 @@ pub fn write_manifest(path: &Path, content: &str) -> Result<(), ManifestError> {
 /// マニフェストを部分内容のまま破壊しうるため、同一ディレクトリの一時ファイルへ
 /// 書き切ってから rename で置き換える。既存ファイルのパーミッションは引き継ぐ。
 fn write_atomically(path: &Path, content: &str) -> std::io::Result<()> {
+    // path 自体が symlink の場合はリンク先の実体を更新対象にする。
+    // rename(2) は path が symlink のときリンク先ではなく symlink そのものを置き換えるため、
+    // そのまま rename すると symlink が通常ファイルに化け、リンク先 (共有マニフェスト等) が
+    // 古いまま取り残される (従来の `fs::write` は symlink を辿って実体を truncate→write していた)。
+    // canonicalize で実パスへ解決し、その実体に対してアトミック置換を行うことで symlink 構造を
+    // 保ったまま中身だけを更新する。tmp も実体側のディレクトリに作るため rename は同一
+    // ファイルシステム内に収まり EXDEV にならない。
+    let resolved;
+    let target = if path
+        .symlink_metadata()
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        resolved = fs::canonicalize(path)?;
+        resolved.as_path()
+    } else {
+        path
+    };
+
     // 既存ファイルが書き込み不可なら従来の `fs::write` と同じくエラーにする。
     // rename はディレクトリ権限だけで成功し、読み取り専用による保護を
     // 迂回してしまうため、先に書き込み権限を確認する。
-    if path.exists() {
-        fs::OpenOptions::new().write(true).open(path)?;
+    if target.exists() {
+        fs::OpenOptions::new().write(true).open(target)?;
     }
 
-    let dir = path
+    let dir = target
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let file_name = path
+    let file_name = target
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("manifest");
@@ -230,10 +249,10 @@ fn write_atomically(path: &Path, content: &str) -> std::io::Result<()> {
 
     let result = (|| {
         fs::write(&tmp_path, content)?;
-        if let Ok(metadata) = fs::metadata(path) {
+        if let Ok(metadata) = fs::metadata(target) {
             let _ = fs::set_permissions(&tmp_path, metadata.permissions());
         }
-        fs::rename(&tmp_path, path)
+        fs::rename(&tmp_path, target)
     })();
 
     if result.is_err() {
@@ -280,6 +299,45 @@ mod tests {
         write_manifest(&path, "new").unwrap();
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "既存ファイルのパーミッションを引き継ぐべき");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_manifest_through_symlink_updates_target() {
+        // マニフェストが symlink の場合、rename でリンクを通常ファイルに化けさせず、
+        // リンク先の実体を更新して symlink 構造を維持すること (アトミック化前の
+        // `fs::write` 挙動との互換)。モノレポで共有マニフェストを symlink 参照する構成を想定。
+        let dir = TempDir::new().unwrap();
+        let real_dir = dir.path().join("shared");
+        fs::create_dir(&real_dir).unwrap();
+        let target = real_dir.join("package.json");
+        fs::write(&target, "old").unwrap();
+
+        let link = dir.path().join("package.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        write_manifest(&link, "new content").unwrap();
+
+        // symlink はそのまま symlink として残る
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "symlink が通常ファイルに置き換わってはならない"
+        );
+        // リンク先の実体が更新されている
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new content");
+        // symlink 経由でも新内容が読める
+        assert_eq!(fs::read_to_string(&link).unwrap(), "new content");
+
+        // 一時ファイルが実体側ディレクトリに残っていないこと
+        let leftovers: Vec<_> = fs::read_dir(&real_dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("depup-tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "一時ファイルが残留: {:?}", leftovers);
     }
 
     struct NoOpParser;

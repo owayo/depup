@@ -34,8 +34,11 @@ static BLOCK_ENTRY_RE: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
-// pinned コメントの正規表現
-static PINNED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"//\s*pinned").unwrap());
+// pinned コメントの正規表現。
+// `// indirect` 判定 (`comment.contains("indirect")`) が語順非依存なのと整合させるため、
+// `pinned` がコメント内のどこに現れてもマッチさせる (`// indirect; pinned` のように
+// `//` 直後でない場合も拾う)。単語境界 `\b` で `repinned` / `unpinned` への誤マッチは防ぐ。
+static PINNED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"//.*\bpinned\b").unwrap());
 
 impl ManifestParser for GoModParser {
     fn parse(&self, content: &str) -> Result<Vec<Dependency>, ManifestError> {
@@ -425,6 +428,63 @@ require github.com/critical/lib v1.0.0 // pinned
         // // pinned コメント付きは GoPinned として扱われる
         assert_eq!(deps[0].version_spec.kind, VersionSpecKind::GoPinned);
         assert!(deps[0].is_pinned());
+    }
+
+    #[test]
+    fn test_parse_pinned_order_independent() {
+        // `// pinned` は `//` の直後に限らず、コメント内のどこにあっても認識される。
+        // `is_indirect` (comment.contains("indirect")) と語順非依存性を揃えることで、
+        // `// indirect; pinned` のように pinned が後置されても GoPinned 扱いになる。
+        let content = r#"
+module example.com/myproject
+
+go 1.21
+
+require (
+	github.com/a/lib v1.0.0 // pinned; indirect
+	github.com/b/lib v1.0.0 // indirect; pinned
+	github.com/c/lib v1.0.0 // pinned
+	github.com/d/lib v1.0.0 // indirect
+)
+"#;
+
+        let deps = parse(content).unwrap();
+        let find = |name: &str| deps.iter().find(|d| d.name == name).unwrap();
+
+        // pinned を含む 3 件はすべて GoPinned (語順を問わない)
+        assert_eq!(
+            find("github.com/a/lib").version_spec.kind,
+            VersionSpecKind::GoPinned
+        );
+        assert_eq!(
+            find("github.com/b/lib").version_spec.kind,
+            VersionSpecKind::GoPinned
+        );
+        assert_eq!(
+            find("github.com/c/lib").version_spec.kind,
+            VersionSpecKind::GoPinned
+        );
+        // pinned を含まない indirect 依存は GoPinned ではない
+        assert_ne!(
+            find("github.com/d/lib").version_spec.kind,
+            VersionSpecKind::GoPinned
+        );
+    }
+
+    #[test]
+    fn test_parse_pinned_word_boundary() {
+        // `unpinned` / `repinned` のような単語は pinned 指定として誤認しない。
+        let content = r#"
+module example.com/myproject
+
+go 1.21
+
+require github.com/x/lib v1.0.0 // unpinned for now
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_ne!(deps[0].version_spec.kind, VersionSpecKind::GoPinned);
     }
 
     #[test]

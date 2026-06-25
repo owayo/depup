@@ -21,39 +21,40 @@ pub struct PhpVersionParser;
 // (例: `1.2.3-rc.1+build123`)
 // また Composer/Packagist は 1〜4 セグメントの数値バージョン (`1.0.0.0` 等) を valid 扱いするため
 // `(?:\.\d+){0,3}` で 4 セグメントまで許容する (composer/semver の VersionParser に準拠)
+// composer/semver は v/V 接頭辞を大小問わず許容するため、各トークンは `[vV]?` で
+// 大文字 `V` (`V1.2.3` / `^V1.2.3`) も受理する (WILDCARD_RE と整合)。
+//
+// バージョンコアのパターンは 1 箇所に集約する。Node パーサの NODE_VERSION_PATTERN と同様、
+// 全演算子の正規表現がこの定数を共有することで、過去に起きた「WILDCARD_RE だけ [vV] を
+// 受理し他は v? のまま」のような定義間の不整合を構造的に防ぐ。
+const PHP_VERSION_CORE: &str = r"[vV]?\d+(?:\.\d+){0,3}(?:-[\w.-]+)?(?:\+[\w.-]+)?";
 
 // Caret: ^1.2.3 / ^1.2.3.4
-static CARET_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^\^\s*(v?\d+(?:\.\d+){0,3}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
-});
+static CARET_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!(r"^\^\s*({PHP_VERSION_CORE})$")).unwrap());
 
 // Tilde: ~1.2.3 / ~1.2.3.4
-static TILDE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^~\s*(v?\d+(?:\.\d+){0,3}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
-});
+static TILDE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!(r"^~\s*({PHP_VERSION_CORE})$")).unwrap());
 
 // 以上: >=1.2.3 / >=1.2.3.4
-static GTE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^>=\s*(v?\d+(?:\.\d+){0,3}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
-});
+static GTE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!(r"^>=\s*({PHP_VERSION_CORE})$")).unwrap());
 
 // より大きい: >1.2.3 / >1.2.3.4
-static GT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^>\s*(v?\d+(?:\.\d+){0,3}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
-});
+static GT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!(r"^>\s*({PHP_VERSION_CORE})$")).unwrap());
 
 // 以下: <=1.2.3 / <=1.2.3.4
-static LTE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^<=\s*(v?\d+(?:\.\d+){0,3}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
-});
+static LTE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!(r"^<=\s*({PHP_VERSION_CORE})$")).unwrap());
 
 // より小さい: <1.2.3 / <1.2.3.4
-static LT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^<\s*(v?\d+(?:\.\d+){0,3}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
-});
-static NOT_EQUAL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^!=\s*(v?\d+(?:\.\d+){0,3}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
-});
+static LT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!(r"^<\s*({PHP_VERSION_CORE})$")).unwrap());
+
+static NOT_EQUAL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!(r"^!=\s*({PHP_VERSION_CORE})$")).unwrap());
 
 // ワイルドカード: 1.2.*, 1.x, 1.2.3.*, *, V1.* (composer/semver は v/V を大小問わず許容)
 static WILDCARD_RE: LazyLock<Regex> =
@@ -69,7 +70,7 @@ fn is_fully_floating_wildcard(raw: &str) -> bool {
 
 // 固定バージョン: 1.2.3 / 1.2.3.4
 static BARE_VERSION_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(v?\d+(?:\.\d+){0,3}(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(&format!(r"^({PHP_VERSION_CORE})$")).unwrap());
 
 // 複合制約用パターン
 static COMPOUND_OR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\|\|?").unwrap());
@@ -78,9 +79,9 @@ static COMPOUND_OR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\|\|?").u
 // 単に `\s-\s` で is_match すると過受理して壊れた制約を Range として書き換える可能性があるため、
 // 両端が `vN(.N)*(-pre)?(+meta)?` の数値トークンに限定して全体一致を要求する。
 static HYPHEN_RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"^\s*v?\d+(?:\.\d+){0,3}(?:-[\w.-]+)?(?:\+[\w.-]+)?\s+-\s+v?\d+(?:\.\d+){0,3}(?:-[\w.-]+)?(?:\+[\w.-]+)?\s*$",
-    )
+    Regex::new(&format!(
+        r"^\s*{PHP_VERSION_CORE}\s+-\s+{PHP_VERSION_CORE}\s*$"
+    ))
     .unwrap()
 });
 
@@ -92,11 +93,15 @@ static COMPOUND_SPACE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^[<>=^~!].*\s+[<>=^~!]").unwrap()
 });
 static COMPOUND_COMMA_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r",").unwrap());
-static VERSION_TOKEN_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"v?\d+(?:\.\d+){0,3}(?:-[\w.-]+)?(?:\+[\w.-]+)?").unwrap());
+static VERSION_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(PHP_VERSION_CORE).unwrap());
 
 fn normalize_version(version: &str) -> String {
-    version.strip_prefix('v').unwrap_or(version).to_string()
+    // composer/semver は v/V 接頭辞を大小問わず許容するため、比較用にはどちらも除去する。
+    version
+        .strip_prefix('v')
+        .or_else(|| version.strip_prefix('V'))
+        .unwrap_or(version)
+        .to_string()
 }
 
 fn extract_first_version(raw: &str) -> String {
@@ -663,6 +668,35 @@ mod tests {
         let spec = parse("v1.*").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Wildcard);
         assert_eq!(spec.format_updated("2.3.4"), "v2.*");
+    }
+
+    #[test]
+    fn test_parse_uppercase_v_prefix() {
+        // composer/semver は v/V を大小問わず許容する。WILDCARD_RE が既に V を受理するのに
+        // 合わせ、Exact / Caret / Tilde / 比較演算子でも大文字 V を受理する。
+        // (以前は `v?` のみで V2.0.0 / ^V1.2.3 等を無言スキップしていた)
+        let exact = parse("V2.0.0").unwrap();
+        assert_eq!(exact.kind, VersionSpecKind::Exact);
+        assert_eq!(exact.version, "2.0.0");
+
+        let caret = parse("^V1.2.3").unwrap();
+        assert_eq!(caret.kind, VersionSpecKind::Caret);
+        assert_eq!(caret.version, "1.2.3");
+
+        let tilde = parse("~V1.2.3").unwrap();
+        assert_eq!(tilde.kind, VersionSpecKind::Tilde);
+        assert_eq!(tilde.version, "1.2.3");
+
+        let gte = parse(">=V1.0").unwrap();
+        assert_eq!(gte.kind, VersionSpecKind::GreaterOrEqual);
+        assert_eq!(gte.version, "1.0");
+    }
+
+    #[test]
+    fn test_format_updated_uppercase_v_caret() {
+        // 大文字 V の caret 更新でも演算子は保持される (V は正規化され除去。小文字 v と同じ)
+        let spec = parse("^V1.2.3").unwrap();
+        assert_eq!(spec.format_updated("2.0.0"), "^2.0.0");
     }
 
     // --- Composer 4セグメントバージョン対応テスト ---

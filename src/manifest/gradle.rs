@@ -67,8 +67,11 @@ static VAR_DEF_GROOVY_DOUBLE: LazyLock<Regex> =
 
 // 変数定義 (Kotlin): val wicketVersion = "1.2.3"。
 // 型注釈付き val wicketVersion: String = "..." (Kotlin DSL の慣用形) も許容する。
-static VAR_DEF_KOTLIN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"^\s*val\s+(\w+)\s*(?::\s*\w+)?\s*=\s*"([^"]+)""#).unwrap());
+// `const val WICKET = "1.2.3"` (Kotlin DSL で最も一般的なバージョン定義形式) も対象にする。
+// 先頭の `const ` は任意とし、キャプチャ位置 (グループ1=名前, グループ2=値) は変えない。
+static VAR_DEF_KOTLIN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^\s*(?:const\s+)?val\s+(\w+)\s*(?::\s*\w+)?\s*=\s*"([^"]+)""#).unwrap()
+});
 
 // ext ブロック内変数: wicketVersion = '1.2.3' または "1.2.3"
 static EXT_VAR_SINGLE: LazyLock<Regex> =
@@ -449,17 +452,14 @@ impl GradleParser {
             let artifact = caps.get(3).map(|m| m.as_str())?;
             let var_name = caps.get(4).map(|m| m.as_str())?;
 
-            // 変数参照を解決
-            let version = variables
-                .get(var_name)
-                .map(|v| v.value.clone())
-                .unwrap_or_default();
+            // 変数参照を解決する。depup が追跡しない場所 (gradle.properties / `by extra(...)` /
+            // 計算値など) で定義された変数は解決できない。その場合に空の `Any` 依存を作ると、
+            // judge は「更新あり」と報告する一方で writer は書き換え先 (リテラル version も
+            // 変数定義も) を見つけられず失敗し、「更新を報告したのに適用エラー」という
+            // 矛盾した結果になる。更新できないことが確定しているため依存ごとスキップする。
+            let version = variables.get(var_name)?.value.clone();
 
-            let spec = if version.is_empty() {
-                VersionSpec::new(VersionSpecKind::Any, "", "")
-            } else {
-                parser.parse(&version)?
-            };
+            let spec = parser.parse(&version)?;
 
             let is_dev = DEV_CONFIGURATIONS.contains(&config);
             let name = format!("{}:{}", group, artifact);
@@ -2371,5 +2371,54 @@ dependencies {
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].name, "com.google.guava:guava");
         assert_eq!(deps[0].version_spec.version, "32.1.2-jre");
+    }
+
+    #[test]
+    fn test_parse_kotlin_const_val_variable() {
+        // Kotlin DSL で最も一般的な `const val` 形式のバージョン定義も解決する
+        let content = r#"
+const val guavaVersion = "32.1.2-jre"
+dependencies {
+    implementation("com.google.guava:guava:$guavaVersion")
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "com.google.guava:guava");
+        assert_eq!(deps[0].version_spec.version, "32.1.2-jre");
+    }
+
+    #[test]
+    fn test_update_kotlin_const_val_variable() {
+        // `const val` 定義の値が更新され、依存行の補間はそのまま保持される
+        let content = r#"
+const val guavaVersion = "32.1.2-jre"
+dependencies {
+    implementation("com.google.guava:guava:$guavaVersion")
+}
+"#;
+        let updated = GradleParser
+            .update_version(content, "com.google.guava:guava", "33.0.0-jre")
+            .unwrap();
+        assert!(updated.contains(r#"const val guavaVersion = "33.0.0-jre""#));
+        // 依存宣言行は変数参照のまま維持される
+        assert!(updated.contains(r#"implementation("com.google.guava:guava:$guavaVersion")"#));
+    }
+
+    #[test]
+    fn test_parse_unresolved_variable_is_skipped() {
+        // depup が追跡しない場所 (gradle.properties / by extra / 計算値) で定義された変数は
+        // 解決できない。空の Any 依存を作って judge が更新を報告した後に writer が失敗する
+        // 「報告したのに適用エラー」を避けるため、依存ごとスキップする。
+        let content = r#"
+dependencies {
+    implementation("com.google.guava:guava:$undefinedVersion")
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert!(
+            deps.is_empty(),
+            "未解決変数の依存は空の Any として残さずスキップされる"
+        );
     }
 }
