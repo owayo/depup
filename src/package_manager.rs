@@ -6,9 +6,28 @@
 //! - `--age` 指定時の transitive 依存 age 制約注入 (対応 PM のみ)
 
 use crate::domain::Language;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
+
+/// パッケージマネージャの実行ファイルを PATH から解決する。
+///
+/// Windows では `npm` / `pnpm` / `yarn` / `bun` / `composer` / `gradle` などが
+/// `.cmd` / `.bat` シムとして配布される。`Command::new("pnpm")` は内部の
+/// `CreateProcessW` 呼び出しで拡張子無しを `.exe` として解決しようとするため、
+/// シムしか無い環境では `program not found` で失敗する (Issue #1)。
+///
+/// `which` クレートは PATHEXT を考慮して実体パス (例: `C:\...\pnpm.cmd`) を
+/// 返すため、それを直接 `Command::new` に渡すことで `.cmd` / `.bat` シムを
+/// 起動できる。フルパスの `.cmd` / `.bat` を `Command::new` に渡した場合は
+/// Rust 標準ライブラリ (1.77+) の引数自動エスケープが効くため、
+/// CVE-2024-24576 (BatBadBut) の影響も緩和される。
+///
+/// 解決に失敗した場合は元のプログラム名をそのまま返し、呼び出し側で
+/// 従来どおりの `program not found` エラーを返せるようにする。
+fn resolve_program(program: &str) -> PathBuf {
+    which::which(program).unwrap_or_else(|_| PathBuf::from(program))
+}
 
 /// パッケージマネージャのインストール結果
 #[derive(Debug, Clone)]
@@ -229,7 +248,11 @@ impl SystemPackageManager {
         }
     }
 
-    /// コマンドを実行して出力をキャプチャする
+    /// コマンドを実行して出力をキャプチャする。
+    ///
+    /// プログラム名 (`command[0]`) は `resolve_program` で PATH 解決してから
+    /// `Command::new` に渡す。Windows で `.cmd` / `.bat` シムしか無い PM
+    /// (`pnpm`, `composer.bat`, `gradle.bat` 等) を起動するための対応 (Issue #1)。
     fn run_command(
         &self,
         command: &[&str],
@@ -243,7 +266,8 @@ impl SystemPackageManager {
             ));
         }
 
-        let mut cmd = Command::new(command[0]);
+        let program = resolve_program(command[0]);
+        let mut cmd = Command::new(&program);
         cmd.args(&command[1..]).current_dir(working_dir);
         for (key, value) in env {
             cmd.env(key, value);
@@ -792,6 +816,68 @@ mod tests {
 
         let pm = SystemPackageManager::new();
         assert_eq!(pm.detect_python_pm(temp_dir.path()), None);
+    }
+
+    #[test]
+    fn test_resolve_program_existing_command_returns_absolute_path() {
+        // `cargo` は cargo test を実行している時点で PATH 上に存在する前提。
+        // which 経由で絶対パスに解決され、`Command::new(full_path)` で起動できる。
+        // Windows ではこれが `.cmd`/`.bat` シムのフルパス、Unix では実体 (`.../cargo`)。
+        let resolved = resolve_program("cargo");
+        assert!(
+            resolved.is_absolute(),
+            "PATH 上に存在する cargo は which で絶対パスに解決されるべき: {:?}",
+            resolved
+        );
+    }
+
+    #[test]
+    fn test_resolve_program_nonexistent_command_falls_back_to_name() {
+        // 存在しないコマンドは which が失敗するため、元の program 名を
+        // そのまま PathBuf として返し、後段の Command::new で従来通り
+        // `program not found` 系の `io::ErrorKind::NotFound` が返るようにする。
+        let bogus = "__depup_definitely_nonexistent_command_xyz__";
+        let resolved = resolve_program(bogus);
+        assert_eq!(
+            resolved,
+            PathBuf::from(bogus),
+            "解決失敗時は元の program 名をそのまま返してフォールバックさせるべき"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_resolve_program_finds_cmd_shim_on_windows() {
+        // Windows で `.cmd` シムのみ存在するパッケージマネージャ (pnpm.cmd 等)
+        // を which が PATHEXT 経由で解決できることを確認する。
+        // tempdir に `pnpm_test_shim.cmd` を置き、PATH の先頭にそのディレクトリを
+        // 追加した状態で which を呼ぶ。
+        let temp_dir = tempfile::tempdir().unwrap();
+        let shim_path = temp_dir.path().join("pnpm_test_shim.cmd");
+        std::fs::write(&shim_path, "@echo off\r\necho ok\r\n").unwrap();
+
+        let original_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut new_paths = vec![temp_dir.path().to_path_buf()];
+        new_paths.extend(std::env::split_paths(&original_path));
+        let joined = std::env::join_paths(new_paths).unwrap();
+
+        // SAFETY: テストはシングルスレッドで PATH を一時的に書き換える。
+        // テスト終了前に元に戻す。
+        unsafe { std::env::set_var("PATH", &joined) };
+        let resolved = resolve_program("pnpm_test_shim");
+        unsafe { std::env::set_var("PATH", &original_path) };
+
+        assert!(
+            resolved.is_absolute(),
+            "Windows では .cmd シムが which で絶対パスに解決されるべき: {:?}",
+            resolved
+        );
+        assert_eq!(
+            resolved.extension().and_then(|s| s.to_str()),
+            Some("cmd"),
+            "解決結果は .cmd 拡張子を持つはず: {:?}",
+            resolved
+        );
     }
 
     #[test]
