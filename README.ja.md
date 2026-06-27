@@ -529,6 +529,14 @@ osv = true
 3. `~/.config/depup/config.toml` の `osv` 値
 4. 組み込みデフォルト（`false` — OSV チェック無効）
 
+## uv マルウェアチェック（preview）
+
+Python プロジェクトに対して `--install` が `uv sync` を呼び出す際、depup は環境変数 `UV_MALWARE_CHECK=1` を常時付与します。これは [uv の preview マルウェアチェック機能](https://astral.sh/blog/uv-audit)（`uv audit` コマンドとは別の、同時発表された独立 preview 機能）を有効化するもので、`uv sync` / `uv add` などの sync 操作のたびに、uv が現在 locked された resolution を OSV の MAL advisories と照合し、マルウェアが含まれていれば sync を中断して悪意あるパッケージの実行を防ぎます。
+
+- 常時 ON。opt-in フラグは不要です。
+- 機能未対応の古い uv バージョンではこの env var が単に作用しないため、強制 ON でも既存環境のビルドを壊しません。
+- Astral 公式は preview 機能と位置づけており、将来挙動が変わる可能性があります。検査自体は uv 側で実行され、マルウェアにマッチすると uv が sync をエラー終了し、その終了コードがそのまま depup に伝搬します。
+
 ## 出力
 
 ### 進捗表示

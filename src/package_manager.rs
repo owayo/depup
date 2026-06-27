@@ -175,6 +175,11 @@ impl SystemPackageManager {
     ///   従うため、この env var は `.npmrc` の `minimum-release-age=<分>` と
     ///   等価になる。pnpm v10.16 未満ではこの env var は未知の設定として
     ///   無視される (graceful no-op)。
+    /// - **uv (preview)**: `UV_MALWARE_CHECK=1` を常に注入し、`uv sync`
+    ///   実行時に OSV の MAL advisories と locked resolution を照合する
+    ///   ライトウェイトなマルウェアチェックを有効化する (Astral の preview
+    ///   機能。`uv audit` 機能の一部)。未対応の uv バージョンではこの
+    ///   env var は未知の設定として無視される (graceful no-op)。
     /// - 他 PM: 現状追加なし。
     fn get_install_env(&self, pm: &str, min_age: Option<Duration>) -> Vec<(String, String)> {
         let mut env: Vec<(String, String)> = Vec::new();
@@ -186,6 +191,9 @@ impl SystemPackageManager {
                 "npm_config_minimum_release_age".to_string(),
                 minutes.to_string(),
             ));
+        }
+        if pm == "uv" {
+            env.push(("UV_MALWARE_CHECK".to_string(), "1".to_string()));
         }
         env
     }
@@ -593,11 +601,58 @@ mod tests {
 
     #[test]
     fn test_get_install_env_uv_does_not_set_age_via_env() {
-        // uv は CLI フラグで age を受けるため env 変数は設定しない。
+        // uv は CLI フラグで age を受けるため age 関連の env 変数は設定しない。
+        // ただし `UV_MALWARE_CHECK=1` は age とは独立に常時付与されるため、
+        // env 全体が空にはならない。age 関連 env のみが含まれないことを確認する。
         let pm = SystemPackageManager::new();
         let age = Duration::from_secs(14 * 24 * 60 * 60);
         let env = pm.get_install_env("uv", Some(age));
-        assert!(env.is_empty());
+        assert!(
+            env.iter()
+                .all(|(k, _)| k != "npm_config_minimum_release_age"),
+            "uv に age を渡しても pnpm 用の env が混入してはならない: {:?}",
+            env
+        );
+    }
+
+    #[test]
+    fn test_get_install_env_uv_sets_malware_check_without_age() {
+        // age 未指定でも `uv sync` 実行時の OSV マルウェアチェックを常時有効化する。
+        let pm = SystemPackageManager::new();
+        let env = pm.get_install_env("uv", None);
+        assert!(
+            env.contains(&("UV_MALWARE_CHECK".to_string(), "1".to_string())),
+            "uv では UV_MALWARE_CHECK=1 が常時付与されるべき: {:?}",
+            env
+        );
+    }
+
+    #[test]
+    fn test_get_install_env_uv_sets_malware_check_with_age() {
+        // age 指定時でも UV_MALWARE_CHECK=1 は付与される。
+        let pm = SystemPackageManager::new();
+        let age = Duration::from_secs(14 * 24 * 60 * 60);
+        let env = pm.get_install_env("uv", Some(age));
+        assert!(
+            env.contains(&("UV_MALWARE_CHECK".to_string(), "1".to_string())),
+            "uv では age 指定の有無に関わらず UV_MALWARE_CHECK=1 が付与されるべき: {:?}",
+            env
+        );
+    }
+
+    #[test]
+    fn test_get_install_env_non_uv_does_not_set_malware_check() {
+        // uv 以外の PM には UV_MALWARE_CHECK を漏らさない。
+        let pm = SystemPackageManager::new();
+        for other in &["pip", "poetry", "rye", "pipenv", "npm", "pnpm", "cargo"] {
+            let env = pm.get_install_env(other, None);
+            assert!(
+                env.iter().all(|(k, _)| k != "UV_MALWARE_CHECK"),
+                "{} に UV_MALWARE_CHECK は付与してはならない: {:?}",
+                other,
+                env
+            );
+        }
     }
 
     #[test]
