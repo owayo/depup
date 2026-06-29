@@ -325,10 +325,14 @@ impl VersionParser for NodeVersionParser {
         }
 
         if let Some(caps) = EQUAL_RE.captures(trimmed) {
-            let version = normalize_valid_version(caps.get(1)?.as_str())?;
-            return Some(
-                VersionSpec::new(VersionSpecKind::Exact, trimmed, version).with_prefix("="),
-            );
+            let raw_version = caps.get(1)?.as_str();
+            let version = normalize_valid_version(raw_version)?;
+            if raw_version.matches('.').count() >= 2 {
+                return Some(
+                    VersionSpec::new(VersionSpecKind::Exact, trimmed, version).with_prefix("="),
+                );
+            }
+            return Some(VersionSpec::new(VersionSpecKind::Range, trimmed, version));
         }
 
         // `*` は完全な浮動指定なので更新対象にしない
@@ -592,6 +596,21 @@ mod tests {
         let spec = parse("=1.2.3").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Exact);
         assert_eq!(spec.prefix, Some("=".to_string()));
+    }
+
+    #[test]
+    fn test_parse_equal_partial_as_range() {
+        // node-semver では `=1.2` / `=1` も partial comparator であり、
+        // `1.2.x` / `1.x` と同じレンジとして扱われる。
+        let spec = parse("=1.2").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1.2.0");
+        assert_eq!(spec.format_updated("2.3.4"), "=2.3");
+
+        let major = parse("=1").unwrap();
+        assert_eq!(major.kind, VersionSpecKind::Range);
+        assert_eq!(major.version, "1.0.0");
+        assert_eq!(major.format_updated("2.3.4"), "=2");
     }
 
     #[test]

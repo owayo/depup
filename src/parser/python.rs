@@ -37,6 +37,24 @@ static RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 static WILDCARD_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\*$|^\d+(?:\.\d+)*\.\*$").unwrap());
+static PEP440_RELEASE_PREFIX_WILDCARD_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[vV]?(?:\d+!)?\d+(?:\.\d+)*\.\*$").unwrap());
+
+fn pep440_prefix_wildcard_is_allowed(op: &str, raw_version: &str) -> bool {
+    if !raw_version.ends_with(".*") {
+        return true;
+    }
+
+    match op {
+        // PEP 440 の prefix matching は `==` / `!=` かつ release segment のみ有効。
+        // pre/post/dev/local を含む `==1.0a1.*` や ordered comparison の `>=1.0.*`
+        // を受けると、上限を持たない Range として誤判定されるため parse 時点で弾く。
+        "==" | "!=" => PEP440_RELEASE_PREFIX_WILDCARD_RE.is_match(raw_version),
+        // `===1.0.*` は arbitrary equality であり prefix matching ではない。
+        "===" => true,
+        _ => false,
+    }
+}
 
 /// 比較用バージョン文字列へ正規化する。
 ///
@@ -155,6 +173,9 @@ impl VersionParser for PythonVersionParser {
         if let Some(caps) = OP_RE.captures(trimmed) {
             let op = caps.get(1)?.as_str();
             let raw_version = caps.get(2)?.as_str();
+            if !pep440_prefix_wildcard_is_allowed(op, raw_version) {
+                return None;
+            }
             let has_local = raw_version.contains('+');
             let normalized = if matches!(op, "==" | "===" | "!=") {
                 normalize_for_compare_preserving_local(raw_version)
@@ -166,7 +187,7 @@ impl VersionParser for PythonVersionParser {
             };
 
             return Some(match op {
-                "===" | "==" if !raw_version.ends_with(".*") => {
+                "===" | "==" if op == "===" || !raw_version.ends_with(".*") => {
                     VersionSpec::new(VersionSpecKind::Exact, trimmed, normalized).with_prefix(op)
                 }
                 "~=" => {
@@ -290,6 +311,33 @@ mod tests {
         let spec = parse("===v1.2-custom").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Exact);
         assert_eq!(spec.prefix, Some("===".to_string()));
+    }
+
+    #[test]
+    fn test_parse_arbitrary_equality_with_star_is_exact() {
+        // `===` は arbitrary equality であり、`.*` が付いても prefix matching ではない。
+        let spec = parse("===1.0.*").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.prefix, Some("===".to_string()));
+        assert!(spec.is_pinned());
+    }
+
+    #[test]
+    fn test_parse_rejects_invalid_pep440_prefix_wildcards() {
+        // PEP 440 の prefix matching は release segment の `==` / `!=` に限定される。
+        assert!(parse(">=1.0.*").is_none());
+        assert!(parse("<=1.0.*").is_none());
+        assert!(parse("~=1.0.*").is_none());
+        assert!(parse(">1.0.*").is_none());
+        assert!(parse("<1.0.*").is_none());
+        assert!(parse("==1.0a1.*").is_none());
+        assert!(parse("==1.0.post1.*").is_none());
+        assert!(parse("==1.0.dev1.*").is_none());
+        assert!(parse("==1.0+local.*").is_none());
+        assert!(parse("!=1.0a1.*").is_none());
+
+        assert_eq!(parse("==1.2.*").unwrap().kind, VersionSpecKind::Range);
+        assert_eq!(parse("!=1.2.*").unwrap().kind, VersionSpecKind::Range);
     }
 
     #[test]

@@ -285,6 +285,7 @@ depup preserves the original version range format:
 "V1.*" → "V2.*" (Composer uppercase `V` preserved)
 "^1.x" → "^2.x" (npm caret + x-range, operator preserved)
 "~1.2.x" → "~2.3.x" (npm tilde + x-range, operator preserved)
+"=1.2" → "=2.3" (npm partial comparator, operator preserved)
 "5.3.+" → "5.4.+" (Gradle prefix preserved)
 "1.2.3!!" → "2.0.0!!" (Gradle strict preserved)
 "[1.0]" → "[2.0]" (Maven Hard requirement preserved)
@@ -301,11 +302,15 @@ Floating selectors such as `"*"`, npm dist-tags like `"latest"`, and Gradle dyna
 
 For npm semver tokens, depup validates prerelease and build metadata identifiers before parsing them as updateable constraints. Identifiers with underscores (`1.2.3-rc_1`), empty identifier segments (`1.2.3-alpha..1`), and numeric prerelease identifiers with leading zeroes (`1.2.3-01`) are skipped instead of being normalized into malformed package.json constraints.
 
+For npm partial comparators, `=1.2` and `=1` follow node-semver's partial-version rules instead of being treated as pinned exact versions. depup keeps the `=` operator and updates only the visible segment shape (`=1.2` → `=2.3`, `=1` → `=2`).
+
 Gradle rich version declarations using `strictly`, `require`, `prefer`, and `reject` are parsed in dependency blocks such as `implementation("org.slf4j:slf4j-api") { version { ... } }`. String notation shorthand such as `group:name:[1.7, 1.8[!!1.7.25` is also parsed. When `strictly` or `require` declares a range and `prefer` declares the selected version, depup keeps the range as the upper-bound constraint and updates the `prefer` value. Versions listed with `reject` are excluded from update candidates, including dynamic rejects such as `2.+`.
 
 Gradle version catalogs under `gradle/*.versions.toml` are detected as Java manifests. depup parses `[libraries]` entries written as `alias = "group:name:version"`, `module = "group:name"`, `group` / `name` / `version`, and `version.ref`; referenced `[versions]` entries are updated in place. Rich version tables with `strictly`, `require`, `prefer`, `reject`, and `rejectAll` follow the same candidate rules as Gradle build files. `[plugins]` entries are skipped because Gradle plugin IDs are not Maven Central coordinates.
 
 Python compatible release clauses follow PEP 440: `~=1.2` (= `>=1.2,<2.0`) and `~=1.2.3` (= `>=1.2.3,<1.3.0`) are treated as ranges with an explicit upper bound, so updates stay within the compatible range (`~=1.2.3` stays in the 1.2 series, `~=1.2` stays in the 1.x series) and preserve the original segment count (`~=1.2` → `~=1.9`). The invalid single-segment form `~=1` is skipped.
+
+PEP 440 prefix matching is accepted only for release-segment `==` / `!=` specifiers such as `==1.2.*` and `!=1.2.*`. Invalid prefix forms such as `>=1.0.*`, `~=1.0.*`, `==1.0a1.*`, `==1.0.post1.*`, and `==1.0+local.*` are skipped at parse time. Arbitrary equality (`===1.0.*`) remains an exact pinned specifier, not prefix matching.
 
 PEP 440 prerelease versions are detected and excluded by default even when written without a separator (e.g. `2.0.0rc1`, `1.0rc1`, `1.0.0a1`), so a stable dependency is never accidentally bumped to a release candidate. Post-releases (`1.0.post1`) compare as newer than the corresponding release, and epochs (`1!2.3`) take precedence in comparison. A post-release attached to a prerelease (`1.0a1.post1`) is also recognised as newer than the underlying prerelease (`1.0a1 < 1.0a1.post1 < 1.0`), so users tracking an alpha can still pick up its post-release fixes.
 

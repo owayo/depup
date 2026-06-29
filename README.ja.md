@@ -285,6 +285,7 @@ depupは元のバージョン範囲形式を維持します：
 "V1.*" → "V2.*" （Composer の大文字 `V` を維持）
 "^1.x" → "^2.x" （npm の caret + x-range、演算子を維持）
 "~1.2.x" → "~2.3.x" （npm の tilde + x-range、演算子を維持）
+"=1.2" → "=2.3" （npm の partial comparator、演算子を維持）
 "5.3.+" → "5.4.+" （Gradle プレフィックスを維持）
 "1.2.3!!" → "2.0.0!!" （Gradle strict を維持）
 "[1.0]" → "[2.0]" （Maven Hard requirement を維持）
@@ -301,11 +302,15 @@ prefer("1.7.25") → prefer("1.7.36") （Gradle rich version の strict 範囲�
 
 npm の semver トークンは、更新対象として解析する前に prerelease / build metadata 識別子を検証します。アンダースコアを含む識別子（`1.2.3-rc_1`）、空識別子を含む形式（`1.2.3-alpha..1`）、先頭ゼロを持つ数値 prerelease 識別子（`1.2.3-01`）は、不正な package.json 制約へ正規化せずスキップします。
 
+npm の partial comparator では、`=1.2` や `=1` を固定バージョンではなく node-semver の部分バージョン規則として扱います。depup は `=` 演算子と見えているセグメント数を保って更新します（`=1.2` → `=2.3`、`=1` → `=2`）。
+
 Gradle の `strictly` / `require` / `prefer` / `reject` を使う rich version 宣言は、`implementation("org.slf4j:slf4j-api") { version { ... } }` のような依存ブロック内でも解析対象になります。`group:name:[1.7, 1.8[!!1.7.25` のような文字列記法の短縮構文も解析できます。`strictly` または `require` が範囲を指定し、`prefer` が選好バージョンを指定している場合、depup は範囲を上限制約として維持しつつ `prefer` の値を更新します。`reject` に列挙されたバージョンは更新候補から除外され、`2.+` のような動的 reject も考慮します。
 
 `gradle/*.versions.toml` にある Gradle version catalog は Java マニフェストとして検出されます。depup は `[libraries]` の `alias = "group:name:version"`、`module = "group:name"`、`group` / `name` / `version`、`version.ref` を解析し、参照先の `[versions]` もその場で更新します。`strictly` / `require` / `prefer` / `reject` / `rejectAll` を含む rich version table は Gradle build ファイルと同じ候補選別ルールで扱います。`[plugins]` は Gradle plugin ID で Maven Central 座標と一致しないため更新対象から除外します。
 
 Python の compatible release 句は PEP 440 に従います。`~=1.2`（= `>=1.2,<2.0`）と `~=1.2.3`（= `>=1.2.3,<1.3.0`）は明示的な上限を持つレンジとして扱われ、互換範囲内に留まって更新されます（`~=1.2.3` は 1.2 系、`~=1.2` は 1.x 系に留まり major/minor を跨ぎません）。書き換えは元のセグメント数を維持します（`~=1.2` → `~=1.9`。`~=1.9.0` にすると上限が `<1.10.0` に変わってしまうため）。単一セグメントの無効な形式である `~=1` はスキップします。
+
+PEP 440 の prefix matching は、`==1.2.*` / `!=1.2.*` のような release segment の `==` / `!=` 指定だけで受け付けます。`>=1.0.*`、`~=1.0.*`、`==1.0a1.*`、`==1.0.post1.*`、`==1.0+local.*` のような無効形はパース時点でスキップします。任意一致の `===1.0.*` は prefix matching ではなく固定指定として扱います。
 
 PEP 440 のプレリリースは、セパレータなしで書かれた場合（例: `2.0.0rc1`, `1.0rc1`, `1.0.0a1`）でも検出され、デフォルトで除外されます。これにより安定版の依存がリリース候補へ誤って更新されることはありません。ポストリリース（`1.0.post1`）は対応する安定版より新しいと比較され、エポック（`1!2.3`）は比較時に最優先されます。プレリリースに付随する post リリース（`1.0a1.post1`）も元のプレリリースより新しいと扱われ（`1.0a1 < 1.0a1.post1 < 1.0`）、α 版を追跡しているユーザーが post の修正を取り逃がすことはありません。
 

@@ -143,12 +143,17 @@ fn format_wildcard_like(raw: &str, new_version: &str) -> Option<String> {
 
 fn format_partial_version_like(raw: &str, new_version: &str) -> Option<String> {
     let trimmed = raw.trim();
-    let (prefix, core) = if let Some(rest) = trimmed.strip_prefix('v') {
-        ("v", rest)
-    } else if let Some(rest) = trimmed.strip_prefix('V') {
-        ("V", rest)
+    let (op_prefix, body) = if let Some(rest) = trimmed.strip_prefix('=') {
+        ("=", rest.trim_start())
     } else {
         ("", trimmed)
+    };
+    let (version_prefix, core) = if let Some(rest) = body.strip_prefix('v') {
+        ("v", rest)
+    } else if let Some(rest) = body.strip_prefix('V') {
+        ("V", rest)
+    } else {
+        ("", body)
     };
 
     if core.is_empty()
@@ -165,7 +170,12 @@ fn format_partial_version_like(raw: &str, new_version: &str) -> Option<String> {
         parts.push("0".to_string());
     }
 
-    Some(format!("{}{}", prefix, parts[..segment_count].join(".")))
+    Some(format!(
+        "{}{}{}",
+        op_prefix,
+        version_prefix,
+        parts[..segment_count].join(".")
+    ))
 }
 
 fn preserve_version_prefix(template: &str, new_version: &str) -> String {
@@ -703,6 +713,12 @@ mod tests {
     fn test_try_format_updated_range_partial_version_preserves_shape() {
         let spec = VersionSpec::new(VersionSpecKind::Range, "1.2", "1.2.0");
         assert_eq!(spec.try_format_updated("2.3.4").as_deref(), Some("2.3"));
+    }
+
+    #[test]
+    fn test_try_format_updated_range_equal_partial_preserves_shape() {
+        let spec = VersionSpec::new(VersionSpecKind::Range, "=1.2", "1.2.0");
+        assert_eq!(spec.try_format_updated("2.3.4").as_deref(), Some("=2.3"));
     }
 
     #[test]
