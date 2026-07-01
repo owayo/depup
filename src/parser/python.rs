@@ -8,7 +8,7 @@
 //! - ワイルドカード: `1.*`
 //! - レンジ: `>=1.0,<2.0`
 
-use crate::domain::{Language, VersionSpec, VersionSpecKind};
+use crate::domain::{Language, VersionSpec, VersionSpecKind, range_lower_bound_version};
 use crate::parser::VersionParser;
 use regex::Regex;
 use std::sync::LazyLock;
@@ -225,10 +225,14 @@ impl VersionParser for PythonVersionParser {
             if trimmed.contains('+') {
                 return None;
             }
+            // 比較基準は記述順に依存せず包含下限を採用する
+            // (`<1.5,>=1.2.2` でも下限 `1.2.2` を基準にし、更新の取りこぼしを防ぐ)。
             return Some(VersionSpec::new(
                 VersionSpecKind::Range,
                 trimmed,
-                extract_first_version(trimmed),
+                range_lower_bound_version(trimmed)
+                    .map(|v| normalize_for_compare(&v))
+                    .unwrap_or_else(|| extract_first_version(trimmed)),
             ));
         }
 
@@ -483,6 +487,19 @@ mod tests {
         assert_eq!(spec.kind, VersionSpecKind::Range);
         assert_eq!(spec.raw, ">=3.5.0,<4.0.0");
         assert_eq!(spec.version, "3.5.0"); // 最初のバージョンが抽出される
+    }
+
+    #[test]
+    fn test_parse_range_upper_bound_first_uses_lower_bound() {
+        // 回帰: 上限が先に書かれた複合制約 (`<1.5,>=1.2.2`) でも、比較基準 version は
+        // 包含下限 `1.2.2` を採用する。PEP 440/508 では comparator の記述順は自由。
+        // 以前は split(',').next() が先頭 (=上限 1.5) を採用し更新を取りこぼしていた。
+        let a = parse("<1.5,>=1.2.2").unwrap();
+        assert_eq!(a.kind, VersionSpecKind::Range);
+        assert_eq!(a.version, "1.2.2");
+        // 下限が先の従来ケースは回帰しないこと
+        let b = parse(">=1.2.2,<1.5").unwrap();
+        assert_eq!(b.version, "1.2.2");
     }
 
     #[test]

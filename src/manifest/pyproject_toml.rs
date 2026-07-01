@@ -220,8 +220,27 @@ impl ManifestParser for PyprojectTomlParser {
         let mut section = TomlSectionKind::Other;
         // `[project]` / `[tool.rye]` 内で依存配列 (`dependencies` / `dev-dependencies`) の中にいるか
         let mut in_scoped_dep_array = false;
+        // マルチライン文字列 (`"""` / `'''`) の内側かどうか (Some の場合はその区切り)。
+        // description 等の docstring 内側では TOML 構文を解釈せず素通しする。
+        let mut multiline_delim: Option<&'static str> = None;
 
         for line in content.split_inclusive('\n') {
+            // マルチライン文字列の内側は素通しする。docstring に依存配列風のテキスト
+            // (`dependencies = [ "requests>=2.0" ]`) があっても誤書き換え・状態汚染しない。
+            if let Some(delim) = multiline_delim {
+                if line.contains(delim) {
+                    multiline_delim = None;
+                }
+                result.push_str(line);
+                continue;
+            }
+            // この行でマルチライン文字列が開いて同一行で閉じないなら、以降を素通しする。
+            if let Some(delim) = opens_unclosed_multiline_string(line) {
+                multiline_delim = Some(delim);
+                result.push_str(line);
+                continue;
+            }
+
             if let Some(header) = toml_section_header(line) {
                 section = classify_toml_section(header);
                 in_scoped_dep_array = false;
@@ -387,6 +406,28 @@ fn line_has_scoped_array_close(line: &str) -> bool {
         }
     }
     false
+}
+
+/// 行がマルチライン文字列 (`"""` / `'''`) を開いて同一行内で閉じない場合、その区切りを返す。
+/// TOML の複数行基本文字列 (`"""`) とリテラル文字列 (`'''`) の両方に対応する。
+/// description 等の docstring を素通しして依存配列の誤検出を防ぐために使う。
+fn opens_unclosed_multiline_string(line: &str) -> Option<&'static str> {
+    // 行内で最初に現れる区切り (""" / ''') を選ぶ
+    let mut earliest: Option<(usize, &'static str)> = None;
+    for delim in ["\"\"\"", "'''"] {
+        if let Some(pos) = line.find(delim)
+            && earliest.map(|(p, _)| pos < p).unwrap_or(true)
+        {
+            earliest = Some((pos, delim));
+        }
+    }
+    let (pos, delim) = earliest?;
+    // 開始区切りの直後に同じ区切りが再度現れれば、同一行で閉じている (開いたままではない)
+    if line[pos + delim.len()..].contains(delim) {
+        None
+    } else {
+        Some(delim)
+    }
 }
 
 /// TOML 行から `#` 以降の行コメントを取り除く。文字列リテラル内 (`"..."` / `'...'`)
@@ -978,6 +1019,67 @@ requests = { version = '^2.28.0', extras = ["security"] }
             result.contains("version = '^2.31.0'"),
             "inline table の単一引用符バージョンを更新できていません: {}",
             result
+        );
+    }
+
+    #[test]
+    fn test_update_version_ignores_multiline_string_content() {
+        // 回帰: [project] の description 等のマルチライン文字列 (""") の中に依存配列風の
+        // テキストがあっても書き換えない。以前はマルチライン文字列を追跡せず、docstring 内の
+        // `dependencies = [ "requests>=2.0" ]` を本物の配列と誤認して版を破壊していた。
+        let content = r#"[project]
+name = "mypkg"
+description = """
+Install example:
+dependencies = [
+  "requests>=2.0",
+]
+"""
+dependencies = [
+    "requests>=2.0",
+]
+"#;
+        let result = PyprojectTomlParser
+            .update_version(content, "requests", "2.31.0")
+            .unwrap();
+        // 本物の依存だけが更新され、docstring 内の擬似依存は保持される
+        assert_eq!(
+            result.matches("requests>=2.0").count(),
+            1,
+            "docstring 内の擬似依存が破壊された: {result}"
+        );
+        assert_eq!(
+            result.matches("requests>=2.31.0").count(),
+            1,
+            "本物の依存が更新されていない: {result}"
+        );
+    }
+
+    #[test]
+    fn test_update_version_multiline_string_unclosed_array_no_leak() {
+        // 回帰: docstring 内に閉じない `dependencies = [` があっても、状態が漏れて
+        // 後続の本物のメタデータ配列 (`keywords` 等) を破壊しないこと。
+        let content = r#"[project]
+name = "mypkg"
+description = """
+dependencies = [
+"""
+keywords = ["evil>=9.9"]
+dependencies = [
+    "evil>=1.0",
+]
+"#;
+        let result = PyprojectTomlParser
+            .update_version(content, "evil", "2.0.0")
+            .unwrap();
+        // keywords 内の文字列は依存ではないので触らない
+        assert!(
+            result.contains(r#"keywords = ["evil>=9.9"]"#),
+            "keywords が破壊された: {result}"
+        );
+        assert!(
+            result.contains("\"evil>=2.0.0\""),
+            "本物の依存未更新: {result}"
         );
     }
 

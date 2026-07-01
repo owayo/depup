@@ -848,29 +848,29 @@ impl GradleParser {
             });
         };
 
-        let mut result = Vec::new();
+        let mut result = String::new();
         let mut in_block_comment = false;
 
-        for (idx, line) in content.lines().enumerate() {
+        // CRLF/LF を保持するため split_inclusive で改行込みに走査し、本文だけを
+        // 処理してから元の改行を再付与する (content.lines()+join は CRLF を潰す)。
+        for (idx, raw_line) in content.split_inclusive('\n').enumerate() {
+            let (line, line_ending) = split_line_ending(raw_line);
             let active_line = strip_gradle_comments_from_line(line, &mut in_block_comment);
 
             if idx + 1 == var_def.line_number
                 && let Some(replaced) =
                     replace_variable_version_value(line, &active_line, &formatted_version)
             {
-                result.push(replaced);
+                result.push_str(&replaced);
+                result.push_str(line_ending);
                 continue;
             }
 
-            result.push(line.to_string());
+            result.push_str(line);
+            result.push_str(line_ending);
         }
 
-        let mut joined = result.join("\n");
-        // 元のファイルが末尾改行を持つ場合は保持する
-        if content.ends_with('\n') {
-            joined.push('\n');
-        }
-        Ok(joined)
+        Ok(result)
     }
 
     /// 依存行の直接バージョンを更新
@@ -1017,19 +1017,21 @@ impl GradleParser {
                 });
             };
 
-            let mut result_lines: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
-            result_lines[update_line_index] = format!(
-                "{}{}{}",
-                &current_line[..selection.value_start],
-                formatted_version,
-                &current_line[selection.value_end..]
-            );
-
-            let mut joined = result_lines.join("\n");
-            if content.ends_with('\n') {
-                joined.push('\n');
+            // CRLF/LF を保持するため、更新行以外は元の生セグメント (改行込み) をそのまま使い、
+            // 更新行だけ本文を差し替えて元の改行を再付与する (join("\n") は CRLF を潰す)。
+            let mut result = String::new();
+            for (i, raw_line) in content.split_inclusive('\n').enumerate() {
+                if i == update_line_index {
+                    let (_, line_ending) = split_line_ending(raw_line);
+                    result.push_str(&current_line[..selection.value_start]);
+                    result.push_str(&formatted_version);
+                    result.push_str(&current_line[selection.value_end..]);
+                    result.push_str(line_ending);
+                } else {
+                    result.push_str(raw_line);
+                }
             }
-            return Ok(Some(joined));
+            return Ok(Some(result));
         }
 
         Ok(None)
@@ -1038,6 +1040,18 @@ impl GradleParser {
 
 fn package_name(group: &str, artifact: &str) -> String {
     format!("{}:{}", group, artifact)
+}
+
+/// 行から改行コード (`\r\n` / `\n` / なし) を分離して (本文, 改行) を返す。
+/// CRLF ファイルの更新で行末を保持するために使う (content.lines()+join は CRLF を潰す)。
+pub(crate) fn split_line_ending(raw_line: &str) -> (&str, &str) {
+    if let Some(body) = raw_line.strip_suffix("\r\n") {
+        (body, "\r\n")
+    } else if let Some(body) = raw_line.strip_suffix('\n') {
+        (body, "\n")
+    } else {
+        (raw_line, "")
+    }
 }
 
 /// 変数定義行のバージョン値 (キャプチャ範囲) だけを差し替える。
@@ -1487,6 +1501,55 @@ dependencies {
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].name, "org.apache.wicket:wicket-core");
         assert_eq!(deps[0].version_spec.version, "9.12.0");
+    }
+
+    #[test]
+    fn test_update_variable_definition_preserves_crlf() {
+        // 回帰: CRLF の build.gradle を変数定義経由で更新しても改行コードを保持する。
+        // 以前は content.lines() + join("\n") が全行の \r を落として LF 化していた
+        // (文字列記法経路は split_inclusive で CRLF を保持しており挙動が食い違っていた)。
+        let content = "def wicketVersion = '1.2.3'\r\ndependencies {\r\n    implementation \"org.apache.wicket:wicket-core:$wicketVersion\"\r\n}\r\n";
+        let result = GradleParser
+            .update_version(content, "org.apache.wicket:wicket-core", "9.12.0")
+            .unwrap();
+        assert!(result.contains("wicketVersion = '9.12.0'"));
+        // すべての行末が CRLF のまま保持される (LF 化しない)
+        assert_eq!(
+            result.matches("\r\n").count(),
+            content.matches("\r\n").count()
+        );
+        assert!(!result.replace("\r\n", "").contains('\n'));
+    }
+
+    #[test]
+    fn test_update_rich_version_block_preserves_crlf() {
+        // 回帰: rich version ブロック経由の更新でも CRLF を保持する
+        // (update_rich_version_block も以前は content.lines()+join で LF 化していた)。
+        let content = "dependencies {\r\n    implementation('org.slf4j:slf4j-api') {\r\n        version {\r\n            strictly '1.7.36'\r\n        }\r\n    }\r\n}\r\n";
+        let result = GradleParser
+            .update_version(content, "org.slf4j:slf4j-api", "2.0.9")
+            .unwrap();
+        assert!(result.contains("strictly '2.0.9'"));
+        assert_eq!(
+            result.matches("\r\n").count(),
+            content.matches("\r\n").count()
+        );
+        assert!(!result.replace("\r\n", "").contains('\n'));
+    }
+
+    #[test]
+    fn test_update_version_catalog_preserves_crlf() {
+        // 回帰: version catalog (.versions.toml) の version.ref 経由更新でも CRLF を保持する。
+        let content = "[versions]\r\njunit = \"4.13.2\"\r\n\r\n[libraries]\r\njunit-core = { module = \"junit:junit\", version.ref = \"junit\" }\r\n";
+        let result = GradleParser
+            .update_version(content, "junit:junit", "4.13.3")
+            .unwrap();
+        assert!(result.contains("junit = \"4.13.3\""));
+        assert_eq!(
+            result.matches("\r\n").count(),
+            content.matches("\r\n").count()
+        );
+        assert!(!result.replace("\r\n", "").contains('\n'));
     }
 
     #[test]

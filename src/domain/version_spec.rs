@@ -318,6 +318,21 @@ fn find_bare_lower_bound_token(raw: &str) -> Option<(usize, usize)> {
     find_version_token_at(raw, leading_ws_len)
 }
 
+/// レンジ文字列から比較基準にする包含下限のバージョン文字列を返す。
+///
+/// `>=` / `~=` / `==` / `=` / `^` / `~` の直後、または裸の下限トークンを、
+/// カンマ/空白区切りの記述順に依存せず探して返す。書き換え側 (`format_range_like`)
+/// と同じトークン探索を使うため、judge が使う比較基準 version と、実際に writer が
+/// 書き換えるトークンが必ず一致する。これにより上限を先に書いたレンジ
+/// (`<1.5, >=1.2.2` など) でも下限 `1.2.2` を基準にでき、AlreadyLatest 誤判定による
+/// 更新取りこぼしを防ぐ。包含下限が無い場合 (厳密下限 `>1.0` のみ等) は `None` を返し、
+/// 呼び出し側の従来ロジックにフォールバックさせる。
+pub fn range_lower_bound_version(raw: &str) -> Option<String> {
+    let (start, end) =
+        find_inclusive_lower_bound_token(raw).or_else(|| find_bare_lower_bound_token(raw))?;
+    Some(raw[start..end].to_string())
+}
+
 fn contains_not_equal_operator(raw: &str) -> bool {
     // `!==` は各エコシステムの有効な制約ではないが、`!=` を含むので同じく拒否する
     raw.as_bytes().windows(2).any(|window| window == b"!=")

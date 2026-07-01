@@ -8,7 +8,7 @@
 //! - ワイルドカード: `1.*`, `1.x`, `1.X`
 //! - レンジ: `>=1.0, <2.0`
 
-use crate::domain::{Language, VersionSpec, VersionSpecKind};
+use crate::domain::{Language, VersionSpec, VersionSpecKind, range_lower_bound_version};
 use crate::parser::VersionParser;
 use regex::Regex;
 use std::sync::LazyLock;
@@ -126,16 +126,21 @@ impl VersionParser for RustVersionParser {
 
         // レンジ
         if RANGE_RE.is_match(trimmed) {
-            // 比較基準として先頭のバージョンを残す。
-            // `>=1.0.0-rc.1, <2.0` のようなプレリリース付き下限は `-` で分割せず保持する
-            let first_version = trimmed
-                .split(',')
-                .next()
-                .and_then(|s| RANGE_FIRST_VERSION_RE.captures(s.trim()))
-                .and_then(|caps| caps.get(1))
-                .map(|m| m.as_str())
-                .unwrap_or("")
-                .to_string();
+            // 比較基準は記述順に依存せず包含下限を採用する
+            // (`<1.5, >=1.2.2` でも下限 `1.2.2` を基準にし、AlreadyLatest 誤判定を防ぐ)。
+            // 包含下限が取れない場合 (厳密下限のみ等) は従来どおり先頭コンマ区切りの
+            // バージョンにフォールバックする。`>=1.0.0-rc.1, <2.0` のようなプレリリース付き
+            // 下限は `-` で分割せず保持する。
+            let first_version = range_lower_bound_version(trimmed)
+                .or_else(|| {
+                    trimmed
+                        .split(',')
+                        .next()
+                        .and_then(|s| RANGE_FIRST_VERSION_RE.captures(s.trim()))
+                        .and_then(|caps| caps.get(1))
+                        .map(|m| m.as_str().to_string())
+                })
+                .unwrap_or_default();
             return Some(VersionSpec::new(
                 VersionSpecKind::Range,
                 trimmed,
@@ -149,9 +154,13 @@ impl VersionParser for RustVersionParser {
         // semver::VersionReq で valid 性を確認して Range として検出する。
         // (`<` 上限のない複数下限などは format 側で安全に Skip される)
         if trimmed.contains(',') && semver::VersionReq::parse(trimmed).is_ok() {
-            let first_version = FIRST_VERSION_TOKEN_RE
-                .find(trimmed)
-                .map(|m| m.as_str().to_string())
+            // ここも包含下限を優先し、取れなければ先頭バージョントークンにフォールバックする。
+            let first_version = range_lower_bound_version(trimmed)
+                .or_else(|| {
+                    FIRST_VERSION_TOKEN_RE
+                        .find(trimmed)
+                        .map(|m| m.as_str().to_string())
+                })
                 .unwrap_or_default();
             return Some(VersionSpec::new(
                 VersionSpecKind::Range,
@@ -319,6 +328,24 @@ mod tests {
         let spec = parse(">=1.0.0+sha.abc123, <2.0").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Range);
         assert_eq!(spec.version, "1.0.0+sha.abc123");
+    }
+
+    #[test]
+    fn test_parse_range_upper_bound_written_first_uses_lower_bound() {
+        // 回帰: 上限が先に書かれたレンジでも、比較基準 version は包含下限を採用する。
+        // 以前は先頭トークン (=上限) を採用し、judge が AlreadyLatest と誤判定して
+        // 有効な更新を取りこぼしていた。comparator の記述順は Cargo(semver)で自由。
+        // comparator のみ (RANGE_RE 経路)
+        let a = parse("<1.5, >=1.2.2").unwrap();
+        assert_eq!(a.kind, VersionSpecKind::Range);
+        assert_eq!(a.version, "1.2.2");
+        // caret と comparator の混在 (VersionReq 経路)
+        let b = parse("<1.5, ^1.2.2").unwrap();
+        assert_eq!(b.kind, VersionSpecKind::Range);
+        assert_eq!(b.version, "1.2.2");
+        // 正しい順序 (下限が先) は従来どおり下限を採用する (回帰しないこと)
+        let c = parse(">=1.2.2, <1.5").unwrap();
+        assert_eq!(c.version, "1.2.2");
     }
 
     #[test]

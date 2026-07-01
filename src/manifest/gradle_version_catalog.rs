@@ -2,6 +2,7 @@
 
 use crate::domain::{Dependency, Language, VersionSpec, VersionSpecKind};
 use crate::error::ManifestError;
+use crate::manifest::gradle::split_line_ending;
 use crate::parser::get_parser;
 use regex::Regex;
 use std::path::PathBuf;
@@ -393,13 +394,15 @@ fn update_version_catalog_version_alias(
     update_member: Option<&str>,
     formatted_version: &str,
 ) -> Option<String> {
-    let mut lines = Vec::new();
+    let mut result = String::new();
     let mut section = String::new();
     let alias_section = format!("versions.{}", alias);
     let mut in_target_block = false;
     let mut updated = false;
 
-    for line in content.lines() {
+    // CRLF/LF を保持するため split_inclusive で改行込みに走査する
+    for raw_line in content.split_inclusive('\n') {
+        let (line, line_ending) = split_line_ending(raw_line);
         if let Some(new_section) = toml_section_name(line) {
             section = new_section;
             in_target_block = false;
@@ -429,18 +432,15 @@ fn update_version_catalog_version_alias(
             updated = true;
         }
 
-        lines.push(next_line);
+        result.push_str(&next_line);
+        result.push_str(line_ending);
     }
 
     if !updated {
         return None;
     }
 
-    let mut joined = lines.join("\n");
-    if content.ends_with('\n') {
-        joined.push('\n');
-    }
-    Some(joined)
+    Some(result)
 }
 
 fn replace_library_version_value(
@@ -508,13 +508,15 @@ fn update_version_catalog_library_alias(
     formatted_version: &str,
 ) -> Option<String> {
     let (group, artifact) = entry.name.split_once(':')?;
-    let mut lines = Vec::new();
+    let mut result = String::new();
     let mut section = String::new();
     let alias_section = format!("libraries.{}", entry.alias);
     let mut in_target_block = false;
     let mut updated = false;
 
-    for line in content.lines() {
+    // CRLF/LF を保持するため split_inclusive で改行込みに走査する
+    for raw_line in content.split_inclusive('\n') {
+        let (line, line_ending) = split_line_ending(raw_line);
         if let Some(new_section) = toml_section_name(line) {
             section = new_section;
             in_target_block = false;
@@ -548,18 +550,15 @@ fn update_version_catalog_library_alias(
             updated = true;
         }
 
-        lines.push(next_line);
+        result.push_str(&next_line);
+        result.push_str(line_ending);
     }
 
     if !updated {
         return None;
     }
 
-    let mut joined = lines.join("\n");
-    if content.ends_with('\n') {
-        joined.push('\n');
-    }
-    Some(joined)
+    Some(result)
 }
 
 pub(super) fn parse(content: &str) -> Result<Option<Vec<Dependency>>, ManifestError> {

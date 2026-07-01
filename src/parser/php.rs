@@ -8,7 +8,7 @@
 //! - 複合制約: `>=1.0 <2.0`, `^1 || ^2`, `1.0 - 2.0`
 //! - ワイルドカード: `1.2.*`, `1.x`
 
-use crate::domain::{Language, VersionSpec, VersionSpecKind};
+use crate::domain::{Language, VersionSpec, VersionSpecKind, range_lower_bound_version};
 use crate::parser::VersionParser;
 use regex::Regex;
 use std::sync::LazyLock;
@@ -219,7 +219,8 @@ impl VersionParser for PhpVersionParser {
             return None;
         }
 
-        // OR を含む複合制約
+        // OR を含む複合制約。比較基準は記述順に依存せず包含下限を採用する
+        // (`<2.0, >=1.0` でも下限 `1.0` を基準にし、更新の取りこぼしを防ぐ)。
         if COMPOUND_OR_RE.is_match(trimmed)
             || HYPHEN_RANGE_RE.is_match(trimmed)
             || COMPOUND_COMMA_RE.is_match(trimmed)
@@ -227,7 +228,9 @@ impl VersionParser for PhpVersionParser {
             return Some(VersionSpec::new(
                 VersionSpecKind::Range,
                 trimmed,
-                extract_first_version(trimmed),
+                range_lower_bound_version(trimmed)
+                    .map(|v| normalize_version(&v))
+                    .unwrap_or_else(|| extract_first_version(trimmed)),
             ));
         }
 
@@ -236,7 +239,9 @@ impl VersionParser for PhpVersionParser {
             return Some(VersionSpec::new(
                 VersionSpecKind::Range,
                 trimmed,
-                extract_first_version(trimmed),
+                range_lower_bound_version(trimmed)
+                    .map(|v| normalize_version(&v))
+                    .unwrap_or_else(|| extract_first_version(trimmed)),
             ));
         }
 
@@ -525,6 +530,20 @@ mod tests {
         let spec = parse(">=1.0,<2.0").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Range);
         assert_eq!(spec.version, "1.0");
+    }
+
+    #[test]
+    fn test_parse_compound_upper_bound_first_uses_lower_bound() {
+        // 回帰: 上限が先に書かれた複合制約でも、比較基準 version は包含下限を採用する。
+        // 以前は先頭トークン (=上限) を基準にして更新を取りこぼしていた。
+        // カンマ区切り
+        let comma = parse("<2.0,>=1.0").unwrap();
+        assert_eq!(comma.kind, VersionSpecKind::Range);
+        assert_eq!(comma.version, "1.0");
+        // 空白区切り
+        let space = parse("<2.0 >=1.0").unwrap();
+        assert_eq!(space.kind, VersionSpecKind::Range);
+        assert_eq!(space.version, "1.0");
     }
 
     #[test]

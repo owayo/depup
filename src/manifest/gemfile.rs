@@ -206,8 +206,13 @@ impl ManifestParser for GemfileParser {
         let parser = get_parser(Language::Ruby);
         let escaped_name = regex::escape(package);
         let mut updated = false;
+        // 末尾コンテキストは 行末/コメント/`)`、オプション (`, require:` 等) に加え、
+        // 行末条件修飾子 (`gem 'wdm' if Gem.win_platform?`) も許容する。これがないと
+        // parse は versionless (Any=更新可能) として拾うのに update で挿入先が見つからず
+        // report/apply が矛盾する (GEM_RE 側は既に if/unless を許容済み)。
+        // if/unless の直前までを一致させ、修飾子本体は line[matched_range.end..] で保持する。
         let no_version_pattern = format!(
-            r#"(gem(?:\s+|\s*\(\s*))(['"])({escaped_name})(['"])(\s*(?:(?:\)\s*)?(?:#|$)|,\s*(?:require|groups?|git|path|branch|ref|tag|source|platforms?|install_if|force_ruby_platform)\s*:))"#
+            r#"(gem(?:\s+|\s*\(\s*))(['"])({escaped_name})(['"])(\s*(?:(?:\)\s*)?(?:#|$)|,\s*(?:require|groups?|git|path|branch|ref|tag|source|platforms?|install_if|force_ruby_platform)\s*:|(?:\)\s*)?(?:if|unless)\b))"#
         );
 
         let no_version_re =
@@ -643,6 +648,39 @@ gem 'pg', '~> 1.1'
         assert!(result.contains("'>= 0.2.0'"));
         // 修飾子は保持される
         assert!(result.contains("if Gem.win_platform?"));
+    }
+
+    #[test]
+    fn test_update_version_versionless_gem_with_conditional_modifier() {
+        // 回帰: バージョンなし gem + 行末条件修飾子 (`if`/`unless`)。
+        // parse は versionless (Any=更新可能) として拾うため judge が更新候補にするが、
+        // 以前は update_version の挿入パターンが ` if`/` unless` を許容せず書き込みに失敗し、
+        // 「更新あり」と報告した後に適用できず矛盾していた。
+        let content = "gem 'wdm' if Gem.win_platform?\n";
+        // parse は更新可能な versionless dep として拾う (report/apply 整合の前提)
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "wdm");
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Any);
+        // update も成功し、version 挿入と修飾子保持が両立する
+        let result = GemfileParser
+            .update_version(content, "wdm", "0.2.0")
+            .unwrap();
+        assert!(result.contains("'wdm'"));
+        assert!(result.contains("'0.2.0'"));
+        assert!(result.contains("if Gem.win_platform?"));
+    }
+
+    #[test]
+    fn test_update_version_versionless_gem_with_unless_modifier() {
+        // `unless` 修飾子・ダブルクォート・括弧付き呼び出しでも同様に成立すること
+        let content = "gem \"wdm\" unless RUBY_PLATFORM =~ /mingw/\n";
+        let result = GemfileParser
+            .update_version(content, "wdm", "0.2.0")
+            .unwrap();
+        assert!(result.contains("\"wdm\""));
+        assert!(result.contains("\"0.2.0\""));
+        assert!(result.contains("unless RUBY_PLATFORM"));
     }
 
     #[test]

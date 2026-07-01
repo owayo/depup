@@ -371,7 +371,10 @@ fn parse_version_components(s: &str) -> (u64, Vec<u64>, Option<Vec<PreIdentifier
             continue;
         }
         // ポストリリース (例: ".post1" / "post1")。曖昧さがないため大文字小文字を許容。
-        if rest.len() >= 4 && rest[..4].eq_ignore_ascii_case("post") {
+        // "post" は ASCII なのでバイト列で比較する。`rest[..4]` の文字列スライスは
+        // rest が多バイト文字を含むと byte index 4 が文字境界に一致せず panic するため、
+        // 常に安全な as_bytes()[..4] を使う (rest.len() >= 4 でバイト長は保証済み)。
+        if rest.len() >= 4 && rest.as_bytes()[..4].eq_ignore_ascii_case(b"post") {
             post = Some(trailing_number(rest).unwrap_or(0));
             break;
         }
@@ -383,7 +386,8 @@ fn parse_version_components(s: &str) -> (u64, Vec<u64>, Option<Vec<PreIdentifier
             // (例: `1.0a1.post1`)。post は後段の比較で別キーとして使うので
             // 取りこぼさないように後続セグメントを走査する。
             for follow in &segments[idx + 1..] {
-                if follow.len() >= 4 && follow[..4].eq_ignore_ascii_case("post") {
+                // rest 側と同様にバイト列比較で多バイト境界 panic を防ぐ。
+                if follow.len() >= 4 && follow.as_bytes()[..4].eq_ignore_ascii_case(b"post") {
                     post = Some(trailing_number(follow).unwrap_or(0));
                     break;
                 }
@@ -625,6 +629,23 @@ mod tests {
         // 同じバージョン文字列は released_at が異なっても等しい
         assert_eq!(a, b);
         assert_eq!(a.cmp(&b), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn test_compare_versions_multibyte_no_panic() {
+        // 数値プレフィックスに続く多バイト文字を含むバージョン文字列でも
+        // panic せず比較できること (バイト境界 panic の回帰防止)。
+        // 以前は parse_version_components の `rest[..4]` / `follow[..4]` が
+        // マルチバイト文字の途中を切って panic していた
+        // (例: "0abcé" → rest="abcé" の byte index 4 は 'é' の内部)。
+        use std::cmp::Ordering;
+        // rest[..4] 経路: 数値コア末尾セグメントが digits + 多バイト。
+        assert_eq!(compare_versions("1.0.0", "1.0.0.0abcé"), Ordering::Greater);
+        assert_eq!(compare_versions("1.0.0.0abcé", "1.0.0"), Ordering::Less);
+        // follow[..4] 経路: prerelease セグメントの後続に多バイトセグメント。
+        let _ = compare_versions("1.0a1.abcé", "1.0");
+        // Python 比較経路も同じ parse_version_components を通る。
+        let _ = compare_python_versions("1.0.0.1xyzé", "1.0.0");
     }
 
     #[test]
