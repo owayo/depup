@@ -39,6 +39,13 @@ static WILDCARD_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\*$|^\d+(?:\.\d+)*\.\*$").unwrap());
 static PEP440_RELEASE_PREFIX_WILDCARD_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[vV]?(?:\d+!)?\d+(?:\.\d+)*\.\*$").unwrap());
+// Poetry の演算子なし完全一致ピン (`requests = "2.28.0"`) 用。
+// PEP 440 の epoch (`1!`)・release・pre/post/dev・local (`+local`) を許容するが、
+// ワイルドカード (`*`) や演算子・カンマ・空白は含まない (単一の bare バージョンのみ)。
+// 書き換え時に `v` を落とす副作用を避けるため v/V 接頭辞は受理しない
+// (Poetry の bare ピンで v 接頭辞を使う例は稀)。
+static BARE_VERSION_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\d[0-9A-Za-z._!+-]*$").unwrap());
 
 fn pep440_prefix_wildcard_is_allowed(op: &str, raw_version: &str) -> bool {
     if !raw_version.ends_with(".*") {
@@ -145,6 +152,29 @@ fn extract_first_version(raw: &str) -> String {
         .trim()
         .trim_start_matches(['=', '<', '>', '!', '~', ' ', '\t']);
     normalize_for_compare(stripped)
+}
+
+/// Poetry の演算子なしバージョン (`requests = "2.28.0"`) を完全一致ピンとして解釈する。
+///
+/// Poetry では bare な文字列は完全一致 (公式ドキュメントの "Exact requirements"、
+/// `==2.28.0` と同義) を意味する。`==` 版と同じく `VersionSpecKind::Exact` にするが、
+/// prefix は付けない (元表記に演算子が無いため、書き換えも演算子なしで行う)。
+/// ワイルドカードや演算子付きは `parse` 側で処理済みなので、ここには到達しない。
+fn parse_poetry_bare_pin(version_str: &str) -> Option<VersionSpec> {
+    let trimmed = version_str.trim();
+    if !BARE_VERSION_RE.is_match(trimmed) {
+        return None;
+    }
+    // `==` と同様に local version (`+local`) を保持して比較する。
+    let normalized = normalize_for_compare_preserving_local(trimmed);
+    if normalized.is_empty() {
+        return None;
+    }
+    Some(VersionSpec::new(
+        VersionSpecKind::Exact,
+        trimmed,
+        normalized,
+    ))
 }
 
 impl VersionParser for PythonVersionParser {
@@ -256,6 +286,14 @@ impl VersionParser for PythonVersionParser {
     fn language(&self) -> Language {
         Language::Python
     }
+
+    /// Poetry の `tool.poetry.dependencies` 向けに、演算子なしの bare バージョンを
+    /// 完全一致ピンとして受理する。通常の `parse` で解釈できたものはそのまま返し、
+    /// None のときだけ bare ピンとしての解釈を試みる。
+    fn parse_exact_pin(&self, version_str: &str) -> Option<VersionSpec> {
+        self.parse(version_str)
+            .or_else(|| parse_poetry_bare_pin(version_str))
+    }
 }
 
 #[cfg(test)]
@@ -273,6 +311,53 @@ mod tests {
         assert_eq!(spec.version, "1.2.3");
         assert_eq!(spec.prefix, Some("==".to_string()));
         assert!(spec.is_pinned());
+    }
+
+    #[test]
+    fn test_parse_exact_pin_poetry_bare_version() {
+        // Poetry の演算子なしバージョンは完全一致ピン (公式: "Exact requirements"、
+        // `==2.28.0` と同義)。parse_exact_pin だけが受理し、通常の parse
+        // (PEP 508 経路) は演算子必須なので従来どおり None を返す。
+        let parser = PythonVersionParser;
+
+        let spec = parser.parse_exact_pin("2.28.0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "2.28.0");
+        assert_eq!(spec.prefix, None);
+        assert!(spec.is_pinned());
+        // 演算子なしなので書き換えも演算子なし (`==` 版と違い prefix を付けない)
+        assert_eq!(spec.format_updated("2.29.0"), "2.29.0");
+
+        // PEP 508 経路 (通常 parse) は bare を受理しない (`name==ver` が必須)
+        assert!(parser.parse("2.28.0").is_none());
+        assert!(parser.parse("1").is_none());
+
+        // 他の bare 形式 (segment 数違い / pre / post / epoch) も Exact ピンとして受理
+        for v in ["1", "1.2", "4.2.1", "1.2.3rc1", "1!2.3", "1.0.post1"] {
+            let s = parser.parse_exact_pin(v).unwrap();
+            assert_eq!(s.kind, VersionSpecKind::Exact, "v={v}");
+            assert!(!s.version.is_empty(), "v={v}");
+        }
+
+        // local version は `==` と同様に保持する
+        assert_eq!(
+            parser.parse_exact_pin("1.0+cu121").unwrap().version,
+            "1.0+cu121"
+        );
+
+        // 非バージョン文字列や空は None のまま
+        assert!(parser.parse_exact_pin("hello").is_none());
+        assert!(parser.parse_exact_pin("").is_none());
+
+        // ワイルドカードや演算子付きは parse 側で処理され、bare ピンにはならない
+        assert_eq!(
+            parser.parse_exact_pin("1.*").unwrap().kind,
+            VersionSpecKind::Wildcard
+        );
+        assert_eq!(
+            parser.parse_exact_pin(">=1.0").unwrap().kind,
+            VersionSpecKind::GreaterOrEqual
+        );
     }
 
     #[test]

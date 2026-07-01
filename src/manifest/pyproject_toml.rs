@@ -470,7 +470,8 @@ fn update_poetry_dependency_line(
         && let Some(caps) = re.captures(line)
     {
         let (quote, old_version) = captured_quote_and_version(&caps);
-        if let Some(spec) = parser.parse(old_version)
+        // Poetry コンテキストでは演算子なしの bare バージョンも完全一致ピンとして扱う
+        if let Some(spec) = parser.parse_exact_pin(old_version)
             && let Some(new_ver) = spec.try_format_updated(new_version)
         {
             let matched_end = caps.get(0).map(|m| m.end()).unwrap_or(0);
@@ -492,7 +493,7 @@ fn update_poetry_dependency_line(
         let (quote, old_version) = captured_quote_and_version(&caps);
         let table_fragment = caps.get(0).map(|m| m.as_str()).unwrap_or("");
         if !inline_poetry_table_has_non_pypi_source(table_fragment)
-            && let Some(spec) = parser.parse(old_version)
+            && let Some(spec) = parser.parse_exact_pin(old_version)
             && let Some(new_ver) = spec.try_format_updated(new_version)
         {
             let matched_end = caps.get(0).map(|m| m.end()).unwrap_or(0);
@@ -758,7 +759,9 @@ fn parse_poetry_dependency(
         _ => return None,
     };
 
-    let spec = parser.parse(&version_str)?;
+    // Poetry の bare バージョン (`requests = "2.28.0"`) は完全一致ピンなので、
+    // parse_exact_pin で拾って更新チェック対象に含める (明示 `==2.28.0` と挙動を揃える)。
+    let spec = parser.parse_exact_pin(&version_str)?;
     Some(if is_dev {
         Dependency::development(name, spec, Language::Python)
     } else {
@@ -829,6 +832,38 @@ pydantic = "~2.0"
 
         let pydantic = deps.iter().find(|d| d.name == "pydantic").unwrap();
         assert_eq!(pydantic.version_spec.kind, VersionSpecKind::Tilde);
+    }
+
+    #[test]
+    fn test_parse_poetry_bare_version_is_exact_pin() {
+        // Poetry の演算子なしバージョン (`django = "4.2.1"`) は完全一致ピン。
+        // 明示 `== ` 版と同様に依存として surface し (以前は無言でドロップされ、
+        // `--include-pinned` を付けても更新チェック対象にすらならなかった)、
+        // Exact/pinned として扱われる。inline table 形式も同様。
+        let content = r#"
+[tool.poetry.dependencies]
+python = "^3.11"
+requests = "^2.28.0"
+django = "4.2.1"
+numpy = { version = "1.26.0", optional = true }
+"#;
+
+        let deps = parse(content).unwrap();
+
+        let django = deps
+            .iter()
+            .find(|d| d.name == "django")
+            .expect("bare 版の django が依存として拾われていない");
+        assert_eq!(django.version_spec.kind, VersionSpecKind::Exact);
+        assert_eq!(django.version_spec.version, "4.2.1");
+        assert!(django.is_pinned());
+
+        let numpy = deps
+            .iter()
+            .find(|d| d.name == "numpy")
+            .expect("inline table の bare 版 numpy が拾われていない");
+        assert_eq!(numpy.version_spec.kind, VersionSpecKind::Exact);
+        assert_eq!(numpy.version_spec.version, "1.26.0");
     }
 
     #[test]
@@ -969,6 +1004,34 @@ requests = "^2.28.0"
             .update_version(content, "requests", "2.31.0")
             .unwrap();
         assert!(result.contains("^2.31.0"));
+    }
+
+    #[test]
+    fn test_update_poetry_bare_version_pin() {
+        // Poetry の演算子なし完全一致ピンを更新すると、演算子を付けずに
+        // 新バージョンへ書き換える (`4.2.1` → `5.0.0`、`==` は付かない)。
+        // simple 形式と inline table 形式の両方で動くこと。
+        let content = r#"
+[tool.poetry.dependencies]
+django = "4.2.1"
+numpy = { version = '1.26.0', optional = true }
+"#;
+
+        let django = PyprojectTomlParser
+            .update_version(content, "django", "5.0.0")
+            .expect("bare 版 django の更新に失敗");
+        assert!(
+            django.contains("django = \"5.0.0\""),
+            "bare 版を演算子なしで更新できていない: {django}"
+        );
+
+        let numpy = PyprojectTomlParser
+            .update_version(content, "numpy", "2.0.0")
+            .expect("inline table の bare 版 numpy の更新に失敗");
+        assert!(
+            numpy.contains("version = '2.0.0'"),
+            "inline table の bare 版 (単一引用符) を更新できていない: {numpy}"
+        );
     }
 
     #[test]

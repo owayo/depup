@@ -672,6 +672,22 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_compound_shell_not_equal_rejected_on_write() {
+        // composer/semver は not-equal を `<>` でも綴れる。`>=1.0 <>1.5.0 <2.0` /
+        // `>=1.0,<>1.5.0,<2.0` は Range として解析されるが、除外制約を含むため
+        // 書き換えは安全側で拒否 (None) される。`!=` 版と挙動が一致すること
+        // (以前は `<>` だけ下限を書き換えて充足不能な制約を生む恐れがあった)。
+        for raw in [">=1.0 <>1.5.0 <2.0", ">=1.0,<>1.5.0,<2.0"] {
+            let spec = parse(raw).unwrap();
+            assert_eq!(spec.kind, VersionSpecKind::Range, "raw={raw}");
+            assert!(
+                spec.try_format_updated("1.9.9").is_none(),
+                "`<>` を含む制約は書き換え拒否されるべき: raw={raw}"
+            );
+        }
+    }
+
+    #[test]
     fn test_parse_caret_with_v_prefix_preserves_v_in_format() {
         // ^v1.2.3 → format_updated は v 接頭辞を保持しないが、version は正規化される
         let spec = parse("^v1.2.3").unwrap();

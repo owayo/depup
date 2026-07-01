@@ -316,6 +316,8 @@ PEP 440 prerelease versions are detected and excluded by default even when writt
 
 PEP 440 local versions are handled as Python-specific version semantics rather than semver build metadata. Exact and exclusion specifiers preserve local labels (`==1.0+cu121`, `!=1.0+local1`), Python candidate ordering treats local versions as newer than the same public version (`1.0+local > 1.0`) and compares local segments per PEP 440 (`1.0+1 > 1.0+abc`, `1.0+abc.2 > 1.0+abc.1`). Ordered and compatible specifiers with local labels, which PEP 440 does not permit (`>=1.0+local`, `~=1.0+local`, `>=1.0+local,<2.0`), are skipped.
 
+In Poetry's `[tool.poetry.dependencies]`, a bare version string without an operator (`requests = "2.28.0"`) is an exact pin — Poetry's official "Exact requirements", equivalent to `==2.28.0`. depup parses it as an exact/pinned dependency for both the simple form and inline tables (`{ version = "1.26.0", optional = true }`), so it surfaces just like an explicit `==2.28.0` (shown as pinned, updatable with `--include-pinned`) and is rewritten without adding an operator (`4.2.1` → `5.0.0`). This bare-exact interpretation applies only in the Poetry context; pip / PEP 508 requirements still require an operator, so a bare version there is not accepted.
+
 ### Range Constraints
 
 depup respects upper-bound range constraints (both exclusive and inclusive):
@@ -345,7 +347,7 @@ When a dependency has a range with an upper bound (e.g., `>=3.5.0,<4.0.0`, `>=1.
 - **Preserve** the original constraint shape in the manifest file
 - **Update only the lower-bound side** to the newest compatible version within the range
 
-Constraints that cannot be rewritten safely are skipped instead of being rewritten partially. This includes examples such as npm/Composer OR constraints (`^1 || ^2`), any exclusion constraint containing `!=` (`!=1.2.3`, `>=1.0, !=1.5.0, <2.0`), upper-bound-only constraints (`<4.0.0`, `<=2.0`), strict lower bounds (`>1.0.0`), Maven-style ranges without a lower bound (`(,2.0]`), and Maven ranges with an exclusive lower bound (`]1.0,2.0[`).
+Constraints that cannot be rewritten safely are skipped instead of being rewritten partially. This includes examples such as npm/Composer OR constraints (`^1 || ^2`), any exclusion constraint containing `!=` (`!=1.2.3`, `>=1.0, !=1.5.0, <2.0`), upper-bound-only constraints (`<4.0.0`, `<=2.0`), strict lower bounds (`>1.0.0`), Maven-style ranges without a lower bound (`(,2.0]`), and Maven ranges with an exclusive lower bound (`]1.0,2.0[`). Composer (composer/semver) also spells not-equal as `<>`, so exclusion constraints using it (`>=1.0 <>1.5.0 <2.0`, `>=1.0,<>1.5.0,<2.0`) are skipped just like their `!=` equivalents.
 
 For JSON manifests, depup only rewrites dependency sections it parses. In `package.json`, `overrides` is left untouched; in `composer.json`, sections such as `replace`, `provide`, and `conflict` are left untouched.
 

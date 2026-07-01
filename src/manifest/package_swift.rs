@@ -920,6 +920,31 @@ let package = Package(
     }
 
     #[test]
+    fn test_update_version_closed_range_preserves_upper_bound() {
+        // 閉区間 `...` でも下限のみ更新し、上限を保持することを確認
+        // (半開 `..<` と共通の version_re.find() 経路だが、閉区間の直接検証がなかった)
+        let content = r#"
+// swift-tools-version: 5.9
+import PackageDescription
+
+let package = Package(
+    name: "MyApp",
+    dependencies: [
+        .package(url: "https://github.com/apple/swift-nio.git", "1.0.0"..."2.0.0"),
+    ]
+)
+"#;
+
+        let result = PackageSwiftParser
+            .update_version(content, "apple/swift-nio", "1.5.0")
+            .unwrap();
+        assert!(
+            result.contains(r#""1.5.0"..."2.0.0""#),
+            "閉区間の下限のみ更新し上限を保持できていない: {result}"
+        );
+    }
+
+    #[test]
     fn test_parse_realistic_package_swift() {
         let content = r#"
 // swift-tools-version: 5.9

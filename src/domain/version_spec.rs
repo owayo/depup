@@ -334,8 +334,14 @@ pub fn range_lower_bound_version(raw: &str) -> Option<String> {
 }
 
 fn contains_not_equal_operator(raw: &str) -> bool {
-    // `!==` は各エコシステムの有効な制約ではないが、`!=` を含むので同じく拒否する
-    raw.as_bytes().windows(2).any(|window| window == b"!=")
+    // `!==` は各エコシステムの有効な制約ではないが、`!=` を含むので同じく拒否する。
+    // Composer (composer/semver) は not-equal を `!=` と `<>` の両方で綴れる
+    // (演算子パターン `(<>|!=|>=?|<=?|==?)`)。`<>` を含む制約も除外制約なので、
+    // `!=` と同様に安全側でスキップする (下限だけ書き換えると除外バージョンを
+    // 選んで充足不能な制約 `>=1.5.0 <>1.5.0 <2.0` を生む恐れがあるため)。
+    raw.as_bytes()
+        .windows(2)
+        .any(|window| window == b"!=" || window == b"<>")
 }
 
 fn format_range_like(raw: &str, new_version: &str) -> Option<String> {
@@ -846,6 +852,18 @@ mod tests {
 
         assert!(comma_spaced.try_format_updated("1.9.0").is_none());
         assert!(space_separated.try_format_updated("1.9.0").is_none());
+    }
+
+    #[test]
+    fn test_format_range_like_shell_not_equal_rejected() {
+        // Composer は not-equal を `<>` でも綴れる。`!=` と同様に、除外制約を含む
+        // レンジは安全に書き換えられないため None を返す (下限だけ進めると除外
+        // バージョンを選んで充足不能な制約を書き戻す恐れがある)。
+        let comma = VersionSpec::new(VersionSpecKind::Range, ">=1.0,<>1.5.0,<2.0", "1.0");
+        let spaced = VersionSpec::new(VersionSpecKind::Range, ">=1.0 <>1.5.0 <2.0", "1.0");
+
+        assert!(comma.try_format_updated("1.9.0").is_none());
+        assert!(spaced.try_format_updated("1.9.0").is_none());
     }
 
     #[test]

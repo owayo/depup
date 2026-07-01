@@ -37,6 +37,17 @@ pub trait VersionParser {
 
     /// このパーサが対応する言語を返す
     fn language(&self) -> Language;
+
+    /// 演算子なしのバージョン文字列が完全一致ピンを意味するコンテキスト向けの解析。
+    ///
+    /// Poetry の `tool.poetry.dependencies` では `requests = "2.28.0"` のような
+    /// 演算子なしの記述が完全一致ピン (公式ドキュメントの "Exact requirements"、
+    /// `==2.28.0` と同義) を意味する。一方 pip / PEP 508 の依存指定では演算子が
+    /// 必須なので、この解釈はマニフェスト側が Poetry コンテキストと分かっている
+    /// 箇所からのみ呼ぶ。デフォルトは通常の `parse` に委譲する (追加解釈なし)。
+    fn parse_exact_pin(&self, version_str: &str) -> Option<VersionSpec> {
+        self.parse(version_str)
+    }
 }
 
 /// 指定された言語に対応するバージョンパーサを取得する
