@@ -406,7 +406,7 @@ impl Orchestrator {
         if let Some(reason) = judge.should_skip(&dep) {
             return OnePassResult {
                 name: dep.name.clone(),
-                outcome: ResultOutcome::Skip(UpdateResult::skip(dep, reason)),
+                outcome: UpdateResult::skip(dep, reason),
                 fetch_error: None,
                 osv_warnings: Vec::new(),
             };
@@ -417,7 +417,7 @@ impl Orchestrator {
             let result = self.judge_git_dependency(&dep).await;
             return OnePassResult {
                 name: dep.name.clone(),
-                outcome: ResultOutcome::Skip(result),
+                outcome: result,
                 fetch_error: None,
                 osv_warnings: Vec::new(),
             };
@@ -440,7 +440,7 @@ impl Orchestrator {
                 };
                 OnePassResult {
                     name: dep.name.clone(),
-                    outcome: ResultOutcome::Skip(result),
+                    outcome: result,
                     fetch_error: None,
                     osv_warnings,
                 }
@@ -449,10 +449,7 @@ impl Orchestrator {
                 let err_msg = e.clone();
                 OnePassResult {
                     name: dep.name.clone(),
-                    outcome: ResultOutcome::Skip(UpdateResult::skip(
-                        dep,
-                        SkipReason::FetchFailed(e),
-                    )),
+                    outcome: UpdateResult::skip(dep, SkipReason::FetchFailed(e)),
                     fetch_error: Some(err_msg),
                     osv_warnings: Vec::new(),
                 }
@@ -611,23 +608,21 @@ impl Orchestrator {
                 continue;
             }
             let parser = get_parser(info.language);
+            let parse_error = |message: String| OrchestratorError::ManifestParseError {
+                path: info.path.display().to_string(),
+                message,
+            };
             let content = match std::fs::read_to_string(&info.path) {
                 Ok(c) => c,
                 Err(e) => {
-                    errors.push(OrchestratorError::ManifestParseError {
-                        path: info.path.display().to_string(),
-                        message: e.to_string(),
-                    });
+                    errors.push(parse_error(e.to_string()));
                     continue;
                 }
             };
             let mut dependencies = match parser.parse(&content) {
                 Ok(deps) => deps,
                 Err(e) => {
-                    errors.push(OrchestratorError::ManifestParseError {
-                        path: info.path.display().to_string(),
-                        message: e.to_string(),
-                    });
+                    errors.push(parse_error(e.to_string()));
                     continue;
                 }
             };
@@ -701,9 +696,7 @@ impl Orchestrator {
                         message: warn,
                     });
                 }
-                match result.outcome {
-                    ResultOutcome::Skip(r) => manifest_result.add_result(r),
-                }
+                manifest_result.add_result(result.outcome);
             }
             summary.add_manifest(manifest_result);
         }
@@ -1121,15 +1114,11 @@ impl Orchestrator {
 /// (内部利用のみ)。
 struct OnePassResult {
     name: String,
-    outcome: ResultOutcome,
+    outcome: UpdateResult,
     /// fetch 失敗時の原因メッセージ (存在する場合のみ `OrchestratorError` として記録される)
     fetch_error: Option<String>,
     /// OSV チェックで除外・問題が生じた version のメッセージ
     osv_warnings: Vec<String>,
-}
-
-enum ResultOutcome {
-    Skip(UpdateResult),
 }
 
 /// `enforce_lock_age_rust` が 1 件の依存に対して実施した調整内容

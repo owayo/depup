@@ -9,7 +9,7 @@
 //! - ワイルドカード: `1.2.*`, `1.x`
 
 use crate::domain::{Language, VersionSpec, VersionSpecKind, range_lower_bound_version};
-use crate::parser::VersionParser;
+use crate::parser::{VersionParser, is_fully_floating_wildcard};
 use regex::Regex;
 use std::sync::LazyLock;
 
@@ -59,14 +59,6 @@ static NOT_EQUAL_RE: LazyLock<Regex> =
 // ワイルドカード: 1.2.*, 1.x, 1.2.3.*, *, V1.* (composer/semver は v/V を大小問わず許容)
 static WILDCARD_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(?:[vV]?(?:\d+|[xX*])(?:\.(?:\d+|[xX*])){0,3}|\*)$").unwrap());
-
-/// 入力が完全浮動ワイルドカード (`*`, `*.*`, `x.x`, `v*`, `V*` 等の数値アンカーなし) かを判定する。
-/// 数値アンカーがないとレジストリ最新版を埋め込んでも形が崩れ、書き換え結果が
-/// raw と同一になる phantom update の原因になる。Node 側の `is_fully_floating_wildcard`
-/// と同じ判定を採用する。
-fn is_fully_floating_wildcard(raw: &str) -> bool {
-    !raw.chars().any(|ch| ch.is_ascii_digit())
-}
 
 // 固定バージョン: 1.2.3 / 1.2.3.4
 static BARE_VERSION_RE: LazyLock<Regex> =

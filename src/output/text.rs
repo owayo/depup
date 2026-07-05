@@ -330,6 +330,58 @@ impl TextFormatter {
         }
     }
 
+    /// 更新グループ (本番/開発) の各更新行を書き出す
+    fn write_update_group(
+        &self,
+        updates: &[&UpdateResult],
+        is_dev: bool,
+        max_name_len: usize,
+        writer: &mut dyn Write,
+    ) -> std::io::Result<()> {
+        for result in updates {
+            if let UpdateResult::Update {
+                dependency,
+                new_version,
+                released_at,
+                osv_skipped,
+                osv_checked,
+            } = result
+            {
+                // git 依存は専用フォーマットで表示
+                if let Some(git) = &dependency.git_source {
+                    self.format_git_update_line(
+                        &dependency.name,
+                        git,
+                        new_version,
+                        is_dev,
+                        max_name_len,
+                        writer,
+                    )?;
+                    continue;
+                }
+                // バージョンなしの依存には "-" を表示
+                let old_version = if dependency.version_spec.version.is_empty() {
+                    "-"
+                } else {
+                    &dependency.version_spec.version
+                };
+                self.format_update_line(
+                    &dependency.name,
+                    old_version,
+                    new_version,
+                    is_dev,
+                    *released_at,
+                    dependency.variable_name.as_deref(),
+                    osv_skipped,
+                    *osv_checked,
+                    max_name_len,
+                    writer,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// グループ化した更新でマニフェストをフォーマット
     fn format_manifest_grouped(
         &self,
@@ -411,91 +463,12 @@ impl TextFormatter {
 
         // 本番依存を書き出す
         if !prod_updates.is_empty() {
-            for result in &prod_updates {
-                if let UpdateResult::Update {
-                    dependency,
-                    new_version,
-                    released_at,
-                    osv_skipped,
-                    osv_checked,
-                } = result
-                {
-                    // git 依存は専用フォーマットで表示
-                    if let Some(git) = &dependency.git_source {
-                        self.format_git_update_line(
-                            &dependency.name,
-                            git,
-                            new_version,
-                            false,
-                            max_name_len,
-                            writer,
-                        )?;
-                        continue;
-                    }
-                    // バージョンなしの依存には "-" を表示
-                    let old_version = if dependency.version_spec.version.is_empty() {
-                        "-"
-                    } else {
-                        &dependency.version_spec.version
-                    };
-                    self.format_update_line(
-                        &dependency.name,
-                        old_version,
-                        new_version,
-                        false,
-                        *released_at,
-                        dependency.variable_name.as_deref(),
-                        osv_skipped,
-                        *osv_checked,
-                        max_name_len,
-                        writer,
-                    )?;
-                }
-            }
+            self.write_update_group(&prod_updates, false, max_name_len, writer)?;
         }
 
         // 開発依存を書き出す
         if !dev_updates.is_empty() {
-            for result in &dev_updates {
-                if let UpdateResult::Update {
-                    dependency,
-                    new_version,
-                    released_at,
-                    osv_skipped,
-                    osv_checked,
-                } = result
-                {
-                    if let Some(git) = &dependency.git_source {
-                        self.format_git_update_line(
-                            &dependency.name,
-                            git,
-                            new_version,
-                            true,
-                            max_name_len,
-                            writer,
-                        )?;
-                        continue;
-                    }
-                    // バージョンなしの依存には "-" を表示
-                    let old_version = if dependency.version_spec.version.is_empty() {
-                        "-"
-                    } else {
-                        &dependency.version_spec.version
-                    };
-                    self.format_update_line(
-                        &dependency.name,
-                        old_version,
-                        new_version,
-                        true,
-                        *released_at,
-                        dependency.variable_name.as_deref(),
-                        osv_skipped,
-                        *osv_checked,
-                        max_name_len,
-                        writer,
-                    )?;
-                }
-            }
+            self.write_update_group(&dev_updates, true, max_name_len, writer)?;
         }
 
         // verbose モードでスキップを書き出す
@@ -797,24 +770,19 @@ impl OutputFormatter for TextFormatter {
         if self.verbosity == Verbosity::Verbose {
             writeln!(writer)?;
             writeln!(writer, "{}:", self.maybe_dimmed("By language"))?;
-            for language in Language::all() {
-                let manifests: Vec<_> = summary.by_language(*language).collect();
-                if !manifests.is_empty() {
-                    let lang_updates: usize = manifests.iter().map(|m| m.update_count()).sum();
-                    let lang_skips: usize = manifests.iter().map(|m| m.skip_count()).sum();
-                    let lang_name = if self.color {
-                        language.to_string().cyan().to_string()
-                    } else {
-                        language.to_string()
-                    };
-                    writeln!(
-                        writer,
-                        "  {}: {} updated, {} skipped",
-                        lang_name,
-                        self.apply_color(&lang_updates.to_string(), Color::Green),
-                        self.maybe_dimmed(&lang_skips.to_string())
-                    )?;
-                }
+            for (language, lang_updates, lang_skips) in summary.language_breakdown() {
+                let lang_name = if self.color {
+                    language.to_string().cyan().to_string()
+                } else {
+                    language.to_string()
+                };
+                writeln!(
+                    writer,
+                    "  {}: {} updated, {} skipped",
+                    lang_name,
+                    self.apply_color(&lang_updates.to_string(), Color::Green),
+                    self.maybe_dimmed(&lang_skips.to_string())
+                )?;
             }
         }
 

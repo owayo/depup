@@ -10,7 +10,10 @@
 
 use crate::domain::{Dependency, GitReference, GitSource, Language, VersionSpec, VersionSpecKind};
 use crate::error::ManifestError;
-use crate::manifest::ManifestParser;
+use crate::manifest::{
+    ManifestParser,
+    line_utils::{captured_quote_and_version, split_line_ending},
+};
 use crate::parser::{VersionParser, get_parser};
 use regex::Regex;
 use std::path::PathBuf;
@@ -182,11 +185,7 @@ impl ManifestParser for CargoTomlParser {
         let mut section = String::new();
         let mut rebuilt = String::new();
         for segment in content.split_inclusive('\n') {
-            let (line, newline) = if let Some(line) = segment.strip_suffix('\n') {
-                (line, "\n")
-            } else {
-                (segment, "")
-            };
+            let (line, newline) = split_line_ending(segment);
 
             if let Some(name) = cargo_section_name(line) {
                 section.clear();
@@ -197,13 +196,7 @@ impl ManifestParser for CargoTomlParser {
 
             if is_cargo_dependency_section(&section) {
                 let replacement = if let Some(caps) = simple_re.captures(line) {
-                    let (quote, old_version) = if let Some(m) = caps.get(2) {
-                        ("\"", m.as_str())
-                    } else if let Some(m) = caps.get(3) {
-                        ("'", m.as_str())
-                    } else {
-                        ("\"", "")
-                    };
+                    let (quote, old_version) = captured_quote_and_version(&caps);
                     if !old_version.contains('/')
                         && let Some(spec) = parser.parse(old_version)
                         && let Some(new_ver) = spec.try_format_updated(new_version)
@@ -214,13 +207,7 @@ impl ManifestParser for CargoTomlParser {
                         None
                     }
                 } else if let Some(caps) = table_re.captures(line) {
-                    let (quote, old_version) = if let Some(m) = caps.get(2) {
-                        ("\"", m.as_str())
-                    } else if let Some(m) = caps.get(3) {
-                        ("'", m.as_str())
-                    } else {
-                        ("\"", "")
-                    };
+                    let (quote, old_version) = captured_quote_and_version(&caps);
                     if let Some(spec) = parser.parse(old_version)
                         && let Some(new_ver) = spec.try_format_updated(new_version)
                     {
@@ -248,13 +235,7 @@ impl ManifestParser for CargoTomlParser {
                 // `features = [...]` が `version` より前にあっても更新でき、コメント行や
                 // 行末コメント内の `version = "..."` は書き換えない。
                 if let Some(caps) = VERSION_LINE_RE.captures(line) {
-                    let (quote, old_version) = if let Some(m) = caps.get(2) {
-                        ("\"", m.as_str())
-                    } else if let Some(m) = caps.get(3) {
-                        ("'", m.as_str())
-                    } else {
-                        ("\"", "")
-                    };
+                    let (quote, old_version) = captured_quote_and_version(&caps);
                     if let Some(spec) = parser.parse(old_version)
                         && let Some(new_ver) = spec.try_format_updated(new_version)
                     {
@@ -305,11 +286,7 @@ impl ManifestParser for CargoTomlParser {
         let mut section = String::new();
         let mut rebuilt = String::new();
         for segment in content.split_inclusive('\n') {
-            let (line, newline) = if let Some(line) = segment.strip_suffix('\n') {
-                (line, "\n")
-            } else {
-                (segment, "")
-            };
+            let (line, newline) = split_line_ending(segment);
 
             if let Some(name) = cargo_section_name(line) {
                 section.clear();
@@ -1714,5 +1691,70 @@ toml = { version = "0.8.0", features = ["derive"] }
         assert!(result.contains("version = \"1.0.0\""));
         assert!(!result.contains("+spec-1.1.0"));
         assert!(result.contains("features"));
+    }
+
+    #[test]
+    fn test_update_version_preserves_crlf() {
+        // 回帰: CRLF の Cargo.toml を update_version しても改行コードを保持し、
+        // 通常依存・inline table・複数行テーブルのいずれの経路でも正しく更新する。
+        let content = "[dependencies]\r\nserde = \"1.0.0\"\r\ntokio = { version = \"1.0.0\", features = [\"full\"] }\r\n\r\n[dependencies.reqwest]\r\nversion = \"0.11.0\"\r\n";
+
+        let simple = CargoTomlParser
+            .update_version(content, "serde", "1.1.0")
+            .unwrap();
+        assert!(simple.contains("serde = \"1.1.0\""));
+        assert_eq!(
+            simple.matches("\r\n").count(),
+            content.matches("\r\n").count()
+        );
+        assert!(!simple.replace("\r\n", "").contains('\n'));
+
+        let inline = CargoTomlParser
+            .update_version(content, "tokio", "1.1.0")
+            .unwrap();
+        assert!(inline.contains("version = \"1.1.0\""));
+        assert!(inline.contains("features = [\"full\"]"));
+        assert_eq!(
+            inline.matches("\r\n").count(),
+            content.matches("\r\n").count()
+        );
+        assert!(!inline.replace("\r\n", "").contains('\n'));
+
+        let multiline = CargoTomlParser
+            .update_version(content, "reqwest", "0.11.20")
+            .unwrap();
+        assert!(multiline.contains("version = \"0.11.20\""));
+        assert_eq!(
+            multiline.matches("\r\n").count(),
+            content.matches("\r\n").count()
+        );
+        assert!(!multiline.replace("\r\n", "").contains('\n'));
+    }
+
+    #[test]
+    fn test_update_git_tag_preserves_crlf() {
+        // 回帰: CRLF の Cargo.toml を update_git_tag しても改行コードを保持し、
+        // inline table・複数行テーブルの両タグ書き換え経路でも正しく更新する。
+        let inline_content = "[dependencies]\r\nbar = { git = \"https://github.com/owner/bar.git\", tag = \"v1.2.3\" }\r\n";
+        let inline = CargoTomlParser
+            .update_git_tag(inline_content, "bar", "v1.3.0")
+            .unwrap();
+        assert!(inline.contains("tag = \"v1.3.0\""));
+        assert_eq!(
+            inline.matches("\r\n").count(),
+            inline_content.matches("\r\n").count()
+        );
+        assert!(!inline.replace("\r\n", "").contains('\n'));
+
+        let table_content = "[dependencies.bar]\r\ngit = \"https://github.com/owner/bar.git\"\r\ntag = \"v1.2.3\"\r\n";
+        let table = CargoTomlParser
+            .update_git_tag(table_content, "bar", "v1.3.0")
+            .unwrap();
+        assert!(table.contains("tag = \"v1.3.0\""));
+        assert_eq!(
+            table.matches("\r\n").count(),
+            table_content.matches("\r\n").count()
+        );
+        assert!(!table.replace("\r\n", "").contains('\n'));
     }
 }

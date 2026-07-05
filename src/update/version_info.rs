@@ -470,10 +470,21 @@ fn parse_python_version_components(s: &str) -> PythonVersionComponents {
 ///
 /// ビルドメタデータ (`+` 以降) は semver 仕様に従い無視する。
 pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    compare_core_pre_post(parse_version_components(a), parse_version_components(b))
+}
+
+/// epoch → 数値コア → プレリリース → ポストリリースの順でバージョン成分を比較する。
+///
+/// semver (`compare_versions`) と PEP 440 (`compare_python_versions`) が共有する
+/// 比較コア。PEP 440 側は戻り値が `Ordering::Equal` のときのみ local version 比較へ続ける。
+fn compare_core_pre_post(
+    a: (u64, Vec<u64>, Option<Vec<PreIdentifier>>, Option<u64>),
+    b: (u64, Vec<u64>, Option<Vec<PreIdentifier>>, Option<u64>),
+) -> std::cmp::Ordering {
     use std::cmp::Ordering;
 
-    let (epoch_a, core_a, pre_a, post_a) = parse_version_components(a);
-    let (epoch_b, core_b, pre_b, post_b) = parse_version_components(b);
+    let (epoch_a, core_a, pre_a, post_a) = a;
+    let (epoch_b, core_b, pre_b, post_b) = b;
 
     // 1. エポック比較
     match epoch_a.cmp(&epoch_b) {
@@ -535,47 +546,12 @@ pub fn compare_python_versions(a: &str, b: &str) -> std::cmp::Ordering {
     let (epoch_a, core_a, pre_a, post_a, local_a) = parse_python_version_components(a);
     let (epoch_b, core_b, pre_b, post_b, local_b) = parse_python_version_components(b);
 
-    match epoch_a.cmp(&epoch_b) {
+    match compare_core_pre_post(
+        (epoch_a, core_a, pre_a, post_a),
+        (epoch_b, core_b, pre_b, post_b),
+    ) {
         Ordering::Equal => {}
         other => return other,
-    }
-
-    let max_len = core_a.len().max(core_b.len());
-    for i in 0..max_len {
-        let pa = core_a.get(i).copied().unwrap_or(0);
-        let pb = core_b.get(i).copied().unwrap_or(0);
-        match pa.cmp(&pb) {
-            Ordering::Equal => continue,
-            other => return other,
-        }
-    }
-
-    match (&pre_a, &pre_b) {
-        (None, None) => {}
-        (None, Some(_)) => return Ordering::Greater,
-        (Some(_), None) => return Ordering::Less,
-        (Some(a_ids), Some(b_ids)) => {
-            for (pa, pb) in a_ids.iter().zip(b_ids.iter()) {
-                match pa.cmp(pb) {
-                    Ordering::Equal => continue,
-                    other => return other,
-                }
-            }
-            match a_ids.len().cmp(&b_ids.len()) {
-                Ordering::Equal => {}
-                other => return other,
-            }
-        }
-    }
-
-    match (post_a, post_b) {
-        (None, None) => {}
-        (None, Some(_)) => return Ordering::Less,
-        (Some(_), None) => return Ordering::Greater,
-        (Some(a_post), Some(b_post)) => match a_post.cmp(&b_post) {
-            Ordering::Equal => {}
-            other => return other,
-        },
     }
 
     match (&local_a, &local_b) {

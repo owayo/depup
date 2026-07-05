@@ -241,21 +241,14 @@ impl OutputFormatter for JsonFormatter {
         let skips = result.summary.total_skips();
 
         let by_language: Vec<JsonLanguageSummary> = if self.verbosity == Verbosity::Verbose {
-            Language::all()
-                .iter()
-                .filter_map(|language| {
-                    let manifests: Vec<_> = result.summary.by_language(*language).collect();
-                    if manifests.is_empty() {
-                        None
-                    } else {
-                        let lang_updates: usize = manifests.iter().map(|m| m.update_count()).sum();
-                        let lang_skips: usize = manifests.iter().map(|m| m.skip_count()).sum();
-                        Some(JsonLanguageSummary {
-                            language: language.display_name().to_string(),
-                            updates: lang_updates,
-                            skips: lang_skips,
-                        })
-                    }
+            result
+                .summary
+                .language_breakdown()
+                .into_iter()
+                .map(|(language, updates, skips)| JsonLanguageSummary {
+                    language: language.display_name().to_string(),
+                    updates,
+                    skips,
                 })
                 .collect()
         } else {

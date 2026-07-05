@@ -30,6 +30,13 @@ pub use swift::SwiftVersionParser;
 
 use crate::domain::{Language, VersionSpec};
 
+/// 入力が完全浮動ワイルドカード (`*`, `*.*`, `x.x`, `v*`, `V*` 等の数値アンカーなし) かを判定する。
+/// 数値アンカーがないとレジストリ最新版を埋め込んでも形が崩れ、書き換え結果が
+/// raw と同一になる phantom update の原因になる。Node / PHP のワイルドカード判定で共有する。
+pub(crate) fn is_fully_floating_wildcard(raw: &str) -> bool {
+    !raw.chars().any(|ch| ch.is_ascii_digit())
+}
+
 /// バージョン指定のパースを行うトレイト
 pub trait VersionParser {
     /// バージョン指定文字列をパースする

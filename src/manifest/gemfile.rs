@@ -9,7 +9,7 @@
 
 use crate::domain::{Dependency, Language, VersionSpec, VersionSpecKind};
 use crate::error::ManifestError;
-use crate::manifest::ManifestParser;
+use crate::manifest::{ManifestParser, line_utils::split_line_ending};
 use crate::parser::get_parser;
 use regex::Regex;
 use std::path::PathBuf;
@@ -235,13 +235,7 @@ impl ManifestParser for GemfileParser {
         let mut lines = Vec::new();
         for raw_line in content.split_inclusive('\n') {
             // 行末の改行コード (`\n` / `\r\n`) を退避し、本文のみを処理対象にする
-            let (line, line_ending) = match raw_line.strip_suffix('\n') {
-                Some(rest) => match rest.strip_suffix('\r') {
-                    Some(body) => (body, "\r\n"),
-                    None => (rest, "\n"),
-                },
-                None => (raw_line, ""),
-            };
+            let (line, line_ending) = split_line_ending(raw_line);
 
             // 同名 gem が複数箇所 (group 内外など) に宣言されている場合は全出現を更新する。
             // Cargo / Gradle / pyproject と同じく「1 依存 = 全出現を書き換え」の不変条件を守る。

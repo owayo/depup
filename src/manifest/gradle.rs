@@ -10,7 +10,7 @@
 
 use crate::domain::{Dependency, Language, VersionSpec, VersionSpecKind};
 use crate::error::ManifestError;
-use crate::manifest::{ManifestParser, gradle_version_catalog};
+use crate::manifest::{ManifestParser, gradle_version_catalog, line_utils::split_line_ending};
 use crate::parser::get_parser;
 use regex::Regex;
 use std::collections::HashMap;
@@ -221,11 +221,7 @@ where
     let mut in_block_comment = false;
 
     for segment in content.split_inclusive('\n') {
-        let (line, newline) = if let Some(line) = segment.strip_suffix('\n') {
-            (line, "\n")
-        } else {
-            (segment, "")
-        };
+        let (line, newline) = split_line_ending(segment);
 
         let active_line = strip_gradle_comments_from_line(line, &mut in_block_comment);
         let mut rebuilt = String::new();
@@ -1042,18 +1038,6 @@ fn package_name(group: &str, artifact: &str) -> String {
     format!("{}:{}", group, artifact)
 }
 
-/// 行から改行コード (`\r\n` / `\n` / なし) を分離して (本文, 改行) を返す。
-/// CRLF ファイルの更新で行末を保持するために使う (content.lines()+join は CRLF を潰す)。
-pub(crate) fn split_line_ending(raw_line: &str) -> (&str, &str) {
-    if let Some(body) = raw_line.strip_suffix("\r\n") {
-        (body, "\r\n")
-    } else if let Some(body) = raw_line.strip_suffix('\n') {
-        (body, "\n")
-    } else {
-        (raw_line, "")
-    }
-}
-
 /// 変数定義行のバージョン値 (キャプチャ範囲) だけを差し替える。
 /// 行を再構築しないため、インデント・行末コメント・クォート文字は元のまま保持される。
 fn replace_variable_version_value(
@@ -1545,6 +1529,22 @@ dependencies {
             .update_version(content, "junit:junit", "4.13.3")
             .unwrap();
         assert!(result.contains("junit = \"4.13.3\""));
+        assert_eq!(
+            result.matches("\r\n").count(),
+            content.matches("\r\n").count()
+        );
+        assert!(!result.replace("\r\n", "").contains('\n'));
+    }
+
+    #[test]
+    fn test_update_string_notation_preserves_crlf() {
+        // 回帰: 文字列記法依存 (リテラルバージョン) を CRLF の build.gradle で更新しても
+        // 改行コードを保持する (replace_all_active_gradle_matches 経路)。
+        let content = "dependencies {\r\n    implementation 'org.apache.commons:commons-lang3:3.12.0'\r\n}\r\n";
+        let result = GradleParser
+            .update_version(content, "org.apache.commons:commons-lang3", "3.14.0")
+            .unwrap();
+        assert!(result.contains("commons-lang3:3.14.0"));
         assert_eq!(
             result.matches("\r\n").count(),
             content.matches("\r\n").count()

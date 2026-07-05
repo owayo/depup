@@ -10,7 +10,7 @@
 
 use crate::domain::{Dependency, Language};
 use crate::error::ManifestError;
-use crate::manifest::ManifestParser;
+use crate::manifest::{ManifestParser, line_utils::captured_quote_and_version};
 use crate::parser::{VersionParser, get_parser};
 use regex::Regex;
 use std::collections::HashSet;
@@ -444,17 +444,6 @@ fn strip_toml_line_comment(line: &str) -> &str {
         }
     }
     line
-}
-
-/// 正規表現キャプチャから引用符種別と旧バージョン文字列 (グループ 2/3) を取り出す
-fn captured_quote_and_version<'a>(caps: &regex::Captures<'a>) -> (&'static str, &'a str) {
-    if let Some(m) = caps.get(2) {
-        ("\"", m.as_str())
-    } else if let Some(m) = caps.get(3) {
-        ("'", m.as_str())
-    } else {
-        ("\"", "")
-    }
 }
 
 /// Poetry 依存セクション内の 1 行を更新する。更新が起きた場合のみ `Some` を返す

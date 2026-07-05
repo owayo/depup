@@ -9,7 +9,7 @@
 //! - レンジ: `>=1.0.0 <2.0.0`, `1.2 <2.0.0`, `1.0.0 - 2.0.0`, `^1 || ^2`
 
 use crate::domain::{Language, VersionSpec, VersionSpecKind, range_lower_bound_version};
-use crate::parser::VersionParser;
+use crate::parser::{VersionParser, is_fully_floating_wildcard};
 use regex::Regex;
 use semver::Version;
 use std::sync::LazyLock;
@@ -228,10 +228,6 @@ fn has_multi_comparator(raw: &str) -> bool {
     }
 
     comparator_count >= 2 || (has_bound_operator && simple_count >= 2)
-}
-
-fn is_fully_floating_wildcard(raw: &str) -> bool {
-    !raw.chars().any(|ch| ch.is_ascii_digit())
 }
 
 /// ワイルドカードトークン列 (`1.x.3` のような形) で、いったんワイルドカード文字 (`x`/`X`/`*`)

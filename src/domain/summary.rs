@@ -124,6 +124,23 @@ impl UpdateSummary {
             .filter(move |m| m.language == language)
     }
 
+    /// 非空の言語ごとに (言語, 更新数, スキップ数) を `Language::all()` 順で返す
+    pub fn language_breakdown(&self) -> Vec<(Language, usize, usize)> {
+        Language::all()
+            .iter()
+            .filter_map(|language| {
+                let manifests: Vec<_> = self.by_language(*language).collect();
+                if manifests.is_empty() {
+                    None
+                } else {
+                    let updates: usize = manifests.iter().map(|m| m.update_count()).sum();
+                    let skips: usize = manifests.iter().map(|m| m.skip_count()).sum();
+                    Some((*language, updates, skips))
+                }
+            })
+            .collect()
+    }
+
     /// 全マニフェストの全更新を返す
     pub fn all_updates(&self) -> impl Iterator<Item = &UpdateResult> {
         self.manifests.iter().flat_map(|m| m.updates())

@@ -19,42 +19,47 @@ pub struct RubyVersionParser;
 // プレリリース識別子は複数のドット/ハイフン区切りに対応する
 // 例: `1.0.0.pre.1`, `7.0.0.alpha.2`, `1.2.3-beta.1`
 
+// バージョンコアのパターンは 1 箇所に集約する。Node の NODE_VERSION_PATTERN /
+// PHP の PHP_VERSION_CORE と同様、全演算子の正規表現がこの定数を共有することで
+// 定義間の不整合を防ぐ。コア断片は非キャプチャグループのみのため `(...)` で包んでも
+// キャプチャ番号はずれない。
+const RUBY_VERSION_CORE: &str = r"\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)*";
+
 // ペシミスティック制約: ~> 1.2 or ~> 1.2.3 or ~> 1.0.0.pre.1
 static PESSIMISTIC_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^~>\s*(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)*)$").unwrap());
+    LazyLock::new(|| Regex::new(&format!(r"^~>\s*({RUBY_VERSION_CORE})$")).unwrap());
 
 // = 接頭辞付き固定: = 1.2.3
 static EXACT_EQ_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^=\s*(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)*)$").unwrap());
+    LazyLock::new(|| Regex::new(&format!(r"^=\s*({RUBY_VERSION_CORE})$")).unwrap());
 
 // 以上: >= 1.2.3
 static GTE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^>=\s*(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)*)$").unwrap());
+    LazyLock::new(|| Regex::new(&format!(r"^>=\s*({RUBY_VERSION_CORE})$")).unwrap());
 
 // より大きい: > 1.2.3
 static GT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^>\s*(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)*)$").unwrap());
+    LazyLock::new(|| Regex::new(&format!(r"^>\s*({RUBY_VERSION_CORE})$")).unwrap());
 
 // 以下: <= 1.2.3
 static LTE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^<=\s*(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)*)$").unwrap());
+    LazyLock::new(|| Regex::new(&format!(r"^<=\s*({RUBY_VERSION_CORE})$")).unwrap());
 
 // より小さい: < 1.2.3
 static LT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^<\s*(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)*)$").unwrap());
+    LazyLock::new(|| Regex::new(&format!(r"^<\s*({RUBY_VERSION_CORE})$")).unwrap());
 static NOT_EQUAL_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^!=\s*(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)*)$").unwrap());
+    LazyLock::new(|| Regex::new(&format!(r"^!=\s*({RUBY_VERSION_CORE})$")).unwrap());
 
 // 裸のバージョン (固定): 1.2.3
 static BARE_VERSION_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)*)$").unwrap());
+    LazyLock::new(|| Regex::new(&format!(r"^({RUBY_VERSION_CORE})$")).unwrap());
 
 // 複合制約パターン (個別パースの前に検出する)
 static COMPOUND_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r",").unwrap());
 static COMPOUND_SPACE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[<>=~!].*\s+[<>=~!]").unwrap());
-static VERSION_TOKEN_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)*").unwrap());
+static VERSION_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(RUBY_VERSION_CORE).unwrap());
 
 fn extract_first_version(raw: &str) -> String {
     VERSION_TOKEN_RE

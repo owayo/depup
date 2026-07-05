@@ -21,26 +21,32 @@ pub struct RustVersionParser;
 // SemVer の prerelease (`-...`) と build metadata (`+...`) は同時指定を許容する
 // (例: `1.2.3-rc.1+build123`)。ビルドメタデータはバージョン比較時には無視されるが、
 // マニフェスト上の表記はそのまま保持する。
+//
+// バージョンコアのパターンは 1 箇所に集約する。Node の NODE_VERSION_PATTERN /
+// PHP の PHP_VERSION_CORE と同様、全演算子の正規表現がこの定数を共有することで
+// 定義間の不整合を防ぐ。コア断片は非キャプチャグループのみのため `(...)` で包んでも
+// キャプチャ番号はずれない (末尾構造が異なる WILDCARD_RE は共有しない)。
+const RUST_VERSION_CORE: &str = r"[\d]+(?:\.[\d]+)*(?:-[\w.-]+)?(?:\+[\w.-]+)?";
 static EXACT_PINNED_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^=\s*([\d]+(?:\.[\d]+)*(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(&format!(r"^=\s*({RUST_VERSION_CORE})$")).unwrap());
 static CARET_EXPLICIT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\^\s*([\d]+(?:\.[\d]+)*(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(&format!(r"^\^\s*({RUST_VERSION_CORE})$")).unwrap());
 static TILDE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^~\s*([\d]+(?:\.[\d]+)*(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(&format!(r"^~\s*({RUST_VERSION_CORE})$")).unwrap());
 static GTE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^>=\s*([\d]+(?:\.[\d]+)*(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(&format!(r"^>=\s*({RUST_VERSION_CORE})$")).unwrap());
 static GT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^>\s*([\d]+(?:\.[\d]+)*(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(&format!(r"^>\s*({RUST_VERSION_CORE})$")).unwrap());
 static LTE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^<=\s*([\d]+(?:\.[\d]+)*(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(&format!(r"^<=\s*({RUST_VERSION_CORE})$")).unwrap());
 static LT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^<\s*([\d]+(?:\.[\d]+)*(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(&format!(r"^<\s*({RUST_VERSION_CORE})$")).unwrap());
 static BARE_VERSION_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^([\d]+(?:\.[\d]+)*(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap());
+    LazyLock::new(|| Regex::new(&format!(r"^({RUST_VERSION_CORE})$")).unwrap());
 static RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"^(?:(?:>=|<=|>|<|=)\s*[\d]+(?:\.[\d]+)*(?:-[\w.-]+)?(?:\+[\w.-]+)?\s*,\s*)+(?:>=|<=|>|<|=)\s*[\d]+(?:\.[\d]+)*(?:-[\w.-]+)?(?:\+[\w.-]+)?$",
-    )
+    Regex::new(&format!(
+        r"^(?:(?:>=|<=|>|<|=)\s*{RUST_VERSION_CORE}\s*,\s*)+(?:>=|<=|>|<|=)\s*{RUST_VERSION_CORE}$"
+    ))
     .unwrap()
 });
 // semver crate は `*` に加えて `x` / `X` もワイルドカード文字として受理する。
@@ -51,13 +57,12 @@ static WILDCARD_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[=^~]?[\d]+(?:\.[\d]+)*(?:\.[*xX]){1,2}$").unwrap());
 // Range の先頭 comparison requirement からバージョン部を抽出する。
 // プレリリース (`-...`) とビルドメタデータ (`+...`) も比較基準として保持する。
-static RANGE_FIRST_VERSION_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(?:>=|<=|>|<|=)\s*([\d]+(?:\.[\d]+)*(?:-[\w.-]+)?(?:\+[\w.-]+)?)$").unwrap()
-});
+static RANGE_FIRST_VERSION_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!(r"^(?:>=|<=|>|<|=)\s*({RUST_VERSION_CORE})$")).unwrap());
 // caret/tilde/wildcard 混在の複数要件から先頭のバージョントークンを抽出する。
 // (`^1.2.2, <1.5` -> `1.2.2`、`>=1.2, <1.5` -> `1.2`)
 static FIRST_VERSION_TOKEN_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"[\d]+(?:\.[\d]+)*(?:-[\w.-]+)?(?:\+[\w.-]+)?").unwrap());
+    LazyLock::new(|| Regex::new(RUST_VERSION_CORE).unwrap());
 
 impl VersionParser for RustVersionParser {
     fn parse(&self, version_str: &str) -> Option<VersionSpec> {

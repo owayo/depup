@@ -2,7 +2,7 @@
 
 use crate::domain::{Dependency, Language, VersionSpec, VersionSpecKind};
 use crate::error::ManifestError;
-use crate::manifest::gradle::split_line_ending;
+use crate::manifest::line_utils::split_line_ending;
 use crate::parser::get_parser;
 use regex::Regex;
 use std::path::PathBuf;
