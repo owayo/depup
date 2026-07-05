@@ -4,9 +4,9 @@
 //! - 更新結果の JSON シリアライズ
 //! - ファイルごとの構造化された更新/スキップ情報
 
-use crate::domain::{
-    GitReference, Language, ManifestUpdateResult, SkipReason, UpdateResult, UpdateSummary,
-};
+#[cfg(test)]
+use crate::domain::Language;
+use crate::domain::{GitReference, ManifestUpdateResult, SkipReason, UpdateResult, UpdateSummary};
 use crate::orchestrator::OrchestratorResult;
 use crate::output::{OutputFormatter, Verbosity};
 use serde::Serialize;
