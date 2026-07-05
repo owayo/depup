@@ -7,9 +7,10 @@
 //! - スキップされたパッケージの理由表示
 //! - 詳細な内訳付きサマリ
 
+#[cfg(test)]
+use crate::domain::Language;
 use crate::domain::{
-    GitReference, GitSource, Language, ManifestUpdateResult, SkipReason, UpdateResult,
-    UpdateSummary,
+    GitReference, GitSource, ManifestUpdateResult, SkipReason, UpdateResult, UpdateSummary,
 };
 use crate::orchestrator::OrchestratorResult;
 use crate::output::{OutputFormatter, Verbosity};

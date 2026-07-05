@@ -925,40 +925,16 @@ impl Orchestrator {
 
         // Nodeマニフェスト内の全Tauri npmパッケージを検索
         // 戻り値: Vec<(manifest_idx, result_idx, result, current_version)>
-        let npm_packages: Vec<(usize, usize, UpdateResult, String)> = summary
-            .manifests
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| m.language == Language::Node)
-            .flat_map(|(mi, m)| {
-                m.results
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, r)| TAURI_NPM_PACKAGES.contains(&r.package_name()))
-                    .map(move |(ri, r)| {
-                        let current = r.dependency().version().to_string();
-                        (mi, ri, r.clone(), current)
-                    })
-            })
-            .collect();
+        let npm_packages: Vec<(usize, usize, UpdateResult, String)> =
+            collect_tauri_packages(summary, Language::Node, |name| {
+                TAURI_NPM_PACKAGES.contains(&name)
+            });
 
         // Rustマニフェスト内のtauri crateを検索
-        let crate_info: Option<(usize, usize, UpdateResult, String)> = summary
-            .manifests
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| m.language == Language::Rust)
-            .flat_map(|(mi, m)| {
-                m.results
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, r)| r.package_name() == TAURI_CRATE)
-                    .map(move |(ri, r)| {
-                        let current = r.dependency().version().to_string();
-                        (mi, ri, r.clone(), current)
-                    })
-            })
-            .next();
+        let crate_info: Option<(usize, usize, UpdateResult, String)> =
+            collect_tauri_packages(summary, Language::Rust, |name| name == TAURI_CRATE)
+                .into_iter()
+                .next();
 
         // tauriパッケージが一つも見つからなければ、同期不要
         if npm_packages.is_empty() && crate_info.is_none() {
@@ -1009,24 +985,21 @@ impl Orchestrator {
 
         // バージョン取得には最初のnpmパッケージ名を使用 (全パッケージでバージョンは共通)
         let npm_pkg_name = TAURI_NPM_PACKAGES[0];
-        let npm_versions = match self.fetch_versions(&*npm_adapter, npm_pkg_name).await {
+        let npm_versions = match self.fetch_for_tauri_sync(&*npm_adapter, npm_pkg_name).await {
             Ok(v) => v,
             Err(e) => {
-                errors.push(OrchestratorError::RegistryError {
-                    package: npm_pkg_name.to_string(),
-                    message: format!("Failed to fetch for Tauri sync: {}", e),
-                });
+                errors.push(e);
                 return;
             }
         };
 
-        let crate_versions = match self.fetch_versions(&*crate_adapter, TAURI_CRATE).await {
+        let crate_versions = match self
+            .fetch_for_tauri_sync(&*crate_adapter, TAURI_CRATE)
+            .await
+        {
             Ok(v) => v,
             Err(e) => {
-                errors.push(OrchestratorError::RegistryError {
-                    package: TAURI_CRATE.to_string(),
-                    message: format!("Failed to fetch for Tauri sync: {}", e),
-                });
+                errors.push(e);
                 return;
             }
         };
@@ -1075,38 +1048,37 @@ impl Orchestrator {
                 let Some(pkg_target) = pkg_target else {
                     continue;
                 };
-                match original {
-                    UpdateResult::Update { dependency, .. } => {
-                        // 既存の更新を調整
-                        let adjusted = UpdateResult::update(dependency.clone(), pkg_target);
-                        summary.manifests[*manifest_idx].results[*result_idx] = adjusted;
-                    }
-                    UpdateResult::Skip { dependency, .. } => {
-                        // スキップから新しい更新を作成
-                        let adjusted = UpdateResult::update(dependency.clone(), pkg_target);
-                        summary.manifests[*manifest_idx].results[*result_idx] = adjusted;
-                        summary.manifests[*manifest_idx].modified = true;
-                    }
-                }
+                apply_sync_adjustment(summary, *manifest_idx, *result_idx, original, pkg_target);
             }
         }
 
         // crateバージョンの調整を適用
         if let Some(ref target) = crate_target_version
-            && let Some((manifest_idx, result_idx, original, _)) = crate_info
+            && let Some((manifest_idx, result_idx, original, _)) = crate_info.as_ref()
         {
-            match original {
-                UpdateResult::Update { dependency, .. } => {
-                    let adjusted = UpdateResult::update(dependency, target);
-                    summary.manifests[manifest_idx].results[result_idx] = adjusted;
-                }
-                UpdateResult::Skip { dependency, .. } => {
-                    let adjusted = UpdateResult::update(dependency, target);
-                    summary.manifests[manifest_idx].results[result_idx] = adjusted;
-                    summary.manifests[manifest_idx].modified = true;
-                }
-            }
+            apply_sync_adjustment(
+                summary,
+                *manifest_idx,
+                *result_idx,
+                original,
+                target.clone(),
+            );
         }
+    }
+
+    /// Tauri 同期用にレジストリからバージョンを取得し、失敗時は
+    /// `RegistryError` に変換して返す (呼び出し側で早期 return する)。
+    async fn fetch_for_tauri_sync(
+        &self,
+        adapter: &(dyn RegistryAdapter + Send + Sync),
+        package: &str,
+    ) -> Result<Vec<VersionInfo>, OrchestratorError> {
+        self.fetch_versions(adapter, package)
+            .await
+            .map_err(|e| OrchestratorError::RegistryError {
+                package: package.to_string(),
+                message: format!("Failed to fetch for Tauri sync: {}", e),
+            })
     }
 }
 
@@ -1402,6 +1374,47 @@ fn tauri_sync_protected(result: &UpdateResult) -> bool {
             reason,
             SkipReason::AlreadyLatest | SkipReason::NoSuitableVersion
         ),
+    }
+}
+
+/// summary 内の指定言語マニフェストから、`is_match` に一致するパッケージの
+/// (manifest_idx, result_idx, 結果のクローン, 現在バージョン) を集める。
+fn collect_tauri_packages(
+    summary: &UpdateSummary,
+    language: Language,
+    is_match: impl Fn(&str) -> bool,
+) -> Vec<(usize, usize, UpdateResult, String)> {
+    summary
+        .manifests
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.language == language)
+        .flat_map(|(mi, m)| {
+            m.results
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| is_match(r.package_name()))
+                .map(move |(ri, r)| {
+                    let current = r.dependency().version().to_string();
+                    (mi, ri, r.clone(), current)
+                })
+        })
+        .collect()
+}
+
+/// Tauri 同期で決定したターゲットバージョンを summary の該当結果へ反映する。
+/// 元が Skip だった場合はマニフェストを modified としてマークする。
+fn apply_sync_adjustment(
+    summary: &mut UpdateSummary,
+    manifest_idx: usize,
+    result_idx: usize,
+    original: &UpdateResult,
+    target: String,
+) {
+    let adjusted = UpdateResult::update(original.dependency().clone(), target);
+    summary.manifests[manifest_idx].results[result_idx] = adjusted;
+    if matches!(original, UpdateResult::Skip { .. }) {
+        summary.manifests[manifest_idx].modified = true;
     }
 }
 
