@@ -41,7 +41,7 @@ src/
   manifest/
     detector.rs      - マニフェストファイル検出
     writer.rs        - マニフェストファイル書き込み (git tag 更新含む)
-    package_json.rs  - Node.js パーサ
+    package_json.rs  - Node.js パーサ (Bun catalogs 対応)
     pyproject_toml.rs - Python パーサ
     cargo_toml.rs    - Rust パーサ (git 依存検出対応)
     cargo_lock.rs    - Cargo.lock から git 依存の現在 commit 抽出
@@ -50,7 +50,7 @@ src/
     composer_json.rs - PHP パーサ
     gradle.rs        - Java パーサ
     gradle_version_catalog.rs - Gradle version catalog パーサ
-    json_sections.rs - JSON マニフェストの依存セクション限定書き換え補助
+    json_sections.rs - JSON マニフェストの依存セクション限定書き換え補助 (ネストした object 範囲の抽出含む)
     line_utils.rs    - 行末改行分離 (split_line_ending)・クォート判定 (captured_quote_and_version) の共通ヘルパ。CRLF 保持と TOML クォート種別判定の単一情報源で、cargo_toml / gemfile / gradle / gradle_version_catalog / pyproject_toml が共用する
     package_swift.rs - Swift パーサ
     pnpm_settings.rs - pnpm設定読み取り
@@ -91,7 +91,7 @@ tests/
 
 | Language | Manifest | Registry |
 |----------|----------|----------|
-| Node.js | package.json | npm |
+| Node.js | package.json (Bun catalogs 含む) | npm |
 | Python | pyproject.toml | PyPI |
 | Rust | Cargo.toml (workspace members 自動検出) | crates.io |
 | Go | go.mod | Go Proxy |
@@ -197,6 +197,7 @@ make help                # Makefileヘルプ
 - `--osv` で OSV.dev API による脆弱性チェックを有効化。`judge_with_osv` は採用しようとした候補だけを `https://api.osv.dev/v1/query` に POST し、`vulns` が空でなければ その version を candidate から除外して再 judge → 次に古い候補へフォールバックする。全 candidate を網羅的にチェックする方式は採らない (1000+ バージョンを持つ `@angular/*` 等で実用速度を確保するため)。通常 1 依存あたり 1〜2 API call で完了する。API エラー時は元の候補を採用して `--verbose` で警告。Swift は OSV ecosystem 未対応のためスキップ。グローバル設定 `osv = true` で常時有効化可能。優先順位は `--no-osv` > `--osv` > グローバル設定 > 組み込みデフォルト (false)。OSV API は認証トークン不要。脆弱版除外は言語別の `compare_dependency_versions` を使うため、Python の PEP 440 ローカルバージョン (`1.0+cu121` 等) が build metadata を無視する semver 比較で誤って同列と判定され、安全な候補まで NoSuitableVersion に落ちることがない
 - OSV フォールバックの警告 (`X vulnerable, falling back`) は設計どおりの正常動作の通知であり、exit code には影響しない (exit code 2 は OSV 警告以外のエラーがある場合のみ)
 - npm alias 依存 (`"react": "npm:@preact/compat@^17"`) は実パッケージ名 (`@preact/compat`) でレジストリ照会し、書き戻しには JSON キー (alias 名) を使う (Cargo の rename 依存と同じ name / manifest_name パターン)。alias 接頭辞 `npm:<real>@` は更新後も保持される
+- Bun Catalogs は root `package.json` のトップレベル `catalog` / `catalogs` と `workspaces.catalog` / `workspaces.catalogs` を解析・更新する。workspace package 側の `catalog:` / `catalog:<name>` 参照は、参照先 catalog 定義で一元管理されるため書き換えず保持する。複数の catalog object を更新するときは、JSON 内の出現順に範囲をソートしてから後方順に置換し、先行置換による byte offset のずれで後続 catalog を壊さない。pnpm の `pnpm-workspace.yaml` catalogs は現時点では未対応で、`package.json` 内の `catalog:` 参照は安全側でスキップする
 - 同一依存が複数箇所に宣言されている場合 (Cargo.toml の `[dependencies]` + `[dev-dependencies]`、Gradle の `compileOnly` + `annotationProcessor`、pyproject の main + dev group、Gemfile の通常宣言 + `group :test` ブロック等) は 1 回の更新で全出現が書き換わる。各出現は自身の旧値の形式 (クォート・演算子・`!!` 等) を保って整形される
 - Cargo.toml の複数行テーブル (`[dependencies.<pkg>]`) はセクション追跡の行ベースで更新され、`features = [...]` が `version` より前にあるキー順でも、テーブル内コメントに `version = "..."` 文字列があっても正しく動く。`update_git_tag` は inline table と複数行 `tag` の両方で同方式を使い、依存/patch セクション外の同名キーを触らず、単一引用符も保持する
 - Package.swift の URL マッチは末尾境界付き (`grpc/grpc-swift` の更新が `grpc/grpc-swift-nio` の宣言に前方一致しない)

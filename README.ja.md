@@ -58,6 +58,7 @@
 - **固定バージョン検出**: 意図的に固定されたバージョンはデフォルトでスキップ
 - **エイジフィルター**: N日/週前以降にリリースされたバージョンのみに更新
 - **pnpm連携**: pnpm設定の `minimumReleaseAge` を自動適用
+- **Bun Catalogs対応**: `package.json` の Bun `catalog` / `catalogs` 定義を更新
 - **モノレポ対応**: `.depup`、pnpmワークスペース、ネストした package install、Tauriプロジェクト
 - **リリース日表示**: 各バージョンのリリース日時を表示
 - **複数出力形式**: テキスト（カラー）、JSON、diff
@@ -66,7 +67,7 @@
 
 | 言語 | マニフェスト | レジストリ | ロックファイル |
 |------|-------------|----------|---------------|
-| <img src="https://img.shields.io/badge/-339933?logo=nodedotjs&logoColor=white" height="16"> Node.js | package.json | npm | package-lock.json, pnpm-lock.yaml, yarn.lock, bun.lock, bun.lockb |
+| <img src="https://img.shields.io/badge/-339933?logo=nodedotjs&logoColor=white" height="16"> Node.js | package.json（Bun catalogs 含む） | npm | package-lock.json, pnpm-lock.yaml, yarn.lock, bun.lock, bun.lockb |
 | <img src="https://img.shields.io/badge/-3776AB?logo=python&logoColor=white" height="16"> Python | pyproject.toml | PyPI | uv.lock, requirements.lock, poetry.lock |
 | <img src="https://img.shields.io/badge/-000000?logo=rust&logoColor=white" height="16"> Rust | Cargo.toml | crates.io | Cargo.lock |
 | <img src="https://img.shields.io/badge/-00ADD8?logo=go&logoColor=white" height="16"> Go | go.mod | Go Proxy | go.sum |
@@ -350,6 +351,8 @@ npm/Composer のハイフンレンジでは、右辺が `1.0 - 2.0` のような
 安全に書き換えられない制約は、部分更新せずにスキップします。例として npm/Composer の OR 制約（`^1 || ^2`）、`!=` を含む除外制約（`!=1.2.3`、`>=1.0, !=1.5.0, <2.0`）、上限のみの制約（`<4.0.0`、`<=2.0`）、厳密な下限制約（`>1.0.0`）、下限を持たない Maven 形式レンジ（`(,2.0]`）、Maven の排他的下限レンジ（`]1.0,2.0[`）などが該当します。Composer（composer/semver）は not-equal を `<>` でも綴れるため、`>=1.0 <>1.5.0 <2.0` / `>=1.0,<>1.5.0,<2.0` のような `<>` 除外制約も `!=` 版と同様にスキップします。
 
 JSON マニフェストでは、depup が解析対象にする依存セクションだけを書き換えます。`package.json` の `overrides`、`composer.json` の `replace` / `provide` / `conflict` などは変更しません。
+
+Bun ワークスペースでは、root `package.json` のトップレベル `catalog` / `catalogs` と `workspaces.catalog` / `workspaces.catalogs` を解析・更新します。ワークスペース package の `"react": "catalog:"` や `"jest": "catalog:testing"` のような参照は `catalog:` のまま保持し、共有 catalog 定義側のバージョンだけを更新します。`pnpm-workspace.yaml` に定義される pnpm catalogs はまだマニフェストとして解析しないため、pnpm catalogs に裏付けられた package.json の `catalog:` 参照は安全側でスキップします。
 
 TOML マニフェストでは、基本文字列（`"..."`）とリテラル文字列（`'...'`）のどちらも、対応する依存セクション内では引用符を維持して更新します。`Cargo.toml` では `[dependencies]`、`[dev-dependencies]`、`[build-dependencies]`、`[workspace.dependencies]`、target 固有の依存テーブルだけを書き換え、metadata テーブルは変更しません。Cargo git tag 更新も inline table と複数行テーブルの両方で同じセクション制限に従い、単一引用符・二重引用符を保持します。`[patch.<registry>]` / `[patch.<registry>.<package>]` も更新対象です。`crates-io` 以外の `registry` を指定した Cargo 依存は、depup が crates.io だけを問い合わせるためスキップします。Cargo の比較レンジは `>=1.0, <2.0, >=1.0.100` のように3個以上のカンマ区切り requirement にも対応します。`^1.2.2, <1.5` のように caret/tilde/wildcard と comparator を混在させた複数要件も `semver::VersionReq` で valid 性を確認して Range として検出します（以前は黙ってスキップしていました）。上限のない複数下限の混在で安全に書き換えられないものは Skip として可視化します。
 

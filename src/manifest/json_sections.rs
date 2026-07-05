@@ -49,7 +49,65 @@ fn find_matching_json_object_end(bytes: &[u8], start: usize) -> Option<usize> {
     None
 }
 
-fn top_level_object_section_ranges(content: &str, section_names: &[&str]) -> Vec<(usize, usize)> {
+pub(crate) fn direct_child_object_section_ranges(
+    content: &str,
+    parent_ranges: &[(usize, usize)],
+    section_names: Option<&[&str]>,
+) -> Vec<(usize, usize)> {
+    let bytes = content.as_bytes();
+    let mut ranges = Vec::new();
+
+    for &(start, end) in parent_ranges {
+        let mut depth = 0usize;
+        let mut i = start;
+
+        while i < end && i < bytes.len() {
+            match bytes[i] {
+                b'"' => {
+                    let Some(string_end) = find_json_string_end(bytes, i) else {
+                        break;
+                    };
+
+                    if depth == 0 {
+                        let key = &content[i + 1..string_end];
+                        let mut j = skip_json_ws(bytes, string_end + 1);
+                        if j < end && bytes[j] == b':' {
+                            j = skip_json_ws(bytes, j + 1);
+                            if j < end
+                                && bytes[j] == b'{'
+                                && section_names.is_none_or(|names| names.contains(&key))
+                                && let Some(object_end) = find_matching_json_object_end(bytes, j)
+                                && object_end <= end
+                            {
+                                ranges.push((j + 1, object_end));
+                                i = object_end + 1;
+                                continue;
+                            }
+                        }
+                    }
+
+                    i = string_end + 1;
+                }
+                b'{' => {
+                    depth += 1;
+                    i += 1;
+                }
+                b'}' => {
+                    depth = depth.saturating_sub(1);
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+        }
+    }
+
+    ranges
+}
+
+pub(crate) fn top_level_object_section_ranges(
+    content: &str,
+    section_names: &[&str],
+) -> Vec<(usize, usize)> {
     let bytes = content.as_bytes();
     let mut ranges = Vec::new();
     let mut depth = 0usize;
@@ -102,14 +160,24 @@ pub(crate) fn replace_string_property_in_top_level_sections(
     property_name: &str,
     mut transform: impl FnMut(&str) -> Option<String>,
 ) -> Result<(String, bool), regex::Error> {
+    let ranges = top_level_object_section_ranges(content, section_names);
+    replace_string_property_in_ranges(content, ranges, property_name, &mut transform)
+}
+
+pub(crate) fn replace_string_property_in_ranges(
+    content: &str,
+    mut ranges: Vec<(usize, usize)>,
+    property_name: &str,
+    transform: &mut impl FnMut(&str) -> Option<String>,
+) -> Result<(String, bool), regex::Error> {
     let escaped_property = regex::escape(property_name);
     let pattern = format!(r#"("{}"\s*:\s*)"([^"]+)""#, escaped_property);
     let re = Regex::new(&pattern)?;
-    let ranges = top_level_object_section_ranges(content, section_names);
 
     let mut result = content.to_string();
     let mut updated = false;
 
+    ranges.sort_by_key(|(start, _)| *start);
     for (start, end) in ranges.into_iter().rev() {
         let replaced = {
             let section = &result[start..end];

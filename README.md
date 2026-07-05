@@ -58,6 +58,7 @@
 - **Pinned Version Detection**: Skips intentionally pinned versions by default
 - **Age Filter**: Only update to versions released N days/weeks ago
 - **pnpm Integration**: Respects `minimumReleaseAge` from pnpm settings
+- **Bun Catalogs**: Updates Bun `catalog` / `catalogs` definitions in `package.json`
 - **Monorepo Support**: `.depup`, pnpm workspaces, nested package installs, and Tauri projects
 - **Release Date Display**: Shows when each new version was released
 - **Multiple Output Formats**: Text (colored), JSON, diff
@@ -66,7 +67,7 @@
 
 | Language | Manifest | Registry | Lock Files |
 |----------|----------|----------|------------|
-| <img src="https://img.shields.io/badge/-339933?logo=nodedotjs&logoColor=white" height="16"> Node.js | package.json | npm | package-lock.json, pnpm-lock.yaml, yarn.lock, bun.lock, bun.lockb |
+| <img src="https://img.shields.io/badge/-339933?logo=nodedotjs&logoColor=white" height="16"> Node.js | package.json (including Bun catalogs) | npm | package-lock.json, pnpm-lock.yaml, yarn.lock, bun.lock, bun.lockb |
 | <img src="https://img.shields.io/badge/-3776AB?logo=python&logoColor=white" height="16"> Python | pyproject.toml | PyPI | uv.lock, requirements.lock, poetry.lock |
 | <img src="https://img.shields.io/badge/-000000?logo=rust&logoColor=white" height="16"> Rust | Cargo.toml | crates.io | Cargo.lock |
 | <img src="https://img.shields.io/badge/-00ADD8?logo=go&logoColor=white" height="16"> Go | go.mod | Go Proxy | go.sum |
@@ -350,6 +351,8 @@ When a dependency has a range with an upper bound (e.g., `>=3.5.0,<4.0.0`, `>=1.
 Constraints that cannot be rewritten safely are skipped instead of being rewritten partially. This includes examples such as npm/Composer OR constraints (`^1 || ^2`), any exclusion constraint containing `!=` (`!=1.2.3`, `>=1.0, !=1.5.0, <2.0`), upper-bound-only constraints (`<4.0.0`, `<=2.0`), strict lower bounds (`>1.0.0`), Maven-style ranges without a lower bound (`(,2.0]`), and Maven ranges with an exclusive lower bound (`]1.0,2.0[`). Composer (composer/semver) also spells not-equal as `<>`, so exclusion constraints using it (`>=1.0 <>1.5.0 <2.0`, `>=1.0,<>1.5.0,<2.0`) are skipped just like their `!=` equivalents.
 
 For JSON manifests, depup only rewrites dependency sections it parses. In `package.json`, `overrides` is left untouched; in `composer.json`, sections such as `replace`, `provide`, and `conflict` are left untouched.
+
+For Bun workspaces, depup parses and updates root `package.json` catalog definitions in both top-level `catalog` / `catalogs` and `workspaces.catalog` / `workspaces.catalogs`. Workspace package references such as `"react": "catalog:"` and `"jest": "catalog:testing"` are kept as catalog references; depup updates the shared catalog entry instead. pnpm catalogs defined in `pnpm-workspace.yaml` are not yet parsed as manifests, so package.json `catalog:` references backed by pnpm catalogs are skipped safely.
 
 For TOML manifests, depup preserves both basic strings (`"..."`) and literal strings (`'...'`) when updating supported dependency sections. In `Cargo.toml`, dependency updates are limited to dependency tables such as `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]`, `[workspace.dependencies]`, and target-specific dependency tables; metadata tables are left untouched. Cargo git tag updates use the same section scoping for inline tables and multiline tables, preserve single or double quotes, and also support `[patch.<registry>]` / `[patch.<registry>.<package>]`. Cargo dependencies that specify a non-`crates-io` `registry` are skipped because depup only queries crates.io. Cargo comparison ranges may contain more than two comma-separated requirements, for example `>=1.0, <2.0, >=1.0.100`. Mixed multi-requirement constraints that combine caret/tilde/wildcard with comparators, such as `^1.2.2, <1.5`, are validated with `semver::VersionReq` and detected as ranges; constraints without an upper bound that cannot be rewritten safely are skipped instead of being silently dropped.
 

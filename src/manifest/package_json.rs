@@ -9,7 +9,10 @@
 use crate::domain::{Dependency, Language};
 use crate::error::ManifestError;
 use crate::manifest::ManifestParser;
-use crate::manifest::json_sections::replace_string_property_in_top_level_sections;
+use crate::manifest::json_sections::{
+    direct_child_object_section_ranges, replace_string_property_in_ranges,
+    replace_string_property_in_top_level_sections, top_level_object_section_ranges,
+};
 use crate::parser::{VersionParser, get_parser};
 use serde_json::{Map, Value};
 use std::path::PathBuf;
@@ -48,6 +51,10 @@ impl ManifestParser for PackageJsonParser {
             parse_dependency_object(deps, parser.as_ref(), false, &mut dependencies);
         }
 
+        // Bun Catalogs は root package.json の `catalog` / `catalogs` か
+        // `workspaces.catalog` / `workspaces.catalogs` で定義される。
+        parse_bun_catalogs(&json, parser.as_ref(), &mut dependencies);
+
         Ok(dependencies)
     }
 
@@ -74,26 +81,23 @@ impl ManifestParser for PackageJsonParser {
             content,
             &sections,
             package,
-            |old_version| {
-                if let Some((parse_target, alias_prefix)) = normalize_node_constraint(old_version)
-                    && let Some(spec) = parser.parse(parse_target)
-                    && let Some(new_ver) = spec.try_format_updated(new_version)
-                {
-                    return Some(if let Some(alias) = alias_prefix {
-                        format!("{}{}", alias, new_ver)
-                    } else {
-                        new_ver
-                    });
-                }
-                // 解釈できないものは元の値を維持する
-                None
-            },
+            |old_version| format_node_update(parser.as_ref(), old_version, new_version),
         )
         .map_err(|e| ManifestError::InvalidVersionSpec {
             path: PathBuf::from("package.json"),
             spec: package.to_string(),
             message: format!("invalid regex pattern: {}", e),
         })?;
+
+        let (result, catalog_updated) =
+            replace_bun_catalog_versions(&result, package, new_version, parser.as_ref()).map_err(
+                |e| ManifestError::InvalidVersionSpec {
+                    path: PathBuf::from("package.json"),
+                    spec: package.to_string(),
+                    message: format!("invalid regex pattern: {}", e),
+                },
+            )?;
+        let updated = updated || catalog_updated;
 
         if !updated {
             return Err(ManifestError::InvalidVersionSpec {
@@ -151,6 +155,21 @@ fn normalize_node_constraint(version: &str) -> Option<(&str, Option<String>)> {
     Some((trimmed, None))
 }
 
+fn format_node_update(
+    parser: &dyn VersionParser,
+    old_version: &str,
+    new_version: &str,
+) -> Option<String> {
+    let (parse_target, alias_prefix) = normalize_node_constraint(old_version)?;
+    let spec = parser.parse(parse_target)?;
+    let new_ver = spec.try_format_updated(new_version)?;
+    Some(if let Some(alias) = alias_prefix {
+        format!("{}{}", alias, new_ver)
+    } else {
+        new_ver
+    })
+}
+
 /// alias 接頭辞 `npm:<real>@` から実パッケージ名を取り出す
 fn real_package_name_from_alias_prefix(prefix: &str) -> Option<&str> {
     prefix.strip_prefix("npm:")?.strip_suffix('@')
@@ -182,6 +201,77 @@ fn parse_dependency_object(
             output.push(dep);
         }
     }
+}
+
+fn parse_bun_catalogs(json: &Value, parser: &dyn VersionParser, output: &mut Vec<Dependency>) {
+    if let Some(root) = json.as_object() {
+        parse_bun_catalog_container(root, parser, output);
+    }
+
+    if let Some(workspaces) = json.get("workspaces").and_then(|v| v.as_object()) {
+        parse_bun_catalog_container(workspaces, parser, output);
+    }
+}
+
+fn parse_bun_catalog_container(
+    container: &Map<String, Value>,
+    parser: &dyn VersionParser,
+    output: &mut Vec<Dependency>,
+) {
+    if let Some(catalog) = container.get("catalog").and_then(|v| v.as_object()) {
+        parse_dependency_object(catalog, parser, false, output);
+    }
+
+    if let Some(catalogs) = container.get("catalogs").and_then(|v| v.as_object()) {
+        for catalog in catalogs.values().filter_map(|v| v.as_object()) {
+            parse_dependency_object(catalog, parser, false, output);
+        }
+    }
+}
+
+fn bun_catalog_object_ranges(content: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+
+    // トップレベルの `catalog`
+    ranges.extend(top_level_object_section_ranges(content, &["catalog"]));
+
+    // トップレベルの `catalogs.<name>`
+    let top_catalogs = top_level_object_section_ranges(content, &["catalogs"]);
+    ranges.extend(direct_child_object_section_ranges(
+        content,
+        &top_catalogs,
+        None,
+    ));
+
+    // `workspaces.catalog`
+    let workspaces = top_level_object_section_ranges(content, &["workspaces"]);
+    ranges.extend(direct_child_object_section_ranges(
+        content,
+        &workspaces,
+        Some(&["catalog"]),
+    ));
+
+    // `workspaces.catalogs.<name>`
+    let workspace_catalogs =
+        direct_child_object_section_ranges(content, &workspaces, Some(&["catalogs"]));
+    ranges.extend(direct_child_object_section_ranges(
+        content,
+        &workspace_catalogs,
+        None,
+    ));
+
+    ranges
+}
+
+fn replace_bun_catalog_versions(
+    content: &str,
+    package: &str,
+    new_version: &str,
+    parser: &dyn VersionParser,
+) -> Result<(String, bool), regex::Error> {
+    let ranges = bun_catalog_object_ranges(content);
+    let mut transform = |old_version: &str| format_node_update(parser, old_version, new_version);
+    replace_string_property_in_ranges(content, ranges, package, &mut transform)
 }
 
 #[cfg(test)]
@@ -702,5 +792,132 @@ mod tests {
             .update_version(content, "ui", "7.1.0")
             .unwrap();
         assert!(result.contains(r#""ui": "npm:@mui/lab@^7.1.0""#));
+    }
+
+    #[test]
+    fn test_parse_bun_top_level_catalogs() {
+        let content = r#"{
+            "catalog": {
+                "react": "^19.0.0"
+            },
+            "catalogs": {
+                "testing": {
+                    "jest": "30.0.0"
+                }
+            },
+            "dependencies": {
+                "react": "catalog:",
+                "jest": "catalog:testing"
+            }
+        }"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 2);
+
+        let react = deps.iter().find(|d| d.name == "react").unwrap();
+        assert_eq!(react.version_spec.kind, VersionSpecKind::Caret);
+        assert_eq!(react.version_spec.version, "19.0.0");
+
+        let jest = deps.iter().find(|d| d.name == "jest").unwrap();
+        assert_eq!(jest.version_spec.kind, VersionSpecKind::Exact);
+        assert_eq!(jest.version_spec.version, "30.0.0");
+    }
+
+    #[test]
+    fn test_parse_bun_workspaces_catalogs() {
+        let content = r#"{
+            "workspaces": {
+                "packages": ["packages/*"],
+                "catalog": {
+                    "react": "^19.0.0"
+                },
+                "catalogs": {
+                    "build": {
+                        "webpack": "5.88.2"
+                    }
+                }
+            }
+        }"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 2);
+        assert!(deps.iter().any(|d| d.name == "react"));
+        assert!(deps.iter().any(|d| d.name == "webpack"));
+    }
+
+    #[test]
+    fn test_update_bun_catalogs_preserves_catalog_references() {
+        let content = r#"{
+  "workspaces": {
+    "packages": ["packages/*"],
+    "catalog": {
+      "react": "^19.0.0"
+    },
+    "catalogs": {
+      "testing": {
+        "jest": "30.0.0"
+      }
+    }
+  },
+  "dependencies": {
+    "react": "catalog:",
+    "jest": "catalog:testing"
+  }
+}"#;
+
+        let result = PackageJsonParser
+            .update_version(content, "react", "19.1.0")
+            .unwrap();
+        assert!(result.contains(r#""react": "^19.1.0""#));
+        assert!(result.contains(r#""react": "catalog:""#));
+
+        let result = PackageJsonParser
+            .update_version(&result, "jest", "30.1.0")
+            .unwrap();
+        assert!(result.contains(r#""jest": "30.1.0""#));
+        assert!(result.contains(r#""jest": "catalog:testing""#));
+    }
+
+    #[test]
+    fn test_update_bun_top_level_catalogs() {
+        let content = r#"{
+  "catalog": {
+    "react": "^19.0.0"
+  },
+  "catalogs": {
+    "testing": {
+      "jest": "30.0.0"
+    }
+  }
+}"#;
+
+        let result = PackageJsonParser
+            .update_version(content, "react", "19.1.0")
+            .unwrap();
+        assert!(result.contains(r#""react": "^19.1.0""#));
+
+        let result = PackageJsonParser
+            .update_version(&result, "jest", "30.1.0")
+            .unwrap();
+        assert!(result.contains(r#""jest": "30.1.0""#));
+    }
+
+    #[test]
+    fn test_update_bun_catalogs_when_ranges_are_not_discovered_in_file_order() {
+        let content = r#"{
+  "workspaces": {
+    "catalog": {
+      "react": "^19.0.0"
+    }
+  },
+  "catalog": {
+    "react": "^19.0.0"
+  }
+}"#;
+
+        let result = PackageJsonParser
+            .update_version(content, "react", "19.1.0")
+            .unwrap();
+        assert_eq!(result.matches(r#""react": "^19.1.0""#).count(), 2);
     }
 }
