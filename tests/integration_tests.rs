@@ -1,15 +1,15 @@
-//! Integration tests for depup
+//! depup の統合テスト
 //!
-//! These tests verify:
-//! - Manifest detection across multiple languages
-//! - Manifest update format preservation
-//! - Registry response parsing
+//! 次の項目を検証する:
+//! - 複数言語のマニフェスト検出
+//! - マニフェスト更新時の書式保持
+//! - レジストリ応答の解析
 
 use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
-/// Test fixture directory creation helper
+/// テスト用ディレクトリを作成するヘルパー
 fn create_test_dir() -> TempDir {
     tempfile::tempdir().expect("Failed to create temp directory")
 }
@@ -17,12 +17,12 @@ fn create_test_dir() -> TempDir {
 mod manifest_detection {
     use super::*;
 
-    /// Test detection of multiple manifests in a single directory
+    /// 単一ディレクトリにある複数マニフェストの検出をテストする
     #[test]
     fn test_detect_multiple_languages() {
         let temp_dir = create_test_dir();
 
-        // Create package.json (Node.js)
+        // package.json（Node.js）を作成する
         let package_json = r#"{
             "name": "test-package",
             "dependencies": {
@@ -31,7 +31,7 @@ mod manifest_detection {
         }"#;
         fs::write(temp_dir.path().join("package.json"), package_json).unwrap();
 
-        // Create pyproject.toml (Python)
+        // pyproject.toml（Python）を作成する
         let pyproject = r#"[project]
 name = "test-package"
 dependencies = [
@@ -40,7 +40,7 @@ dependencies = [
 "#;
         fs::write(temp_dir.path().join("pyproject.toml"), pyproject).unwrap();
 
-        // Create Cargo.toml (Rust)
+        // Cargo.toml（Rust）を作成する
         let cargo_toml = r#"[package]
 name = "test-package"
 version = "0.1.0"
@@ -50,7 +50,7 @@ serde = "1.0"
 "#;
         fs::write(temp_dir.path().join("Cargo.toml"), cargo_toml).unwrap();
 
-        // Create go.mod (Go)
+        // go.mod（Go）を作成する
         let go_mod = r#"module example.com/test
 
 go 1.21
@@ -59,13 +59,13 @@ require github.com/gin-gonic/gin v1.9.0
 "#;
         fs::write(temp_dir.path().join("go.mod"), go_mod).unwrap();
 
-        // Use the detect_manifests function
+        // マニフェスト検出関数を使う
         let manifests = depup::manifest::detect_manifests(temp_dir.path());
 
-        // Should detect all 4 manifest files
+        // 4個すべてのマニフェストを検出する
         assert_eq!(manifests.len(), 4, "Should detect 4 manifest files");
 
-        // Verify each language is represented
+        // 各言語が含まれることを確認する
         let languages: Vec<_> = manifests.iter().map(|m| m.language).collect();
         assert!(
             languages.contains(&depup::domain::Language::Node),
@@ -85,12 +85,12 @@ require github.com/gin-gonic/gin v1.9.0
         );
     }
 
-    /// Test detection of Ruby and PHP manifests
+    /// Ruby と PHP のマニフェスト検出をテストする
     #[test]
     fn test_detect_ruby_php_manifests() {
         let temp_dir = create_test_dir();
 
-        // Create Gemfile (Ruby)
+        // Gemfile（Ruby）を作成する
         let gemfile = r#"source 'https://rubygems.org'
 
 gem 'rails', '~> 7.0'
@@ -98,7 +98,7 @@ gem 'pg', '~> 1.5'
 "#;
         fs::write(temp_dir.path().join("Gemfile"), gemfile).unwrap();
 
-        // Create composer.json (PHP)
+        // composer.json（PHP）を作成する
         let composer_json = r#"{
     "require": {
         "laravel/framework": "^10.0",
@@ -122,19 +122,19 @@ gem 'pg', '~> 1.5'
         );
     }
 
-    /// Test detection of all 6 languages together
+    /// 6言語すべての同時検出をテストする
     #[test]
     fn test_detect_all_six_languages() {
         let temp_dir = create_test_dir();
 
-        // Node.js
+        // Node.js 用マニフェスト
         fs::write(
             temp_dir.path().join("package.json"),
             r#"{"dependencies": {"lodash": "^4.17.21"}}"#,
         )
         .unwrap();
 
-        // Python
+        // Python 用マニフェスト
         fs::write(
             temp_dir.path().join("pyproject.toml"),
             r#"[project]
@@ -143,7 +143,7 @@ dependencies = ["requests>=2.28.0"]
         )
         .unwrap();
 
-        // Rust
+        // Rust 用マニフェスト
         fs::write(
             temp_dir.path().join("Cargo.toml"),
             r#"[package]
@@ -168,10 +168,10 @@ require github.com/gin-gonic/gin v1.9.0
         )
         .unwrap();
 
-        // Ruby
+        // Ruby 用マニフェスト
         fs::write(temp_dir.path().join("Gemfile"), r#"gem 'rails', '~> 7.0'"#).unwrap();
 
-        // PHP
+        // PHP 用マニフェスト
         fs::write(
             temp_dir.path().join("composer.json"),
             r#"{"require": {"laravel/framework": "^10.0"}}"#,
@@ -183,12 +183,12 @@ require github.com/gin-gonic/gin v1.9.0
         assert_eq!(manifests.len(), 6, "Should detect all 6 manifest files");
     }
 
-    /// Test detection with partial manifests (some languages only)
+    /// 一部の言語だけにマニフェストがある場合をテストする
     #[test]
     fn test_detect_partial_manifests() {
         let temp_dir = create_test_dir();
 
-        // Create only Node.js and Python manifests
+        // Node.js と Python のマニフェストだけを作成する
         let package_json = r#"{"name": "test", "dependencies": {"express": "^4.18.0"}}"#;
         fs::write(temp_dir.path().join("package.json"), package_json).unwrap();
 
@@ -203,7 +203,7 @@ dependencies = ["flask>=2.0.0"]
         assert_eq!(manifests.len(), 2, "Should detect 2 manifest files");
     }
 
-    /// Test empty directory
+    /// 空のディレクトリをテストする
     #[test]
     fn test_detect_empty_directory() {
         let temp_dir = create_test_dir();
@@ -214,7 +214,7 @@ dependencies = ["flask>=2.0.0"]
         );
     }
 
-    /// Test non-existent directory
+    /// 存在しないディレクトリをテストする
     #[test]
     fn test_detect_nonexistent_directory() {
         let manifests = depup::manifest::detect_manifests(&PathBuf::from("/nonexistent/path"));
@@ -224,12 +224,12 @@ dependencies = ["flask>=2.0.0"]
         );
     }
 
-    /// Test detection of Java/Gradle manifests (build.gradle and build.gradle.kts)
+    /// Java/Gradle マニフェスト（build.gradle と build.gradle.kts）の検出をテストする
     #[test]
     fn test_detect_gradle_manifests() {
         let temp_dir = create_test_dir();
 
-        // Create build.gradle (Groovy DSL)
+        // build.gradle（Groovy DSL）を作成する
         let build_gradle = r#"plugins {
     id 'java'
 }
@@ -251,7 +251,7 @@ dependencies {
         );
     }
 
-    /// Test detection of build.gradle.kts (Kotlin DSL)
+    /// build.gradle.kts（Kotlin DSL）の検出をテストする
     #[test]
     fn test_detect_gradle_kts_manifest() {
         let temp_dir = create_test_dir();
@@ -337,7 +337,7 @@ spotless = { id = "com.diffplug.spotless", version = "6.25.0" }
     fn test_detect_swift_manifest() {
         let temp_dir = create_test_dir();
 
-        // Package.swift (Swift)
+        // Package.swift（Swift）を作成する
         let package_swift = r#"// swift-tools-version:5.9
 import PackageDescription
 let package = Package(
@@ -360,26 +360,26 @@ let package = Package(
         );
     }
 
-    /// Test detection of all 7 languages including Java
+    /// Java を含む7言語すべての検出をテストする
     #[test]
     fn test_detect_all_seven_languages() {
         let temp_dir = create_test_dir();
 
-        // Node.js
+        // Node.js 用マニフェスト
         fs::write(
             temp_dir.path().join("package.json"),
             r#"{"dependencies": {"lodash": "^4.17.21"}}"#,
         )
         .unwrap();
 
-        // Python
+        // Python 用マニフェスト
         fs::write(
             temp_dir.path().join("pyproject.toml"),
             "[project]\ndependencies = [\"requests>=2.28.0\"]\n",
         )
         .unwrap();
 
-        // Rust
+        // Rust 用マニフェスト
         fs::write(
             temp_dir.path().join("Cargo.toml"),
             "[package]\nname = \"test\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1.0\"\n",
@@ -393,17 +393,17 @@ let package = Package(
         )
         .unwrap();
 
-        // Ruby
+        // Ruby 用マニフェスト
         fs::write(temp_dir.path().join("Gemfile"), "gem 'rails', '~> 7.0'\n").unwrap();
 
-        // PHP
+        // PHP 用マニフェスト
         fs::write(
             temp_dir.path().join("composer.json"),
             r#"{"require": {"laravel/framework": "^10.0"}}"#,
         )
         .unwrap();
 
-        // Java
+        // Java 用マニフェスト
         fs::write(
             temp_dir.path().join("build.gradle"),
             "dependencies {\n    implementation 'com.google.guava:guava:33.0.0-jre'\n}\n",
@@ -426,7 +426,7 @@ mod manifest_update_format_preservation {
     use depup::domain::{Language, VersionSpecKind};
     use depup::manifest::get_parser;
 
-    /// Test package.json format preservation with caret versions
+    /// caret バージョンを持つ package.json の書式保持をテストする
     #[test]
     fn test_package_json_caret_preservation() {
         let content = r#"{
@@ -443,7 +443,7 @@ mod manifest_update_format_preservation {
         assert_eq!(deps[0].name, "lodash");
         assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Caret);
 
-        // Update the version
+        // バージョンを更新する
         let updated = parser.update_version(content, "lodash", "4.18.0").unwrap();
         assert!(
             updated.contains("\"^4.18.0\""),
@@ -452,7 +452,7 @@ mod manifest_update_format_preservation {
         );
     }
 
-    /// Test package.json format preservation with tilde versions
+    /// tilde バージョンを持つ package.json の書式保持をテストする
     #[test]
     fn test_package_json_tilde_preservation() {
         let content = r#"{
@@ -470,7 +470,7 @@ mod manifest_update_format_preservation {
         );
     }
 
-    /// Test pyproject.toml format preservation
+    /// pyproject.toml の書式保持をテストする
     #[test]
     fn test_pyproject_toml_gte_preservation() {
         let content = r#"[project]
@@ -496,7 +496,7 @@ dependencies = [
         );
     }
 
-    /// Test Cargo.toml format preservation
+    /// Cargo.toml の書式保持をテストする
     #[test]
     fn test_cargo_toml_bare_version_preservation() {
         let content = r#"[package]
@@ -513,7 +513,7 @@ serde = "1.0.190"
         assert!(deps.iter().any(|d| d.name == "serde"));
 
         let updated = parser.update_version(content, "serde", "1.0.195").unwrap();
-        // Cargo bare version should be preserved (no prefix)
+        // Cargo の演算子なしバージョンを維持する（接頭辞なし）
         assert!(
             updated.contains("\"1.0.195\""),
             "Should update bare version: {}",
@@ -521,7 +521,7 @@ serde = "1.0.190"
         );
     }
 
-    /// Test Cargo.toml inline table format preservation
+    /// Cargo.toml のインラインテーブル書式保持をテストする
     #[test]
     fn test_cargo_toml_inline_table_preservation() {
         let content = r#"[package]
@@ -535,7 +535,7 @@ tokio = { version = "1.35", features = ["full"] }
         let parser = get_parser(Language::Rust);
         let updated = parser.update_version(content, "tokio", "1.40").unwrap();
 
-        // Should preserve inline table format
+        // インラインテーブルの書式を維持する
         assert!(
             updated.contains("{ version = \"1.40\"") || updated.contains("{version = \"1.40\""),
             "Should preserve inline table: {}",
@@ -548,7 +548,7 @@ tokio = { version = "1.35", features = ["full"] }
         );
     }
 
-    /// Test go.mod format preservation
+    /// go.mod の書式保持をテストする
     #[test]
     fn test_go_mod_v_prefix_preservation() {
         let content = r#"module example.com/test
@@ -574,7 +574,7 @@ require github.com/gin-gonic/gin v1.9.0
         );
     }
 
-    /// Test go.mod comment preservation
+    /// go.mod のコメント保持をテストする
     #[test]
     fn test_go_mod_comment_preservation() {
         let content = r#"module example.com/test
@@ -590,7 +590,7 @@ require (
         let parser = get_parser(Language::Go);
         let deps = parser.parse(content).unwrap();
 
-        // stretchr/testify should be marked as pinned
+        // stretchr/testify は固定指定として扱われる
         let testify = deps.iter().find(|d| d.name.contains("testify"));
         assert!(testify.is_some());
         assert!(
@@ -598,7 +598,7 @@ require (
             "Should detect pinned comment"
         );
 
-        // Update gin
+        // gin を更新する
         let updated = parser
             .update_version(content, "github.com/gin-gonic/gin", "v1.10.0")
             .unwrap();
@@ -609,7 +609,7 @@ require (
         );
     }
 
-    /// Test Gemfile pessimistic constraint (~>) preservation
+    /// Gemfile の悲観的制約（~>）保持をテストする
     #[test]
     fn test_gemfile_pessimistic_preservation() {
         let content = r#"source 'https://rubygems.org'
@@ -634,7 +634,7 @@ gem 'pg', '~> 1.5'
         );
     }
 
-    /// Test Gemfile exact version preservation
+    /// Gemfile の固定バージョン保持をテストする
     #[test]
     fn test_gemfile_exact_version_preservation() {
         let content = r#"gem 'bcrypt', '3.1.18'"#;
@@ -648,7 +648,7 @@ gem 'pg', '~> 1.5'
         );
     }
 
-    /// Test Gemfile double quotes preservation
+    /// Gemfile の二重引用符保持をテストする
     #[test]
     fn test_gemfile_double_quotes_preservation() {
         let content = r#"gem "rails", "~> 7.0""#;
@@ -662,7 +662,7 @@ gem 'pg', '~> 1.5'
         );
     }
 
-    /// Test composer.json caret preservation
+    /// composer.json の caret 保持をテストする
     #[test]
     fn test_composer_json_caret_preservation() {
         let content = r#"{
@@ -688,7 +688,7 @@ gem 'pg', '~> 1.5'
         );
     }
 
-    /// Test composer.json tilde preservation
+    /// composer.json の tilde 保持をテストする
     #[test]
     fn test_composer_json_tilde_preservation() {
         let content = r#"{
@@ -708,7 +708,7 @@ gem 'pg', '~> 1.5'
         );
     }
 
-    /// Test composer.json wildcard preservation
+    /// composer.json のワイルドカード保持をテストする
     #[test]
     fn test_composer_json_wildcard_preservation() {
         let content = r#"{
@@ -728,7 +728,7 @@ gem 'pg', '~> 1.5'
         );
     }
 
-    /// Test Gradle string notation parsing and update
+    /// Gradle の文字列記法の解析と更新をテストする
     #[test]
     fn test_gradle_string_notation_preservation() {
         let content = r#"plugins {
@@ -759,7 +759,7 @@ dependencies {
         );
     }
 
-    /// Test Gradle Kotlin DSL string notation
+    /// Gradle Kotlin DSL の文字列記法をテストする
     #[test]
     fn test_gradle_kts_string_notation_preservation() {
         let content = r#"plugins {
@@ -781,7 +781,7 @@ dependencies {
         );
     }
 
-    /// Test Gradle variable-based version definition
+    /// Gradle の変数によるバージョン定義をテストする
     #[test]
     fn test_gradle_variable_version() {
         let content = r#"
@@ -803,7 +803,7 @@ dependencies {
         }
     }
 
-    /// Test Gradle dev dependency detection
+    /// Gradle の開発依存検出をテストする
     #[test]
     fn test_gradle_dev_dependency_detection() {
         let content = r#"dependencies {
@@ -825,7 +825,7 @@ dependencies {
         assert!(junit.is_dev, "testImplementation should be dev dependency");
     }
 
-    /// Test composer.json require-dev parsing
+    /// composer.json の require-dev 解析をテストする
     #[test]
     fn test_composer_json_require_dev() {
         let content = r#"{
@@ -849,7 +849,7 @@ dependencies {
         assert!(!laravel.is_dev, "Should mark require as non-dev dependency");
     }
 
-    /// Test Package.swift half-open range (..<) の下限更新と上限保持
+    /// Package.swift の半開区間 (..<) で下限更新と上限保持をテストする
     #[test]
     fn test_package_swift_half_open_range_preservation() {
         let content = r#"// swift-tools-version:5.9
@@ -880,7 +880,7 @@ let package = Package(
         );
     }
 
-    /// Test Package.swift closed range (...) の下限更新と上限保持
+    /// Package.swift の閉区間 (...) で下限更新と上限保持をテストする
     #[test]
     fn test_package_swift_closed_range_preservation() {
         let content = r#"// swift-tools-version:5.9
@@ -911,7 +911,7 @@ let package = Package(
         );
     }
 
-    /// Test npm alias (npm:@scope/pkg@^1.0) のパースと更新
+    /// npm alias (npm:@scope/pkg@^1.0) のパースと更新をテストする
     #[test]
     fn test_package_json_npm_alias_preservation() {
         let content = r#"{
@@ -940,7 +940,7 @@ let package = Package(
         );
     }
 
-    /// Test Maven 半開区間の下限更新
+    /// Maven 半開区間の下限更新をテストする
     #[test]
     fn test_gradle_maven_range_lower_bound_update() {
         let content = r#"dependencies {
@@ -1018,10 +1018,10 @@ mod registry_response_parsing {
     use chrono::{TimeZone, Utc};
     use depup::update::VersionInfo;
 
-    /// Test npm response JSON parsing
+    /// npm の JSON 応答解析をテストする
     #[test]
     fn test_npm_response_structure() {
-        // Simulate npm registry response structure
+        // npm レジストリの応答構造を再現する
         let npm_response = r#"{
             "time": {
                 "4.17.21": "2021-02-20T15:30:00.000Z",
@@ -1043,10 +1043,10 @@ mod registry_response_parsing {
         assert_eq!(versions.len(), 2);
     }
 
-    /// Test PyPI response JSON parsing
+    /// PyPI の JSON 応答解析をテストする
     #[test]
     fn test_pypi_response_structure() {
-        // Simulate PyPI JSON API response structure
+        // PyPI JSON API の応答構造を再現する
         let pypi_response = r#"{
             "releases": {
                 "2.28.0": [
@@ -1068,10 +1068,10 @@ mod registry_response_parsing {
         assert!(v2_31[0].get("upload_time_iso_8601").is_some());
     }
 
-    /// Test crates.io response JSON parsing
+    /// crates.io の JSON 応答解析をテストする
     #[test]
     fn test_crates_io_response_structure() {
-        // Simulate crates.io API response structure
+        // crates.io API の応答構造を再現する
         let crates_response = r#"{
             "versions": [
                 {"num": "1.0.195", "created_at": "2024-01-15T10:00:00.000Z"},
@@ -1089,10 +1089,10 @@ mod registry_response_parsing {
         assert!(v195.get("created_at").is_some());
     }
 
-    /// Test Go proxy response parsing (plain text)
+    /// Go Proxy のプレーンテキスト応答解析をテストする
     #[test]
     fn test_go_proxy_list_response() {
-        // Simulate Go proxy /@v/list response (plain text)
+        // Go Proxy の /@v/list プレーンテキスト応答を再現する
         let go_list_response = "v1.9.0\nv1.9.1\nv1.10.0\n";
 
         let versions: Vec<&str> = go_list_response.lines().collect();
@@ -1101,10 +1101,10 @@ mod registry_response_parsing {
         assert_eq!(versions[2], "v1.10.0");
     }
 
-    /// Test Go proxy .info response
+    /// Go Proxy の .info 応答をテストする
     #[test]
     fn test_go_proxy_info_response() {
-        // Simulate Go proxy /@v/version.info response
+        // Go Proxy の /@v/version.info 応答を再現する
         let go_info_response = r#"{
             "Version": "v1.10.0",
             "Time": "2024-01-20T15:00:00Z"
@@ -1115,7 +1115,7 @@ mod registry_response_parsing {
         assert!(parsed.get("Time").is_some());
     }
 
-    /// Test VersionInfo sorting
+    /// VersionInfo の並べ替えをテストする
     #[test]
     fn test_version_info_sorting() {
         let v1 = VersionInfo::new("1.0.0", Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap());
@@ -1130,8 +1130,7 @@ mod registry_response_parsing {
         assert_eq!(versions[2].version, "1.1.0");
     }
 
-    /// Test version comparison edge cases
-    /// Note: The simplified version comparison ignores non-numeric pre-release identifiers
+    /// バージョン比較のエッジケースをテストする
     #[test]
     fn test_version_comparison_edge_cases() {
         let now = Utc::now();
@@ -1141,18 +1140,18 @@ mod registry_response_parsing {
         let patch = VersionInfo::new("1.0.1", now);
 
         // semver 仕様: 数値コアが等しい場合、プレリリース付きは安定版より小さい。
-        // 1.0.0-alpha < 1.0.0
+        // プレリリースは同じコアの安定版より古い
         assert!(prerelease < stable);
-        // Stable should come before next patch
+        // 安定版は次のパッチ版より古い
         assert!(stable < patch);
-        // Pre-release also comes before next patch
+        // プレリリースも次のパッチ版より古い
         assert!(prerelease < patch);
     }
 
-    /// Test RubyGems response JSON parsing
+    /// RubyGems の JSON 応答解析をテストする
     #[test]
     fn test_rubygems_response_structure() {
-        // Simulate RubyGems API response structure
+        // RubyGems API の応答構造を再現する
         let rubygems_response = r#"[
             {"number": "7.1.0", "created_at": "2023-10-05T12:00:00Z", "platform": "ruby", "yanked": false},
             {"number": "7.0.8", "created_at": "2023-09-01T12:00:00Z", "platform": "ruby", "yanked": false},
@@ -1168,15 +1167,15 @@ mod registry_response_parsing {
         assert!(!v710.get("yanked").unwrap().as_bool().unwrap());
         assert!(v710.get("created_at").is_some());
 
-        // Third version is yanked
+        // 3番目のバージョンは yanked 扱い
         let v707 = &parsed[2];
         assert!(v707.get("yanked").unwrap().as_bool().unwrap());
     }
 
-    /// Test Packagist response JSON parsing
+    /// Packagist の JSON 応答解析をテストする
     #[test]
     fn test_packagist_response_structure() {
-        // Simulate Packagist p2 API response structure
+        // Packagist p2 API の応答構造を再現する
         let packagist_response = r#"{
             "packages": {
                 "laravel/framework": [
@@ -1203,7 +1202,7 @@ mod registry_response_parsing {
         assert_eq!(v10.get("version").unwrap().as_str().unwrap(), "v10.0.0");
         assert!(v10.get("time").is_some());
 
-        // Dev version should be filtered in actual implementation
+        // 実際の実装では開発版を除外する
         let dev = &versions[2];
         assert!(
             dev.get("version")
@@ -1214,7 +1213,7 @@ mod registry_response_parsing {
         );
     }
 
-    /// Test RubyGems version filtering (yanked)
+    /// RubyGems の yanked バージョン除外をテストする
     #[test]
     fn test_rubygems_yanked_filtering_logic() {
         let versions = vec![
@@ -1235,7 +1234,7 @@ mod registry_response_parsing {
         assert!(!active_versions.contains(&"7.0.7"));
     }
 
-    /// Test Packagist dev version filtering logic
+    /// Packagist の開発版除外ロジックをテストする
     #[test]
     fn test_packagist_dev_version_filtering_logic() {
         let versions = vec!["v10.0.0", "v9.0.0", "dev-master", "dev-main", "1.0.x-dev"];
@@ -1253,7 +1252,7 @@ mod registry_response_parsing {
         assert!(stable_versions.contains(&"v9.0.0"));
     }
 
-    /// Test Packagist version normalization (v prefix removal)
+    /// Packagist のバージョン正規化（v 接頭辞の除去）をテストする
     #[test]
     fn test_packagist_version_normalization() {
         let normalize =
@@ -1269,7 +1268,7 @@ mod monorepo_config {
     use super::*;
     use depup::config::DepupConfig;
 
-    /// Test parsing a .depup config file with valid directories
+    /// 有効なディレクトリを持つ .depup 設定の解析をテストする
     #[test]
     fn test_parse_config_with_valid_dirs() {
         let dir = create_test_dir();
@@ -1282,25 +1281,25 @@ mod monorepo_config {
         assert_eq!(config.directories.len(), 3);
     }
 
-    /// Test that manifest detection works across monorepo directories
+    /// モノレポ内の複数ディレクトリでマニフェスト検出が動作することをテストする
     #[test]
     fn test_monorepo_manifest_detection() {
         let dir = create_test_dir();
 
-        // Create subdirectories with manifests
+        // マニフェストを持つサブディレクトリを作成する
         let gui_dir = dir.path().join("gui");
         let web_dir = dir.path().join("web");
         fs::create_dir(&gui_dir).unwrap();
         fs::create_dir(&web_dir).unwrap();
 
-        // gui has package.json
+        // gui に package.json を配置する
         fs::write(
             gui_dir.join("package.json"),
             r#"{"dependencies": {"react": "^18.0.0"}}"#,
         )
         .unwrap();
 
-        // web has package.json and pyproject.toml
+        // web に package.json と pyproject.toml を配置する
         fs::write(
             web_dir.join("package.json"),
             r#"{"dependencies": {"express": "^4.18.0"}}"#,
@@ -1312,19 +1311,19 @@ mod monorepo_config {
         )
         .unwrap();
 
-        // Detect manifests per directory
+        // ディレクトリごとにマニフェストを検出する
         let gui_manifests = depup::manifest::detect_manifests(&gui_dir);
         let web_manifests = depup::manifest::detect_manifests(&web_dir);
 
         assert_eq!(gui_manifests.len(), 1);
         assert_eq!(web_manifests.len(), 2);
 
-        // Combined
+        // 検出結果を結合する
         let total = gui_manifests.len() + web_manifests.len();
         assert_eq!(total, 3);
     }
 
-    /// Test .depup file with comments and inline comments
+    /// コメントと行末コメントを含む .depup をテストする
     #[test]
     fn test_config_with_comments() {
         let dir = create_test_dir();
@@ -1343,7 +1342,7 @@ lib
         assert_eq!(config.directories.len(), 2);
     }
 
-    /// Test .depup with nonexistent directories skipped
+    /// .depup にある存在しないディレクトリが除外されることをテストする
     #[test]
     fn test_config_skips_nonexistent() {
         let dir = create_test_dir();
@@ -1354,15 +1353,15 @@ lib
         assert_eq!(config.directories.len(), 1);
     }
 
-    /// Test from_dir with and without .depup file
+    /// .depup ファイルがある場合とない場合の from_dir をテストする
     #[test]
     fn test_from_dir_presence() {
         let dir = create_test_dir();
 
-        // No .depup file
+        // .depup ファイルがない場合
         assert!(DepupConfig::from_dir(dir.path()).is_none());
 
-        // Create .depup with a valid directory
+        // 有効なディレクトリを持つ .depup を作成する
         fs::create_dir(dir.path().join("sub")).unwrap();
         fs::write(dir.path().join(".depup"), "sub\n").unwrap();
 
@@ -1378,7 +1377,7 @@ mod pipeline_tests {
     use depup::manifest::{ManifestWriter, detect_manifests, get_parser};
     use depup::update::{UpdateFilter, UpdateJudge, VersionInfo};
 
-    /// Test full pipeline: detect -> parse -> judge -> write (without network)
+    /// 一連の処理（検出→解析→判定→書き込み）をネットワークなしでテストする
     #[test]
     fn test_pipeline_updates_manifest_file() {
         let dir = create_test_dir();
@@ -1393,27 +1392,27 @@ mod pipeline_tests {
         )
         .unwrap();
 
-        // Step 1: Detect manifests
+        // 手順1: マニフェストを検出する
         let manifests = detect_manifests(dir.path());
         assert_eq!(manifests.len(), 1);
 
-        // Step 2: Parse dependencies
+        // 手順2: 依存関係を解析する
         let parser = get_parser(manifests[0].language);
         let content = fs::read_to_string(&path).unwrap();
         let deps = parser.parse(&content).unwrap();
         assert_eq!(deps.len(), 1);
 
-        // Step 3: Simulate version info (without network)
+        // 手順3: ネットワークなしでバージョン情報を用意する
         let versions = vec![
             VersionInfo::new("4.17.21", Utc::now() - chrono::Duration::days(100)),
             VersionInfo::new("4.18.0", Utc::now() - chrono::Duration::days(10)),
         ];
 
-        // Step 4: Judge update
+        // 手順4: 更新を判定する
         let judge = UpdateJudge::new(UpdateFilter::new());
         let result = judge.judge(&deps[0], &versions);
 
-        // Step 5: Apply update
+        // 手順5: 更新を適用する
         let mut manifest_result = ManifestUpdateResult::new(&path, manifests[0].language);
         manifest_result.add_result(result);
 
@@ -1425,24 +1424,24 @@ mod pipeline_tests {
         assert_eq!(write_result.updates_applied, 1);
         assert!(write_result.file_modified);
 
-        // Verify file content changed
+        // ファイル内容が変更されたことを確認する
         let updated = fs::read_to_string(&path).unwrap();
         assert!(updated.contains("^4.18.0"));
     }
 
-    /// Test pipeline with multiple languages
+    /// 複数言語を含む処理をテストする
     #[test]
     fn test_pipeline_multi_language() {
         let dir = create_test_dir();
 
-        // Create package.json
+        // package.json を作成する
         fs::write(
             dir.path().join("package.json"),
             r#"{"dependencies": {"lodash": "^4.17.21"}}"#,
         )
         .unwrap();
 
-        // Create Cargo.toml
+        // Cargo.toml を作成する
         fs::write(
             dir.path().join("Cargo.toml"),
             r#"[package]
@@ -1455,23 +1454,23 @@ serde = "1.0.0"
         )
         .unwrap();
 
-        // Detect all manifests
+        // すべてのマニフェストを検出する
         let manifests = detect_manifests(dir.path());
         assert_eq!(manifests.len(), 2);
 
-        // Verify both languages detected
+        // 両方の言語が検出されたことを確認する
         let languages: Vec<_> = manifests.iter().map(|m| m.language).collect();
         assert!(languages.contains(&depup::domain::Language::Node));
         assert!(languages.contains(&depup::domain::Language::Rust));
     }
 
-    /// Test pipeline preserves file format
+    /// 一連の処理でファイル書式が維持されることをテストする
     #[test]
     fn test_pipeline_preserves_formatting() {
         let dir = create_test_dir();
         let path = dir.path().join("package.json");
 
-        // Original content with specific formatting
+        // 特定の書式を持つ元の内容
         let original_content = r#"{
   "name": "test-package",
   "version": "1.0.0",
@@ -1488,7 +1487,7 @@ serde = "1.0.0"
         let content = fs::read_to_string(&path).unwrap();
         let deps = parser.parse(&content).unwrap();
 
-        // Find lodash dependency
+        // lodash の依存関係を探す
         let lodash = deps.iter().find(|d| d.name == "lodash").unwrap();
 
         let versions = vec![
@@ -1509,7 +1508,7 @@ serde = "1.0.0"
 
         let updated = fs::read_to_string(&path).unwrap();
 
-        // Verify key order preserved (zod before axios before lodash)
+        // キー順（zod、axios、lodash）が維持されることを確認する
         let zod_pos = updated.find("\"zod\"").unwrap();
         let axios_pos = updated.find("\"axios\"").unwrap();
         let lodash_pos = updated.find("\"lodash\"").unwrap();
@@ -1517,7 +1516,7 @@ serde = "1.0.0"
         assert!(axios_pos < lodash_pos, "axios should come before lodash");
     }
 
-    /// Test pipeline dry-run doesn't modify files
+    /// ドライランでファイルが変更されないことをテストする
     #[test]
     fn test_pipeline_dry_run_no_modification() {
         let dir = create_test_dir();
@@ -1541,17 +1540,17 @@ serde = "1.0.0"
         let mut manifest_result = ManifestUpdateResult::new(&path, manifests[0].language);
         manifest_result.add_result(result);
 
-        // Use dry-run mode
+        // ドライランモードを使う
         let writer = ManifestWriter::dry_run();
         let write_result = writer
             .apply_updates(&manifest_result, parser.as_ref())
             .unwrap();
 
-        // Update should be counted but file not modified
+        // 更新件数には含めるがファイルは変更しない
         assert_eq!(write_result.updates_applied, 1);
         assert!(!write_result.file_modified);
 
-        // Verify file unchanged
+        // ファイルが変更されていないことを確認する
         let after = fs::read_to_string(&path).unwrap();
         assert_eq!(after, original_content);
     }

@@ -565,7 +565,14 @@ pub(super) fn parse(content: &str) -> Result<Option<Vec<Dependency>>, ManifestEr
     Ok(parse_version_catalog_entries(content)?.map(|entries| {
         entries
             .into_iter()
-            .map(|entry| Dependency::production(entry.name, entry.version.spec, Language::Java))
+            .map(|entry| {
+                let dependency =
+                    Dependency::production(entry.name, entry.version.spec, Language::Java);
+                match entry.version_ref {
+                    Some(version_ref) => dependency.with_variable(version_ref),
+                    None => dependency,
+                }
+            })
             .collect()
     }))
 }

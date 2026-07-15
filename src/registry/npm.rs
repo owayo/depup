@@ -6,7 +6,7 @@
 use crate::domain::Language;
 use crate::error::RegistryError;
 use crate::registry::{HttpClient, RegistryAdapter};
-use crate::update::{VersionInfo, compare_versions, is_prerelease_version};
+use crate::update::{VersionInfo, compare_semver_versions, is_prerelease_version};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -61,7 +61,7 @@ impl NpmAdapter {
         let Some(latest) = latest else {
             return false;
         };
-        compare_versions(version, latest) == std::cmp::Ordering::Greater
+        compare_semver_versions(version, latest) == std::cmp::Ordering::Greater
             && !is_prerelease_version(version)
     }
 }
@@ -159,7 +159,7 @@ mod tests {
 
         // プレリリースバージョンは latest より大きいとみなされるべき
         assert_eq!(
-            compare_versions(prerelease, latest),
+            compare_semver_versions(prerelease, latest),
             std::cmp::Ordering::Greater
         );
     }
@@ -170,11 +170,20 @@ mod tests {
         let latest = "7.2.0";
 
         // 同じバージョン
-        assert_eq!(compare_versions("7.2.0", latest), std::cmp::Ordering::Equal);
+        assert_eq!(
+            compare_semver_versions("7.2.0", latest),
+            std::cmp::Ordering::Equal
+        );
 
         // 古いバージョン
-        assert_eq!(compare_versions("7.1.0", latest), std::cmp::Ordering::Less);
-        assert_eq!(compare_versions("6.0.0", latest), std::cmp::Ordering::Less);
+        assert_eq!(
+            compare_semver_versions("7.1.0", latest),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_semver_versions("6.0.0", latest),
+            std::cmp::Ordering::Less
+        );
     }
 
     /// バグ回帰テスト: latest より新しい「検出可能なプレリリース」(canary/beta 等) は

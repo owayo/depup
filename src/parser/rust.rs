@@ -2,8 +2,8 @@
 //!
 //! 対応する形式:
 //! - 固定: `=1.2.3`
-//! - Caret: `1.2.3`, `^1.2.3`
-//! - Tilde: `~1.2.3`
+//! - キャレット: `1.2.3`, `^1.2.3`
+//! - チルダ: `~1.2.3`
 //! - 比較演算子: `>=1.2.3`, `>1.2.3`, `<=1.2.3`, `<1.2.3`
 //! - ワイルドカード: `1.*`, `1.x`, `1.X`
 //! - レンジ: `>=1.0, <2.0`
@@ -88,7 +88,7 @@ impl VersionParser for RustVersionParser {
             );
         }
 
-        // Tilde
+        // チルダ
         if let Some(caps) = TILDE_RE.captures(trimmed) {
             let version = caps.get(1)?.as_str();
             return Some(

@@ -51,10 +51,7 @@ pub fn find_cargo_lock_upward(start: &Path, boundary: &Path) -> Option<PathBuf> 
         if dir == boundary {
             return None;
         }
-        match dir.parent() {
-            Some(parent) => dir = parent,
-            None => return None,
-        }
+        dir = dir.parent()?;
     }
 }
 

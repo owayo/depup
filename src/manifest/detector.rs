@@ -209,7 +209,7 @@ fn detect_pnpm_workspace_packages(dir: &Path) -> Result<Vec<PathBuf>, std::io::E
         if let Some(rest) = trimmed.strip_prefix("packages:") {
             let rest = rest.trim();
             if let Some(after_bracket) = rest.strip_prefix('[') {
-                // flow-style: `packages: ['packages/*', 'apps/*']`
+                // フロー形式: `packages: ['packages/*', 'apps/*']`
                 if let Some(end) = after_bracket.find(']') {
                     add_flow_workspace_patterns(
                         &after_bracket[..end],

@@ -4,8 +4,8 @@
 //! 一致させ、ビルドエラーを防止する。
 //!
 //! Tauri の要件:
-//! - npm: @tauri-apps/api, @tauri-apps/cli
-//! - crates.io: tauri
+//! - npm パッケージ: @tauri-apps/api, @tauri-apps/cli
+//! - crates.io クレート: tauri
 //!   全てが同じメジャー.マイナーバージョンである必要がある (例: 2.10.x)
 
 use crate::domain::{Language, UpdateResult};

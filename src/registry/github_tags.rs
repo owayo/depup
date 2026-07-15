@@ -92,7 +92,7 @@ impl GitHubTagsAdapter {
 /// `Link` ヘッダから `rel="next"` の URL を取り出す
 ///
 /// GitHub のページネーション形式:
-/// `<https://api.github.com/...?page=2>; rel="next", <https://api.github.com/...?page=5>; rel="last"`
+/// URL 例: `<https://api.github.com/...?page=2>; rel="next", <https://api.github.com/...?page=5>; rel="last"`
 fn parse_next_link(link_header: &str) -> Option<String> {
     for part in link_header.split(',') {
         let part = part.trim();

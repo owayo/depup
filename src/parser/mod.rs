@@ -1,14 +1,14 @@
 //! 各パッケージエコシステムのバージョン指定パーサ
 //!
 //! 以下の言語のバージョン指定をパースする:
-//! - Node.js (npm/yarn/pnpm)
-//! - Python (pip/poetry)
-//! - Rust (cargo)
-//! - Go (go mod)
-//! - Ruby (bundler)
-//! - PHP (composer)
-//! - Java (gradle)
-//! - Swift (SPM)
+//! - Node.js（npm/yarn/pnpm）向け
+//! - Python（pip/poetry）向け
+//! - Rust（cargo）向け
+//! - Go（go mod）向け
+//! - Ruby（bundler）向け
+//! - PHP（composer）向け
+//! - Java（gradle）向け
+//! - Swift（SPM）向け
 
 mod go;
 mod java;

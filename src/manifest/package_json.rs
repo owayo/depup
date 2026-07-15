@@ -1,10 +1,10 @@
 //! Node.js プロジェクト向けの `package.json` パーサ。
 //!
 //! 対応対象:
-//! - dependencies
-//! - devDependencies
-//! - peerDependencies
-//! - optionalDependencies
+//! - dependencies セクション
+//! - devDependencies セクション
+//! - peerDependencies セクション
+//! - optionalDependencies セクション
 
 use crate::domain::{Dependency, Language};
 use crate::error::ManifestError;
@@ -118,7 +118,7 @@ fn normalize_node_constraint(version: &str) -> Option<(&str, Option<String>)> {
         return None;
     }
 
-    // npm alias: `npm:real-package@^1.2.3`
+    // npm エイリアス: `npm:real-package@^1.2.3`
     if let Some(rest) = trimmed.strip_prefix("npm:") {
         if let Some(at_pos) = rest.rfind('@')
             && at_pos > 0

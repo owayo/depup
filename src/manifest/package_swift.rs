@@ -1,12 +1,12 @@
 //! Swift Package Manager プロジェクト向けの `Package.swift` パーサ。
 //!
 //! 対応対象:
-//! - `.package(url:, from:)` / `.package(name:, url:, from:)` → Caret
-//! - `.package(url:, .upToNextMajor(from:))` → Caret
-//! - `.package(url:, .upToNextMinor(from:))` → Tilde
+//! - `.package(url:, from:)` / `.package(name:, url:, from:)` → キャレット
+//! - `.package(url:, .upToNextMajor(from:))` → キャレット
+//! - `.package(url:, .upToNextMinor(from:))` → チルダ
 //! - `.package(url:, exact:)` / `.package(url:, .exact())` → Exact (固定)
-//! - `.package(url:, "V1"..<"V2")` → Range
-//! - `.package(url:, "V1"..."V2")` → Range
+//! - `.package(url:, "V1"..<"V2")` → レンジ
+//! - `.package(url:, "V1"..."V2")` → レンジ
 //! - `.package(path:)` → スキップ (ローカル依存)
 //! - `branch:` / `revision:` / `.branch()` / `.revision()` → スキップ (バージョンなし)
 //! - 行コメント (`//`) とブロックコメント (`/* ... */`) はスキップ
@@ -92,9 +92,9 @@ static RANGE_CLOSED_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// GitHub URL から owner/repo を抽出する
 ///
 /// 対応形式:
-/// - https://github.com/owner/repo.git
-/// - https://github.com/owner/repo
-/// - git@github.com:owner/repo.git
+/// - URL 例: https://github.com/owner/repo.git
+/// - URL 例: https://github.com/owner/repo
+/// - SSH URL 例: git@github.com:owner/repo.git
 fn extract_github_owner_repo(url: &str) -> Option<String> {
     // owner/repo に `?` `#` 空白等の不正文字が混ざると、後段の GitHub API URL 構築で
     // クエリ汚染やパストラバーサルを誘発しうるため、ここで文字種を GitHub 準拠に限定する。

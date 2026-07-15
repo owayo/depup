@@ -21,7 +21,7 @@ impl PnpmSettings {
     /// 優先順に確認する:
     /// 1. .npmrc (minimum-release-age 設定)
     /// 2. pnpm-workspace.yaml (minimumReleaseAge、分単位)
-    /// 3. package.json (pnpm.minimumReleaseAge / pnpm.settings.minimumReleaseAge)
+    /// 3. package.json の設定（pnpm.minimumReleaseAge / pnpm.settings.minimumReleaseAge）
     pub fn from_dir(dir: &Path) -> Self {
         let mut settings = PnpmSettings::default();
         if let Some((age, _source)) = Self::minimum_release_age_with_source(dir) {
@@ -59,10 +59,8 @@ fn parse_duration(s: &str) -> Option<Duration> {
         (n, 'd')
     } else if let Some(n) = s.strip_suffix('w') {
         (n, 'w')
-    } else if let Some(n) = s.strip_suffix('m') {
-        (n, 'm')
     } else {
-        return None;
+        (s.strip_suffix('m')?, 'm')
     };
 
     let num: u64 = num_str.parse().ok()?;

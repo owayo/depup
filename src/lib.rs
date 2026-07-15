@@ -1,13 +1,13 @@
 //! depup - 多言語対応の依存関係アップデーターライブラリ
 //!
 //! 複数のプログラミング言語の依存関係更新に必要なコア機能を提供する:
-//! - Node.js (package.json)
-//! - Python (pyproject.toml)
-//! - Rust (Cargo.toml)
-//! - Go (go.mod)
-//! - Ruby (Gemfile)
-//! - PHP (composer.json)
-//! - Java (build.gradle / build.gradle.kts)
+//! - Node.js（package.json）対応
+//! - Python（pyproject.toml）対応
+//! - Rust（Cargo.toml）対応
+//! - Go（go.mod）対応
+//! - Ruby（Gemfile）対応
+//! - PHP（composer.json）対応
+//! - Java（build.gradle / build.gradle.kts）対応
 
 pub mod cli;
 pub mod config;

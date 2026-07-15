@@ -2,8 +2,8 @@
 //!
 //! 対応する形式:
 //! - 固定: `1.2.3`
-//! - Caret: `^1.2.3`, `^1.2`, `^1`
-//! - Tilde: `~1.2.3`, `~1.2`, `~1`
+//! - キャレット: `^1.2.3`, `^1.2`, `^1`
+//! - チルダ: `~1.2.3`, `~1.2`, `~1`
 //! - 比較演算子: `>=1.2.3`, `>1.2.3`, `<=1.2.3`, `<1.2.3`
 //! - ワイルドカード: `1.x`, `1.2.*`, `^1.x`, `~1.2.x` (caret/tilde + x-range)
 //! - レンジ: `>=1.0.0 <2.0.0`, `1.2 <2.0.0`, `1.0.0 - 2.0.0`, `^1 || ^2`
@@ -76,7 +76,7 @@ const NODE_VERSION_OR_X_PATTERN: &str = r"v?(?:\d+|[xX*])(?:\.(?:\d+|[xX*])){0,2
 static CARET_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&format!(r"^\^\s*({NODE_VERSION_PATTERN})$")).unwrap());
 static TILDE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"^~\s*({NODE_VERSION_PATTERN})$")).unwrap());
+    LazyLock::new(|| Regex::new(&format!(r"^~>?\s*({NODE_VERSION_PATTERN})$")).unwrap());
 static GTE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&format!(r"^>=\s*({NODE_VERSION_PATTERN})$")).unwrap());
 static GT_RE: LazyLock<Regex> =
@@ -286,8 +286,9 @@ impl VersionParser for NodeVersionParser {
         // Tilde レンジ
         if let Some(caps) = TILDE_RE.captures(trimmed) {
             let version = normalize_valid_version(caps.get(1)?.as_str())?;
+            let prefix = if trimmed.starts_with("~>") { "~>" } else { "~" };
             return Some(
-                VersionSpec::new(VersionSpecKind::Tilde, trimmed, version).with_prefix("~"),
+                VersionSpec::new(VersionSpecKind::Tilde, trimmed, version).with_prefix(prefix),
             );
         }
 
@@ -1091,5 +1092,14 @@ mod tests {
         // プレリリース付き
         let spec = parse("1.0.0-beta - 2.0.0-rc").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Range);
+    }
+
+    #[test]
+    fn test_parse_legacy_tilde_greater_operator() {
+        let spec = parse("~>1.2.3").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Tilde);
+        assert_eq!(spec.version, "1.2.3");
+        assert_eq!(spec.prefix.as_deref(), Some("~>"));
+        assert_eq!(spec.format_updated("1.3.0"), "~>1.3.0");
     }
 }

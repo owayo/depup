@@ -54,7 +54,9 @@ impl ChangeLevel {
             return None;
         }
         // 欠落セグメントは 0 として比較する ("1" == "1.0.0")
-        let seg = |parts: &[u64], idx: usize| parts.get(idx).copied().unwrap_or(0);
+        let seg = |parts: &[crate::update::NumericIdentifier], idx: usize| {
+            parts.get(idx).cloned().unwrap_or_default()
+        };
         if seg(&old_p, 0) != seg(&new_p, 0) {
             Some(ChangeLevel::Major)
         } else if seg(&old_p, 1) != seg(&new_p, 1) {
@@ -80,7 +82,7 @@ impl fmt::Display for ChangeLevel {
 /// 各セグメントは先頭の数値プレフィックスのみを取る (例: `"0rc1"` → 0)。
 /// 数値が全く無いセグメント (qualifier 等) 以降は無視するため、
 /// 非数値セグメントを読み飛ばして詰めることによる位置ずれ比較は起きない。
-fn split_core(s: &str) -> Vec<u64> {
+fn split_core(s: &str) -> Vec<crate::update::NumericIdentifier> {
     crate::update::numeric_core(s.trim())
         .into_iter()
         .take(3)
@@ -193,6 +195,14 @@ mod tests {
             ChangeLevel::from_versions("1.2.3.4", "1.2.3.5"),
             None,
             "本実装は先頭 3 セグメントしか比較しない"
+        );
+    }
+
+    #[test]
+    fn test_from_versions_handles_numbers_larger_than_u64() {
+        assert_eq!(
+            ChangeLevel::from_versions("18446744073709551616.0.0", "2.0.0"),
+            Some(ChangeLevel::Major)
         );
     }
 

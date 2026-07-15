@@ -257,7 +257,7 @@ depup --cd ./projects/myapp -n
 >
 > **注意**: バージョンなしで `git:` / `github:` / `bitbucket:` / `gist:` / `path:` / `source:` を指定した Gemfile 依存は、RubyGems のレジストリ制約へ変換せずにスキップします。行単位の `group:` / `groups:` オプションは開発依存の判定に使います。
 >
-> **注意**: Gemfile の依存宣言は、一般的な Ruby DSL 形式（`gem "rack", "~> 3.0"`）と括弧付きメソッド呼び出し形式（`gem("rack", "~> 3.0")`）のどちらも解析・更新できます。更新時は元の呼び出し形式を保持します。同じ gem が複数箇所（例: トップレベルと `group :test` ブロックの両方）に宣言されている場合は、すべての出現が更新されます。
+> **注意**: Gemfile の依存宣言は、一般的な Ruby DSL 形式（`gem "rack", "~> 3.0"`）と括弧付きメソッド呼び出し形式（`gem("rack", "~> 3.0")`）のどちらも解析・更新できます。更新時は元の呼び出し形式を保持します。同じ gem が複数箇所（例: トップレベルと `group :test` ブロックの両方）に宣言されている場合は、曖昧な書き込みとして拒否します。
 >
 > **注意**: `alias = { package = "actual-crate", version = "1" }` のような Cargo のリネーム依存は、実パッケージ名で取得し、マニフェスト上のキーへ書き戻します。`--only` / `--exclude` はどちらの名前でも指定できます。
 >
@@ -305,7 +305,11 @@ npm の semver トークンは、更新対象として解析する前に prerele
 
 npm の partial comparator では、`=1.2` や `=1` を固定バージョンではなく node-semver の部分バージョン規則として扱います。depup は `=` 演算子と見えているセグメント数を保って更新します（`=1.2` → `=2.3`、`=1` → `=2`）。
 
-Gradle の `strictly` / `require` / `prefer` / `reject` を使う rich version 宣言は、`implementation("org.slf4j:slf4j-api") { version { ... } }` のような依存ブロック内でも解析対象になります。`group:name:[1.7, 1.8[!!1.7.25` のような文字列記法の短縮構文も解析できます。`strictly` または `require` が範囲を指定し、`prefer` が選好バージョンを指定している場合、depup は範囲を上限制約として維持しつつ `prefer` の値を更新します。`reject` に列挙されたバージョンは更新候補から除外され、`2.+` のような動的 reject も考慮します。
+更新候補の順序はエコシステム別に比較します。Node.js / Rust / Go / Swift は数値プレリリース（`1.0.0-1`）を含む SemVer、Python は PEP 440 正規化、Ruby は RubyGems のセグメント順（英字またはハイフンを含む版はプレリリース）、Composer は対応する安定版より新しい patch alias（`-p1` / `-pl1` / `-patch1`）、Java は Gradle 公式のバージョン順序を使います。数値セグメントは固定整数サイズの上限なしで比較します。
+
+Node.js は node-semver 互換の従来形式 `~>1.2.3` も受理し、更新後も `~>` を保持します。Composer は明示的な等価演算子（`=1.2.3` / `==1.2.3`）を保持して更新します。除外指定の `<>1.2.3` は解析しますが、安全のため自動書き換えません。
+
+Gradle の `strictly` / `require` / `prefer` / `reject` を使う rich version 宣言は、`implementation("org.slf4j:slf4j-api") { version { ... } }` のような依存ブロック内でも解析対象になります。`group:name:[1.7, 1.8[!!1.7.25` のような文字列記法の短縮構文も解析できます。`strictly` または `require` が範囲を指定し、`prefer` が選好バージョンを指定している場合、depup は範囲を上限制約として維持しつつ `prefer` の値を更新します。`reject` に列挙されたバージョンは更新候補から除外され、`2.+` のような動的 reject と `[1.5,1.9)` のようなレンジ reject も考慮します。
 
 `gradle/*.versions.toml` にある Gradle version catalog は Java マニフェストとして検出されます。depup は `[libraries]` の `alias = "group:name:version"`、`module = "group:name"`、`group` / `name` / `version`、`version.ref` を解析し、参照先の `[versions]` もその場で更新します。`strictly` / `require` / `prefer` / `reject` / `rejectAll` を含む rich version table は Gradle build ファイルと同じ候補選別ルールで扱います。`[plugins]` は Gradle plugin ID で Maven Central 座標と一致しないため更新対象から除外します。
 
@@ -352,6 +356,8 @@ npm/Composer のハイフンレンジでは、右辺が `1.0 - 2.0` のような
 
 JSON マニフェストでは、depup が解析対象にする依存セクションだけを書き換えます。`package.json` の `overrides`、`composer.json` の `replace` / `provide` / `conflict` などは変更しません。
 
+同じ依存キーがマニフェスト内に複数回宣言されている場合や、複数の Gradle 依存が一つのバージョン変数または version catalog の `version.ref` を共有している場合、depup は曖昧な書き込みを拒否します。これにより、スキップまたは固定された別の宣言を暗黙に変更しません。
+
 Bun ワークスペースでは、root `package.json` のトップレベル `catalog` / `catalogs` と `workspaces.catalog` / `workspaces.catalogs` を解析・更新します。ワークスペース package の `"react": "catalog:"` や `"jest": "catalog:testing"` のような参照は `catalog:` のまま保持し、共有 catalog 定義側のバージョンだけを更新します。`pnpm-workspace.yaml` に定義される pnpm catalogs はまだマニフェストとして解析しないため、pnpm catalogs に裏付けられた package.json の `catalog:` 参照は安全側でスキップします。
 
 TOML マニフェストでは、基本文字列（`"..."`）とリテラル文字列（`'...'`）のどちらも、対応する依存セクション内では引用符を維持して更新します。`Cargo.toml` では `[dependencies]`、`[dev-dependencies]`、`[build-dependencies]`、`[workspace.dependencies]`、target 固有の依存テーブルだけを書き換え、metadata テーブルは変更しません。Cargo git tag 更新も inline table と複数行テーブルの両方で同じセクション制限に従い、単一引用符・二重引用符を保持します。`[patch.<registry>]` / `[patch.<registry>.<package>]` も更新対象です。`crates-io` 以外の `registry` を指定した Cargo 依存は、depup が crates.io だけを問い合わせるためスキップします。Cargo の比較レンジは `>=1.0, <2.0, >=1.0.100` のように3個以上のカンマ区切り requirement にも対応します。`^1.2.2, <1.5` のように caret/tilde/wildcard と comparator を混在させた複数要件も `semver::VersionReq` で valid 性を確認して Range として検出します（以前は黙ってスキップしていました）。上限のない複数下限の混在で安全に書き換えられないものは Skip として可視化します。
@@ -368,6 +374,7 @@ SPM の semver 2.0.0 仕様に合わせ、プレリリース識別子付きバ�
 
 `go.mod` では、`) // direct deps` のようなコメント付きブロック終端も通常のブロック終端として扱い、`require` / `replace` / `exclude` ブロックのパースと更新に反映します。
 `require "golang.org/x/text" "v0.14.0"` のような quoted module path / version も解析し、引用符を維持して更新します。
+`go.mod` の単一行・ブロック形式の `require` 更新では、元の LF / CRLF 改行を維持します。
 
 ## エイジフィルター
 
@@ -622,6 +629,7 @@ shared    # 共有ライブラリ
 - `#` 以降はコメント（行頭・インライン両対応）
 - 空行は無視
 - パスは `.depup` ファイルの配置ディレクトリからの相対パス
+- 絶対パス、親ディレクトリ（`..`）への移動、`.depup` の配置ディレクトリ外を指すシンボリックリンクは拒否
 - 存在しないディレクトリは警告してスキップ
 - ルートディレクトリは常にスキャン対象に含まれる
 

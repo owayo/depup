@@ -1,9 +1,9 @@
 //! Rust プロジェクト向けの `Cargo.toml` パーサ。
 //!
 //! 対応対象:
-//! - `dependencies`
-//! - `dev-dependencies`
-//! - `build-dependencies`
+//! - `dependencies` セクション
+//! - `dev-dependencies` セクション
+//! - `build-dependencies` セクション
 //! - `workspace.dependencies`（ワークスペースルート）
 //! - inline table 形式: `{ version = "1.0" }`
 //! - workspace 依存関係

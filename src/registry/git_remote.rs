@@ -22,9 +22,9 @@ const LS_REMOTE_TIMEOUT: Duration = Duration::from_secs(30);
 /// git ls-remote の取得結果
 #[derive(Debug, Clone, Default)]
 pub struct GitRemoteRefs {
-    /// `refs/heads/<name>` -> commit hash
+    /// `refs/heads/<name>` からコミットハッシュへの対応
     pub heads: HashMap<String, String>,
-    /// `refs/tags/<name>` -> commit hash
+    /// `refs/tags/<name>` からコミットハッシュへの対応
     pub tags: HashMap<String, String>,
     /// `HEAD` に対応するコミットハッシュ
     pub head: Option<String>,

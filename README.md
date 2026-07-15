@@ -257,7 +257,7 @@ Use `--include-pinned` to update pinned versions.
 >
 > **Note**: Gemfile entries that point to non-registry sources without a version (`git:`, `github:`, `bitbucket:`, `gist:`, `path:`, `source:`) are skipped instead of being converted into RubyGems registry constraints. Inline `group:` / `groups:` options are used to classify development dependencies.
 >
-> **Note**: Gemfile declarations can use either the common Ruby DSL form (`gem "rack", "~> 3.0"`) or parenthesized method-call form (`gem("rack", "~> 3.0")`). Both forms are parsed and updated while preserving the original call style. When the same gem is declared in multiple places (for example both at the top level and inside a `group :test` block), all occurrences are updated.
+> **Note**: Gemfile declarations can use either the common Ruby DSL form (`gem "rack", "~> 3.0"`) or parenthesized method-call form (`gem("rack", "~> 3.0")`). Both forms are parsed and updated while preserving the original call style. When the same gem is declared in multiple places (for example both at the top level and inside a `group :test` block), depup refuses the ambiguous write.
 >
 > **Note**: Cargo renamed dependencies such as `alias = { package = "actual-crate", version = "1" }` are fetched by the real package name and written back through the manifest key. `--only` and `--exclude` accept either name.
 >
@@ -305,7 +305,11 @@ For npm semver tokens, depup validates prerelease and build metadata identifiers
 
 For npm partial comparators, `=1.2` and `=1` follow node-semver's partial-version rules instead of being treated as pinned exact versions. depup keeps the `=` operator and updates only the visible segment shape (`=1.2` → `=2.3`, `=1` → `=2`).
 
-Gradle rich version declarations using `strictly`, `require`, `prefer`, and `reject` are parsed in dependency blocks such as `implementation("org.slf4j:slf4j-api") { version { ... } }`. String notation shorthand such as `group:name:[1.7, 1.8[!!1.7.25` is also parsed. When `strictly` or `require` declares a range and `prefer` declares the selected version, depup keeps the range as the upper-bound constraint and updates the `prefer` value. Versions listed with `reject` are excluded from update candidates, including dynamic rejects such as `2.+`.
+Version candidates are ordered with ecosystem-specific rules. Node.js, Rust, Go, and Swift use SemVer (including numeric prereleases such as `1.0.0-1`); Python uses PEP 440 normalization; Ruby follows RubyGems segment ordering and treats alphabetic or hyphenated versions as prereleases; Composer patch aliases (`-p1`, `-pl1`, `-patch1`) sort after the corresponding release; and Java uses Gradle's documented version ordering. Numeric components are compared without a fixed integer-size limit.
+
+Node.js also accepts the node-semver-compatible legacy tilde spelling `~>1.2.3` and preserves `~>` when updating. Composer accepts explicit equality (`=1.2.3`, `==1.2.3`) while preserving the operator. Its `<>1.2.3` exclusion spelling is parsed but intentionally not rewritten.
+
+Gradle rich version declarations using `strictly`, `require`, `prefer`, and `reject` are parsed in dependency blocks such as `implementation("org.slf4j:slf4j-api") { version { ... } }`. String notation shorthand such as `group:name:[1.7, 1.8[!!1.7.25` is also parsed. When `strictly` or `require` declares a range and `prefer` declares the selected version, depup keeps the range as the upper-bound constraint and updates the `prefer` value. Versions listed with `reject` are excluded from update candidates, including dynamic rejects such as `2.+` and ranges such as `[1.5,1.9)`.
 
 Gradle version catalogs under `gradle/*.versions.toml` are detected as Java manifests. depup parses `[libraries]` entries written as `alias = "group:name:version"`, `module = "group:name"`, `group` / `name` / `version`, and `version.ref`; referenced `[versions]` entries are updated in place. Rich version tables with `strictly`, `require`, `prefer`, `reject`, and `rejectAll` follow the same candidate rules as Gradle build files. `[plugins]` entries are skipped because Gradle plugin IDs are not Maven Central coordinates.
 
@@ -352,6 +356,8 @@ Constraints that cannot be rewritten safely are skipped instead of being rewritt
 
 For JSON manifests, depup only rewrites dependency sections it parses. In `package.json`, `overrides` is left untouched; in `composer.json`, sections such as `replace`, `provide`, and `conflict` are left untouched.
 
+If the same dependency key is declared more than once in a manifest, or multiple dependencies share one Gradle version variable or version-catalog `version.ref`, depup refuses the ambiguous write instead of changing skipped or pinned declarations implicitly.
+
 For Bun workspaces, depup parses and updates root `package.json` catalog definitions in both top-level `catalog` / `catalogs` and `workspaces.catalog` / `workspaces.catalogs`. Workspace package references such as `"react": "catalog:"` and `"jest": "catalog:testing"` are kept as catalog references; depup updates the shared catalog entry instead. pnpm catalogs defined in `pnpm-workspace.yaml` are not yet parsed as manifests, so package.json `catalog:` references backed by pnpm catalogs are skipped safely.
 
 For TOML manifests, depup preserves both basic strings (`"..."`) and literal strings (`'...'`) when updating supported dependency sections. In `Cargo.toml`, dependency updates are limited to dependency tables such as `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]`, `[workspace.dependencies]`, and target-specific dependency tables; metadata tables are left untouched. Cargo git tag updates use the same section scoping for inline tables and multiline tables, preserve single or double quotes, and also support `[patch.<registry>]` / `[patch.<registry>.<package>]`. Cargo dependencies that specify a non-`crates-io` `registry` are skipped because depup only queries crates.io. Cargo comparison ranges may contain more than two comma-separated requirements, for example `>=1.0, <2.0, >=1.0.100`. Mixed multi-requirement constraints that combine caret/tilde/wildcard with comparators, such as `^1.2.2, <1.5`, are validated with `semver::VersionReq` and detected as ranges; constraints without an upper bound that cannot be rewritten safely are skipped instead of being silently dropped.
@@ -368,6 +374,7 @@ depup also parses `.package(...)` declarations with trailing arguments such as `
 
 For `go.mod`, depup treats block endings with trailing comments such as `) // direct deps` as normal block endings when parsing and updating `require`, `replace`, and `exclude` blocks.
 Quoted `go.mod` module paths and versions, such as `require "golang.org/x/text" "v0.14.0"`, are parsed and updated while preserving the quotes.
+`go.mod` updates preserve the original LF or CRLF line endings in both single-line and block `require` declarations.
 
 ## Age Filter
 
@@ -622,6 +629,7 @@ When `--install` is used, depup runs the package manager in the nearest matching
 - `#` starts a comment (line or inline)
 - Empty lines are ignored
 - Paths are relative to the `.depup` file location
+- Absolute paths, parent-directory (`..`) traversal, and symlinks resolving outside the `.depup` directory are rejected
 - Non-existent directories are warned and skipped
 - The root directory is always included as a scan target
 

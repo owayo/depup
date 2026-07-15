@@ -8,7 +8,7 @@
 
 use crate::domain::{Dependency, Language};
 use crate::error::ManifestError;
-use crate::manifest::ManifestParser;
+use crate::manifest::{ManifestParser, line_utils::split_line_ending};
 use crate::parser::{VersionParser, get_parser};
 use regex::Regex;
 use std::path::PathBuf;
@@ -124,7 +124,8 @@ impl ManifestParser for GoModParser {
             format!("v{}", new_version)
         };
 
-        for line in content.lines() {
+        for raw_line in content.split_inclusive('\n') {
+            let (line, line_ending) = split_line_ending(raw_line);
             let trimmed = line.trim();
             let logical = trimmed.split("//").next().unwrap_or("").trim();
 
@@ -198,12 +199,7 @@ impl ManifestParser for GoModParser {
             } else {
                 result.push_str(line);
             }
-            result.push('\n');
-        }
-
-        // 元のファイルに末尾改行がなければ除去する
-        if !content.ends_with('\n') && result.ends_with('\n') {
-            result.pop();
+            result.push_str(line_ending);
         }
 
         if updated {
@@ -827,6 +823,34 @@ require github.com/critical/lib v1.0.0 // pinned
             .unwrap();
         assert!(!result.ends_with('\n'));
         assert!(result.contains("v1.10.0"));
+    }
+
+    #[test]
+    fn test_update_single_require_preserves_crlf() {
+        let content = "module example.com/myproject\r\n\r\ngo 1.21\r\n\r\nrequire github.com/gin-gonic/gin v1.9.1\r\n";
+
+        let result = GoModParser
+            .update_version(content, "github.com/gin-gonic/gin", "v1.10.0")
+            .unwrap();
+
+        assert_eq!(
+            result,
+            "module example.com/myproject\r\n\r\ngo 1.21\r\n\r\nrequire github.com/gin-gonic/gin v1.10.0\r\n"
+        );
+    }
+
+    #[test]
+    fn test_update_require_block_preserves_crlf() {
+        let content = "module example.com/myproject\r\n\r\ngo 1.21\r\n\r\nrequire (\r\n\tgithub.com/gin-gonic/gin v1.9.1 // indirect\r\n\tgithub.com/pkg/errors v0.9.1\r\n)\r\n";
+
+        let result = GoModParser
+            .update_version(content, "github.com/gin-gonic/gin", "v1.10.0")
+            .unwrap();
+
+        assert_eq!(
+            result,
+            "module example.com/myproject\r\n\r\ngo 1.21\r\n\r\nrequire (\r\n\tgithub.com/gin-gonic/gin v1.10.0 // indirect\r\n\tgithub.com/pkg/errors v0.9.1\r\n)\r\n"
+        );
     }
 
     #[test]

@@ -2,8 +2,8 @@
 //!
 //! 対応する形式:
 //! - 固定: `1.2.3`
-//! - Caret: `^1.2.3`
-//! - Tilde: `~1.2.3`
+//! - キャレット: `^1.2.3`
+//! - チルダ: `~1.2.3`
 //! - 比較演算子: `>=`, `<`, `>`, `<=`
 //! - 複合制約: `>=1.0 <2.0`, `^1 || ^2`, `1.0 - 2.0`
 //! - ワイルドカード: `1.2.*`, `1.x`
@@ -29,11 +29,11 @@ pub struct PhpVersionParser;
 // 受理し他は v? のまま」のような定義間の不整合を構造的に防ぐ。
 const PHP_VERSION_CORE: &str = r"[vV]?\d+(?:\.\d+){0,3}(?:-[\w.-]+)?(?:\+[\w.-]+)?";
 
-// Caret: ^1.2.3 / ^1.2.3.4
+// キャレット: ^1.2.3 / ^1.2.3.4
 static CARET_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&format!(r"^\^\s*({PHP_VERSION_CORE})$")).unwrap());
 
-// Tilde: ~1.2.3 / ~1.2.3.4
+// チルダ: ~1.2.3 / ~1.2.3.4
 static TILDE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&format!(r"^~\s*({PHP_VERSION_CORE})$")).unwrap());
 
@@ -53,8 +53,11 @@ static LTE_RE: LazyLock<Regex> =
 static LT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&format!(r"^<\s*({PHP_VERSION_CORE})$")).unwrap());
 
+static EQUAL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!(r"^(==|=)\s*({PHP_VERSION_CORE})$")).unwrap());
+
 static NOT_EQUAL_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"^!=\s*({PHP_VERSION_CORE})$")).unwrap());
+    LazyLock::new(|| Regex::new(&format!(r"^(<>|!=)\s*({PHP_VERSION_CORE})$")).unwrap());
 
 // ワイルドカード: 1.2.*, 1.x, 1.2.3.*, *, V1.* (composer/semver は v/V を大小問わず許容)
 static WILDCARD_RE: LazyLock<Regex> =
@@ -117,7 +120,7 @@ impl PhpVersionParser {
             return None;
         }
 
-        // Caret
+        // キャレット
         if let Some(caps) = CARET_RE.captures(trimmed) {
             let version = normalize_version(caps.get(1)?.as_str());
             return Some(
@@ -125,7 +128,7 @@ impl PhpVersionParser {
             );
         }
 
-        // Tilde
+        // チルダ
         if let Some(caps) = TILDE_RE.captures(trimmed) {
             let version = normalize_version(caps.get(1)?.as_str());
             return Some(
@@ -166,8 +169,16 @@ impl PhpVersionParser {
             );
         }
 
+        if let Some(caps) = EQUAL_RE.captures(trimmed) {
+            let prefix = caps.get(1)?.as_str();
+            let version = normalize_version(caps.get(2)?.as_str());
+            return Some(
+                VersionSpec::new(VersionSpecKind::Exact, trimmed, version).with_prefix(prefix),
+            );
+        }
+
         if let Some(caps) = NOT_EQUAL_RE.captures(trimmed) {
-            let version = normalize_version(caps.get(1)?.as_str());
+            let version = normalize_version(caps.get(2)?.as_str());
             return Some(VersionSpec::new(VersionSpecKind::Range, trimmed, version));
         }
 
@@ -928,5 +939,24 @@ mod tests {
         // プレリリース付き
         let spec = parse("1.0.0-beta - 2.0.0-rc").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Range);
+    }
+
+    #[test]
+    fn test_parse_explicit_equality_operators() {
+        for operator in ["=", "=="] {
+            let spec = parse(&format!("{operator}1.2.3")).unwrap();
+            assert_eq!(spec.kind, VersionSpecKind::Exact);
+            assert_eq!(spec.version, "1.2.3");
+            assert_eq!(spec.prefix.as_deref(), Some(operator));
+            assert_eq!(spec.format_updated("2.0.0"), format!("{operator}2.0.0"));
+        }
+    }
+
+    #[test]
+    fn test_parse_shell_style_not_equal_operator_is_not_rewritten() {
+        let spec = parse("<>1.2.3").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1.2.3");
+        assert_eq!(spec.try_format_updated("2.0.0"), None);
     }
 }

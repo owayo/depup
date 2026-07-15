@@ -9,6 +9,7 @@
 use crate::domain::{GitReference, Language, ManifestUpdateResult, UpdateResult};
 use crate::error::ManifestError;
 use crate::manifest::ManifestParser;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -87,6 +88,29 @@ impl ManifestWriter {
             source: e,
         })?;
 
+        // 現行のパーサAPIは依存名だけで書き換えるため、同じキーが複数箇所にあると
+        // 更新対象外の宣言まで変更してしまう。位置情報付き編集へ移行するまでは、
+        // 曖昧な更新を拒否してマニフェスト破壊を防ぐ。
+        let parsed_dependencies = parser.parse(&content)?;
+        let mut declaration_counts = HashMap::new();
+        let mut variable_counts = HashMap::new();
+        for dependency in &parsed_dependencies {
+            *declaration_counts
+                .entry(dependency.manifest_name().to_string())
+                .or_insert(0usize) += 1;
+            if let Some(variable) = &dependency.variable_name {
+                *variable_counts.entry(variable.clone()).or_insert(0usize) += 1;
+            }
+        }
+        let ambiguous_declarations: HashSet<String> = declaration_counts
+            .into_iter()
+            .filter_map(|(name, count)| (count > 1).then_some(name))
+            .collect();
+        let ambiguous_variables: HashSet<String> = variable_counts
+            .into_iter()
+            .filter_map(|(name, count)| (count > 1).then_some(name))
+            .collect();
+
         // 更新は順番に適用する
         let mut current_content = content.clone();
 
@@ -97,6 +121,20 @@ impl ManifestWriter {
                 ..
             } = update
             {
+                let ambiguous_variable = dependency
+                    .variable_name
+                    .as_ref()
+                    .is_some_and(|name| ambiguous_variables.contains(name));
+                if ambiguous_declarations.contains(dependency.manifest_name()) || ambiguous_variable
+                {
+                    result.updates_failed += 1;
+                    result.errors.push(format!(
+                        "Refusing to update ambiguous dependency '{}' because it has multiple declarations or a shared version target",
+                        dependency.manifest_name()
+                    ));
+                    continue;
+                }
+
                 // git 依存の場合は参照種別で挙動が変わる。
                 //   - tag: マニフェストの tag 文字列を書き換える
                 //   - branch/default/rev: マニフェストを書き換えない
@@ -529,6 +567,79 @@ tokio_v1 = { package = "tokio", version = "1.0", features = ["rt"] }
         let content = fs::read_to_string(&path).unwrap();
         assert!(content.contains("^4.18.0")); // lodash が更新される
         assert!(content.contains("^4.19.0")); // express が更新される
+    }
+
+    #[test]
+    fn test_apply_updates_refuses_ambiguous_duplicate_dependency() {
+        let temp_dir = TempDir::new().unwrap();
+        let original_content = r#"{
+  "dependencies": {
+    "shared": "^1.0.0"
+  },
+  "devDependencies": {
+    "shared": "2.0.0"
+  }
+}"#;
+        let path = create_temp_package_json(&temp_dir, original_content);
+        let parser = crate::manifest::PackageJsonParser;
+        let dependencies = parser.parse(original_content).unwrap();
+        let production = dependencies
+            .iter()
+            .find(|dependency| !dependency.is_dev)
+            .unwrap()
+            .clone();
+        let development = dependencies
+            .iter()
+            .find(|dependency| dependency.is_dev)
+            .unwrap()
+            .clone();
+
+        let mut manifest_result = ManifestUpdateResult::new(&path, Language::Node);
+        manifest_result.add_result(UpdateResult::update(production, "3.0.0"));
+        manifest_result.add_result(UpdateResult::skip_pinned(development));
+
+        let result = ManifestWriter::new(false)
+            .apply_updates(&manifest_result, &parser)
+            .unwrap();
+
+        assert_eq!(result.updates_applied, 0);
+        assert_eq!(result.updates_failed, 1);
+        assert!(!result.file_modified);
+        assert!(result.errors[0].contains("ambiguous dependency"));
+        assert_eq!(fs::read_to_string(path).unwrap(), original_content);
+    }
+
+    #[test]
+    fn test_apply_updates_refuses_shared_version_catalog_reference() {
+        let temp_dir = TempDir::new().unwrap();
+        let original_content = r#"[versions]
+shared = "1.0.0"
+
+[libraries]
+alpha = { module = "com.example:alpha", version.ref = "shared" }
+beta = { module = "com.example:beta", version.ref = "shared" }
+"#;
+        let path = temp_dir.path().join("libs.versions.toml");
+        fs::write(&path, original_content).unwrap();
+
+        let parser = crate::manifest::GradleParser;
+        let dependency = parser
+            .parse(original_content)
+            .unwrap()
+            .into_iter()
+            .find(|dependency| dependency.name == "com.example:alpha")
+            .unwrap();
+        let mut manifest_result = ManifestUpdateResult::new(&path, Language::Java);
+        manifest_result.add_result(UpdateResult::update(dependency, "2.0.0"));
+
+        let result = ManifestWriter::new(false)
+            .apply_updates(&manifest_result, &parser)
+            .unwrap();
+
+        assert_eq!(result.updates_applied, 0);
+        assert_eq!(result.updates_failed, 1);
+        assert!(!result.file_modified);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original_content);
     }
 
     #[test]

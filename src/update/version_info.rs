@@ -4,6 +4,7 @@
 //! VersionInfo 構造体を提供する。
 
 use chrono::{DateTime, Utc};
+use pep440_rs::Version as Pep440Version;
 use serde::{Deserialize, Serialize};
 
 /// レジストリから取得したパッケージバージョンの情報
@@ -112,7 +113,7 @@ pub fn is_prerelease_version(version: &str) -> bool {
     }
 
     // Python/PEP 440 形式の短縮識別子をチェック:
-    // - 26.1a1 (alpha), 21.12b0 (beta), 1.0c1 (release candidate)
+    // - 26.1a1（アルファ）、21.12b0（ベータ）、1.0c1（リリース候補）
     // - 1.0rc1, 2.0.0rc1 (release candidate, セパレータなしの rc 表記)
     // パターン: 数字の後に 'rc'+数字、または 'a'/'b'/'c'+数字 が続く
     let chars: Vec<char> = scan.chars().collect();
@@ -139,6 +140,17 @@ pub fn is_prerelease_version(version: &str) -> bool {
     false
 }
 
+/// Python の PEP 440 正規化規則に従ってプレリリースかを判定する。
+///
+/// `_` 区切りや `preview` / `c` などの代替綴りも標準パーサで正規化する。
+/// PEP 440 でない入力は、他エコシステムとの互換性を保つため共通判定へ戻す。
+pub(crate) fn is_python_prerelease_version(version: &str) -> bool {
+    version
+        .parse::<Pep440Version>()
+        .map(|parsed| parsed.any_prerelease())
+        .unwrap_or_else(|_| is_prerelease_version(version))
+}
+
 impl PartialEq for VersionInfo {
     fn eq(&self, other: &Self) -> bool {
         compare_versions(&self.version, &other.version) == std::cmp::Ordering::Equal
@@ -160,15 +172,58 @@ impl PartialOrd for VersionInfo {
     }
 }
 
-/// 文字列末尾の連続する数字を `u64` として取り出す。
+/// 任意桁の非負整数を比較可能な正規形で保持する。
+///
+/// レジストリ由来のバージョンは `u64` の上限を超える場合があるため、数値を
+/// 10 進文字列のまま保持し、桁数と辞書順で比較する。先頭ゼロは除去する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NumericIdentifier(String);
+
+impl NumericIdentifier {
+    fn parse(value: &str) -> Option<Self> {
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+
+        let normalized = value.trim_start_matches('0');
+        Some(Self(if normalized.is_empty() {
+            "0".to_string()
+        } else {
+            normalized.to_string()
+        }))
+    }
+}
+
+impl Default for NumericIdentifier {
+    fn default() -> Self {
+        Self("0".to_string())
+    }
+}
+
+impl Ord for NumericIdentifier {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0
+            .len()
+            .cmp(&other.0.len())
+            .then_with(|| self.0.cmp(&other.0))
+    }
+}
+
+impl PartialOrd for NumericIdentifier {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// 文字列末尾の連続する数字を任意桁の数値として取り出す。
 /// PEP 440 のポストリリース (例: `post1` → 1、`post` → None) の
 /// 数値識別子抽出に使う。
-fn trailing_number(s: &str) -> Option<u64> {
+fn trailing_number(s: &str) -> Option<NumericIdentifier> {
     let digits: String = s.chars().rev().take_while(char::is_ascii_digit).collect();
     if digits.is_empty() {
         return None;
     }
-    digits.chars().rev().collect::<String>().parse().ok()
+    NumericIdentifier::parse(&digits.chars().rev().collect::<String>())
 }
 
 /// プレリリース識別子 1 個分の構造化表現 (semver 11.4 準拠の比較用)。
@@ -179,7 +234,7 @@ fn trailing_number(s: &str) -> Option<u64> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PreIdentifier {
     /// 数値識別子
-    Numeric(u64),
+    Numeric(NumericIdentifier),
     /// 英字を含む識別子 (小文字化済み)
     Alpha(String),
 }
@@ -188,9 +243,9 @@ impl PreIdentifier {
     /// セパレータ区切りの識別子 1 個をパースする。
     /// 数値としてパースできれば `Numeric`、できなければ小文字化した `Alpha`。
     fn from_part(part: &str) -> Self {
-        match part.parse::<u64>() {
-            Ok(n) => PreIdentifier::Numeric(n),
-            Err(_) => PreIdentifier::Alpha(part.to_ascii_lowercase()),
+        match NumericIdentifier::parse(part) {
+            Some(n) => PreIdentifier::Numeric(n),
+            None => PreIdentifier::Alpha(part.to_ascii_lowercase()),
         }
     }
 }
@@ -229,14 +284,14 @@ enum LocalIdentifier {
     /// 英字を含む local version セグメント (小文字化済み)
     Alpha(String),
     /// 数値のみの local version セグメント
-    Numeric(u64),
+    Numeric(NumericIdentifier),
 }
 
 impl LocalIdentifier {
     fn from_part(part: &str) -> Self {
-        match part.parse::<u64>() {
-            Ok(n) => LocalIdentifier::Numeric(n),
-            Err(_) => LocalIdentifier::Alpha(part.to_ascii_lowercase()),
+        match NumericIdentifier::parse(part) {
+            Some(n) => LocalIdentifier::Numeric(n),
+            None => LocalIdentifier::Alpha(part.to_ascii_lowercase()),
         }
     }
 }
@@ -262,10 +317,10 @@ impl PartialOrd for LocalIdentifier {
 }
 
 type PythonVersionComponents = (
-    u64,
-    Vec<u64>,
+    NumericIdentifier,
+    Vec<NumericIdentifier>,
     Option<Vec<PreIdentifier>>,
-    Option<u64>,
+    Option<NumericIdentifier>,
     Option<Vec<LocalIdentifier>>,
 );
 
@@ -314,7 +369,7 @@ fn is_known_prerelease_segment(segment: &str) -> bool {
 /// 各セグメントは先頭の数値プレフィックスのみを取り (例: `0rc1` → 0)、
 /// 数値が全く無いセグメント以降は無視する。`ChangeLevel::from_versions` と
 /// `compare_versions` で同じ抽出規則を共有するための pub(crate) ヘルパー。
-pub(crate) fn numeric_core(s: &str) -> Vec<u64> {
+pub(crate) fn numeric_core(s: &str) -> Vec<NumericIdentifier> {
     parse_version_components(s).1
 }
 
@@ -330,7 +385,26 @@ pub(crate) fn numeric_core(s: &str) -> Vec<u64> {
 /// 注意: `compare_versions` は全エコシステム共通のため、`1.0.0-1` のような
 /// ハイフン + 純数字は semver の数値プレリリースと衝突しうる。誤判定を避けるため
 /// post は曖昧さのない `.post` トークン形式のみを対象とする。
-fn parse_version_components(s: &str) -> (u64, Vec<u64>, Option<Vec<PreIdentifier>>, Option<u64>) {
+fn parse_version_components(
+    s: &str,
+) -> (
+    NumericIdentifier,
+    Vec<NumericIdentifier>,
+    Option<Vec<PreIdentifier>>,
+    Option<NumericIdentifier>,
+) {
+    parse_version_components_with_options(s, false)
+}
+
+fn parse_version_components_with_options(
+    s: &str,
+    numeric_hyphen_is_prerelease: bool,
+) -> (
+    NumericIdentifier,
+    Vec<NumericIdentifier>,
+    Option<Vec<PreIdentifier>>,
+    Option<NumericIdentifier>,
+) {
     // 先頭の 'v' または 'V' を除去
     let s = s
         .strip_prefix('v')
@@ -340,8 +414,8 @@ fn parse_version_components(s: &str) -> (u64, Vec<u64>, Option<Vec<PreIdentifier
     let s = s.split('+').next().unwrap_or(s);
     // PEP 440 エポック (`N!`) を切り出す。なければ 0。
     let (epoch, s) = match s.split_once('!') {
-        Some((e, rest)) => (e.parse::<u64>().unwrap_or(0), rest),
-        None => (0, s),
+        Some((e, rest)) => (NumericIdentifier::parse(e).unwrap_or_default(), rest),
+        None => (NumericIdentifier::default(), s),
     };
     // 数値コアとプレリリース部に分離する。最初の '-' 以前が数値コアの候補。
     let mut split = s.splitn(2, '-');
@@ -358,13 +432,13 @@ fn parse_version_components(s: &str) -> (u64, Vec<u64>, Option<Vec<PreIdentifier
     let segments: Vec<&str> = core.split('.').collect();
     let mut nums = Vec::new();
     let mut core_pre: Option<Vec<PreIdentifier>> = None;
-    let mut post: Option<u64> = None;
+    let mut post: Option<NumericIdentifier> = None;
     for (idx, segment) in segments.iter().enumerate() {
         let digit_end = segment
             .find(|c: char| !c.is_ascii_digit())
             .unwrap_or(segment.len());
         let (digits, rest) = segment.split_at(digit_end);
-        if let Ok(value) = digits.parse::<u64>() {
+        if let Some(value) = NumericIdentifier::parse(digits) {
             nums.push(value);
         }
         if rest.is_empty() {
@@ -375,7 +449,7 @@ fn parse_version_components(s: &str) -> (u64, Vec<u64>, Option<Vec<PreIdentifier
         // rest が多バイト文字を含むと byte index 4 が文字境界に一致せず panic するため、
         // 常に安全な as_bytes()[..4] を使う (rest.len() >= 4 でバイト長は保証済み)。
         if rest.len() >= 4 && rest.as_bytes()[..4].eq_ignore_ascii_case(b"post") {
-            post = Some(trailing_number(rest).unwrap_or(0));
+            post = Some(trailing_number(rest).unwrap_or_default());
             break;
         }
         // 数字が先行する英字付きセグメント (例: "0rc1") は prerelease。
@@ -388,7 +462,7 @@ fn parse_version_components(s: &str) -> (u64, Vec<u64>, Option<Vec<PreIdentifier
             for follow in &segments[idx + 1..] {
                 // rest 側と同様にバイト列比較で多バイト境界 panic を防ぐ。
                 if follow.len() >= 4 && follow.as_bytes()[..4].eq_ignore_ascii_case(b"post") {
-                    post = Some(trailing_number(follow).unwrap_or(0));
+                    post = Some(trailing_number(follow).unwrap_or_default());
                     break;
                 }
             }
@@ -414,12 +488,17 @@ fn parse_version_components(s: &str) -> (u64, Vec<u64>, Option<Vec<PreIdentifier
     // - 数値コア内で見つかった prerelease (core_pre) を優先する
     // - '-' 区切り表記 (hyphen_pre, 例: "canary-456" → [canary, 456], "rc.1" → [rc, 1])
     //   は数値パース成功 → Numeric、失敗 → Alpha (小文字化) として構造化する
-    // 純粋に数値だけの '-' サフィックスは Java SNAPSHOT 等の qualifier なので prerelease 扱いしない
+    // Java では純粋な数値サフィックスを安定版の追加パートとして扱う一方、SemVer
+    // では数値だけでも prerelease になる。呼び出し側の規則で切り替える。
     let pre = if core_pre.is_some() {
         core_pre
     } else {
         hyphen_pre.and_then(|p| {
-            if !p.is_empty() && p.split('.').any(|part| part.parse::<u64>().is_err()) {
+            if !p.is_empty()
+                && (numeric_hyphen_is_prerelease
+                    || p.split('.')
+                        .any(|part| NumericIdentifier::parse(part).is_none()))
+            {
                 Some(
                     p.split(['.', '-'])
                         .filter(|part| !part.is_empty())
@@ -473,13 +552,216 @@ pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
     compare_core_pre_post(parse_version_components(a), parse_version_components(b))
 }
 
+/// SemVer 2.0.0 の優先順位で比較する。
+///
+/// Node.js / Rust / Go / Swift では `-1` も数値 prerelease である。通常は
+/// `semver` クレートを使い、実装上限を超える任意桁の数値だけ独自比較へ戻す。
+pub fn compare_semver_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    fn strip_v(value: &str) -> &str {
+        value
+            .strip_prefix('v')
+            .or_else(|| value.strip_prefix('V'))
+            .unwrap_or(value)
+    }
+    if let (Ok(a), Ok(b)) = (
+        semver::Version::parse(strip_v(a)),
+        semver::Version::parse(strip_v(b)),
+    ) {
+        return a.cmp(&b);
+    }
+
+    compare_core_pre_post(
+        parse_version_components_with_options(a, true),
+        parse_version_components_with_options(b, true),
+    )
+}
+
+/// SemVer の prerelease かどうかを判定する。
+pub(crate) fn is_semver_prerelease_version(version: &str) -> bool {
+    let stripped = version
+        .strip_prefix('v')
+        .or_else(|| version.strip_prefix('V'))
+        .unwrap_or(version);
+    if let Ok(parsed) = semver::Version::parse(stripped) {
+        return !parsed.pre.is_empty();
+    }
+
+    let public = stripped.split('+').next().unwrap_or(stripped);
+    public
+        .split_once('-')
+        .is_some_and(|(_, prerelease)| !prerelease.is_empty())
+        || is_prerelease_version(version)
+}
+
+/// Composer の patch alias をポストリリースへ正規化して比較する。
+pub(crate) fn compare_composer_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    fn normalize(value: &str) -> String {
+        let Some((base, suffix)) = value.rsplit_once('-') else {
+            return value.to_string();
+        };
+        let lower = suffix.to_ascii_lowercase();
+        for prefix in ["patch", "pl", "p"] {
+            if let Some(number) = lower.strip_prefix(prefix)
+                && NumericIdentifier::parse(number).is_some()
+            {
+                return format!("{base}.post{number}");
+            }
+        }
+        value.to_string()
+    }
+
+    compare_versions(&normalize(a), &normalize(b))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EcosystemPart {
+    Numeric(NumericIdentifier),
+    Text(String),
+}
+
+fn alphanumeric_parts(value: &str, ruby_hyphen: bool) -> Vec<EcosystemPart> {
+    let normalized = if ruby_hyphen {
+        value.replace('-', ".pre.")
+    } else {
+        value.to_string()
+    };
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut digit_run = None;
+
+    let flush =
+        |current: &mut String, digit_run: &mut Option<bool>, parts: &mut Vec<EcosystemPart>| {
+            if current.is_empty() {
+                return;
+            }
+            if digit_run == &Some(true) {
+                if let Some(number) = NumericIdentifier::parse(current) {
+                    parts.push(EcosystemPart::Numeric(number));
+                }
+            } else {
+                parts.push(EcosystemPart::Text(current.clone()));
+            }
+            current.clear();
+            *digit_run = None;
+        };
+
+    for ch in normalized.chars() {
+        if !ch.is_ascii_alphanumeric() {
+            flush(&mut current, &mut digit_run, &mut parts);
+            continue;
+        }
+        let is_digit = ch.is_ascii_digit();
+        if digit_run.is_some_and(|previous| previous != is_digit) {
+            flush(&mut current, &mut digit_run, &mut parts);
+        }
+        digit_run = Some(is_digit);
+        current.push(ch);
+    }
+    flush(&mut current, &mut digit_run, &mut parts);
+    parts
+}
+
+/// RubyGems の規則に従い、英字またはハイフンを含む版をプレリリースと判定する。
+pub(crate) fn is_ruby_prerelease_version(version: &str) -> bool {
+    let version = version
+        .strip_prefix('v')
+        .or_else(|| version.strip_prefix('V'))
+        .unwrap_or(version);
+    version.contains('-') || version.bytes().any(|byte| byte.is_ascii_alphabetic())
+}
+
+/// RubyGems の `Gem::Version` と同じ数値・英字セグメント規則で比較する。
+pub(crate) fn compare_ruby_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    let a = alphanumeric_parts(a, true);
+    let b = alphanumeric_parts(b, true);
+    let zero = EcosystemPart::Numeric(NumericIdentifier::default());
+    for index in 0..a.len().max(b.len()) {
+        let a_part = a.get(index).unwrap_or(&zero);
+        let b_part = b.get(index).unwrap_or(&zero);
+        let ordering = match (a_part, b_part) {
+            (EcosystemPart::Numeric(a), EcosystemPart::Numeric(b)) => a.cmp(b),
+            (EcosystemPart::Text(a), EcosystemPart::Text(b)) => a.cmp(b),
+            (EcosystemPart::Numeric(_), EcosystemPart::Text(_)) => Ordering::Greater,
+            (EcosystemPart::Text(_), EcosystemPart::Numeric(_)) => Ordering::Less,
+        };
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    Ordering::Equal
+}
+
+fn gradle_text_order(a: &str, b: &str) -> std::cmp::Ordering {
+    fn special_rank(value: &str) -> Option<u8> {
+        match value.to_ascii_lowercase().as_str() {
+            "dev" => Some(0),
+            "rc" => Some(2),
+            "snapshot" => Some(3),
+            "final" => Some(4),
+            "ga" => Some(5),
+            "release" => Some(6),
+            "sp" => Some(7),
+            _ => None,
+        }
+    }
+
+    match (special_rank(a), special_rank(b)) {
+        (Some(a), Some(b)) => a.cmp(&b),
+        (Some(0), None) => std::cmp::Ordering::Less,
+        (None, Some(0)) => std::cmp::Ordering::Greater,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (None, None) => a.cmp(b),
+    }
+}
+
+/// Gradle の公式 version ordering で比較する。
+pub(crate) fn compare_gradle_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    let a = alphanumeric_parts(a, false);
+    let b = alphanumeric_parts(b, false);
+    for (a_part, b_part) in a.iter().zip(&b) {
+        let ordering = match (a_part, b_part) {
+            (EcosystemPart::Numeric(a), EcosystemPart::Numeric(b)) => a.cmp(b),
+            (EcosystemPart::Text(a), EcosystemPart::Text(b)) => gradle_text_order(a, b),
+            (EcosystemPart::Numeric(_), EcosystemPart::Text(_)) => Ordering::Greater,
+            (EcosystemPart::Text(_), EcosystemPart::Numeric(_)) => Ordering::Less,
+        };
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+
+    match (a.get(b.len()), b.get(a.len())) {
+        (None, None) => Ordering::Equal,
+        (Some(EcosystemPart::Numeric(_)), None) => Ordering::Greater,
+        (Some(EcosystemPart::Text(_)), None) => Ordering::Less,
+        (None, Some(EcosystemPart::Numeric(_))) => Ordering::Less,
+        (None, Some(EcosystemPart::Text(_))) => Ordering::Greater,
+        _ => Ordering::Equal,
+    }
+}
+
 /// epoch → 数値コア → プレリリース → ポストリリースの順でバージョン成分を比較する。
 ///
 /// semver (`compare_versions`) と PEP 440 (`compare_python_versions`) が共有する
 /// 比較コア。PEP 440 側は戻り値が `Ordering::Equal` のときのみ local version 比較へ続ける。
 fn compare_core_pre_post(
-    a: (u64, Vec<u64>, Option<Vec<PreIdentifier>>, Option<u64>),
-    b: (u64, Vec<u64>, Option<Vec<PreIdentifier>>, Option<u64>),
+    a: (
+        NumericIdentifier,
+        Vec<NumericIdentifier>,
+        Option<Vec<PreIdentifier>>,
+        Option<NumericIdentifier>,
+    ),
+    b: (
+        NumericIdentifier,
+        Vec<NumericIdentifier>,
+        Option<Vec<PreIdentifier>>,
+        Option<NumericIdentifier>,
+    ),
 ) -> std::cmp::Ordering {
     use std::cmp::Ordering;
 
@@ -494,10 +776,11 @@ fn compare_core_pre_post(
 
     // 2. 数値コア比較 (不足パートは 0 として扱う)
     let max_len = core_a.len().max(core_b.len());
+    let zero = NumericIdentifier::default();
     for i in 0..max_len {
-        let pa = core_a.get(i).copied().unwrap_or(0);
-        let pb = core_b.get(i).copied().unwrap_or(0);
-        match pa.cmp(&pb) {
+        let pa = core_a.get(i).unwrap_or(&zero);
+        let pb = core_b.get(i).unwrap_or(&zero);
+        match pa.cmp(pb) {
             Ordering::Equal => continue,
             other => return other,
         }
@@ -543,6 +826,10 @@ fn compare_core_pre_post(
 pub fn compare_python_versions(a: &str, b: &str) -> std::cmp::Ordering {
     use std::cmp::Ordering;
 
+    if let (Ok(a), Ok(b)) = (a.parse::<Pep440Version>(), b.parse::<Pep440Version>()) {
+        return a.cmp(&b);
+    }
+
     let (epoch_a, core_a, pre_a, post_a, local_a) = parse_python_version_components(a);
     let (epoch_b, core_b, pre_b, post_b, local_b) = parse_python_version_components(b);
 
@@ -574,6 +861,10 @@ pub fn compare_python_versions(a: &str, b: &str) -> std::cmp::Ordering {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    fn numeric(value: &str) -> NumericIdentifier {
+        NumericIdentifier::parse(value).expect("テスト用の数値文字列であること")
+    }
 
     #[test]
     fn test_version_info_new() {
@@ -941,6 +1232,37 @@ mod tests {
     }
 
     #[test]
+    fn test_compare_python_versions_pep440_normalization_and_suffix_ordering() {
+        use std::cmp::Ordering;
+
+        assert_eq!(
+            compare_python_versions("1.0_alpha1", "1.0a1"),
+            Ordering::Equal
+        );
+        assert_eq!(
+            compare_python_versions("1.0alpha1", "1.0a2"),
+            Ordering::Less
+        );
+        assert_eq!(compare_python_versions("1.0-1", "1.0"), Ordering::Greater);
+        assert_eq!(
+            compare_python_versions("1.0a1.dev1", "1.0a1"),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_python_versions("1.0preview1", "1.0rc1"),
+            Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn test_python_prerelease_detection_accepts_pep440_alternative_spellings() {
+        assert!(is_python_prerelease_version("1.0_alpha1"));
+        assert!(is_python_prerelease_version("1.0preview1"));
+        assert!(is_python_prerelease_version("1.0_dev"));
+        assert!(!is_python_prerelease_version("1.0-r4"));
+    }
+
+    #[test]
     fn test_compare_versions_four_part_versions() {
         // 一部のエコシステムは4パートバージョンを使用 (例: Java SNAPSHOT, .NET)
         assert_eq!(
@@ -971,6 +1293,34 @@ mod tests {
         assert_eq!(
             compare_versions("20260226", "20260227"),
             std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn test_compare_versions_numbers_larger_than_u64() {
+        use std::cmp::Ordering;
+
+        assert_eq!(
+            compare_versions("18446744073709551616.0.0", "2.0.0"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_versions(
+                "1.0.0-rc.18446744073709551616",
+                "1.0.0-rc.9223372036854775808"
+            ),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_versions("18446744073709551616!1.0", "2!999.0"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_versions(
+                "1.0.post18446744073709551616",
+                "1.0.post9223372036854775808"
+            ),
+            Ordering::Greater
         );
     }
 
@@ -1292,9 +1642,9 @@ mod tests {
 
     #[test]
     fn test_trailing_number_extraction() {
-        assert_eq!(super::trailing_number("rc1"), Some(1));
-        assert_eq!(super::trailing_number("rc12"), Some(12));
-        assert_eq!(super::trailing_number("a0"), Some(0));
+        assert_eq!(super::trailing_number("rc1"), Some(numeric("1")));
+        assert_eq!(super::trailing_number("rc12"), Some(numeric("12")));
+        assert_eq!(super::trailing_number("a0"), Some(numeric("0")));
         assert_eq!(super::trailing_number("rc"), None);
         assert_eq!(super::trailing_number(""), None);
     }
@@ -1369,38 +1719,53 @@ mod tests {
         // 構成要素分解の単体確認
         assert_eq!(
             super::parse_version_components("1.2.3"),
-            (0, vec![1, 2, 3], None, None)
+            (
+                numeric("0"),
+                vec![numeric("1"), numeric("2"), numeric("3")],
+                None,
+                None
+            )
         );
         // セパレータなし prerelease は英字部と数値部へ分解される
         assert_eq!(
             super::parse_version_components("2.0.0rc1"),
             (
-                0,
-                vec![2, 0, 0],
-                Some(vec![Alpha("rc".to_string()), Numeric(1)]),
+                numeric("0"),
+                vec![numeric("2"), numeric("0"), numeric("0")],
+                Some(vec![Alpha("rc".to_string()), Numeric(numeric("1"))]),
                 None
             )
         );
         assert_eq!(
             super::parse_version_components("1.0.post2"),
-            (0, vec![1, 0], None, Some(2))
+            (
+                numeric("0"),
+                vec![numeric("1"), numeric("0")],
+                None,
+                Some(numeric("2"))
+            )
         );
         assert_eq!(
             super::parse_version_components("1!2.3"),
-            (1, vec![2, 3], None, None)
+            (numeric("1"), vec![numeric("2"), numeric("3")], None, None)
         );
         // RELEASE qualifier は数値コアにもステージにも影響しない
         assert_eq!(
             super::parse_version_components("5.0.0.RELEASE"),
-            (0, vec![5, 0, 0], None, None)
+            (
+                numeric("0"),
+                vec![numeric("5"), numeric("0"), numeric("0")],
+                None,
+                None
+            )
         );
         // ハイフン区切り prerelease は識別子ごとに Numeric / Alpha (小文字化) へ構造化される
         assert_eq!(
             super::parse_version_components("1.0.0-RC.1"),
             (
-                0,
-                vec![1, 0, 0],
-                Some(vec![Alpha("rc".to_string()), Numeric(1)]),
+                numeric("0"),
+                vec![numeric("1"), numeric("0"), numeric("0")],
+                Some(vec![Alpha("rc".to_string()), Numeric(numeric("1"))]),
                 None
             )
         );
@@ -1408,9 +1773,9 @@ mod tests {
         assert_eq!(
             super::parse_version_components("1.0.1.dev1"),
             (
-                0,
-                vec![1, 0, 1],
-                Some(vec![Alpha("dev".to_string()), Numeric(1)]),
+                numeric("0"),
+                vec![numeric("1"), numeric("0"), numeric("1")],
+                Some(vec![Alpha("dev".to_string()), Numeric(numeric("1"))]),
                 None
             )
         );
@@ -1431,7 +1796,7 @@ mod tests {
             compare_versions("6.0.0-beta.2", "6.0.0-alpha.24"),
             Ordering::Greater
         );
-        // beta.2 < rc.1
+        // ベータ2はリリース候補1より古い
         assert_eq!(
             compare_versions("1.0.0-beta.2", "1.0.0-rc.1"),
             Ordering::Less
@@ -1446,7 +1811,7 @@ mod tests {
             compare_versions("1.0.0-Alpha.1", "1.0.0-alpha.1"),
             Ordering::Equal
         );
-        // Numeric < Alpha (semver 11.4.3)
+        // 数値識別子 < 英字識別子（semver 11.4.3）
         assert_eq!(
             compare_versions("1.0.0-alpha.1", "1.0.0-alpha.beta"),
             Ordering::Less
@@ -1454,7 +1819,7 @@ mod tests {
     }
 
     /// semver 11.4 のスペック例そのままの順序チェーン:
-    /// alpha < alpha.1 < alpha.beta < beta < beta.2 < beta.11 < rc.1 < (release)
+    /// 優先順位: alpha < alpha.1 < alpha.beta < beta < beta.2 < beta.11 < rc.1 < 安定版
     #[test]
     fn test_compare_versions_semver_spec_precedence_chain() {
         let chain = [
@@ -1581,10 +1946,10 @@ mod tests {
     fn test_pre_identifier_ordering_rules() {
         use super::PreIdentifier::{Alpha, Numeric};
         // Numeric 同士は数値比較
-        assert!(Numeric(1) < Numeric(2));
-        assert!(Numeric(2) < Numeric(11));
-        // Numeric < Alpha (semver 11.4.3)
-        assert!(Numeric(999) < Alpha("alpha".to_string()));
+        assert!(Numeric(numeric("1")) < Numeric(numeric("2")));
+        assert!(Numeric(numeric("2")) < Numeric(numeric("11")));
+        // 数値識別子 < 英字識別子（semver 11.4.3）
+        assert!(Numeric(numeric("999")) < Alpha("alpha".to_string()));
         // Alpha 同士は ASCII 辞書順
         assert!(Alpha("alpha".to_string()) < Alpha("beta".to_string()));
         assert!(Alpha("beta".to_string()) < Alpha("rc".to_string()));
@@ -1600,39 +1965,106 @@ mod tests {
         use super::PreIdentifier::{Alpha, Numeric};
         assert_eq!(
             super::decompose_alnum_runs("rc1"),
-            vec![Alpha("rc".to_string()), Numeric(1)]
+            vec![Alpha("rc".to_string()), Numeric(numeric("1"))]
         );
         assert_eq!(
             super::decompose_alnum_runs("dev1rc1"),
             vec![
                 Alpha("dev".to_string()),
-                Numeric(1),
+                Numeric(numeric("1")),
                 Alpha("rc".to_string()),
-                Numeric(1)
+                Numeric(numeric("1"))
             ]
         );
         assert_eq!(
             super::decompose_alnum_runs("alpha"),
             vec![Alpha("alpha".to_string())]
         );
-        assert_eq!(super::decompose_alnum_runs("2"), vec![Numeric(2)]);
+        assert_eq!(
+            super::decompose_alnum_runs("2"),
+            vec![Numeric(numeric("2"))]
+        );
         assert_eq!(super::decompose_alnum_runs(""), Vec::<PreIdentifier>::new());
     }
 
     #[test]
     fn test_numeric_core_extraction() {
         // ChangeLevel と共有する数値コア抽出ヘルパー
-        assert_eq!(super::numeric_core("1.2.3"), vec![1, 2, 3]);
-        assert_eq!(super::numeric_core("v1.2.3"), vec![1, 2, 3]);
-        assert_eq!(super::numeric_core("1.2.3-rc.1"), vec![1, 2, 3]);
-        assert_eq!(super::numeric_core("1.2.3+sha.abc"), vec![1, 2, 3]);
+        let expected = || vec![numeric("1"), numeric("2"), numeric("3")];
+        assert_eq!(super::numeric_core("1.2.3"), expected());
+        assert_eq!(super::numeric_core("v1.2.3"), expected());
+        assert_eq!(super::numeric_core("1.2.3-rc.1"), expected());
+        assert_eq!(super::numeric_core("1.2.3+sha.abc"), expected());
         // セグメントは先頭の数値プレフィックスのみを取る
-        assert_eq!(super::numeric_core("1.0.0rc1"), vec![1, 0, 0]);
+        assert_eq!(
+            super::numeric_core("1.0.0rc1"),
+            vec![numeric("1"), numeric("0"), numeric("0")]
+        );
         // 数値が全く無いセグメント以降は無視する
-        assert_eq!(super::numeric_core("5.0.0.RELEASE"), vec![5, 0, 0]);
-        assert_eq!(super::numeric_core("1.2.RELEASE.3"), vec![1, 2]);
+        assert_eq!(
+            super::numeric_core("5.0.0.RELEASE"),
+            vec![numeric("5"), numeric("0"), numeric("0")]
+        );
+        assert_eq!(
+            super::numeric_core("1.2.RELEASE.3"),
+            vec![numeric("1"), numeric("2")]
+        );
         // エポックは数値コアに含めない
-        assert_eq!(super::numeric_core("1!2.3"), vec![2, 3]);
-        assert_eq!(super::numeric_core("abc"), Vec::<u64>::new());
+        assert_eq!(
+            super::numeric_core("1!2.3"),
+            vec![numeric("2"), numeric("3")]
+        );
+        assert_eq!(super::numeric_core("abc"), Vec::<NumericIdentifier>::new());
+    }
+
+    #[test]
+    fn test_semver_numeric_prerelease_ordering() {
+        use std::cmp::Ordering;
+
+        assert_eq!(compare_semver_versions("1.0.0-1", "1.0.0"), Ordering::Less);
+        assert_eq!(
+            compare_semver_versions("1.0.0-18446744073709551616", "1.0.0-2"),
+            Ordering::Greater
+        );
+        assert!(is_semver_prerelease_version("1.0.0-1"));
+    }
+
+    #[test]
+    fn test_rubygems_version_ordering() {
+        use std::cmp::Ordering;
+
+        assert_eq!(compare_ruby_versions("1.0.zeta", "1.0"), Ordering::Less);
+        assert_eq!(compare_ruby_versions("1.0.0-1", "1.0.0"), Ordering::Less);
+        assert_eq!(compare_ruby_versions("1.0.0", "1.0.0.0"), Ordering::Equal);
+        assert_eq!(compare_ruby_versions("1.0.A", "1.0.a"), Ordering::Less);
+        assert!(is_ruby_prerelease_version("1.0.zeta"));
+        assert!(is_ruby_prerelease_version("1.0.0-1"));
+        assert!(!is_ruby_prerelease_version("1.0.0"));
+    }
+
+    #[test]
+    fn test_composer_patch_alias_ordering() {
+        use std::cmp::Ordering;
+
+        for alias in ["1.0.0-p1", "1.0.0-pl1", "1.0.0-patch1"] {
+            assert_eq!(compare_composer_versions(alias, "1.0.0"), Ordering::Greater);
+        }
+    }
+
+    #[test]
+    fn test_gradle_version_ordering() {
+        use std::cmp::Ordering;
+
+        assert_eq!(
+            compare_gradle_versions("1.0-zeta", "1.0-rc"),
+            Ordering::Less
+        );
+        assert_eq!(compare_gradle_versions("1.1", "1.1.0"), Ordering::Less);
+        assert_eq!(compare_gradle_versions("1.1.a", "1.1"), Ordering::Less);
+        assert_eq!(compare_gradle_versions("1a1", "1-a+1"), Ordering::Equal);
+        assert_eq!(
+            compare_gradle_versions("1.0-RC-1", "1.0.rc.1"),
+            Ordering::Equal
+        );
     }
 }

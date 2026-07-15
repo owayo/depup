@@ -1,8 +1,8 @@
 //! Java プロジェクト向け Gradle マニフェストパーサ
 //!
 //! 対応内容:
-//! - build.gradle (Groovy DSL)
-//! - build.gradle.kts (Kotlin DSL)
+//! - build.gradle（Groovy DSL）対応
+//! - build.gradle.kts（Kotlin DSL）対応
 //! - 変数定義 (def, val, ext block)
 //! - map 記法依存: group: 'x', name: 'y', version: 'z'
 //! - 文字列記法依存: 'group:name:version'
@@ -1841,12 +1841,14 @@ commons-lang3 = { group = "org.apache.commons", name = "commons-lang3", version 
             .find(|dep| dep.name == "org.codehaus.groovy:groovy")
             .unwrap();
         assert_eq!(groovy.version_spec.version, "3.0.5");
+        assert_eq!(groovy.variable_name.as_deref(), Some("groovy"));
 
         let commons = deps
             .iter()
             .find(|dep| dep.name == "org.apache.commons:commons-lang3")
             .unwrap();
         assert_eq!(commons.version_spec.version, "3.12.0");
+        assert_eq!(commons.variable_name, None);
     }
 
     #[test]

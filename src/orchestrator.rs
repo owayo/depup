@@ -61,6 +61,7 @@ const MAX_ENFORCE_LOCK_AGE_PASSES: usize = 5;
 
 /// バージョン情報のキャッシュ (言語, パッケージ名) をキーとする
 pub type VersionCache = Arc<Mutex<HashMap<(Language, String), Vec<VersionInfo>>>>;
+type VersionFetchLocks = Arc<Mutex<HashMap<(Language, String), Arc<Mutex<()>>>>>;
 
 /// プロジェクト直下から検出した minimumReleaseAge とそのソース
 struct ProjectAge {
@@ -188,6 +189,8 @@ pub struct Orchestrator {
     crates_io_semaphore: Arc<Semaphore>,
     /// ディレクトリ間で共有されるバージョンキャッシュ
     version_cache: VersionCache,
+    /// 同一パッケージの取得を一つにまとめるキー単位のロック
+    version_fetch_locks: VersionFetchLocks,
     /// URL 単位でキャッシュされる git ls-remote クライアント
     git_remote: GitRemote,
     /// OSV チェッカー (`args.osv` が true のときのみ初期化)
@@ -266,6 +269,7 @@ impl Orchestrator {
             general_semaphore: Arc::new(Semaphore::new(DEFAULT_CONCURRENCY)),
             crates_io_semaphore: Arc::new(Semaphore::new(CRATES_IO_CONCURRENCY)),
             version_cache: Arc::new(Mutex::new(HashMap::new())),
+            version_fetch_locks: Arc::new(Mutex::new(HashMap::new())),
             git_remote: GitRemote::new(),
             osv_checker,
             global_config: None,
@@ -881,6 +885,25 @@ impl Orchestrator {
             }
         }
 
+        // 同一キーの取得だけを直列化する。異なるパッケージの並列性は維持する。
+        let fetch_lock = {
+            let mut locks = self.version_fetch_locks.lock().await;
+            Arc::clone(
+                locks
+                    .entry(cache_key.clone())
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+        let _fetch_guard = fetch_lock.lock().await;
+
+        // キー単位ロックの待機中に先行取得が完了している場合はキャッシュを返す。
+        {
+            let cache = self.version_cache.lock().await;
+            if let Some(cached) = cache.get(&cache_key) {
+                return Ok(cached.clone());
+            }
+        }
+
         // レジストリに応じて適切なセマフォを使用
         let semaphore = if adapter.language() == Language::Rust {
             &self.crates_io_semaphore
@@ -889,14 +912,6 @@ impl Orchestrator {
         };
 
         let _permit = semaphore.acquire().await.unwrap();
-
-        // セマフォ取得後にキャッシュを再確認（同一パッケージの並行フェッチを防止）
-        {
-            let cache = self.version_cache.lock().await;
-            if let Some(cached) = cache.get(&cache_key) {
-                return Ok(cached.clone());
-            }
-        }
 
         let result = adapter
             .fetch_versions(package)
@@ -1750,9 +1765,35 @@ mod git_helper_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use clap::Parser;
     use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    struct CountingAdapter {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl RegistryAdapter for CountingAdapter {
+        fn language(&self) -> Language {
+            Language::Node
+        }
+
+        fn registry_name(&self) -> &'static str {
+            "counting"
+        }
+
+        async fn fetch_versions(
+            &self,
+            _package: &str,
+        ) -> Result<Vec<VersionInfo>, crate::error::RegistryError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            Ok(vec![VersionInfo::now("1.0.0")])
+        }
+    }
 
     fn make_args(args: &[&str]) -> CliArgs {
         CliArgs::parse_from(args)
@@ -2198,6 +2239,25 @@ mod tests {
         let versions = result.unwrap();
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0].version, "4.17.21");
+    }
+
+    #[tokio::test]
+    async fn test_version_cache_coalesces_concurrent_fetches() {
+        let orchestrator = Orchestrator::new(make_args(&["depup"])).unwrap();
+        let adapter = CountingAdapter {
+            calls: AtomicUsize::new(0),
+        };
+
+        let (first, second, third) = tokio::join!(
+            orchestrator.fetch_versions(&adapter, "shared-package"),
+            orchestrator.fetch_versions(&adapter, "shared-package"),
+            orchestrator.fetch_versions(&adapter, "shared-package")
+        );
+
+        assert!(first.is_ok());
+        assert!(second.is_ok());
+        assert!(third.is_ok());
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

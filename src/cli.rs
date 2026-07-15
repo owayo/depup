@@ -53,113 +53,113 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
     disable_version_flag = true
 )]
 pub struct CliArgs {
-    /// Print version
+    /// バージョンを表示する
     #[arg(short = 'V', long = "version")]
     pub print_version: bool,
 
-    /// Target directory (default: current directory)
+    /// 対象ディレクトリ（既定値: 現在のディレクトリ）
     #[arg(default_value = ".")]
     pub path: PathBuf,
 
-    /// Change to directory before running
+    /// 実行前に対象ディレクトリへ移動する
     #[arg(short = 'C', long = "cd", value_name = "DIR")]
     pub directory: Option<PathBuf>,
 
     // 一般オプション
-    /// Dry run mode - show what would be updated without making changes
+    /// ドライランモード（変更せずに更新予定を表示する）
     #[arg(short = 'n', long)]
     pub dry_run: bool,
 
-    /// Enable verbose output
+    /// 詳細な出力を有効にする
     #[arg(long)]
     pub verbose: bool,
 
-    /// Enable quiet mode - minimal output
+    /// 最小限の出力にする
     #[arg(short, long)]
     pub quiet: bool,
 
     // 言語フィルタ
-    /// Update only Node.js (package.json) dependencies
+    /// Node.js（package.json）の依存関係だけを更新する
     #[arg(long)]
     pub node: bool,
 
-    /// Update only Python (pyproject.toml) dependencies
+    /// Python（pyproject.toml）の依存関係だけを更新する
     #[arg(long)]
     pub python: bool,
 
-    /// Update only Rust (Cargo.toml) dependencies
+    /// Rust（Cargo.toml）の依存関係だけを更新する
     #[arg(long = "rust")]
     pub rust_lang: bool,
 
-    /// Update only Go (go.mod) dependencies
+    /// Go（go.mod）の依存関係だけを更新する
     #[arg(long)]
     pub go: bool,
 
-    /// Update only Ruby (Gemfile) dependencies
+    /// Ruby（Gemfile）の依存関係だけを更新する
     #[arg(long)]
     pub ruby: bool,
 
-    /// Update only PHP (composer.json) dependencies
+    /// PHP（composer.json）の依存関係だけを更新する
     #[arg(long)]
     pub php: bool,
 
-    /// Update only Java (build.gradle) dependencies
+    /// Java（build.gradle）の依存関係だけを更新する
     #[arg(long)]
     pub java: bool,
 
-    /// Update only Swift (Package.swift) dependencies
+    /// Swift（Package.swift）の依存関係だけを更新する
     #[arg(long)]
     pub swift: bool,
 
     // パッケージフィルタ
-    /// Exclude specific packages from update (can be specified multiple times)
+    /// 指定したパッケージを更新対象から除外する（複数回指定可）
     #[arg(long, action = ArgAction::Append)]
     pub exclude: Vec<String>,
 
-    /// Update only specific packages (can be specified multiple times)
+    /// 指定したパッケージだけを更新する（複数回指定可）
     #[arg(long, action = ArgAction::Append)]
     pub only: Vec<String>,
 
-    /// Include pinned versions in update
+    /// 固定バージョンも更新対象に含める
     #[arg(long)]
     pub include_pinned: bool,
 
     // 経過時間フィルタ
-    /// Only update to versions released at least this long ago (e.g., 2w, 10d, 1m)
+    /// 指定期間以上前にリリースされたバージョンだけへ更新する（例: 2w、10d、1m）
     #[arg(long, value_parser = parse_duration, conflicts_with = "no_age")]
     pub age: Option<Duration>,
 
-    /// Disable the age filter for this run (overrides global config and default)
+    /// 今回の実行ではリリース経過期間フィルタを無効にする（グローバル設定と既定値より優先）
     #[arg(long = "no-age")]
     pub no_age: bool,
 
     // 脆弱性チェック (OSV.dev)
-    /// Check candidate versions against the OSV.dev vulnerability database
-    /// and skip versions with known vulnerabilities (requires network access)
+    /// 更新候補を OSV.dev の脆弱性データベースで確認し、
+    /// 既知の脆弱性があるバージョンを除外する（ネットワーク接続が必要）
     #[arg(long, conflicts_with = "no_osv")]
     pub osv: bool,
 
-    /// Disable OSV vulnerability check for this run (overrides global config)
+    /// 今回の実行では OSV 脆弱性チェックを無効にする（グローバル設定より優先）
     #[arg(long = "no-osv")]
     pub no_osv: bool,
 
     // 変更レベル上限
-    /// Limit the maximum allowed version change (patch / minor / major).
-    /// Default: no limit (= major bumps allowed).
+    /// 許可する最大のバージョン変更レベルを制限する（patch / minor / major）
+    /// 既定値は制限なし（メジャー更新を許可）
     #[arg(long, value_parser = parse_change_level)]
     pub max_change: Option<ChangeLevel>,
 
     // 出力オプション
-    /// Output results in JSON format
+    /// 結果を JSON 形式で出力する
     #[arg(long)]
     pub json: bool,
 
-    /// Show changes in diff format
+    /// 変更を diff 形式で表示する
     #[arg(long)]
     pub diff: bool,
 
     // インストールオプション
-    /// Run package manager install after update
+    /// 更新後にパッケージマネージャのインストール処理を実行する
     #[arg(long)]
     pub install: bool,
 }

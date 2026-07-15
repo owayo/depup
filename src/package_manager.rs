@@ -231,18 +231,18 @@ impl SystemPackageManager {
             "poetry" => vec!["poetry", "install"],
             "rye" => vec!["rye", "sync"],
             "pipenv" => vec!["pipenv", "install"],
-            // Rust
+            // Rust の処理
             "cargo" => vec!["cargo", "update"],
             // Go
             "go" => vec!["go", "mod", "download"],
-            // Ruby
+            // Ruby の処理
             "bundle" => vec!["bundle", "install"],
-            // PHP
+            // PHP の処理
             "composer" => vec!["composer", "install"],
-            // Java/Gradle
+            // Java/Gradle の処理
             "gradle" => vec!["gradle", "dependencies"],
             "./gradlew" => vec!["./gradlew", "dependencies"],
-            // Swift
+            // Swift の処理
             "swift" => vec!["swift", "package", "resolve"],
             _ => vec![],
         }

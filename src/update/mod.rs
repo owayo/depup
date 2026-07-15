@@ -9,8 +9,10 @@ mod filter;
 mod version_info;
 
 pub use filter::UpdateFilter;
-pub(crate) use version_info::numeric_core;
-pub use version_info::{VersionInfo, compare_versions, is_prerelease_version};
+pub(crate) use version_info::{NumericIdentifier, numeric_core};
+pub use version_info::{
+    VersionInfo, compare_semver_versions, compare_versions, is_prerelease_version,
+};
 // Python の PEP 440 (local version / epoch 等) を含む言語別比較を OSV フォールバック等から
 // 直接呼び出せるように公開する。
 pub use version_info::compare_python_versions;
@@ -375,12 +377,21 @@ impl UpdateJudge {
         dependency: &Dependency,
         available_versions: &'a [VersionInfo],
     ) -> Vec<&'a VersionInfo> {
-        if is_prerelease_version(dependency.version()) {
+        let is_prerelease = |version: &str| match dependency.language {
+            Language::Node | Language::Rust | Language::Go | Language::Swift => {
+                version_info::is_semver_prerelease_version(version)
+            }
+            Language::Python => version_info::is_python_prerelease_version(version),
+            Language::Ruby => version_info::is_ruby_prerelease_version(version),
+            _ => is_prerelease_version(version),
+        };
+
+        if is_prerelease(dependency.version()) {
             available_versions.iter().collect()
         } else {
             available_versions
                 .iter()
-                .filter(|v| !v.is_prerelease())
+                .filter(|v| !is_prerelease(&v.version))
                 .collect()
         }
     }
@@ -417,7 +428,7 @@ fn apply_range_upper_bound<'a>(
     candidates
         .into_iter()
         .filter(
-            |v| match version_info::compare_versions(&v.version, &upper_bound) {
+            |v| match compare_dependency_versions(dependency, &v.version, &upper_bound) {
                 std::cmp::Ordering::Less => true,
                 std::cmp::Ordering::Equal => inclusive,
                 std::cmp::Ordering::Greater => false,
@@ -426,7 +437,7 @@ fn apply_range_upper_bound<'a>(
         .collect()
 }
 
-fn matches_rejected_version(candidate: &str, rejected: &str) -> bool {
+fn matches_rejected_version(dependency: &Dependency, candidate: &str, rejected: &str) -> bool {
     let rejected = rejected.trim();
     if rejected.is_empty() {
         return false;
@@ -438,6 +449,29 @@ fn matches_rejected_version(candidate: &str, rejected: &str) -> bool {
 
     if let Some(prefix) = rejected.strip_suffix('+') {
         return candidate.starts_with(prefix);
+    }
+
+    if let Some(captures) = MAVEN_RANGE_RE.captures(rejected) {
+        let lower = captures.get(2).map(|value| value.as_str());
+        let upper = captures.get(3).map(|value| value.as_str());
+        let lower_inclusive = captures.get(1).map(|value| value.as_str()) == Some("[");
+        let upper_inclusive = captures.get(4).map(|value| value.as_str()) == Some("]");
+
+        let above_lower = lower.is_none_or(|bound| {
+            match compare_dependency_versions(dependency, candidate, bound) {
+                std::cmp::Ordering::Greater => true,
+                std::cmp::Ordering::Equal => lower_inclusive,
+                std::cmp::Ordering::Less => false,
+            }
+        });
+        let below_upper = upper.is_none_or(|bound| {
+            match compare_dependency_versions(dependency, candidate, bound) {
+                std::cmp::Ordering::Less => true,
+                std::cmp::Ordering::Equal => upper_inclusive,
+                std::cmp::Ordering::Greater => false,
+            }
+        });
+        return above_lower && below_upper;
     }
 
     candidate == rejected
@@ -459,7 +493,7 @@ fn apply_rejected_versions<'a>(
                 .version_spec
                 .rejected_versions
                 .iter()
-                .any(|rejected| matches_rejected_version(&candidate.version, rejected))
+                .any(|rejected| matches_rejected_version(dependency, &candidate.version, rejected))
         })
         .collect()
 }
@@ -490,10 +524,14 @@ pub fn compare_dependency_versions(
     a: &str,
     b: &str,
 ) -> std::cmp::Ordering {
-    if dependency.language == Language::Python {
-        version_info::compare_python_versions(a, b)
-    } else {
-        version_info::compare_versions(a, b)
+    match dependency.language {
+        Language::Node | Language::Rust | Language::Go | Language::Swift => {
+            version_info::compare_semver_versions(a, b)
+        }
+        Language::Python => version_info::compare_python_versions(a, b),
+        Language::Ruby => version_info::compare_ruby_versions(a, b),
+        Language::Php => version_info::compare_composer_versions(a, b),
+        Language::Java => version_info::compare_gradle_versions(a, b),
     }
 }
 
@@ -1106,6 +1144,24 @@ mod tests {
     }
 
     #[test]
+    fn test_judge_python_pep440_preview_spelling_not_chosen_for_stable_user() {
+        let filter = UpdateFilter::new();
+        let judge = UpdateJudge::new(filter);
+
+        let dep = make_dependency("django", "1.0", Language::Python, false);
+        let versions = vec![
+            make_version_info("1.0", 100),
+            make_version_info("2.0preview1", 10),
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_skip());
+        if let UpdateResult::Skip { reason, .. } = result {
+            assert_eq!(reason, SkipReason::AlreadyLatest);
+        }
+    }
+
+    #[test]
     fn test_judge_python_pep440_prefers_stable_over_rc() {
         // 安定版と rc が両方ある場合は安定版を選ぶ
         let filter = UpdateFilter::new();
@@ -1563,6 +1619,28 @@ mod tests {
             }
             other => panic!("unexpected result: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_judge_rejected_version_range_is_excluded() {
+        let judge = UpdateJudge::new(UpdateFilter::new());
+        let spec = VersionSpec::new(VersionSpecKind::Range, "[1.0,2.0)", "1.4")
+            .with_rejected_versions(["[1.5,1.9)"]);
+        let dep = Dependency::new("org.example:demo", spec, false, Language::Java);
+        let versions = vec![
+            make_version_info("1.5", 50),
+            make_version_info("1.8", 30),
+            make_version_info("1.9", 20),
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(matches!(
+            result,
+            UpdateResult::Update { ref new_version, .. } if new_version == "1.9"
+        ));
+        assert!(matches_rejected_version(&dep, "1.5", "[1.5,1.9)"));
+        assert!(matches_rejected_version(&dep, "1.8", "[1.5,1.9)"));
+        assert!(!matches_rejected_version(&dep, "1.9", "[1.5,1.9)"));
     }
 
     #[test]
@@ -2314,5 +2392,116 @@ mod tests {
         if let UpdateResult::Skip { reason, .. } = result {
             assert_eq!(reason, SkipReason::AlreadyLatest);
         }
+    }
+
+    #[test]
+    fn test_judge_ruby_unknown_prerelease_is_filtered_for_stable_user() {
+        let judge = UpdateJudge::new(UpdateFilter::new());
+        let dependency = make_dependency("rack", "0.9.0", Language::Ruby, false);
+        let versions = vec![
+            make_version_info("0.9.1", 10),
+            make_version_info("1.0.zeta", 10),
+        ];
+
+        let result = judge.judge(&dependency, &versions);
+        assert!(matches!(
+            result,
+            UpdateResult::Update { ref new_version, .. } if new_version == "0.9.1"
+        ));
+    }
+
+    #[test]
+    fn test_compare_dependency_versions_uses_ecosystem_rules() {
+        use std::cmp::Ordering;
+
+        let node = make_dependency("node", "1.0.0-1", Language::Node, false);
+        assert_eq!(
+            compare_dependency_versions(&node, "1.0.0-1", "1.0.0"),
+            Ordering::Less
+        );
+
+        let ruby = make_dependency("ruby", "1.0.zeta", Language::Ruby, false);
+        assert_eq!(
+            compare_dependency_versions(&ruby, "1.0.zeta", "1.0"),
+            Ordering::Less
+        );
+
+        let php = make_dependency("php", "1.0.0-p1", Language::Php, false);
+        assert_eq!(
+            compare_dependency_versions(&php, "1.0.0-p1", "1.0.0"),
+            Ordering::Greater
+        );
+
+        let java = make_dependency("java", "1.0-rc", Language::Java, false);
+        assert_eq!(
+            compare_dependency_versions(&java, "1.0-zeta", "1.0-rc"),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn test_judge_semver_numeric_prerelease_is_filtered_for_stable_user() {
+        let judge = UpdateJudge::new(UpdateFilter::new());
+        let dep = make_dependency("demo", "0.9.0", Language::Node, false);
+        let result = judge.judge(&dep, &[make_version_info("1.0.0-1", 10)]);
+
+        assert!(matches!(
+            result,
+            UpdateResult::Skip {
+                reason: SkipReason::NoSuitableVersion,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_judge_semver_numeric_prerelease_upgrades_to_stable() {
+        let judge = UpdateJudge::new(UpdateFilter::new());
+        let dep = make_dependency("demo", "1.0.0-1", Language::Rust, false);
+        let versions = vec![
+            make_version_info("1.0.0-1", 20),
+            make_version_info("1.0.0", 10),
+        ];
+        let result = judge.judge(&dep, &versions);
+
+        assert!(matches!(
+            result,
+            UpdateResult::Update { ref new_version, .. } if new_version == "1.0.0"
+        ));
+    }
+
+    #[test]
+    fn test_judge_gradle_does_not_downgrade_rc_to_ordinary_qualifier() {
+        let judge = UpdateJudge::new(UpdateFilter::new());
+        let dep = make_dependency("org.example:demo", "1.0-rc", Language::Java, false);
+        let versions = vec![
+            make_version_info("1.0-zeta", 10),
+            make_version_info("1.0-rc", 20),
+        ];
+        let result = judge.judge(&dep, &versions);
+
+        assert!(matches!(
+            result,
+            UpdateResult::Skip {
+                reason: SkipReason::AlreadyLatest,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_judge_composer_patch_alias_is_not_downgraded() {
+        let judge = UpdateJudge::new(UpdateFilter::new());
+        let dep = make_dependency("vendor/demo", "1.0.0-p1", Language::Php, false);
+        let versions = vec![make_version_info("1.0.0", 10)];
+        let result = judge.judge(&dep, &versions);
+
+        assert!(matches!(
+            result,
+            UpdateResult::Skip {
+                reason: SkipReason::AlreadyLatest,
+                ..
+            }
+        ));
     }
 }

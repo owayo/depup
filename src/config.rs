@@ -4,7 +4,7 @@
 //! 各行はマニフェストファイルを含むサブディレクトリへの相対パス。
 //! `#` で始まる行はコメントとして扱い、インラインの `#` コメントもサポートする。
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// `.depup` ファイルから解析された設定
 #[derive(Debug, Clone)]
@@ -52,6 +52,13 @@ impl DepupConfig {
     /// 存在しないディレクトリは警告を出してスキップする。
     pub fn parse(content: &str, base_dir: &Path) -> Result<Self, String> {
         let mut directories = Vec::new();
+        let canonical_base = base_dir.canonicalize().map_err(|error| {
+            format!(
+                "failed to resolve .depup base directory '{}': {}",
+                base_dir.display(),
+                error
+            )
+        })?;
 
         for line in content.lines() {
             // インラインコメントを除去
@@ -65,6 +72,18 @@ impl DepupConfig {
                 continue;
             }
 
+            let configured_path = Path::new(trimmed);
+            if configured_path.is_absolute()
+                || configured_path
+                    .components()
+                    .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
+            {
+                return Err(format!(
+                    "directory '{}' must be a relative path below the .depup directory",
+                    trimmed
+                ));
+            }
+
             let dir_path = base_dir.join(trimmed);
             if !dir_path.is_dir() {
                 eprintln!(
@@ -72,6 +91,20 @@ impl DepupConfig {
                     dir_path.display()
                 );
                 continue;
+            }
+
+            let canonical_dir = dir_path.canonicalize().map_err(|error| {
+                format!(
+                    "failed to resolve directory '{}': {}",
+                    dir_path.display(),
+                    error
+                )
+            })?;
+            if !canonical_dir.starts_with(&canonical_base) {
+                return Err(format!(
+                    "directory '{}' resolves outside the .depup directory",
+                    trimmed
+                ));
             }
 
             directories.push(dir_path);
@@ -324,5 +357,39 @@ missing
         assert_eq!(config.directories.len(), 2);
         assert_eq!(config.directories[0], dir.path().join("packages/frontend"));
         assert_eq!(config.directories[1], dir.path().join("packages/backend"));
+    }
+
+    #[test]
+    fn test_parse_rejects_parent_directory_escape() {
+        let parent = create_test_dir();
+        let base = parent.path().join("project");
+        fs::create_dir(&base).unwrap();
+        fs::create_dir(parent.path().join("outside")).unwrap();
+
+        let error = DepupConfig::parse("../outside\n", &base).unwrap_err();
+        assert!(error.contains("relative path below"));
+    }
+
+    #[test]
+    fn test_parse_rejects_absolute_directory() {
+        let base = create_test_dir();
+        let outside = create_test_dir();
+
+        let error = DepupConfig::parse(&format!("{}\n", outside.path().display()), base.path())
+            .unwrap_err();
+        assert!(error.contains("relative path below"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_parse_rejects_symlink_resolving_outside_base() {
+        use std::os::unix::fs::symlink;
+
+        let base = create_test_dir();
+        let outside = create_test_dir();
+        symlink(outside.path(), base.path().join("outside-link")).unwrap();
+
+        let error = DepupConfig::parse("outside-link\n", base.path()).unwrap_err();
+        assert!(error.contains("resolves outside"));
     }
 }

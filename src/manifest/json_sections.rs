@@ -198,3 +198,72 @@ pub(crate) fn replace_string_property_in_ranges(
 
     Ok((result, updated))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_top_level_ranges_ignore_braces_and_escaped_quotes_in_strings() {
+        let content = r#"{
+  "description": "文字列内の { dependencies } と \"引用符\" は構造ではない",
+  "dependencies": { "serde": "1.0" },
+  "nested": { "dependencies": { "serde": "0.9" } }
+}"#;
+
+        let ranges = top_level_object_section_ranges(content, &["dependencies"]);
+
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(&content[ranges[0].0..ranges[0].1], r#" "serde": "1.0" "#);
+    }
+
+    #[test]
+    fn test_direct_child_ranges_only_return_selected_sections() {
+        let content = r#"{
+  "workspaces": {
+    "catalog": { "react": "^19.0.0" },
+    "ignored": { "react": "^18.0.0" }
+  }
+}"#;
+        let parents = top_level_object_section_ranges(content, &["workspaces"]);
+
+        let ranges = direct_child_object_section_ranges(content, &parents, Some(&["catalog"]));
+
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(
+            &content[ranges[0].0..ranges[0].1],
+            r#" "react": "^19.0.0" "#
+        );
+    }
+
+    #[test]
+    fn test_replace_property_updates_multiple_ranges_from_the_end() {
+        let content = r#"{
+  "dependencies": { "@scope/pkg": "^1.0.0" },
+  "devDependencies": { "@scope/pkg": "~1.0.0" },
+  "overrides": { "@scope/pkg": "1.0.0" }
+}"#;
+
+        let (updated, changed) = replace_string_property_in_top_level_sections(
+            content,
+            &["dependencies", "devDependencies"],
+            "@scope/pkg",
+            |old| Some(old.replace("1.0.0", "2.0.0")),
+        )
+        .unwrap();
+
+        assert!(changed);
+        assert!(updated.contains(r#""@scope/pkg": "^2.0.0""#));
+        assert!(updated.contains(r#""@scope/pkg": "~2.0.0""#));
+        assert!(updated.contains(r#""overrides": { "@scope/pkg": "1.0.0" }"#));
+    }
+
+    #[test]
+    fn test_malformed_object_returns_no_range_without_panicking() {
+        let content = r#"{ "dependencies": { "serde": "1.0" "#;
+
+        let ranges = top_level_object_section_ranges(content, &["dependencies"]);
+
+        assert!(ranges.is_empty());
+    }
+}

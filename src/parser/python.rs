@@ -2,14 +2,15 @@
 //!
 //! 対応する形式:
 //! - 固定: `==1.2.3`
-//! - Caret: `^1.2.3` (Poetry)
-//! - Tilde: `~1.2.3`, `~=1.2.3`
+//! - キャレット: `^1.2.3`（Poetry）
+//! - チルダ: `~1.2.3`, `~=1.2.3`
 //! - 比較演算子: `>=1.2.3`, `>1.2.3`, `<=1.2.3`, `<1.2.3`, `!=1.2.3`, `===1.2.3`
 //! - ワイルドカード: `1.*`
 //! - レンジ: `>=1.0,<2.0`
 
 use crate::domain::{Language, VersionSpec, VersionSpecKind, range_lower_bound_version};
 use crate::parser::VersionParser;
+use pep440_rs::Version as Pep440Version;
 use regex::Regex;
 use std::sync::LazyLock;
 
@@ -94,6 +95,21 @@ fn normalize_local_label(local: &str) -> String {
 
 fn normalize_for_compare_inner(version: &str, preserve_local: bool) -> String {
     let s = version.trim();
+    let pep440_input = s
+        .strip_suffix('*')
+        .map(|value| value.trim_end_matches(['.', '-', '_']))
+        .unwrap_or(s);
+
+    if let Ok(parsed) = pep440_input.parse::<Pep440Version>() {
+        return if preserve_local {
+            parsed.to_string()
+        } else {
+            parsed.without_local().to_string()
+        };
+    }
+
+    // `===` の arbitrary equality は PEP 440 の正規バージョン以外も許容するため、
+    // 標準パーサで解釈できない入力だけ従来の安全な数値抽出へフォールバックする。
     let s = s
         .strip_prefix('v')
         .or_else(|| s.strip_prefix('V'))
@@ -815,6 +831,25 @@ mod tests {
         assert_eq!(normalize_for_compare("  1.2.3  "), "1.2.3");
         assert_eq!(normalize_for_compare(""), "");
         assert_eq!(normalize_for_compare("custom"), "");
+    }
+
+    #[test]
+    fn test_normalize_for_compare_pep440_alternative_spellings() {
+        // PEP 440 が受理する区切り・別綴り・暗黙番号は正規形へ揃える。
+        assert_eq!(normalize_for_compare("1.0_alpha1"), "1.0a1");
+        assert_eq!(normalize_for_compare("1.0beta2"), "1.0b2");
+        assert_eq!(normalize_for_compare("1.0preview3"), "1.0rc3");
+        assert_eq!(normalize_for_compare("1.0c4"), "1.0rc4");
+        assert_eq!(normalize_for_compare("1.0-r4"), "1.0.post4");
+        assert_eq!(normalize_for_compare("1.0_dev"), "1.0.dev0");
+    }
+
+    #[test]
+    fn test_parse_pep440_alternative_spelling_uses_canonical_version() {
+        let spec = parse("==1.0_alpha1").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "1.0a1");
+        assert_eq!(spec.prefix, Some("==".to_string()));
     }
 
     #[test]
