@@ -10,10 +10,12 @@
 #[cfg(test)]
 use crate::domain::Language;
 use crate::domain::{
-    GitReference, GitSource, ManifestUpdateResult, SkipReason, UpdateResult, UpdateSummary,
+    ChangeLevel, GitReference, GitSource, ManifestUpdateResult, SkipReason, UpdateResult,
+    UpdateSummary,
 };
 use crate::orchestrator::OrchestratorResult;
 use crate::output::{OutputFormatter, Verbosity};
+use crate::update::numeric_core;
 use chrono::{DateTime, Utc};
 use colored::Colorize;
 use std::io::Write;
@@ -35,42 +37,30 @@ pub enum VersionChangeType {
 
 impl VersionChangeType {
     /// 2つのバージョン間の変更種別を判定
+    ///
+    /// major/minor/patch の分類は `--max-change` の judge が使う
+    /// `ChangeLevel::from_versions` (任意桁の数値コア比較) に委譲し、
+    /// 表示ラベルと judge の分類が食い違わないようにする。
     pub fn from_versions(old: &str, new: &str) -> Self {
         // 旧バージョンが空か "-" なら新規追加
         if old.is_empty() || old == "-" {
             return VersionChangeType::New;
         }
 
-        let parse = |v: &str| -> Option<(u64, u64, u64)> {
-            let v = v.strip_prefix('v').unwrap_or(v);
-            // . と - で分割してプレリリースサフィックスに対応
-            let parts: Vec<&str> = v.split(['.', '-']).collect();
-            if parts.len() >= 3 {
-                Some((
-                    parts[0].parse().ok()?,
-                    parts[1].parse().ok()?,
-                    parts[2].parse().ok()?,
-                ))
-            } else if parts.len() == 2 {
-                Some((parts[0].parse().ok()?, parts[1].parse().ok()?, 0))
-            } else if parts.len() == 1 {
-                Some((parts[0].parse().ok()?, 0, 0))
-            } else {
-                None
-            }
-        };
-
-        match (parse(old), parse(new)) {
-            (Some((old_major, old_minor, _)), Some((new_major, new_minor, _))) => {
-                if new_major != old_major {
-                    VersionChangeType::Major
-                } else if new_minor != old_minor {
-                    VersionChangeType::Minor
+        match ChangeLevel::from_versions(old, new) {
+            Some(ChangeLevel::Major) => VersionChangeType::Major,
+            Some(ChangeLevel::Minor) => VersionChangeType::Minor,
+            Some(ChangeLevel::Patch) => VersionChangeType::Patch,
+            // ChangeLevel は「数値コア同値」と「パース不能」の両方で None を返す。
+            // 数値コアが両側で取れているなら先頭3セグメント同値 (旧実装と同じく
+            // Patch 表示)、取れていなければ Unknown。
+            None => {
+                if numeric_core(old.trim()).is_empty() || numeric_core(new.trim()).is_empty() {
+                    VersionChangeType::Unknown
                 } else {
                     VersionChangeType::Patch
                 }
             }
-            _ => VersionChangeType::Unknown,
         }
     }
 
@@ -1154,6 +1144,28 @@ mod tests {
         assert_eq!(
             VersionChangeType::from_versions("1.2.3.4", "2.0.0.0"),
             VersionChangeType::Major
+        );
+    }
+
+    /// 回帰テスト: ChangeLevel への委譲で judge (--max-change) と分類が揃う。
+    /// 以前の独自 u64 パーサは u64 超の数値で Unknown、大文字 V 接頭辞で
+    /// Unknown になり、judge の分類と食い違っていた。
+    #[test]
+    fn test_version_change_type_matches_change_level_semantics() {
+        // u64 を超える数値コアでも任意桁10進で比較される
+        assert_eq!(
+            VersionChangeType::from_versions("18446744073709551616.0.0", "2.0.0"),
+            VersionChangeType::Major
+        );
+        // 大文字 V 接頭辞も numeric_core 側で除去される
+        assert_eq!(
+            VersionChangeType::from_versions("V1.0.0", "V2.0.0"),
+            VersionChangeType::Major
+        );
+        // qualifier セグメント (数値なし) は無視され Patch 扱い
+        assert_eq!(
+            VersionChangeType::from_versions("5.0.0.RELEASE", "5.0.1"),
+            VersionChangeType::Patch
         );
     }
 }
