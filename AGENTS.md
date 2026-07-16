@@ -51,7 +51,7 @@ src/
     gradle.rs        - Java パーサ
     gradle_version_catalog.rs - Gradle version catalog パーサ
     json_sections.rs - JSON マニフェストの依存セクション限定書き換え補助 (ネストした object 範囲の抽出含む)
-    line_utils.rs    - 行末改行分離 (split_line_ending)・クォート判定 (captured_quote_and_version)・クォート考慮の # 行コメント除去 (strip_hash_line_comment、HashCommentMode でバックスラッシュエスケープ解釈を Gemfile/TOML で切替) の共通ヘルパ。CRLF 保持と TOML クォート種別判定の単一情報源で、cargo_toml / gemfile / gradle / gradle_version_catalog / pyproject_toml が共用する
+    line_utils.rs    - 行末改行分離 (split_line_ending)・クォート判定 (captured_quote_and_version)・クォート考慮の # 行コメント除去 (strip_hash_line_comment、HashCommentMode でバックスラッシュエスケープ解釈を Gemfile/TOML で切替)・TOML セクションヘッダ字句解析 (parse_toml_section_header、`[key]` / `[[key]]` / ヘッダ内空白 / 行末コメントを解釈) の共通ヘルパ。CRLF 保持と TOML クォート種別判定・セクション追跡の単一情報源で、cargo_toml / gemfile / gradle / gradle_version_catalog / pyproject_toml が共用する
     package_swift.rs - Swift パーサ
     pnpm_settings.rs - pnpm設定読み取り
   parser/           - 言語別パース処理

@@ -2,7 +2,7 @@
 
 use crate::domain::{Dependency, Language, VersionSpec, VersionSpecKind};
 use crate::error::ManifestError;
-use crate::manifest::line_utils::split_line_ending;
+use crate::manifest::line_utils::{parse_toml_section_header, split_line_ending};
 use crate::parser::get_parser;
 use regex::Regex;
 use std::path::PathBuf;
@@ -132,19 +132,10 @@ fn line_starts_toml_assignment(line: &str, key: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// セクションヘッダ行 (`[versions]` / `[libraries]` 等) からセクション名を取り出す。
+/// 字句解析は line_utils の共有実装に委譲する。
 fn toml_section_name(line: &str) -> Option<String> {
-    let trimmed = line.trim();
-    let trimmed = trimmed.split('#').next().unwrap_or("").trim();
-    if !trimmed.starts_with('[') || !trimmed.ends_with(']') {
-        return None;
-    }
-
-    let section = trimmed.trim_start_matches('[').trim_end_matches(']');
-    if section.starts_with('[') || section.ends_with(']') {
-        return None;
-    }
-
-    Some(section.trim().to_string())
+    parse_toml_section_header(line).map(str::to_string)
 }
 
 fn parse_version_catalog_version_table(

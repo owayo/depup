@@ -12,7 +12,7 @@ use crate::domain::{Dependency, GitReference, GitSource, Language, VersionSpec, 
 use crate::error::ManifestError;
 use crate::manifest::{
     ManifestParser,
-    line_utils::{captured_quote_and_version, split_line_ending},
+    line_utils::{captured_quote_and_version, parse_toml_section_header, split_line_ending},
 };
 use crate::parser::{VersionParser, get_parser};
 use regex::Regex;
@@ -23,13 +23,13 @@ use toml::Value;
 /// `Cargo.toml` 用パーサ
 pub struct CargoTomlParser;
 
+/// セクションヘッダ行 (`[dependencies]` 等) からセクション名を取り出す。
+///
+/// 字句解析は line_utils の共有実装に委譲する。`[ dependencies ]` のような
+/// ヘッダ内空白は TOML 仕様どおりキーの一部にしない (toml クレートによる
+/// parse 側の解釈と一致し、依存セクションの照合が食い違わない)。
 fn cargo_section_name(line: &str) -> Option<&str> {
-    let trimmed = line.split('#').next().unwrap_or(line).trim();
-    if trimmed.starts_with('[') && trimmed.ends_with(']') {
-        Some(trimmed.trim_matches(['[', ']']))
-    } else {
-        None
-    }
+    parse_toml_section_header(line)
 }
 
 fn is_cargo_dependency_section(section: &str) -> bool {
@@ -870,6 +870,24 @@ serde = "1.0.0"
     fn test_update_simple_version_under_commented_section_header() {
         let content = r#"
 [dependencies] # direct deps
+serde = "1.0.0"
+"#;
+
+        let result = CargoTomlParser
+            .update_version(content, "serde", "1.1.0")
+            .unwrap();
+
+        assert!(result.contains(r#"serde = "1.1.0""#));
+    }
+
+    /// 回帰テスト: TOML 仕様が許容するヘッダ内空白 (`[ dependencies ]`) でも
+    /// 依存セクションとして認識して更新できる。以前はセクション名に空白が
+    /// 残って照合に失敗し、parse (toml クレート) は依存として読むのに
+    /// writer は書き換えないという parse/write 不整合があった。
+    #[test]
+    fn test_update_simple_version_under_whitespace_padded_section_header() {
+        let content = r#"
+[ dependencies ]
 serde = "1.0.0"
 "#;
 
