@@ -8,7 +8,9 @@
 //! - crates.io クレート: tauri
 //!   全てが同じメジャー.マイナーバージョンである必要がある (例: 2.10.x)
 
-use crate::domain::{Language, UpdateResult};
+#[cfg(test)]
+use crate::domain::Language;
+use crate::domain::UpdateResult;
 use crate::update::VersionInfo;
 use std::cmp::Ordering;
 
@@ -111,6 +113,8 @@ impl TauriVersionSync {
     ///
     /// ターゲットのクレートバージョンを受け取り、全パッケージが使用すべき
     /// メジャー.マイナーを返す。戻り値は (npm_target_version, crate_target_version)。
+    /// 本番経路は `synchronize_with_current` に置き換え済みで、現在はテスト専用。
+    #[cfg(test)]
     fn get_synchronized_versions(&self, crate_target_version: &str) -> Option<(String, String)> {
         let target_mm = extract_major_minor(crate_target_version)?;
 
@@ -132,16 +136,22 @@ impl TauriVersionSync {
     }
 
     /// パッケージが Tauri npm パッケージかどうかをチェックする
+    ///
+    /// 本番経路は `TAURI_NPM_PACKAGES` / `TAURI_CRATE` を直接参照しており、
+    /// 以下 3 メソッドは現在テスト専用。
+    #[cfg(test)]
     fn is_tauri_npm_package(name: &str) -> bool {
         TAURI_NPM_PACKAGES.contains(&name)
     }
 
     /// パッケージが Tauri クレートかどうかをチェックする
+    #[cfg(test)]
     fn is_tauri_crate(name: &str) -> bool {
         name == TAURI_CRATE
     }
 
     /// パッケージが何らかの Tauri パッケージかどうかをチェックする
+    #[cfg(test)]
     fn is_tauri_package(name: &str, language: Language) -> bool {
         match language {
             Language::Node => Self::is_tauri_npm_package(name),
