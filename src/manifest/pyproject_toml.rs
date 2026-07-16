@@ -12,7 +12,10 @@ use crate::domain::{Dependency, Language};
 use crate::error::ManifestError;
 use crate::manifest::{
     ManifestParser,
-    line_utils::{HashCommentMode, captured_quote_and_version, strip_hash_line_comment},
+    line_utils::{
+        HashCommentMode, captured_quote_and_version, parse_toml_section_header,
+        strip_hash_line_comment,
+    },
 };
 use crate::parser::{VersionParser, get_parser};
 use regex::Regex;
@@ -336,22 +339,10 @@ enum TomlSectionKind {
     Other,
 }
 
-/// TOML のセクションヘッダ行 (`[section]` / `[[section]]`) からドット区切りキーを取り出す
+/// TOML のセクションヘッダ行 (`[section]` / `[[section]]`) からドット区切りキーを取り出す。
+/// 字句解析は line_utils の共有実装に委譲する (この実装が共有元になった)。
 fn toml_section_header(line: &str) -> Option<&str> {
-    let trimmed = line.trim();
-    if !trimmed.starts_with('[') {
-        return None;
-    }
-    let inner = trimmed
-        .strip_prefix("[[")
-        .or_else(|| trimmed.strip_prefix('['))?;
-    let close = inner.find(']')?;
-    let key = inner[..close].trim();
-    let rest = inner[close..].trim_start_matches(']').trim_start();
-    if key.is_empty() || !(rest.is_empty() || rest.starts_with('#')) {
-        return None;
-    }
-    Some(key)
+    parse_toml_section_header(line)
 }
 
 /// セクションヘッダのドット区切りキーから置換対象種別を判定する
