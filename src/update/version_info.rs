@@ -430,13 +430,27 @@ fn parse_version_components_with_options(
     let core = split.next().unwrap_or("");
     let hyphen_pre = split.next();
 
-    // 数値コアを '.' 区切りで走査する。各セグメントは先頭の数値部分のみを取り、
-    // 英字が続くセグメントは種類に応じて解釈する:
-    //   - "post" で始まれば ポストリリース (例: "post1")
-    //   - 数字が先行していれば PEP 440 のセパレータなし prerelease (例: "0rc1" の "rc1")
-    //   - 既知の prerelease 識別子で始まれば dot 区切り prerelease
-    //     (例: "1.0.1.dev1" の "dev1"、Ruby 風 "7.0.0.alpha.2" の "alpha" 以降)
-    //   - それ以外の英字 qualifier (Java の RELEASE / Final 等) はそこで走査を終える
+    let (nums, core_pre, post) = scan_core_segments(core);
+    let pre = resolve_hyphen_prerelease(core_pre, hyphen_pre, numeric_hyphen_is_prerelease);
+
+    (epoch, nums, pre, post)
+}
+
+/// 数値コアを '.' 区切りで走査し、数値列・コア内 prerelease・post を取り出す。
+///
+/// 各セグメントは先頭の数値部分のみを取り、英字が続くセグメントは種類に応じて解釈する:
+///   - "post" で始まれば ポストリリース (例: "post1")
+///   - 数字が先行していれば PEP 440 のセパレータなし prerelease (例: "0rc1" の "rc1")
+///   - 既知の prerelease 識別子で始まれば dot 区切り prerelease
+///     (例: "1.0.1.dev1" の "dev1"、Ruby 風 "7.0.0.alpha.2" の "alpha" 以降)
+///   - それ以外の英字 qualifier (Java の RELEASE / Final 等) はそこで走査を終える
+fn scan_core_segments(
+    core: &str,
+) -> (
+    Vec<NumericIdentifier>,
+    Option<Vec<PreIdentifier>>,
+    Option<NumericIdentifier>,
+) {
     let segments: Vec<&str> = core.split('.').collect();
     let mut nums = Vec::new();
     let mut core_pre: Option<Vec<PreIdentifier>> = None;
@@ -491,35 +505,41 @@ fn parse_version_components_with_options(
         // 含めず、位置ずれ比較を防ぐためここで走査を終える
         break;
     }
+    (nums, core_pre, post)
+}
 
-    // プレリリース識別子列を確定する。
-    // - 数値コア内で見つかった prerelease (core_pre) を優先する
-    // - '-' 区切り表記 (hyphen_pre, 例: "canary-456" → [canary, 456], "rc.1" → [rc, 1])
-    //   は数値パース成功 → Numeric、失敗 → Alpha (小文字化) として構造化する
-    // Java では純粋な数値サフィックスを安定版の追加パートとして扱う一方、SemVer
-    // では数値だけでも prerelease になる。呼び出し側の規則で切り替える。
-    let pre = if core_pre.is_some() {
-        core_pre
-    } else {
-        hyphen_pre.and_then(|p| {
-            if !p.is_empty()
-                && (numeric_hyphen_is_prerelease
-                    || p.split('.')
-                        .any(|part| NumericIdentifier::parse(part).is_none()))
-            {
-                Some(
-                    p.split(['.', '-'])
-                        .filter(|part| !part.is_empty())
-                        .map(PreIdentifier::from_part)
-                        .collect(),
-                )
-            } else {
-                None
-            }
-        })
-    };
-
-    (epoch, nums, pre, post)
+/// プレリリース識別子列を確定する。
+///
+/// - 数値コア内で見つかった prerelease (`core_pre`) を優先する
+/// - '-' 区切り表記 (`hyphen_pre`, 例: "canary-456" → [canary, 456], "rc.1" → [rc, 1])
+///   は数値パース成功 → Numeric、失敗 → Alpha (小文字化) として構造化する
+///
+/// Java では純粋な数値サフィックスを安定版の追加パートとして扱う一方、SemVer
+/// では数値だけでも prerelease になる。`numeric_hyphen_is_prerelease` で切り替える。
+fn resolve_hyphen_prerelease(
+    core_pre: Option<Vec<PreIdentifier>>,
+    hyphen_pre: Option<&str>,
+    numeric_hyphen_is_prerelease: bool,
+) -> Option<Vec<PreIdentifier>> {
+    if core_pre.is_some() {
+        return core_pre;
+    }
+    hyphen_pre.and_then(|p| {
+        if !p.is_empty()
+            && (numeric_hyphen_is_prerelease
+                || p.split('.')
+                    .any(|part| NumericIdentifier::parse(part).is_none()))
+        {
+            Some(
+                p.split(['.', '-'])
+                    .filter(|part| !part.is_empty())
+                    .map(PreIdentifier::from_part)
+                    .collect(),
+            )
+        } else {
+            None
+        }
+    })
 }
 
 fn parse_local_identifiers(local: &str) -> Option<Vec<LocalIdentifier>> {
