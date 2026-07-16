@@ -1789,6 +1789,148 @@ mod tests {
         );
     }
 
+    /// characterization テスト: 分解ロジックのリファクタで挙動が変わらないことを
+    /// 固定する。前処理 (v/V・ビルドメタデータ・エポック)、コアセグメント走査の
+    /// 各分岐 (post / セパレータなし prerelease + 後続 post / dot 区切り prerelease /
+    /// qualifier)、多バイト境界の panic セーフを component レベルで検証する。
+    #[test]
+    fn test_parse_version_components_preprocessing_and_scan_branches() {
+        use super::PreIdentifier::{Alpha, Numeric};
+        // v/V 接頭辞とビルドメタデータ (+...) は分解前に除去される
+        assert_eq!(
+            super::parse_version_components("V1.2.3+build.5"),
+            (
+                numeric("0"),
+                vec![numeric("1"), numeric("2"), numeric("3")],
+                None,
+                None
+            )
+        );
+        // post は大文字小文字を区別しない
+        assert_eq!(
+            super::parse_version_components("1.0.POST2"),
+            (
+                numeric("0"),
+                vec![numeric("1"), numeric("0")],
+                None,
+                Some(numeric("2"))
+            )
+        );
+        // セパレータなし prerelease の後続セグメントから post を取りこぼさない
+        // (PEP 440 の `1.0a1.post1`)
+        assert_eq!(
+            super::parse_version_components("1.0a1.post1"),
+            (
+                numeric("0"),
+                vec![numeric("1"), numeric("0")],
+                Some(vec![Alpha("a".to_string()), Numeric(numeric("1"))]),
+                Some(numeric("1"))
+            )
+        );
+        // Ruby 風ドット区切り prerelease は識別子列として複数セグメントを取り込む
+        assert_eq!(
+            super::parse_version_components("7.0.0.alpha.2"),
+            (
+                numeric("0"),
+                vec![numeric("7"), numeric("0"), numeric("0")],
+                Some(vec![Alpha("alpha".to_string()), Numeric(numeric("2"))]),
+                None
+            )
+        );
+        // 多バイト文字を含む post セグメントはバイト列比較で panic せず、
+        // 末尾数字なしのため post は既定値 0 になる
+        assert_eq!(
+            super::parse_version_components("1.0.0.posté"),
+            (
+                numeric("0"),
+                vec![numeric("1"), numeric("0"), numeric("0")],
+                None,
+                Some(numeric("0"))
+            )
+        );
+        // 数値プレフィックス付き多バイトセグメントはセパレータなし prerelease として
+        // 文字境界安全に分解される
+        assert_eq!(
+            super::parse_version_components("1.0.0.0abcé"),
+            (
+                numeric("0"),
+                vec![numeric("1"), numeric("0"), numeric("0"), numeric("0")],
+                Some(vec![Alpha("abcé".to_string())]),
+                None
+            )
+        );
+        // u64 を超える数値コアも任意桁で保持される
+        assert_eq!(
+            super::parse_version_components("18446744073709551616.0"),
+            (
+                numeric("0"),
+                vec![numeric("18446744073709551616"), numeric("0")],
+                None,
+                None
+            )
+        );
+    }
+
+    /// characterization テスト: ハイフン区切り prerelease の確定規則を固定する。
+    /// `numeric_hyphen_is_prerelease` フラグ (semver: 純数字も prerelease /
+    /// Java: 安定版の追加パート) と、コア内 prerelease が優先される規則、
+    /// ネストしたハイフン・空 prerelease の扱いを検証する。
+    #[test]
+    fn test_parse_version_components_hyphen_prerelease_resolution() {
+        use super::PreIdentifier::{Alpha, Numeric};
+        // 純数字ハイフンはデフォルト (Java 等) では prerelease にならない
+        assert_eq!(
+            super::parse_version_components_with_options("1.0.0-1", false),
+            (
+                numeric("0"),
+                vec![numeric("1"), numeric("0"), numeric("0")],
+                None,
+                None
+            )
+        );
+        // semver 系 (numeric_hyphen_is_prerelease=true) では純数字も prerelease
+        assert_eq!(
+            super::parse_version_components_with_options("1.0.0-1", true),
+            (
+                numeric("0"),
+                vec![numeric("1"), numeric("0"), numeric("0")],
+                Some(vec![Numeric(numeric("1"))]),
+                None
+            )
+        );
+        // 英字を含むハイフン prerelease はフラグに関係なく取り込まれ、
+        // 2 個目以降のハイフンも識別子区切りとして分解される
+        assert_eq!(
+            super::parse_version_components_with_options("1.0.0-canary-456", false),
+            (
+                numeric("0"),
+                vec![numeric("1"), numeric("0"), numeric("0")],
+                Some(vec![Alpha("canary".to_string()), Numeric(numeric("456"))]),
+                None
+            )
+        );
+        // 末尾ハイフンのみ (空 prerelease) は None
+        assert_eq!(
+            super::parse_version_components_with_options("1.2.3-", true),
+            (
+                numeric("0"),
+                vec![numeric("1"), numeric("2"), numeric("3")],
+                None,
+                None
+            )
+        );
+        // コアセグメント内で prerelease が確定した場合はハイフン側より優先される
+        assert_eq!(
+            super::parse_version_components_with_options("1.0rc1-beta", true),
+            (
+                numeric("0"),
+                vec![numeric("1"), numeric("0")],
+                Some(vec![Alpha("rc".to_string()), Numeric(numeric("1"))]),
+                None
+            )
+        );
+    }
+
     /// 回帰テスト (semver 11.4): プレリリースの英字識別子を ASCII 辞書順で比較する。
     /// 以前は数値識別子しか見ておらず `6.0.0-alpha.24 > 6.0.0-beta.2` となり、
     /// プレリリース利用者が beta → alpha へ実質ダウングレードされていた。
