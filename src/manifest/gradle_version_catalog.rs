@@ -388,15 +388,22 @@ fn replace_version_alias_line(
     }
 }
 
-fn update_version_catalog_version_alias(
+/// version catalog の行走査による書き換え共通処理。
+/// `toml_section_name` によるセクション追跡と split_inclusive('\n') + split_line_ending
+/// による CRLF/LF 保持を行いながら、対象セクション (`primary_section`) の行には
+/// `replace_primary` (対象エントリの `{ ... }` ブロック継続を追う `in_target_block` 付き) を、
+/// alias 専用テーブル (`alias_section`、例: `[versions.foo]`) の行には
+/// `replace_in_alias_section` を適用する。最初の更新以降は残りを素通しし、
+/// 1 行も更新できなければ None を返す。
+fn rewrite_catalog_lines(
     content: &str,
-    alias: &str,
-    update_member: Option<&str>,
-    formatted_version: &str,
+    primary_section: &str,
+    alias_section: &str,
+    mut replace_primary: impl FnMut(&str, &mut bool) -> Option<String>,
+    mut replace_in_alias_section: impl FnMut(&str) -> Option<String>,
 ) -> Option<String> {
     let mut result = String::new();
     let mut section = String::new();
-    let alias_section = format!("versions.{}", alias);
     let mut in_target_block = false;
     let mut updated = false;
 
@@ -411,22 +418,15 @@ fn update_version_catalog_version_alias(
         let trimmed = line.trim_start();
         let mut next_line = line.to_string();
 
-        if !updated && section == "versions" && !trimmed.starts_with('#') {
-            if let Some(replaced) = replace_version_alias_line(
-                line,
-                alias,
-                update_member,
-                formatted_version,
-                &mut in_target_block,
-            ) {
+        if !updated && section == primary_section && !trimmed.starts_with('#') {
+            if let Some(replaced) = replace_primary(line, &mut in_target_block) {
                 next_line = replaced;
                 updated = true;
             }
         } else if !updated
             && section == alias_section
             && !trimmed.starts_with('#')
-            && let Some(member) = update_member
-            && let Some(replaced) = replace_toml_string_member(line, member, formatted_version)
+            && let Some(replaced) = replace_in_alias_section(line)
         {
             next_line = replaced;
             updated = true;
@@ -441,6 +441,34 @@ fn update_version_catalog_version_alias(
     }
 
     Some(result)
+}
+
+fn update_version_catalog_version_alias(
+    content: &str,
+    alias: &str,
+    update_member: Option<&str>,
+    formatted_version: &str,
+) -> Option<String> {
+    let alias_section = format!("versions.{}", alias);
+    rewrite_catalog_lines(
+        content,
+        "versions",
+        &alias_section,
+        |line, in_target_block| {
+            replace_version_alias_line(
+                line,
+                alias,
+                update_member,
+                formatted_version,
+                in_target_block,
+            )
+        },
+        // `[versions.<alias>]` テーブル内は rich version メンバー指定時のみ書き換える
+        |line| {
+            update_member
+                .and_then(|member| replace_toml_string_member(line, member, formatted_version))
+        },
+    )
 }
 
 fn replace_library_version_value(
@@ -508,57 +536,25 @@ fn update_version_catalog_library_alias(
     formatted_version: &str,
 ) -> Option<String> {
     let (group, artifact) = entry.name.split_once(':')?;
-    let mut result = String::new();
-    let mut section = String::new();
     let alias_section = format!("libraries.{}", entry.alias);
-    let mut in_target_block = false;
-    let mut updated = false;
-
-    // CRLF/LF を保持するため split_inclusive で改行込みに走査する
-    for raw_line in content.split_inclusive('\n') {
-        let (line, line_ending) = split_line_ending(raw_line);
-        if let Some(new_section) = toml_section_name(line) {
-            section = new_section;
-            in_target_block = false;
-        }
-
-        let trimmed = line.trim_start();
-        let mut next_line = line.to_string();
-
-        if !updated && section == "libraries" && !trimmed.starts_with('#') {
-            if let Some(replaced) = replace_library_dotted_line(line, entry, formatted_version)
-                .or_else(|| {
-                    replace_library_assignment_line(
-                        line,
-                        entry,
-                        group,
-                        artifact,
-                        formatted_version,
-                        &mut in_target_block,
-                    )
-                })
-            {
-                next_line = replaced;
-                updated = true;
-            }
-        } else if !updated
-            && section == alias_section
-            && !trimmed.starts_with('#')
-            && let Some(replaced) = replace_library_version_value(line, entry, formatted_version)
-        {
-            next_line = replaced;
-            updated = true;
-        }
-
-        result.push_str(&next_line);
-        result.push_str(line_ending);
-    }
-
-    if !updated {
-        return None;
-    }
-
-    Some(result)
+    rewrite_catalog_lines(
+        content,
+        "libraries",
+        &alias_section,
+        |line, in_target_block| {
+            replace_library_dotted_line(line, entry, formatted_version).or_else(|| {
+                replace_library_assignment_line(
+                    line,
+                    entry,
+                    group,
+                    artifact,
+                    formatted_version,
+                    in_target_block,
+                )
+            })
+        },
+        |line| replace_library_version_value(line, entry, formatted_version),
+    )
 }
 
 pub(super) fn parse(content: &str) -> Result<Option<Vec<Dependency>>, ManifestError> {

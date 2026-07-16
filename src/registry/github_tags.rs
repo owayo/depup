@@ -8,7 +8,8 @@
 
 use crate::domain::Language;
 use crate::error::RegistryError;
-use crate::registry::{HttpClient, RegistryAdapter};
+use crate::registry::client::{map_send_error, map_status_error};
+use crate::registry::{HttpClient, RegistryAdapter, is_valid_registry_id_segment};
 use crate::update::VersionInfo;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -70,15 +71,14 @@ impl GitHubTagsAdapter {
 
     /// パッケージ名が "owner/repo" 形式かつ GitHub の許容文字のみであることを検証する。
     /// owner/repo に `?` `#` `/` `..` 等が混ざると `build_url` で URL クエリ汚染や
-    /// パストラバーサルが起きうるため、Maven Central と同様に文字種を限定する。
+    /// パストラバーサルが起きうるため、Maven Central と共通の検証
+    /// (`is_valid_registry_id_segment`) で文字種を限定する。
     fn validate_package_name(&self, package: &str) -> Result<(), RegistryError> {
         let parts: Vec<&str> = package.split('/').collect();
-        let is_valid_segment = |s: &str| {
-            !s.is_empty()
-                && s.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
-        };
-        if parts.len() != 2 || !is_valid_segment(parts[0]) || !is_valid_segment(parts[1]) {
+        if parts.len() != 2
+            || !is_valid_registry_id_segment(parts[0])
+            || !is_valid_registry_id_segment(parts[1])
+        {
             return Err(RegistryError::InvalidPackageName {
                 name: package.to_string(),
                 registry: self.registry_name().to_string(),
@@ -160,57 +160,33 @@ impl RegistryAdapter for GitHubTagsAdapter {
                 request = request.header("Authorization", format!("Bearer {}", token));
             }
 
-            let response = request.send().await.map_err(|e| {
-                if e.is_timeout() {
-                    RegistryError::Timeout {
-                        package: package.to_string(),
-                        registry: self.registry_name().to_string(),
-                    }
-                } else {
-                    RegistryError::NetworkError {
-                        package: package.to_string(),
-                        registry: self.registry_name().to_string(),
-                        message: e.to_string(),
-                    }
-                }
-            })?;
+            // 送信エラー (タイムアウト / トランスポート) は client.rs の共通マッピングで変換
+            let response = request
+                .send()
+                .await
+                .map_err(|e| map_send_error(&e, package, self.registry_name()))?;
 
-            // HTTP ステータスコードを処理
-            match response.status() {
-                status if status == reqwest::StatusCode::NOT_FOUND => {
-                    return Err(RegistryError::PackageNotFound {
-                        package: package.to_string(),
-                        registry: self.registry_name().to_string(),
-                    });
-                }
-                status if status == reqwest::StatusCode::TOO_MANY_REQUESTS => {
-                    return Err(RegistryError::RateLimitExceeded {
-                        registry: self.registry_name().to_string(),
-                    });
-                }
-                status if status == reqwest::StatusCode::FORBIDDEN => {
-                    // GitHub はレート制限超過を 403 + X-RateLimit-Remaining: 0 で返す。
-                    // 認証エラーと区別して報告する (classify_forbidden を参照)。
-                    let remaining = response
-                        .headers()
-                        .get("x-ratelimit-remaining")
-                        .and_then(|v| v.to_str().ok());
-                    return Err(classify_forbidden(remaining));
-                }
-                status if status == reqwest::StatusCode::UNAUTHORIZED => {
-                    return Err(RegistryError::AuthenticationError {
-                        registry: self.registry_name().to_string(),
-                        message: format!("HTTP {}", status),
-                    });
-                }
-                status if !status.is_success() => {
-                    return Err(RegistryError::NetworkError {
-                        package: package.to_string(),
-                        registry: self.registry_name().to_string(),
-                        message: format!("HTTP {}", status),
-                    });
-                }
-                _ => {}
+            // HTTP ステータスコードを処理。
+            // GitHub 固有の解釈が必要な 403 / 401 を先に処理し、
+            // 404 / 429 / その他の非成功ステータスは client.rs の共通マッピングへ委ねる。
+            let status = response.status();
+            if status == reqwest::StatusCode::FORBIDDEN {
+                // GitHub はレート制限超過を 403 + X-RateLimit-Remaining: 0 で返す。
+                // 認証エラーと区別して報告する (classify_forbidden を参照)。
+                let remaining = response
+                    .headers()
+                    .get("x-ratelimit-remaining")
+                    .and_then(|v| v.to_str().ok());
+                return Err(classify_forbidden(remaining));
+            }
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                return Err(RegistryError::AuthenticationError {
+                    registry: self.registry_name().to_string(),
+                    message: format!("HTTP {}", status),
+                });
+            }
+            if let Some(error) = map_status_error(status, package, self.registry_name()) {
+                return Err(error);
             }
 
             // 次ページ URL は body の消費前にヘッダから取り出しておく

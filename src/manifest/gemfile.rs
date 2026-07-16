@@ -9,7 +9,10 @@
 
 use crate::domain::{Dependency, Language, VersionSpec, VersionSpecKind};
 use crate::error::ManifestError;
-use crate::manifest::{ManifestParser, line_utils::split_line_ending};
+use crate::manifest::{
+    ManifestParser,
+    line_utils::{HashCommentMode, split_line_ending, strip_hash_line_comment},
+};
 use crate::parser::get_parser;
 use regex::Regex;
 use std::path::PathBuf;
@@ -90,23 +93,8 @@ fn has_non_registry_source(line: &str) -> bool {
 /// クォート外の `#` 以降 (行コメント) を取り除いた部分文字列を返す。
 /// 文字列リテラル内の `#` (例: `source 'http://x#y'`) はコメント扱いしない
 fn strip_line_comment(line: &str) -> &str {
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut escaped = false;
-    for (idx, ch) in line.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '\\' if in_single || in_double => escaped = true,
-            '\'' if !in_double => in_single = !in_single,
-            '"' if !in_single => in_double = !in_double,
-            '#' if !in_single && !in_double => return &line[..idx],
-            _ => {}
-        }
-    }
-    line
+    // Ruby はバックスラッシュエスケープを解釈する (`"a\"#b"` の `#` は文字列内)
+    strip_hash_line_comment(line, HashCommentMode::BackslashEscapes)
 }
 
 impl ManifestParser for GemfileParser {

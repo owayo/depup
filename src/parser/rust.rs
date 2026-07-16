@@ -9,7 +9,7 @@
 //! - レンジ: `>=1.0, <2.0`
 
 use crate::domain::{Language, VersionSpec, VersionSpecKind, range_lower_bound_version};
-use crate::parser::VersionParser;
+use crate::parser::{VersionParser, anchored_op_pattern};
 use regex::Regex;
 use std::sync::LazyLock;
 
@@ -28,19 +28,19 @@ pub struct RustVersionParser;
 // キャプチャ番号はずれない (末尾構造が異なる WILDCARD_RE は共有しない)。
 const RUST_VERSION_CORE: &str = r"[\d]+(?:\.[\d]+)*(?:-[\w.-]+)?(?:\+[\w.-]+)?";
 static EXACT_PINNED_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"^=\s*({RUST_VERSION_CORE})$")).unwrap());
+    LazyLock::new(|| Regex::new(&anchored_op_pattern(r"=", RUST_VERSION_CORE)).unwrap());
 static CARET_EXPLICIT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"^\^\s*({RUST_VERSION_CORE})$")).unwrap());
+    LazyLock::new(|| Regex::new(&anchored_op_pattern(r"\^", RUST_VERSION_CORE)).unwrap());
 static TILDE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"^~\s*({RUST_VERSION_CORE})$")).unwrap());
+    LazyLock::new(|| Regex::new(&anchored_op_pattern(r"~", RUST_VERSION_CORE)).unwrap());
 static GTE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"^>=\s*({RUST_VERSION_CORE})$")).unwrap());
+    LazyLock::new(|| Regex::new(&anchored_op_pattern(r">=", RUST_VERSION_CORE)).unwrap());
 static GT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"^>\s*({RUST_VERSION_CORE})$")).unwrap());
+    LazyLock::new(|| Regex::new(&anchored_op_pattern(r">", RUST_VERSION_CORE)).unwrap());
 static LTE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"^<=\s*({RUST_VERSION_CORE})$")).unwrap());
+    LazyLock::new(|| Regex::new(&anchored_op_pattern(r"<=", RUST_VERSION_CORE)).unwrap());
 static LT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"^<\s*({RUST_VERSION_CORE})$")).unwrap());
+    LazyLock::new(|| Regex::new(&anchored_op_pattern(r"<", RUST_VERSION_CORE)).unwrap());
 static BARE_VERSION_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&format!(r"^({RUST_VERSION_CORE})$")).unwrap());
 static RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {

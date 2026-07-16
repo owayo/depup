@@ -9,7 +9,7 @@
 //! - レンジ: `>=1.0.0 <2.0.0`, `1.2 <2.0.0`, `1.0.0 - 2.0.0`, `^1 || ^2`
 
 use crate::domain::{Language, VersionSpec, VersionSpecKind, range_lower_bound_version};
-use crate::parser::{VersionParser, is_fully_floating_wildcard};
+use crate::parser::{VersionParser, anchored_op_pattern, is_fully_floating_wildcard};
 use regex::Regex;
 use semver::Version;
 use std::sync::LazyLock;
@@ -74,19 +74,19 @@ fn normalize_valid_version(version: &str) -> Option<String> {
 const NODE_VERSION_PATTERN: &str = r"v?\d+(?:\.\d+){0,2}(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?";
 const NODE_VERSION_OR_X_PATTERN: &str = r"v?(?:\d+|[xX*])(?:\.(?:\d+|[xX*])){0,2}(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?";
 static CARET_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"^\^\s*({NODE_VERSION_PATTERN})$")).unwrap());
+    LazyLock::new(|| Regex::new(&anchored_op_pattern(r"\^", NODE_VERSION_PATTERN)).unwrap());
 static TILDE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"^~>?\s*({NODE_VERSION_PATTERN})$")).unwrap());
+    LazyLock::new(|| Regex::new(&anchored_op_pattern(r"~>?", NODE_VERSION_PATTERN)).unwrap());
 static GTE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"^>=\s*({NODE_VERSION_PATTERN})$")).unwrap());
+    LazyLock::new(|| Regex::new(&anchored_op_pattern(r">=", NODE_VERSION_PATTERN)).unwrap());
 static GT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"^>\s*({NODE_VERSION_PATTERN})$")).unwrap());
+    LazyLock::new(|| Regex::new(&anchored_op_pattern(r">", NODE_VERSION_PATTERN)).unwrap());
 static LTE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"^<=\s*({NODE_VERSION_PATTERN})$")).unwrap());
+    LazyLock::new(|| Regex::new(&anchored_op_pattern(r"<=", NODE_VERSION_PATTERN)).unwrap());
 static LT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"^<\s*({NODE_VERSION_PATTERN})$")).unwrap());
+    LazyLock::new(|| Regex::new(&anchored_op_pattern(r"<", NODE_VERSION_PATTERN)).unwrap());
 static EQUAL_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"^=\s*({NODE_VERSION_PATTERN})$")).unwrap());
+    LazyLock::new(|| Regex::new(&anchored_op_pattern(r"=", NODE_VERSION_PATTERN)).unwrap());
 static EXACT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&format!(r"^({NODE_VERSION_PATTERN})$")).unwrap());
 static WILDCARD_RE: LazyLock<Regex> =
@@ -246,6 +246,29 @@ fn has_digit_after_wildcard(body: &str) -> bool {
     false
 }
 
+/// ワイルドカード指定の共通末尾処理。caret/tilde 付き (`^1.x`) と裸 (`1.x`) の
+/// 両経路が共用する。`body` は呼び出し側で `^` / `~` などの演算子を剥がした後の
+/// 文字列を渡す (先頭の `v` / `V` はここで剥がす)。
+fn build_wildcard_spec(trimmed: &str, body: &str) -> Option<VersionSpec> {
+    // `^x` / `~*` / `x.x` のような完全浮動指定は意味を変えないため更新対象にしない
+    // (version が空の Wildcard を作ると phantom update の原因になる)
+    if is_fully_floating_wildcard(trimmed) {
+        return None;
+    }
+    // `1.x.3` / `^x.0.0` のように一度ワイルドカードが出た後に数値セグメントが続く形は
+    // semver / node-semver の x-range 規約上 invalid (Rust の semver crate も同様に拒否)。
+    // 誤って受理して `version="0.0.0"` のような捏造値で比較されるのを防ぐためここで弾く。
+    let body = body.strip_prefix(['v', 'V']).unwrap_or(body);
+    if has_digit_after_wildcard(body) {
+        return None;
+    }
+    Some(VersionSpec::new(
+        VersionSpecKind::Wildcard,
+        trimmed,
+        extract_first_version(trimmed),
+    ))
+}
+
 impl VersionParser for NodeVersionParser {
     fn parse(&self, version_str: &str) -> Option<VersionSpec> {
         let trimmed = version_str.trim();
@@ -348,44 +371,16 @@ impl VersionParser for NodeVersionParser {
         if CARET_TILDE_WILDCARD_RE.is_match(trimmed)
             && (trimmed.contains('x') || trimmed.contains('X') || trimmed.contains('*'))
         {
-            // `^x` / `~*` のような完全浮動指定は意味を変えないため更新対象にしない
-            // (version が空の Wildcard を作ると phantom update の原因になる)
-            if is_fully_floating_wildcard(trimmed) {
-                return None;
-            }
-            // `^x.0.0` のようにワイルドカードの後ろに数値セグメントが続く形式は
-            // node-semver 上 invalid (`1.x.3` も同様)。誤って受理して `version="0.0.0"` の
-            // ような捏造値で比較されるのを防ぐためここで弾く。
+            // ワイルドカード位置の検査は `^` / `~` を剥がした本体に対して行う
             let body = trimmed.trim_start_matches(['^', '~']).trim_start();
-            let body = body.strip_prefix(['v', 'V']).unwrap_or(body);
-            if has_digit_after_wildcard(body) {
-                return None;
-            }
-            return Some(VersionSpec::new(
-                VersionSpecKind::Wildcard,
-                trimmed,
-                extract_first_version(trimmed),
-            ));
+            return build_wildcard_spec(trimmed, body);
         }
 
         // `1.x` や `1.2.*` は形を保ったまま更新する
         if WILDCARD_RE.is_match(trimmed)
             && (trimmed.contains('x') || trimmed.contains('X') || trimmed.contains('*'))
         {
-            if is_fully_floating_wildcard(trimmed) {
-                return None;
-            }
-            // `1.x.3` のように一度ワイルドカードが出た後に数値セグメントが続く形は
-            // semver / node-semver の x-range 規約上 invalid (Rust の semver crate も同様に拒否)。
-            let body = trimmed.strip_prefix(['v', 'V']).unwrap_or(trimmed);
-            if has_digit_after_wildcard(body) {
-                return None;
-            }
-            return Some(VersionSpec::new(
-                VersionSpecKind::Wildcard,
-                trimmed,
-                extract_first_version(trimmed),
-            ));
+            return build_wildcard_spec(trimmed, trimmed);
         }
 
         // 固定バージョンまたは部分指定

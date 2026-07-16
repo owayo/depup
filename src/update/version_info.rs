@@ -94,6 +94,17 @@ fn contains_identifier_word(haystack: &str, needle: &str) -> bool {
     false
 }
 
+/// 先頭の ASCII `v` / `V` 接頭辞を 1 文字だけ取り除く。
+///
+/// `v1.2.3` / `V1.2.3` のような接頭辞付きバージョン表記を比較・正規化の前に
+/// 揃えるための共通ヘルパー。接頭辞がなければ入力をそのまま返す。
+/// (Packagist の `normalize_version` は仕様に合わせて小文字 `v` のみを剥がす別処理)
+pub(crate) fn strip_ascii_v_prefix(s: &str) -> &str {
+    s.strip_prefix('v')
+        .or_else(|| s.strip_prefix('V'))
+        .unwrap_or(s)
+}
+
 /// バージョン文字列がプレリリースバージョンを表すかチェックする
 pub fn is_prerelease_version(version: &str) -> bool {
     let lower = version.to_lowercase();
@@ -406,10 +417,7 @@ fn parse_version_components_with_options(
     Option<NumericIdentifier>,
 ) {
     // 先頭の 'v' または 'V' を除去
-    let s = s
-        .strip_prefix('v')
-        .or_else(|| s.strip_prefix('V'))
-        .unwrap_or(s);
+    let s = strip_ascii_v_prefix(s);
     // ビルドメタデータ (+...) を除去
     let s = s.split('+').next().unwrap_or(s);
     // PEP 440 エポック (`N!`) を切り出す。なければ 0。
@@ -557,15 +565,9 @@ pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
 /// Node.js / Rust / Go / Swift では `-1` も数値 prerelease である。通常は
 /// `semver` クレートを使い、実装上限を超える任意桁の数値だけ独自比較へ戻す。
 pub fn compare_semver_versions(a: &str, b: &str) -> std::cmp::Ordering {
-    fn strip_v(value: &str) -> &str {
-        value
-            .strip_prefix('v')
-            .or_else(|| value.strip_prefix('V'))
-            .unwrap_or(value)
-    }
     if let (Ok(a), Ok(b)) = (
-        semver::Version::parse(strip_v(a)),
-        semver::Version::parse(strip_v(b)),
+        semver::Version::parse(strip_ascii_v_prefix(a)),
+        semver::Version::parse(strip_ascii_v_prefix(b)),
     ) {
         return a.cmp(&b);
     }
@@ -578,10 +580,7 @@ pub fn compare_semver_versions(a: &str, b: &str) -> std::cmp::Ordering {
 
 /// SemVer の prerelease かどうかを判定する。
 pub(crate) fn is_semver_prerelease_version(version: &str) -> bool {
-    let stripped = version
-        .strip_prefix('v')
-        .or_else(|| version.strip_prefix('V'))
-        .unwrap_or(version);
+    let stripped = strip_ascii_v_prefix(version);
     if let Ok(parsed) = semver::Version::parse(stripped) {
         return !parsed.pre.is_empty();
     }
@@ -663,10 +662,7 @@ fn alphanumeric_parts(value: &str, ruby_hyphen: bool) -> Vec<EcosystemPart> {
 
 /// RubyGems の規則に従い、英字またはハイフンを含む版をプレリリースと判定する。
 pub(crate) fn is_ruby_prerelease_version(version: &str) -> bool {
-    let version = version
-        .strip_prefix('v')
-        .or_else(|| version.strip_prefix('V'))
-        .unwrap_or(version);
+    let version = strip_ascii_v_prefix(version);
     version.contains('-') || version.bytes().any(|byte| byte.is_ascii_alphabetic())
 }
 
@@ -956,6 +952,18 @@ mod tests {
         let v2 = VersionInfo::now("v1.0.0");
         // 等しいはず (v接頭辞は除去される)
         assert_eq!(v1.cmp(&v2), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn test_strip_ascii_v_prefix() {
+        assert_eq!(strip_ascii_v_prefix("v1.2.3"), "1.2.3");
+        assert_eq!(strip_ascii_v_prefix("V1.2.3"), "1.2.3");
+        assert_eq!(strip_ascii_v_prefix("1.2.3"), "1.2.3");
+        // 剥がすのは先頭の 1 文字だけ
+        assert_eq!(strip_ascii_v_prefix("vv1.0"), "v1.0");
+        // 接頭辞以外の位置の v / V は触らない
+        assert_eq!(strip_ascii_v_prefix("1.0.0-v2"), "1.0.0-v2");
+        assert_eq!(strip_ascii_v_prefix(""), "");
     }
 
     #[test]

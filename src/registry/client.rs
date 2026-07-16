@@ -59,6 +59,68 @@ fn retry_after_for_status(status: StatusCode, response: &reqwest::Response) -> O
     )
 }
 
+/// GET 送信エラー (トランスポート層) を `RegistryError` へ変換する共通マッピング
+///
+/// - タイムアウト → `Timeout`
+/// - その他の送信エラー → `NetworkError`
+///
+/// `get_with_context` のリトライループと、独自にリクエストを組み立てるアダプタ
+/// (GitHub Tags のようにカスタムヘッダ / ページネーションが必要で `get_json` を
+/// 使えないもの) が同じ変換を共有する。
+pub(crate) fn map_send_error(
+    error: &reqwest::Error,
+    package: &str,
+    registry: &str,
+) -> RegistryError {
+    if error.is_timeout() {
+        RegistryError::Timeout {
+            package: package.to_string(),
+            registry: registry.to_string(),
+        }
+    } else {
+        RegistryError::NetworkError {
+            package: package.to_string(),
+            registry: registry.to_string(),
+            message: error.to_string(),
+        }
+    }
+}
+
+/// HTTP ステータスコードを `RegistryError` へ変換する共通マッピング
+///
+/// - 429 Too Many Requests → `RateLimitExceeded`
+/// - 404 Not Found → `PackageNotFound`
+/// - その他の非成功ステータス (5xx = レジストリの一時障害を含む) → `NetworkError`
+/// - 成功ステータス → `None`
+///
+/// 403 / 401 のようにレジストリ固有の解釈が必要なステータスは、
+/// 呼び出し側 (GitHub Tags の `classify_forbidden` 等) がこの関数より先に処理する。
+pub(crate) fn map_status_error(
+    status: StatusCode,
+    package: &str,
+    registry: &str,
+) -> Option<RegistryError> {
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return Some(RegistryError::RateLimitExceeded {
+            registry: registry.to_string(),
+        });
+    }
+    if status == StatusCode::NOT_FOUND {
+        return Some(RegistryError::PackageNotFound {
+            package: package.to_string(),
+            registry: registry.to_string(),
+        });
+    }
+    if !status.is_success() {
+        return Some(RegistryError::NetworkError {
+            package: package.to_string(),
+            registry: registry.to_string(),
+            message: format!("HTTP {}", status),
+        });
+    }
+    None
+}
+
 /// リトライロジック付き HTTP クライアントラッパー
 #[derive(Clone)]
 pub struct HttpClient {
@@ -91,7 +153,11 @@ impl HttpClient {
     }
 
     /// 最大リトライ回数を設定
-    pub fn with_max_retries(mut self, max_retries: u32) -> Self {
+    ///
+    /// 現状は同一ファイル内のテストからのみ利用されるため test 専用とする
+    /// (非 test コードで必要になったら `#[cfg(test)]` を外す)。
+    #[cfg(test)]
+    fn with_max_retries(mut self, max_retries: u32) -> Self {
         self.max_retries = max_retries;
         self
     }
@@ -123,18 +189,10 @@ impl HttpClient {
 
                     // リトライ対象ステータス (429 / 5xx) のチェック
                     if is_retryable_status(status) {
-                        last_error = Some(if status == StatusCode::TOO_MANY_REQUESTS {
-                            RegistryError::RateLimitExceeded {
-                                registry: registry.to_string(),
-                            }
-                        } else {
-                            // 5xx はレジストリの一時障害として NetworkError で報告
-                            RegistryError::NetworkError {
-                                package: package.to_string(),
-                                registry: registry.to_string(),
-                                message: format!("HTTP {}", status),
-                            }
-                        });
+                        // 429 → RateLimitExceeded / 5xx → NetworkError (一時障害) の変換は
+                        // 共通マッピングに委ねる。リトライ対象は必ず非成功ステータスなので
+                        // `map_status_error` は Some を返す。
+                        last_error = map_status_error(status, package, registry);
 
                         if attempt < self.max_retries {
                             // 429/503 の Retry-After ヘッダ (秒数値) があれば尊重し、
@@ -151,39 +209,16 @@ impl HttpClient {
                         return Err(last_error.unwrap());
                     }
 
-                    // 404 Not Found チェック
-                    if status == StatusCode::NOT_FOUND {
-                        return Err(RegistryError::PackageNotFound {
-                            package: package.to_string(),
-                            registry: registry.to_string(),
-                        });
-                    }
-
-                    // その他のエラーチェック (リトライしても無駄な 4xx 等)
-                    if !status.is_success() {
-                        return Err(RegistryError::NetworkError {
-                            package: package.to_string(),
-                            registry: registry.to_string(),
-                            message: format!("HTTP {}", status),
-                        });
+                    // 恒久的なエラーステータス (404、リトライしても無駄な 4xx 等) の共通マッピング
+                    if let Some(error) = map_status_error(status, package, registry) {
+                        return Err(error);
                     }
 
                     return Ok(response);
                 }
                 Err(e) => {
-                    // タイムアウトチェック
-                    if e.is_timeout() {
-                        last_error = Some(RegistryError::Timeout {
-                            package: package.to_string(),
-                            registry: registry.to_string(),
-                        });
-                    } else {
-                        last_error = Some(RegistryError::NetworkError {
-                            package: package.to_string(),
-                            registry: registry.to_string(),
-                            message: e.to_string(),
-                        });
-                    }
+                    // タイムアウト / トランスポートエラーを共通マッピングで変換
+                    last_error = Some(map_send_error(&e, package, registry));
 
                     if attempt < self.max_retries {
                         // 指数バックオフでリトライ
@@ -312,6 +347,49 @@ mod tests {
         assert!(!is_retryable_status(StatusCode::UNAUTHORIZED)); // 401
         assert!(!is_retryable_status(StatusCode::FORBIDDEN)); // 403
         assert!(!is_retryable_status(StatusCode::NOT_FOUND)); // 404
+    }
+
+    /// 共通ステータスマッピング: 429 はレート制限として報告される
+    #[test]
+    fn test_map_status_error_rate_limit() {
+        assert!(matches!(
+            map_status_error(StatusCode::TOO_MANY_REQUESTS, "pkg", "reg"),
+            Some(RegistryError::RateLimitExceeded { .. })
+        ));
+    }
+
+    /// 共通ステータスマッピング: 404 はパッケージ未検出として報告される
+    #[test]
+    fn test_map_status_error_not_found() {
+        assert!(matches!(
+            map_status_error(StatusCode::NOT_FOUND, "pkg", "reg"),
+            Some(RegistryError::PackageNotFound { .. })
+        ));
+    }
+
+    /// 共通ステータスマッピング: その他の非成功 (4xx / 5xx) は NetworkError ("HTTP {status}")
+    #[test]
+    fn test_map_status_error_other_non_success() {
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::FORBIDDEN,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+        ] {
+            match map_status_error(status, "pkg", "reg") {
+                Some(RegistryError::NetworkError { message, .. }) => {
+                    assert_eq!(message, format!("HTTP {}", status));
+                }
+                other => panic!("expected NetworkError for {}, got: {:?}", status, other),
+            }
+        }
+    }
+
+    /// 共通ステータスマッピング: 成功ステータスはエラーにならない
+    #[test]
+    fn test_map_status_error_success_is_none() {
+        assert!(map_status_error(StatusCode::OK, "pkg", "reg").is_none());
+        assert!(map_status_error(StatusCode::CREATED, "pkg", "reg").is_none());
     }
 
     #[test]

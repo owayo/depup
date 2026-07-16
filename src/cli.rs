@@ -188,37 +188,6 @@ impl CliArgs {
             .filter_map(|(on, lang)| on.then_some(lang))
             .collect()
     }
-
-    /// 指定された言語を処理すべきかを確認する
-    pub fn should_process_language(&self, lang: &str) -> bool {
-        if !self.has_language_filter() {
-            return true; // フィルタなしの場合は全言語を処理
-        }
-        match lang {
-            "node" | "nodejs" | "javascript" => self.node,
-            "python" => self.python,
-            "rust" => self.rust_lang,
-            "go" | "golang" => self.go,
-            "ruby" => self.ruby,
-            "php" => self.php,
-            "java" => self.java,
-            "swift" => self.swift,
-            _ => false,
-        }
-    }
-
-    /// フィルタ条件に基づいてパッケージを処理すべきかを確認する
-    pub fn should_process_package(&self, name: &str) -> bool {
-        // --only が指定されている場合、そのパッケージのみ処理
-        if !self.only.is_empty() {
-            return self.only.iter().any(|p| p == name);
-        }
-        // --exclude が指定されている場合、そのパッケージをスキップ
-        if self.exclude.iter().any(|p| p == name) {
-            return false;
-        }
-        true
-    }
 }
 
 #[cfg(test)]
@@ -459,43 +428,6 @@ mod tests {
 
         let args = CliArgs::parse_from(["depup", "--java"]);
         assert!(args.has_language_filter());
-    }
-
-    #[test]
-    fn test_should_process_language() {
-        let args = CliArgs::parse_from(["depup"]);
-        assert!(args.should_process_language("node"));
-        assert!(args.should_process_language("python"));
-        assert!(args.should_process_language("rust"));
-        assert!(args.should_process_language("go"));
-        assert!(args.should_process_language("java"));
-
-        let args = CliArgs::parse_from(["depup", "--node", "--python"]);
-        assert!(args.should_process_language("node"));
-        assert!(args.should_process_language("python"));
-        assert!(!args.should_process_language("rust"));
-        assert!(!args.should_process_language("go"));
-        assert!(!args.should_process_language("java"));
-
-        // Javaのみのフィルタテスト
-        let args = CliArgs::parse_from(["depup", "--java"]);
-        assert!(args.should_process_language("java"));
-        assert!(!args.should_process_language("node"));
-        assert!(!args.should_process_language("python"));
-    }
-
-    #[test]
-    fn test_should_process_package() {
-        let args = CliArgs::parse_from(["depup"]);
-        assert!(args.should_process_package("any-package"));
-
-        let args = CliArgs::parse_from(["depup", "--exclude", "foo"]);
-        assert!(!args.should_process_package("foo"));
-        assert!(args.should_process_package("bar"));
-
-        let args = CliArgs::parse_from(["depup", "--only", "foo"]);
-        assert!(args.should_process_package("foo"));
-        assert!(!args.should_process_package("bar"));
     }
 
     #[test]

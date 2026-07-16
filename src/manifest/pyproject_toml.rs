@@ -10,7 +10,10 @@
 
 use crate::domain::{Dependency, Language};
 use crate::error::ManifestError;
-use crate::manifest::{ManifestParser, line_utils::captured_quote_and_version};
+use crate::manifest::{
+    ManifestParser,
+    line_utils::{HashCommentMode, captured_quote_and_version, strip_hash_line_comment},
+};
 use crate::parser::{VersionParser, get_parser};
 use regex::Regex;
 use std::collections::HashSet;
@@ -433,17 +436,8 @@ fn opens_unclosed_multiline_string(line: &str) -> Option<&'static str> {
 /// TOML 行から `#` 以降の行コメントを取り除く。文字列リテラル内 (`"..."` / `'...'`)
 /// の `#` は保持する。改行コードや末尾の空白はそのまま残す。
 fn strip_toml_line_comment(line: &str) -> &str {
-    let mut in_single = false;
-    let mut in_double = false;
-    for (idx, ch) in line.char_indices() {
-        match ch {
-            '"' if !in_single => in_double = !in_double,
-            '\'' if !in_double => in_single = !in_single,
-            '#' if !in_single && !in_double => return &line[..idx],
-            _ => {}
-        }
-    }
-    line
+    // TOML ではバックスラッシュをリテラル扱いする (Plain モード)
+    strip_hash_line_comment(line, HashCommentMode::Plain)
 }
 
 /// Poetry 依存セクション内の 1 行を更新する。更新が起きた場合のみ `Some` を返す

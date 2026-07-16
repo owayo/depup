@@ -7,7 +7,7 @@
 
 use crate::domain::Language;
 use crate::error::RegistryError;
-use crate::registry::{HttpClient, RegistryAdapter};
+use crate::registry::{HttpClient, RegistryAdapter, is_valid_registry_id_segment};
 use crate::update::VersionInfo;
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
@@ -65,13 +65,8 @@ impl MavenCentralAdapter {
         let (group, artifact) = (parts[0], parts[1]);
 
         // Maven coordinates に不正な文字が含まれていないか検証する
-        // (URLクエリ文字列へのインジェクション防止)
-        let is_valid_maven_id = |s: &str| {
-            !s.is_empty()
-                && s.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
-        };
-        if !is_valid_maven_id(group) || !is_valid_maven_id(artifact) {
+        // (URLクエリ文字列へのインジェクション防止。GitHub Tags と共通の検証)
+        if !is_valid_registry_id_segment(group) || !is_valid_registry_id_segment(artifact) {
             return Err(RegistryError::InvalidPackageName {
                 name: package.to_string(),
                 registry: self.registry_name().to_string(),

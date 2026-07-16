@@ -28,13 +28,13 @@ struct PackagistResponse {
 }
 
 /// Packagist API レスポンスのバージョン情報
+///
+/// serde はデフォルトで未知の JSON フィールド (`version_normalized` 等) を無視するため、
+/// 利用するフィールドだけを宣言する。
 #[derive(Debug, Deserialize)]
 struct PackagistVersionInfo {
     /// バージョン文字列 (例: "v1.0.0" または "1.0.0")
     version: String,
-    /// 比較用の正規化バージョン
-    #[allow(dead_code)]
-    version_normalized: Option<String>,
     /// ISO 8601 形式のリリースタイムスタンプ
     time: Option<String>,
 }

@@ -111,10 +111,7 @@ impl TauriVersionSync {
     ///
     /// ターゲットのクレートバージョンを受け取り、全パッケージが使用すべき
     /// メジャー.マイナーを返す。戻り値は (npm_target_version, crate_target_version)。
-    pub fn get_synchronized_versions(
-        &self,
-        crate_target_version: &str,
-    ) -> Option<(String, String)> {
+    fn get_synchronized_versions(&self, crate_target_version: &str) -> Option<(String, String)> {
         let target_mm = extract_major_minor(crate_target_version)?;
 
         // このメジャー.マイナーが npm で利用可能かチェック
@@ -135,17 +132,17 @@ impl TauriVersionSync {
     }
 
     /// パッケージが Tauri npm パッケージかどうかをチェックする
-    pub fn is_tauri_npm_package(name: &str) -> bool {
+    fn is_tauri_npm_package(name: &str) -> bool {
         TAURI_NPM_PACKAGES.contains(&name)
     }
 
     /// パッケージが Tauri クレートかどうかをチェックする
-    pub fn is_tauri_crate(name: &str) -> bool {
+    fn is_tauri_crate(name: &str) -> bool {
         name == TAURI_CRATE
     }
 
     /// パッケージが何らかの Tauri パッケージかどうかをチェックする
-    pub fn is_tauri_package(name: &str, language: Language) -> bool {
+    fn is_tauri_package(name: &str, language: Language) -> bool {
         match language {
             Language::Node => Self::is_tauri_npm_package(name),
             Language::Rust => Self::is_tauri_crate(name),
@@ -197,53 +194,47 @@ impl TauriVersionSync {
         };
 
         // 設定予定のバージョンから変更が必要な場合のみバージョンを返す
-        let npm_result = if npm_update.map(|r| r.is_update()).unwrap_or(false) {
-            // npm に更新がある場合、調整が必要かチェック
-            let planned = match npm_update.unwrap() {
-                UpdateResult::Update { new_version, .. } => new_version.as_str(),
-                _ => npm_v,
-            };
-            if planned != npm_sync {
-                Some(npm_sync.clone())
-            } else {
-                None
-            }
-        } else {
-            // npm に更新がない場合、現在のバージョンが異なれば追加が必要
-            if npm_current
-                .map(|v| !versions_match(v, &crate_sync))
-                .unwrap_or(false)
-            {
-                Some(npm_sync.clone())
-            } else {
-                None
-            }
-        };
-
-        let crate_result = if crate_update.map(|r| r.is_update()).unwrap_or(false) {
-            // クレートに更新がある場合、調整が必要かチェック
-            let planned = match crate_update.unwrap() {
-                UpdateResult::Update { new_version, .. } => new_version.as_str(),
-                _ => crate_v,
-            };
-            if planned != crate_sync {
-                Some(crate_sync.clone())
-            } else {
-                None
-            }
-        } else {
-            // クレートに更新がない場合、現在のバージョンが異なれば追加が必要
-            if crate_current
-                .map(|v| !versions_match(v, &npm_sync))
-                .unwrap_or(false)
-            {
-                Some(crate_sync)
-            } else {
-                None
-            }
-        };
+        let npm_result =
+            Self::side_adjustment(npm_update, npm_current, npm_v, &npm_sync, &crate_sync);
+        let crate_result =
+            Self::side_adjustment(crate_update, crate_current, crate_v, &crate_sync, &npm_sync);
 
         (npm_result, crate_result)
+    }
+
+    /// 片側 (npm またはクレート) の同期調整が必要かを判定する
+    ///
+    /// `own_*` は判定対象側、`other_sync` は反対側の同期先バージョン。
+    /// 自側のバージョンを調整する必要がある場合のみ設定すべきバージョンを返す。
+    fn side_adjustment(
+        own_update: Option<&UpdateResult>,
+        own_current: Option<&str>,
+        own_target: &str,
+        own_sync: &str,
+        other_sync: &str,
+    ) -> Option<String> {
+        if own_update.map(|r| r.is_update()).unwrap_or(false) {
+            // 自側に更新がある場合、調整が必要かチェック
+            let planned = match own_update.unwrap() {
+                UpdateResult::Update { new_version, .. } => new_version.as_str(),
+                _ => own_target,
+            };
+            if planned != own_sync {
+                Some(own_sync.to_string())
+            } else {
+                None
+            }
+        } else {
+            // 自側に更新がない場合、現在のバージョンが異なれば追加が必要
+            if own_current
+                .map(|v| !versions_match(v, other_sync))
+                .unwrap_or(false)
+            {
+                Some(own_sync.to_string())
+            } else {
+                None
+            }
+        }
     }
 }
 

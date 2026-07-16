@@ -66,11 +66,7 @@ static PEP440_COMPATIBLE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^~=\s*[vV]?((?:\d+!)?\d+(?:\.\d+)+)$").unwrap());
 
 fn normalize_bound_version(version: &str) -> String {
-    version
-        .strip_prefix('v')
-        .or_else(|| version.strip_prefix('V'))
-        .unwrap_or(version)
-        .to_string()
+    version_info::strip_ascii_v_prefix(version).to_string()
 }
 
 /// npm / Composer のハイフンレンジ右辺を上限制約へ正規化する。

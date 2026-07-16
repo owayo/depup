@@ -47,3 +47,42 @@ pub trait RegistryAdapter: Send + Sync {
     /// パッケージの利用可能なバージョンを取得
     async fn fetch_versions(&self, package: &str) -> Result<Vec<VersionInfo>, RegistryError>;
 }
+
+/// Maven 座標 (groupId / artifactId) と GitHub owner/repo セグメントの共通文字種検証。
+///
+/// 空でなく、ASCII 英数字と `.` `-` `_` のみで構成される場合に有効とする。
+/// `?` / `#` / `/` / `..` 等の混入による URL クエリ汚染・パストラバーサルを防ぐ
+/// (URL インジェクション防止)。
+pub(crate) fn is_valid_registry_id_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_valid_registry_id_segment_valid() {
+        // Maven 座標 / GitHub owner/repo で使われる文字種は許可する
+        assert!(is_valid_registry_id_segment("org.apache.wicket"));
+        assert!(is_valid_registry_id_segment("wicket-core"));
+        assert!(is_valid_registry_id_segment("swift_nio2"));
+        assert!(is_valid_registry_id_segment("apple"));
+    }
+
+    #[test]
+    fn test_is_valid_registry_id_segment_invalid() {
+        // 空セグメントは不可
+        assert!(!is_valid_registry_id_segment(""));
+        // URL インジェクションに使える文字は不可
+        assert!(!is_valid_registry_id_segment("a?b"));
+        assert!(!is_valid_registry_id_segment("a#b"));
+        assert!(!is_valid_registry_id_segment("a/b"));
+        assert!(!is_valid_registry_id_segment("a b"));
+        assert!(!is_valid_registry_id_segment("a:b"));
+        // 非 ASCII は不可
+        assert!(!is_valid_registry_id_segment("café"));
+    }
+}

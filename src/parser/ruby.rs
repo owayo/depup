@@ -7,7 +7,7 @@
 //! - 複合制約: `>= 1.0, < 2.0`, `>= 1.0 < 2.0`
 
 use crate::domain::{Language, VersionSpec, VersionSpecKind};
-use crate::parser::VersionParser;
+use crate::parser::{VersionParser, anchored_op_pattern};
 use regex::Regex;
 use std::sync::LazyLock;
 
@@ -27,29 +27,29 @@ const RUBY_VERSION_CORE: &str = r"\d+(?:\.\d+)*(?:[-.][A-Za-z0-9]+)*";
 
 // ペシミスティック制約: ~> 1.2 or ~> 1.2.3 or ~> 1.0.0.pre.1
 static PESSIMISTIC_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"^~>\s*({RUBY_VERSION_CORE})$")).unwrap());
+    LazyLock::new(|| Regex::new(&anchored_op_pattern(r"~>", RUBY_VERSION_CORE)).unwrap());
 
 // = 接頭辞付き固定: = 1.2.3
 static EXACT_EQ_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"^=\s*({RUBY_VERSION_CORE})$")).unwrap());
+    LazyLock::new(|| Regex::new(&anchored_op_pattern(r"=", RUBY_VERSION_CORE)).unwrap());
 
 // 以上: >= 1.2.3
 static GTE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"^>=\s*({RUBY_VERSION_CORE})$")).unwrap());
+    LazyLock::new(|| Regex::new(&anchored_op_pattern(r">=", RUBY_VERSION_CORE)).unwrap());
 
 // より大きい: > 1.2.3
 static GT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"^>\s*({RUBY_VERSION_CORE})$")).unwrap());
+    LazyLock::new(|| Regex::new(&anchored_op_pattern(r">", RUBY_VERSION_CORE)).unwrap());
 
 // 以下: <= 1.2.3
 static LTE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"^<=\s*({RUBY_VERSION_CORE})$")).unwrap());
+    LazyLock::new(|| Regex::new(&anchored_op_pattern(r"<=", RUBY_VERSION_CORE)).unwrap());
 
 // より小さい: < 1.2.3
 static LT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"^<\s*({RUBY_VERSION_CORE})$")).unwrap());
+    LazyLock::new(|| Regex::new(&anchored_op_pattern(r"<", RUBY_VERSION_CORE)).unwrap());
 static NOT_EQUAL_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"^!=\s*({RUBY_VERSION_CORE})$")).unwrap());
+    LazyLock::new(|| Regex::new(&anchored_op_pattern(r"!=", RUBY_VERSION_CORE)).unwrap());
 
 // 裸のバージョン (固定): 1.2.3
 static BARE_VERSION_RE: LazyLock<Regex> =

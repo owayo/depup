@@ -255,6 +255,38 @@ where
     (output, updated)
 }
 
+/// 変数定義キャプチャ (グループ 1=名前, グループ 2=値) を検証して変数表へ登録する。
+/// `exclude_non_version_names` が真のとき、ext ブロックで一般的な非バージョン変数
+/// (`source*` / `target*` / `encoding`) は除外する。
+fn insert_captured_variable(
+    variables: &mut HashMap<String, VariableDefinition>,
+    caps: &regex::Captures,
+    line_number: usize,
+    exclude_non_version_names: bool,
+) {
+    let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+    let value = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+
+    if name.is_empty() || value.is_empty() {
+        return;
+    }
+
+    // 一般的な非バージョン変数は除外
+    if exclude_non_version_names
+        && (name.starts_with("source") || name.starts_with("target") || name == "encoding")
+    {
+        return;
+    }
+
+    variables.insert(
+        name.to_string(),
+        VariableDefinition {
+            value: value.to_string(),
+            line_number,
+        },
+    );
+}
+
 impl GradleParser {
     /// content から変数定義を抽出
     fn extract_variables(&self, content: &str) -> HashMap<String, VariableDefinition> {
@@ -296,101 +328,23 @@ impl GradleParser {
                 }
             }
 
-            // Groovy def 変数 (シングルクォート) を判定
-            if let Some(caps) = VAR_DEF_GROOVY_SINGLE.captures(line) {
-                let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                let value = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-
-                if !name.is_empty() && !value.is_empty() {
-                    variables.insert(
-                        name.to_string(),
-                        VariableDefinition {
-                            value: value.to_string(),
-                            line_number,
-                        },
-                    );
-                }
+            // 変数定義 (Groovy def シングル/ダブルクォート, Kotlin val) を従来の判定順で試し、
+            // 最初にマッチした正規表現を採用する
+            let var_def_regexes: [&Regex; 3] = [
+                &*VAR_DEF_GROOVY_SINGLE,
+                &*VAR_DEF_GROOVY_DOUBLE,
+                &*VAR_DEF_KOTLIN,
+            ];
+            if let Some(caps) = var_def_regexes.into_iter().find_map(|re| re.captures(line)) {
+                insert_captured_variable(&mut variables, &caps, line_number, false);
                 continue;
             }
 
-            // Groovy def 変数 (ダブルクォート) を判定
-            if let Some(caps) = VAR_DEF_GROOVY_DOUBLE.captures(line) {
-                let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                let value = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-
-                if !name.is_empty() && !value.is_empty() {
-                    variables.insert(
-                        name.to_string(),
-                        VariableDefinition {
-                            value: value.to_string(),
-                            line_number,
-                        },
-                    );
-                }
-                continue;
-            }
-
-            // Kotlin val 変数を判定
-            if let Some(caps) = VAR_DEF_KOTLIN.captures(line) {
-                let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                let value = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-
-                if !name.is_empty() && !value.is_empty() {
-                    variables.insert(
-                        name.to_string(),
-                        VariableDefinition {
-                            value: value.to_string(),
-                            line_number,
-                        },
-                    );
-                }
-                continue;
-            }
-
-            // ext ブロック変数 (シングルクォート) を判定
+            // ext ブロック変数 (シングル/ダブルクォート) を判定
             if in_ext_block {
-                if let Some(caps) = EXT_VAR_SINGLE.captures(line) {
-                    let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                    let value = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-
-                    // 一般的な非バージョン変数は除外
-                    if !name.is_empty()
-                        && !value.is_empty()
-                        && !name.starts_with("source")
-                        && !name.starts_with("target")
-                        && name != "encoding"
-                    {
-                        variables.insert(
-                            name.to_string(),
-                            VariableDefinition {
-                                value: value.to_string(),
-                                line_number,
-                            },
-                        );
-                    }
-                    continue;
-                }
-
-                // ext ブロック変数 (ダブルクォート) を判定
-                if let Some(caps) = EXT_VAR_DOUBLE.captures(line) {
-                    let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                    let value = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-
-                    // 一般的な非バージョン変数は除外
-                    if !name.is_empty()
-                        && !value.is_empty()
-                        && !name.starts_with("source")
-                        && !name.starts_with("target")
-                        && name != "encoding"
-                    {
-                        variables.insert(
-                            name.to_string(),
-                            VariableDefinition {
-                                value: value.to_string(),
-                                line_number,
-                            },
-                        );
-                    }
+                let ext_var_regexes: [&Regex; 2] = [&*EXT_VAR_SINGLE, &*EXT_VAR_DOUBLE];
+                if let Some(caps) = ext_var_regexes.into_iter().find_map(|re| re.captures(line)) {
+                    insert_captured_variable(&mut variables, &caps, line_number, true);
                 }
             }
         }

@@ -37,7 +37,11 @@ impl GitRemoteRefs {
     }
 
     /// 指定されたタグのコミットハッシュを取得する。`^{}` (peeled) を優先する
-    pub fn tag_commit(&self, name: &str) -> Option<&str> {
+    ///
+    /// 現状は同一ファイル内のテストからのみ参照されるため test 専用とする
+    /// (非 test コードで必要になったら `#[cfg(test)]` を外す)。
+    #[cfg(test)]
+    fn tag_commit(&self, name: &str) -> Option<&str> {
         let peeled = format!("{}^{{}}", name);
         self.tags
             .get(&peeled)

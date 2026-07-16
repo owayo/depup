@@ -9,7 +9,7 @@
 //! - ワイルドカード: `1.2.*`, `1.x`
 
 use crate::domain::{Language, VersionSpec, VersionSpecKind, range_lower_bound_version};
-use crate::parser::{VersionParser, is_fully_floating_wildcard};
+use crate::parser::{VersionParser, anchored_op_pattern, is_fully_floating_wildcard};
 use regex::Regex;
 use std::sync::LazyLock;
 
@@ -31,27 +31,27 @@ const PHP_VERSION_CORE: &str = r"[vV]?\d+(?:\.\d+){0,3}(?:-[\w.-]+)?(?:\+[\w.-]+
 
 // キャレット: ^1.2.3 / ^1.2.3.4
 static CARET_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"^\^\s*({PHP_VERSION_CORE})$")).unwrap());
+    LazyLock::new(|| Regex::new(&anchored_op_pattern(r"\^", PHP_VERSION_CORE)).unwrap());
 
 // チルダ: ~1.2.3 / ~1.2.3.4
 static TILDE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"^~\s*({PHP_VERSION_CORE})$")).unwrap());
+    LazyLock::new(|| Regex::new(&anchored_op_pattern(r"~", PHP_VERSION_CORE)).unwrap());
 
 // 以上: >=1.2.3 / >=1.2.3.4
 static GTE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"^>=\s*({PHP_VERSION_CORE})$")).unwrap());
+    LazyLock::new(|| Regex::new(&anchored_op_pattern(r">=", PHP_VERSION_CORE)).unwrap());
 
 // より大きい: >1.2.3 / >1.2.3.4
 static GT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"^>\s*({PHP_VERSION_CORE})$")).unwrap());
+    LazyLock::new(|| Regex::new(&anchored_op_pattern(r">", PHP_VERSION_CORE)).unwrap());
 
 // 以下: <=1.2.3 / <=1.2.3.4
 static LTE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"^<=\s*({PHP_VERSION_CORE})$")).unwrap());
+    LazyLock::new(|| Regex::new(&anchored_op_pattern(r"<=", PHP_VERSION_CORE)).unwrap());
 
 // より小さい: <1.2.3 / <1.2.3.4
 static LT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"^<\s*({PHP_VERSION_CORE})$")).unwrap());
+    LazyLock::new(|| Regex::new(&anchored_op_pattern(r"<", PHP_VERSION_CORE)).unwrap());
 
 static EQUAL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&format!(r"^(==|=)\s*({PHP_VERSION_CORE})$")).unwrap());

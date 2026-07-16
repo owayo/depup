@@ -37,6 +37,13 @@ pub(crate) fn is_fully_floating_wildcard(raw: &str) -> bool {
     !raw.chars().any(|ch| ch.is_ascii_digit())
 }
 
+/// 演算子付きアンカー正規表現パターンを生成する。
+/// 各言語パーサの GTE/GT/LTE/LT (および同形の caret/tilde) ラッパが共用し、
+/// CORE 定数だけ差し替えても「1本だけパターンがずれる」不整合を防ぐ。
+pub(crate) fn anchored_op_pattern(op: &str, core: &str) -> String {
+    format!(r"^{op}\s*({core})$")
+}
+
 /// バージョン指定のパースを行うトレイト
 pub trait VersionParser {
     /// バージョン指定文字列をパースする
@@ -97,5 +104,13 @@ mod tests {
     fn test_get_parser_go() {
         let parser = get_parser(Language::Go);
         assert_eq!(parser.language(), Language::Go);
+    }
+
+    #[test]
+    fn test_anchored_op_pattern_shape() {
+        // 生成形 `^{op}\s*({core})$` を固定する (op は正規表現片としてそのまま埋め込まれる)
+        assert_eq!(anchored_op_pattern(r">=", "X"), r"^>=\s*(X)$");
+        assert_eq!(anchored_op_pattern(r"\^", "X"), r"^\^\s*(X)$");
+        assert_eq!(anchored_op_pattern(r"~>?", "X"), r"^~>?\s*(X)$");
     }
 }

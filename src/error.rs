@@ -3,33 +3,11 @@
 //! エラー階層:
 //! - ManifestError: マニフェストファイルの解析に関する問題
 //! - RegistryError: パッケージレジストリとの通信に関する問題
-//! - ConfigError: CLI 設定に関する問題
-//! - IoError: ファイルシステム操作の失敗
 
 use std::path::PathBuf;
 use thiserror::Error;
 
 use crate::domain::Language;
-
-/// アプリケーションレベルのエラー型
-#[derive(Error, Debug)]
-pub enum AppError {
-    /// マニフェストファイル関連のエラー
-    #[error(transparent)]
-    Manifest(#[from] ManifestError),
-
-    /// パッケージレジストリ関連のエラー
-    #[error(transparent)]
-    Registry(#[from] RegistryError),
-
-    /// 設定関連のエラー
-    #[error(transparent)]
-    Config(#[from] ConfigError),
-
-    /// IO 関連のエラー
-    #[error(transparent)]
-    Io(#[from] IoError),
-}
 
 /// マニフェストファイル操作に関するエラー
 #[derive(Error, Debug)]
@@ -120,46 +98,6 @@ pub enum RegistryError {
         name: String,
         registry: String,
         reason: String,
-    },
-}
-
-/// 設定に関するエラー
-#[derive(Error, Debug)]
-pub enum ConfigError {
-    /// 無効な期間形式
-    #[error("invalid duration format '{value}': expected format like '2w', '10d', '1m'")]
-    InvalidDuration { value: String },
-
-    /// 無効な言語フィルタ
-    #[error("invalid language filter '{value}': expected 'node', 'python', 'rust', or 'go'")]
-    InvalidLanguageFilter { value: String },
-
-    /// 無効なパス
-    #[error("invalid path '{path}': {message}")]
-    InvalidPath { path: PathBuf, message: String },
-
-    /// 競合するオプション
-    #[error("conflicting options: {message}")]
-    ConflictingOptions { message: String },
-}
-
-/// IO 操作に関するエラー
-#[derive(Error, Debug)]
-pub enum IoError {
-    /// ディレクトリが見つからない
-    #[error("directory not found: {path}")]
-    DirectoryNotFound { path: PathBuf },
-
-    /// パーミッション拒否
-    #[error("permission denied: {path}")]
-    PermissionDenied { path: PathBuf },
-
-    /// 汎用 IO エラー
-    #[error("IO error at {path}: {source}")]
-    Generic {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
     },
 }
 
@@ -267,26 +205,6 @@ impl RegistryError {
     }
 }
 
-impl IoError {
-    /// DirectoryNotFound エラーを作成する
-    pub fn directory_not_found(path: impl Into<PathBuf>) -> Self {
-        IoError::DirectoryNotFound { path: path.into() }
-    }
-
-    /// PermissionDenied エラーを作成する
-    pub fn permission_denied(path: impl Into<PathBuf>) -> Self {
-        IoError::PermissionDenied { path: path.into() }
-    }
-
-    /// 汎用 IO エラーを作成する
-    pub fn generic(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
-        IoError::Generic {
-            path: path.into(),
-            source,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,73 +286,6 @@ mod tests {
     }
 
     #[test]
-    fn test_config_error_invalid_duration() {
-        let err = ConfigError::InvalidDuration {
-            value: "abc".to_string(),
-        };
-        let msg = format!("{}", err);
-        assert!(msg.contains("invalid duration format"));
-        assert!(msg.contains("abc"));
-    }
-
-    #[test]
-    fn test_config_error_conflicting_options() {
-        let err = ConfigError::ConflictingOptions {
-            message: "--quiet and --verbose cannot be used together".to_string(),
-        };
-        let msg = format!("{}", err);
-        assert!(msg.contains("conflicting options"));
-    }
-
-    #[test]
-    fn test_io_error_directory_not_found() {
-        let err = IoError::directory_not_found("/path/to/missing");
-        let msg = format!("{}", err);
-        assert!(msg.contains("directory not found"));
-    }
-
-    #[test]
-    fn test_io_error_permission_denied() {
-        let err = IoError::permission_denied("/path/to/protected");
-        let msg = format!("{}", err);
-        assert!(msg.contains("permission denied"));
-    }
-
-    #[test]
-    fn test_app_error_from_manifest_error() {
-        let manifest_err = ManifestError::not_found("/path");
-        let app_err: AppError = manifest_err.into();
-        let msg = format!("{}", app_err);
-        assert!(msg.contains("manifest file not found"));
-    }
-
-    #[test]
-    fn test_app_error_from_registry_error() {
-        let registry_err = RegistryError::package_not_found("pkg", "npm");
-        let app_err: AppError = registry_err.into();
-        let msg = format!("{}", app_err);
-        assert!(msg.contains("package 'pkg' not found"));
-    }
-
-    #[test]
-    fn test_app_error_from_config_error() {
-        let config_err = ConfigError::InvalidDuration {
-            value: "bad".to_string(),
-        };
-        let app_err: AppError = config_err.into();
-        let msg = format!("{}", app_err);
-        assert!(msg.contains("invalid duration format"));
-    }
-
-    #[test]
-    fn test_app_error_from_io_error() {
-        let io_err = IoError::directory_not_found("/missing");
-        let app_err: AppError = io_err.into();
-        let msg = format!("{}", app_err);
-        assert!(msg.contains("directory not found"));
-    }
-
-    #[test]
     fn test_error_debug_trait() {
         let err = ManifestError::not_found("/test");
         let debug = format!("{:?}", err);
@@ -513,34 +364,5 @@ mod tests {
         let msg = format!("{}", err);
         assert!(msg.contains("invalid package name"));
         assert!(msg.contains("@invalid//pkg"));
-    }
-
-    #[test]
-    fn test_config_error_invalid_path() {
-        let err = ConfigError::InvalidPath {
-            path: PathBuf::from("/null\0byte"),
-            message: "contains null byte".to_string(),
-        };
-        let msg = format!("{}", err);
-        assert!(msg.contains("invalid path"));
-    }
-
-    #[test]
-    fn test_config_error_invalid_language_filter() {
-        let err = ConfigError::InvalidLanguageFilter {
-            value: "kotlin".to_string(),
-        };
-        let msg = format!("{}", err);
-        assert!(msg.contains("invalid language filter"));
-        assert!(msg.contains("kotlin"));
-    }
-
-    #[test]
-    fn test_io_error_generic() {
-        let io_err = std::io::Error::other("disk full");
-        let err = IoError::generic("/path/to/file", io_err);
-        let msg = format!("{}", err);
-        assert!(msg.contains("IO error"));
-        assert!(msg.contains("disk full"));
     }
 }
