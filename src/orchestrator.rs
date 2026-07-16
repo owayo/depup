@@ -936,8 +936,6 @@ impl Orchestrator {
         summary: &mut UpdateSummary,
         errors: &mut Vec<OrchestratorError>,
     ) {
-        use crate::tauri_sync::extract_major_minor;
-
         // Nodeマニフェスト内の全Tauri npmパッケージを検索
         // 戻り値: Vec<(manifest_idx, result_idx, result, current_version)>
         let npm_packages: Vec<(usize, usize, UpdateResult, String)> =
@@ -972,62 +970,24 @@ impl Orchestrator {
         // 最初の npm パッケージの現在バージョンを参照用に取得
         let npm_current = npm_packages.first().map(|(_, _, _, v)| v.as_str());
 
-        // 保留中の更新後の実効バージョンを決定
-        let npm_effective = npm_packages.first().map(|(_, _, r, current)| match r {
-            UpdateResult::Update { new_version, .. } => new_version.as_str(),
-            _ => current.as_str(),
-        });
-
-        let crate_effective = crate_info.as_ref().map(|(_, _, r, current)| match r {
-            UpdateResult::Update { new_version, .. } => new_version.as_str(),
-            _ => current.as_str(),
-        });
-
-        // バージョンが既に一致しているか確認 - 一致していれば同期不要
-        if let (Some(npm_v), Some(crate_v)) = (npm_effective, crate_effective)
-            && let (Some(npm_mm), Some(crate_mm)) =
-                (extract_major_minor(npm_v), extract_major_minor(crate_v))
-            && npm_mm == crate_mm
-        {
+        // 保留中の更新後の実効バージョンが既にメジャー.マイナーで一致して
+        // いれば同期不要
+        let npm_effective = npm_packages
+            .first()
+            .map(|(_, _, r, current)| effective_version(r, current));
+        let crate_effective = crate_info
+            .as_ref()
+            .map(|(_, _, r, current)| effective_version(r, current));
+        if same_effective_major_minor(npm_effective, crate_effective) {
             return;
         }
 
-        // バージョンが不一致 - 同期が必要
-
-        // 両方のレジストリからバージョンを取得
-        let npm_adapter = self.get_adapter(Language::Node);
-        let crate_adapter = self.get_adapter(Language::Rust);
-
-        // バージョン取得には最初のnpmパッケージ名を使用 (全パッケージでバージョンは共通)
-        let npm_pkg_name = TAURI_NPM_PACKAGES[0];
-        let npm_versions = match self.fetch_for_tauri_sync(&*npm_adapter, npm_pkg_name).await {
-            Ok(v) => v,
-            Err(e) => {
-                errors.push(e);
-                return;
-            }
+        // バージョンが不一致 - 同期が必要。両レジストリから候補を取得する
+        let Some((npm_versions, crate_versions, cutoff)) =
+            self.fetch_tauri_sync_versions(errors).await
+        else {
+            return;
         };
-
-        let crate_versions = match self
-            .fetch_for_tauri_sync(&*crate_adapter, TAURI_CRATE)
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                errors.push(e);
-                return;
-            }
-        };
-
-        // 同期先の候補にも judge と同じ解決済み age を適用する
-        // (同期が age ポリシーを迂回して新しすぎるバージョンを書かないように)
-        let cutoff = self.resolved_min_age().and_then(|age| {
-            chrono::Duration::from_std(age)
-                .ok()
-                .map(|d| chrono::Utc::now() - d)
-        });
-        let npm_versions = filter_versions_by_cutoff(npm_versions, cutoff);
-        let crate_versions = filter_versions_by_cutoff(crate_versions, cutoff);
 
         // 同期ヘルパーを作成し、同期後のバージョンを取得
         let sync = TauriVersionSync::new(npm_versions, crate_versions);
@@ -1042,29 +1002,10 @@ impl Orchestrator {
             crate_update_result,
         );
 
-        // 全Tauri npmパッケージにnpmバージョンの調整を適用。
-        // @tauri-apps/api と @tauri-apps/cli はパッチバージョン集合が一致しない
-        // ことがあるため、パッケージごとに実在するバージョンを選ぶ。
+        // npm 側の調整を全 Tauri npm パッケージへ適用
         if let Some(ref target) = npm_target_version {
-            for (manifest_idx, result_idx, original, _current) in &npm_packages {
-                let pkg_name = original.package_name();
-                let pkg_target = if pkg_name == npm_pkg_name {
-                    Some(target.clone())
-                } else {
-                    match self.fetch_versions(&*npm_adapter, pkg_name).await {
-                        Ok(vs) => {
-                            let vs = filter_versions_by_cutoff(vs, cutoff);
-                            pick_sync_version(&vs, target)
-                        }
-                        // フェッチできない場合はこのパッケージの同期を見送る
-                        Err(_) => None,
-                    }
-                };
-                let Some(pkg_target) = pkg_target else {
-                    continue;
-                };
-                apply_sync_adjustment(summary, *manifest_idx, *result_idx, original, pkg_target);
-            }
+            self.apply_npm_sync_adjustments(summary, &npm_packages, target, cutoff)
+                .await;
         }
 
         // crateバージョンの調整を適用
@@ -1078,6 +1019,92 @@ impl Orchestrator {
                 original,
                 target.clone(),
             );
+        }
+    }
+
+    /// Tauri 同期用に npm / crates.io 両レジストリからバージョン一覧を取得し、
+    /// judge と同じ解決済み age の cutoff を適用して返す。
+    ///
+    /// 取得失敗時は `errors` へ積んで `None` を返す (呼び出し側は同期を中止する)。
+    async fn fetch_tauri_sync_versions(
+        &self,
+        errors: &mut Vec<OrchestratorError>,
+    ) -> Option<(
+        Vec<VersionInfo>,
+        Vec<VersionInfo>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    )> {
+        let npm_adapter = self.get_adapter(Language::Node);
+        let crate_adapter = self.get_adapter(Language::Rust);
+
+        // バージョン取得には最初のnpmパッケージ名を使用 (全パッケージでバージョンは共通)
+        let npm_versions = match self
+            .fetch_for_tauri_sync(&*npm_adapter, TAURI_NPM_PACKAGES[0])
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                errors.push(e);
+                return None;
+            }
+        };
+
+        let crate_versions = match self
+            .fetch_for_tauri_sync(&*crate_adapter, TAURI_CRATE)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                errors.push(e);
+                return None;
+            }
+        };
+
+        // 同期先の候補にも judge と同じ解決済み age を適用する
+        // (同期が age ポリシーを迂回して新しすぎるバージョンを書かないように)
+        let cutoff = self.resolved_min_age().and_then(|age| {
+            chrono::Duration::from_std(age)
+                .ok()
+                .map(|d| chrono::Utc::now() - d)
+        });
+        Some((
+            filter_versions_by_cutoff(npm_versions, cutoff),
+            filter_versions_by_cutoff(crate_versions, cutoff),
+            cutoff,
+        ))
+    }
+
+    /// npm 側の同期調整を全 Tauri npm パッケージへ適用する。
+    ///
+    /// @tauri-apps/api と @tauri-apps/cli はパッチバージョン集合が一致しない
+    /// ことがあるため、パッケージごとに実在するバージョンを選ぶ。
+    async fn apply_npm_sync_adjustments(
+        &self,
+        summary: &mut UpdateSummary,
+        npm_packages: &[(usize, usize, UpdateResult, String)],
+        target: &str,
+        cutoff: Option<chrono::DateTime<chrono::Utc>>,
+    ) {
+        let npm_adapter = self.get_adapter(Language::Node);
+        let npm_pkg_name = TAURI_NPM_PACKAGES[0];
+        for (manifest_idx, result_idx, original, _current) in npm_packages {
+            let pkg_name = original.package_name();
+            let pkg_target = if pkg_name == npm_pkg_name {
+                Some(target.to_string())
+            } else {
+                match self.fetch_versions(&*npm_adapter, pkg_name).await {
+                    Ok(vs) => {
+                        let vs = filter_versions_by_cutoff(vs, cutoff);
+                        pick_sync_version(&vs, target)
+                    }
+                    // フェッチできない場合はこのパッケージの同期を見送る
+                    Err(_) => None,
+                }
+            };
+            let Some(pkg_target) = pkg_target else {
+                continue;
+            };
+            apply_sync_adjustment(summary, *manifest_idx, *result_idx, original, pkg_target);
         }
     }
 
@@ -1392,6 +1419,31 @@ fn tauri_sync_protected(result: &UpdateResult) -> bool {
     }
 }
 
+/// 保留中の更新を織り込んだ実効バージョンを返す。
+/// Update なら更新後のバージョン、それ以外 (AlreadyLatest 等の Skip) は現在版。
+fn effective_version<'a>(result: &'a UpdateResult, current: &'a str) -> &'a str {
+    match result {
+        UpdateResult::Update { new_version, .. } => new_version.as_str(),
+        _ => current,
+    }
+}
+
+/// npm 側と crate 側の実効バージョンが同じメジャー.マイナーに揃っているか判定する。
+/// どちらかが欠けている・メジャー.マイナーを抽出できない場合は false
+/// (= 同期処理を継続する)。
+fn same_effective_major_minor(npm_version: Option<&str>, crate_version: Option<&str>) -> bool {
+    use crate::tauri_sync::extract_major_minor;
+
+    if let (Some(npm_v), Some(crate_v)) = (npm_version, crate_version)
+        && let (Some(npm_mm), Some(crate_mm)) =
+            (extract_major_minor(npm_v), extract_major_minor(crate_v))
+    {
+        npm_mm == crate_mm
+    } else {
+        false
+    }
+}
+
 /// summary 内の指定言語マニフェストから、`is_match` に一致するパッケージの
 /// (manifest_idx, result_idx, 結果のクローン, 現在バージョン) を集める。
 fn collect_tauri_packages(
@@ -1634,6 +1686,45 @@ mod git_helper_tests {
             SkipReason::NoSuitableVersion
         )));
         assert!(!tauri_sync_protected(&UpdateResult::update(dep, "2.0.0")));
+    }
+
+    #[test]
+    fn test_effective_version_pending_update_takes_precedence() {
+        let dep = git_dep("tauri", GitReference::DefaultBranch);
+
+        // Update は更新後バージョンを実効値とする
+        assert_eq!(
+            effective_version(&UpdateResult::update(dep.clone(), "2.1.0"), "2.0.0"),
+            "2.1.0"
+        );
+        // Skip (AlreadyLatest 等) は現在版を実効値とする
+        assert_eq!(
+            effective_version(
+                &UpdateResult::skip(dep.clone(), SkipReason::AlreadyLatest),
+                "2.0.0"
+            ),
+            "2.0.0"
+        );
+        assert_eq!(
+            effective_version(&UpdateResult::skip(dep, SkipReason::Pinned), "1.5.3"),
+            "1.5.3"
+        );
+    }
+
+    #[test]
+    fn test_same_effective_major_minor_alignment() {
+        // 同じ major.minor なら整合 (パッチ差は同期不要)
+        assert!(same_effective_major_minor(Some("2.0.0"), Some("2.0.5")));
+        // minor 違いは不整合
+        assert!(!same_effective_major_minor(Some("2.0.0"), Some("2.1.0")));
+        // major 違いは不整合
+        assert!(!same_effective_major_minor(Some("1.9.0"), Some("2.9.0")));
+        // 片側欠落・両側欠落は「整合とは判定しない」(同期継続側に倒す)
+        assert!(!same_effective_major_minor(Some("2.0.0"), None));
+        assert!(!same_effective_major_minor(None, Some("2.0.0")));
+        assert!(!same_effective_major_minor(None, None));
+        // メジャー.マイナーを抽出できない文字列も整合扱いしない
+        assert!(!same_effective_major_minor(Some("latest"), Some("2.0.0")));
     }
 
     #[test]
