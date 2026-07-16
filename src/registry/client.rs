@@ -179,41 +179,59 @@ impl HttpClient {
         package: &str,
         registry: &str,
     ) -> Result<reqwest::Response, RegistryError> {
+        let response = self
+            .get_response_with_retry(|| self.client.get(url), package, registry)
+            .await?;
+
+        // 恒久的なエラーステータス (404 等) と、リトライを使い切った 429/5xx を
+        // 共通マッピングで変換する
+        if let Some(error) = map_status_error(response.status(), package, registry) {
+            return Err(error);
+        }
+
+        Ok(response)
+    }
+
+    /// リトライ+バックオフ付きで GET を実行し、生の Response を返す共通コア
+    ///
+    /// - 429 / 5xx は `max_retries` まで再試行する (429/503 は `Retry-After` を
+    ///   尊重、上限 `RETRY_AFTER_MAX_SECS` 秒。なければ指数バックオフ)
+    /// - 送信エラー (タイムアウト / トランスポート) もリトライし、使い切ったら
+    ///   `map_send_error` の変換結果を返す
+    /// - リトライを使い切った場合を含め、レスポンスが得られたら最後の Response を
+    ///   そのまま返す。ステータスの最終判定は呼び出し側に委ねる (GitHub Tags の
+    ///   403 レート制限分類のようなレジストリ固有解釈を共通経路の外に置くため)
+    ///
+    /// `build_request` は試行ごとに呼ばれる (reqwest の `RequestBuilder` は
+    /// 再利用できないため)。カスタムヘッダが必要なアダプタはここで付与する。
+    pub(crate) async fn get_response_with_retry(
+        &self,
+        build_request: impl Fn() -> reqwest::RequestBuilder,
+        package: &str,
+        registry: &str,
+    ) -> Result<reqwest::Response, RegistryError> {
         let mut last_error = None;
         let mut delay = BASE_DELAY_MS;
 
         for attempt in 0..=self.max_retries {
-            match self.client.get(url).send().await {
+            match build_request().send().await {
                 Ok(response) => {
                     let status = response.status();
 
-                    // リトライ対象ステータス (429 / 5xx) のチェック
-                    if is_retryable_status(status) {
-                        // 429 → RateLimitExceeded / 5xx → NetworkError (一時障害) の変換は
-                        // 共通マッピングに委ねる。リトライ対象は必ず非成功ステータスなので
-                        // `map_status_error` は Some を返す。
-                        last_error = map_status_error(status, package, registry);
-
-                        if attempt < self.max_retries {
-                            // 429/503 の Retry-After ヘッダ (秒数値) があれば尊重し、
-                            // なければ指数バックオフで待機してリトライ
-                            let wait = match retry_after_for_status(status, &response) {
-                                Some(secs) => Duration::from_secs(secs),
-                                None => Duration::from_millis(delay),
-                            };
-                            tokio::time::sleep(wait).await;
-                            delay *= 2;
-                            continue;
-                        }
-                        // 最終リトライでも失敗した場合はエラーを返す
-                        return Err(last_error.unwrap());
+                    // リトライ対象ステータス (429 / 5xx) は残り回数があれば待機して再試行
+                    if is_retryable_status(status) && attempt < self.max_retries {
+                        // 429/503 の Retry-After ヘッダ (秒数値) があれば尊重し、
+                        // なければ指数バックオフで待機してリトライ
+                        let wait = match retry_after_for_status(status, &response) {
+                            Some(secs) => Duration::from_secs(secs),
+                            None => Duration::from_millis(delay),
+                        };
+                        tokio::time::sleep(wait).await;
+                        delay *= 2;
+                        continue;
                     }
 
-                    // 恒久的なエラーステータス (404、リトライしても無駄な 4xx 等) の共通マッピング
-                    if let Some(error) = map_status_error(status, package, registry) {
-                        return Err(error);
-                    }
-
+                    // 成功・恒久エラー・リトライ使い切りのいずれも Response を返す
                     return Ok(response);
                 }
                 Err(e) => {
@@ -423,5 +441,99 @@ mod tests {
         assert_eq!(parse_retry_after_secs(Some("-1")), None);
         assert_eq!(parse_retry_after_secs(Some("1.5")), None);
         assert_eq!(parse_retry_after_secs(Some("")), None);
+    }
+
+    /// 指定したステータス行の列を順番に返すループバック HTTP サーバを立てる。
+    /// 外部ネットワークに出ないため unit テストから使用できる。
+    fn spawn_canned_server(
+        status_lines: Vec<&'static str>,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = status_lines.len();
+        let handle = std::thread::spawn(move || {
+            for (stream, status_line) in listener.incoming().take(count).zip(status_lines) {
+                let mut stream = stream.unwrap();
+                // リクエストを一部読み捨ててからレスポンスを返す
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let response = format!(
+                    "HTTP/1.1 {}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    status_line
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (format!("http://{}/", addr), handle)
+    }
+
+    /// リトライコア: 5xx は再試行され、回復すれば成功レスポンスが返る
+    #[tokio::test]
+    async fn test_get_response_with_retry_recovers_from_5xx() {
+        let (url, handle) = spawn_canned_server(vec!["500 Internal Server Error", "200 OK"]);
+
+        let client = HttpClient::new().unwrap().with_max_retries(2);
+        let response = client
+            .get_response_with_retry(|| client.inner().get(&url), "pkg", "reg")
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        handle.join().unwrap();
+    }
+
+    /// リトライコア: リトライを使い切った場合は最後の Response をそのまま返し、
+    /// ステータスの最終判定は呼び出し側に委ねる (エラーにはしない)
+    #[tokio::test]
+    async fn test_get_response_with_retry_exhausted_returns_last_response() {
+        let (url, handle) =
+            spawn_canned_server(vec!["503 Service Unavailable", "503 Service Unavailable"]);
+
+        let client = HttpClient::new().unwrap().with_max_retries(1);
+        let response = client
+            .get_response_with_retry(|| client.inner().get(&url), "pkg", "reg")
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        handle.join().unwrap();
+    }
+
+    /// リトライコア: 非リトライ対象 (403 等) は再試行せず即座に Response を返す
+    #[tokio::test]
+    async fn test_get_response_with_retry_non_retryable_returns_immediately() {
+        let (url, handle) = spawn_canned_server(vec!["403 Forbidden"]);
+
+        let client = HttpClient::new().unwrap().with_max_retries(3);
+        let response = client
+            .get_response_with_retry(|| client.inner().get(&url), "pkg", "reg")
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        handle.join().unwrap();
+    }
+
+    /// get_with_context はリトライ使い切りの 5xx を NetworkError へ変換する
+    /// (リトライコア導入前と同じ外形挙動)
+    #[tokio::test]
+    async fn test_get_with_context_maps_exhausted_5xx_to_error() {
+        let (url, handle) = spawn_canned_server(vec![
+            "500 Internal Server Error",
+            "500 Internal Server Error",
+        ]);
+
+        let client = HttpClient::new().unwrap().with_max_retries(1);
+        let result = client.get_with_context(&url, "pkg", "reg").await;
+
+        match result {
+            Err(RegistryError::NetworkError { message, .. }) => {
+                assert_eq!(message, "HTTP 500 Internal Server Error");
+            }
+            other => panic!("expected NetworkError, got: {:?}", other),
+        }
+        handle.join().unwrap();
     }
 }

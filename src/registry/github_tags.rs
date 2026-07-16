@@ -8,7 +8,7 @@
 
 use crate::domain::Language;
 use crate::error::RegistryError;
-use crate::registry::client::{map_send_error, map_status_error};
+use crate::registry::client::map_status_error;
 use crate::registry::{HttpClient, RegistryAdapter, is_valid_registry_id_segment};
 use crate::update::VersionInfo;
 use async_trait::async_trait;
@@ -152,19 +152,25 @@ impl RegistryAdapter for GitHubTagsAdapter {
         // (per_page=100 の 1 ページのみだと 100 タグ超のリポジトリで最新タグを取り逃す)。
         // 安全弁として最大 MAX_TAG_PAGES ページ (= 1000 タグ) まで。
         for _page in 0..MAX_TAG_PAGES {
-            // 適切なヘッダ付きでリクエストを構築
-            let mut request = self.client.inner().get(&url);
-            request = request.header("Accept", "application/vnd.github+json");
-
-            if let Some(ref token) = self.token {
-                request = request.header("Authorization", format!("Bearer {}", token));
-            }
-
-            // 送信エラー (タイムアウト / トランスポート) は client.rs の共通マッピングで変換
-            let response = request
-                .send()
-                .await
-                .map_err(|e| map_send_error(&e, package, self.registry_name()))?;
+            // 適切なヘッダ付きでリクエストを構築し、client.rs の共通リトライ経路
+            // (429/5xx の再試行 + Retry-After 尊重 + 送信エラー変換) で実行する。
+            // 403 / 401 は GitHub 固有の解釈が必要なため、リトライ経路では変換せず
+            // 生の Response を受け取ってこちらでステータスを最終判定する。
+            let response = self
+                .client
+                .get_response_with_retry(
+                    || {
+                        let mut request = self.client.inner().get(&url);
+                        request = request.header("Accept", "application/vnd.github+json");
+                        if let Some(ref token) = self.token {
+                            request = request.header("Authorization", format!("Bearer {}", token));
+                        }
+                        request
+                    },
+                    package,
+                    self.registry_name(),
+                )
+                .await?;
 
             // HTTP ステータスコードを処理。
             // GitHub 固有の解釈が必要な 403 / 401 を先に処理し、
