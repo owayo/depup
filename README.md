@@ -253,6 +253,8 @@ Use `--include-pinned` to update pinned versions.
 
 > **Note**: Go dependencies are always included in updates regardless of the `--include-pinned` flag, because `go.mod` only supports exact versions (no range specifiers like `^` or `~`). All Go versions are effectively "pinned" by nature.
 >
+> **Note**: Go `exclude` directives are applied to update candidates without rewriting the directive itself. Versions retracted by the upstream module's latest `go.mod` are also excluded, including closed retract ranges. For modules without tagged versions, depup falls back to the Go Proxy `@latest` endpoint; an omitted `.info` `Time` uses the Unix epoch so an unknown release date is not permanently filtered by `--age`.
+>
 > **Note**: Gemfile compound and exclusion constraints such as `gem "pg", ">= 0.18", "< 2.0"` and `gem "rack", "!= 2.2.4"` are parsed, but depup does not rewrite them automatically. Replacing only part of those constraints can change their meaning, so depup reports them instead of applying an unsafe edit.
 >
 > **Note**: Gemfile entries that point to non-registry sources without a version (`git:`, `github:`, `bitbucket:`, `gist:`, `path:`, `source:`) are skipped instead of being converted into RubyGems registry constraints. Inline `group:` / `groups:` options are used to classify development dependencies.

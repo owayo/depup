@@ -818,7 +818,7 @@ fn compare_core_pre_post(
             // 前方一致で等しい場合は識別子数が少ない方が小さい (semver 11.4.4)
             match a_ids.len().cmp(&b_ids.len()) {
                 // プレリリース識別子が同一なら post まで踏み込んで比較する
-                // (PEP 440: `1.0a1.post1 > 1.0a1`)
+                // PEP 440 では `1.0a1.post1 > 1.0a1`
                 Ordering::Equal => {}
                 other => return other,
             }

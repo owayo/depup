@@ -470,6 +470,11 @@ fn matches_rejected_version(dependency: &Dependency, candidate: &str, rejected: 
         return above_lower && below_upper;
     }
 
+    if dependency.language == Language::Go {
+        return compare_dependency_versions(dependency, candidate, rejected)
+            == std::cmp::Ordering::Equal;
+    }
+
     candidate == rejected
 }
 
@@ -2075,6 +2080,28 @@ mod tests {
         assert!(result.is_update());
         if let UpdateResult::Update { new_version, .. } = result {
             assert_eq!(new_version, "2.0.0");
+        }
+    }
+
+    #[test]
+    fn test_judge_go_excluded_version_is_not_selected() {
+        let filter = UpdateFilter::new().with_include_pinned(true);
+        let judge = UpdateJudge::new(filter);
+
+        let spec = VersionSpec::new(VersionSpecKind::GoPinned, "v1.9.1", "1.9.1")
+            .with_rejected_versions(["v1.10.0"]);
+        let dep = Dependency::new("example.com/module", spec, false, Language::Go);
+        let versions = vec![
+            make_version_info("1.9.2", 20),
+            make_version_info("1.10.0", 10),
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        match result {
+            UpdateResult::Update { new_version, .. } => {
+                assert_eq!(new_version, "1.9.2");
+            }
+            other => panic!("予期しない更新判定: {other:?}"),
         }
     }
 

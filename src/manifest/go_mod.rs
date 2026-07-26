@@ -4,13 +4,14 @@
 //! - require 文 (単一行およびブロック)
 //! - `// pinned` コメントによるバージョン固定
 //! - replace ディレクティブ (パースと更新の両方でスキップ)
-//! - exclude ディレクティブ (パースと更新の両方でスキップ)
+//! - exclude ディレクティブ (更新候補から除外し、記述自体は書き換えない)
 
 use crate::domain::{Dependency, Language};
 use crate::error::ManifestError;
 use crate::manifest::{ManifestParser, line_utils::split_line_ending};
 use crate::parser::{VersionParser, get_parser};
 use regex::Regex;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
@@ -96,6 +97,21 @@ impl ManifestParser for GoModParser {
                 && let Some(dep) = parse_go_dependency(&caps, parser.as_ref(), is_pinned)
             {
                 dependencies.push(dep);
+            }
+        }
+
+        let excluded_versions = collect_excluded_versions(content);
+        for dependency in &mut dependencies {
+            let Some(versions) = excluded_versions.get(&dependency.name) else {
+                continue;
+            };
+            for version in versions {
+                if !dependency.version_spec.rejected_versions.contains(version) {
+                    dependency
+                        .version_spec
+                        .rejected_versions
+                        .push(version.clone());
+                }
             }
         }
 
@@ -233,6 +249,54 @@ fn quote_go_version_like(original: &str, new_version: &str) -> String {
     } else {
         new_version.to_string()
     }
+}
+
+/// `exclude` 指示をモジュール名ごとの除外バージョンへ変換する。
+fn collect_excluded_versions(content: &str) -> HashMap<String, Vec<String>> {
+    let mut excluded_versions: HashMap<String, Vec<String>> = HashMap::new();
+    let mut in_exclude_block = false;
+
+    for line in content.lines() {
+        let logical = line.split("//").next().unwrap_or("").trim();
+        if logical.is_empty() {
+            continue;
+        }
+
+        if logical.starts_with("exclude (") || logical == "exclude (" {
+            in_exclude_block = true;
+            continue;
+        }
+        if in_exclude_block && logical == ")" {
+            in_exclude_block = false;
+            continue;
+        }
+
+        let entry = if in_exclude_block {
+            logical
+        } else if let Some(entry) = logical.strip_prefix("exclude ") {
+            entry.trim()
+        } else {
+            continue;
+        };
+        let Some(caps) = BLOCK_ENTRY_RE.captures(entry) else {
+            continue;
+        };
+        let Some(module) = caps.get(1) else {
+            continue;
+        };
+        let Some(version) = caps.get(2) else {
+            continue;
+        };
+
+        let module = unquote_go_token(module.as_str()).to_string();
+        let version = unquote_go_token(version.as_str()).to_string();
+        let versions = excluded_versions.entry(module).or_default();
+        if !versions.contains(&version) {
+            versions.push(version);
+        }
+    }
+
+    excluded_versions
 }
 
 fn parse_go_dependency(
@@ -666,8 +730,8 @@ require github.com/gin-gonic/gin v1.9.1
     }
 
     #[test]
-    fn test_parse_ignores_exclude() {
-        // exclude ディレクティブは依存関係としてパースされないこと
+    fn test_parse_applies_single_exclude_to_matching_dependency() {
+        // exclude の対象を依存関係の除外候補へ反映すること
         let content = r#"
 module example.com/myproject
 
@@ -675,33 +739,62 @@ go 1.21
 
 require github.com/gin-gonic/gin v1.9.1
 
-exclude github.com/bad/pkg v1.2.3
+exclude github.com/gin-gonic/gin v1.10.0
 "#;
 
         let deps = parse(content).unwrap();
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].name, "github.com/gin-gonic/gin");
+        assert_eq!(deps[0].version_spec.rejected_versions, vec!["v1.10.0"]);
     }
 
     #[test]
-    fn test_parse_ignores_exclude_block() {
-        // exclude ブロックは依存関係としてパースされないこと
+    fn test_parse_applies_exclude_block_to_matching_dependencies() {
+        // exclude ブロックの複数指定を対応する依存関係へ反映すること
         let content = r#"
 module example.com/myproject
 
 go 1.21
 
-require github.com/gin-gonic/gin v1.9.1
+require (
+ github.com/gin-gonic/gin v1.9.1
+ github.com/old/module v0.1.0
+)
 
 exclude (
-	github.com/bad/pkg v1.2.3
-	github.com/old/module v0.1.0
+ github.com/gin-gonic/gin v1.10.0
+ github.com/gin-gonic/gin v1.11.0
+ github.com/old/module v0.2.0
 )
 "#;
 
         let deps = parse(content).unwrap();
-        assert_eq!(deps.len(), 1);
+        assert_eq!(deps.len(), 2);
         assert_eq!(deps[0].name, "github.com/gin-gonic/gin");
+        assert_eq!(
+            deps[0].version_spec.rejected_versions,
+            vec!["v1.10.0", "v1.11.0"]
+        );
+        assert_eq!(deps[1].version_spec.rejected_versions, vec!["v0.2.0"]);
+    }
+
+    #[test]
+    fn test_parse_applies_quoted_exclude_before_require_without_duplicates() {
+        // require より前の引用符付き exclude も収集し、重複は一度だけ反映すること
+        let content = r#"
+module example.com/myproject
+
+go 1.21
+
+exclude "github.com/gin-gonic/gin" "v1.10.0"
+exclude github.com/gin-gonic/gin v1.10.0
+
+require "github.com/gin-gonic/gin" "v1.9.1"
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].version_spec.rejected_versions, vec!["v1.10.0"]);
     }
 
     #[test]
