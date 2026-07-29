@@ -164,7 +164,7 @@ mod tests {
 
     #[test]
     fn test_timestamp_to_datetime() {
-        // 2024-01-15T10:30:00Z = 1705314600000 ms
+        // 日時変換の例: 2024-01-15T10:30:00Z = 1705314600000ミリ秒
         let timestamp_ms = 1705314600000_i64;
         let dt = MavenCentralAdapter::timestamp_to_datetime(timestamp_ms).unwrap();
         assert_eq!(dt.year(), 2024);

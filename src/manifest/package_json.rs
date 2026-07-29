@@ -243,7 +243,7 @@ fn bun_catalog_object_ranges(content: &str) -> Vec<(usize, usize)> {
         None,
     ));
 
-    // `workspaces.catalog`
+    // `workspaces.catalog` を処理する
     let workspaces = top_level_object_section_ranges(content, &["workspaces"]);
     ranges.extend(direct_child_object_section_ranges(
         content,
@@ -251,7 +251,7 @@ fn bun_catalog_object_ranges(content: &str) -> Vec<(usize, usize)> {
         Some(&["catalog"]),
     ));
 
-    // `workspaces.catalogs.<name>`
+    // `workspaces.catalogs.<name>` を処理する
     let workspace_catalogs =
         direct_child_object_section_ranges(content, &workspaces, Some(&["catalogs"]));
     ranges.extend(direct_child_object_section_ranges(

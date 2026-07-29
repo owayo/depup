@@ -186,8 +186,8 @@ fn detect_pnpm_workspace_packages(dir: &Path) -> Result<Vec<PathBuf>, std::io::E
 
     // packages 配列の簡易 YAML パース
     // 形式: packages:
-    //          - 'packages/*'
-    //          - 'apps/*'
+    //          - 'packages/*' というワークスペース設定例
+    //          - 'apps/*' というワークスペース設定例
     let mut in_packages = false;
     // flow-style 配列 (`packages: ['a/*', 'b/*']`) を複数行に跨って蓄積するバッファ
     let mut flow_buffer: Option<String> = None;

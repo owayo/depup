@@ -119,10 +119,11 @@ make help                # Makefileヘルプ
 - **Integration tests**: `tests/integration_tests.rs` - マニフェスト検出、パース、パイプラインテスト
 - **E2E tests**: `tests/e2e_tests.rs` - バイナリ実行テスト (dry-run、JSON出力、exit code)
 - ネットワークアクセスを伴うテストは E2E テストに限定
+- E2E テストは Cargo が提供する `CARGO_BIN_EXE_depup` のコンパイル済みバイナリを使う。テストプロセス内から `cargo build` を起動すると、親の `cargo test` が保持する Cargo ロックと循環待ちになり全テストが停止するため、独自ビルドを行わない
 
 ## Important Notes
 
-- 更新候補の比較はエコシステム別に行う。Node/Rust/Go/Swift は SemVer 2.0.0 を使い、純粋に数値だけの `-` サフィックス (`1.0.0-1`) もプレリリースとして安定版より小さく扱う。Python は `pep440_rs` による PEP 440 正規化・順序付け（代替綴り、epoch、pre/dev/post/local を含む）、Ruby は RubyGems の数値・英字セグメント順を使い、英字またはハイフンを含む版をプレリリースとして安定版利用者の候補から除外する。PHP は Composer の patch alias (`-p1` / `-pl1` / `-patch1`)、Java は Gradle 公式の version ordering（区切り同値、英数字分割、追加パート、special qualifier 順）を使う。数値コア・epoch・pre/post/local の数値識別子は `u64` へ変換せず任意桁の10進文字列として比較し、巨大な数値でもオーバーフローによるダウングレードを起こさない
+- 更新候補の比較はエコシステム別に行う。Node/Rust/Go/Swift は SemVer 2.0.0 を使い、純粋に数値だけの `-` サフィックス (`1.0.0-1`) もプレリリースとして安定版より小さく扱う。優先順位の比較では `semver::Version::cmp_precedence` を使って build metadata (`+...`) を無視し、`1.1.3` と `1.1.3+spec-1.1.0` の差だけで更新を発生させない。通常の `Ord` は全順序のため build metadata も比較するので更新判定には使わない。Python は `pep440_rs` による PEP 440 正規化・順序付け（代替綴り、epoch、pre/dev/post/local を含む）、Ruby は RubyGems の数値・英字セグメント順を使い、英字またはハイフンを含む版をプレリリースとして安定版利用者の候補から除外する。PHP は Composer の patch alias (`-p1` / `-pl1` / `-patch1`)、Java は Gradle 公式の version ordering（区切り同値、英数字分割、追加パート、special qualifier 順）を使う。数値コア・epoch・pre/post/local の数値識別子は `u64` へ変換せず任意桁の10進文字列として比較し、巨大な数値でもオーバーフローによるダウングレードを起こさない
 - Node は node-semver 互換の `~>1.2.3` を Tilde として受理し、更新後も `~>` を保持する。Composer は `=1.2.3` / `==1.2.3` を Exact として演算子を保持し、`<>1.2.3` は除外 Range として surface するが安全に書き換えられないため Skip する。Gradle rich version の `reject` は固定値・動的指定 (`2.+`) に加えて Maven 形式レンジ (`[1.5,1.9)`) も候補除外へ反映する
 - `.depup` の各行は配置ディレクトリ配下の相対パスだけを許可する。絶対パス、`..`、外部ディレクトリへ解決される symlink は設定エラーとして拒否し、`--install` を含む処理がプロジェクト外へ出ないようにする
 - バージョンキャッシュはキー単位ロックで single-flight 化し、同一言語・同一パッケージの並行要求は1回のレジストリアクセスへ集約する。異なるパッケージの並列性は維持する

@@ -1029,21 +1029,21 @@ let package = Package(
         let deps = parse(content).unwrap();
         assert_eq!(deps.len(), 4);
 
-        // from: → Caret
+        // from: 指定は Caret として扱う
         let swift_log = deps.iter().find(|d| d.name == "apple/swift-log").unwrap();
         assert_eq!(swift_log.version_spec.kind, VersionSpecKind::Caret);
         assert_eq!(swift_log.version_spec.version, "1.5.0");
 
-        // upToNextMinor → Tilde
+        // upToNextMinor 指定は Tilde として扱う
         let vapor = deps.iter().find(|d| d.name == "vapor/vapor").unwrap();
         assert_eq!(vapor.version_spec.kind, VersionSpecKind::Tilde);
         assert_eq!(vapor.version_spec.version, "4.89.0");
 
-        // exact: → Exact
+        // exact: 指定は Exact として扱う
         let nio = deps.iter().find(|d| d.name == "apple/swift-nio").unwrap();
         assert_eq!(nio.version_spec.kind, VersionSpecKind::Exact);
 
-        // ..<  → Range
+        // ..< 指定は Range として扱う
         let http_client = deps
             .iter()
             .find(|d| d.name == "swift-server/async-http-client")

@@ -666,6 +666,30 @@ mod tests {
     }
 
     #[test]
+    fn test_judge_semver_build_metadata_does_not_trigger_update() {
+        let judge = UpdateJudge::new(UpdateFilter::new());
+        let versions = vec![make_version_info("1.1.3+spec-1.1.0", 10)];
+
+        for language in [
+            Language::Node,
+            Language::Rust,
+            Language::Go,
+            Language::Swift,
+        ] {
+            let dependency = make_dependency("package", "1.1.3", language, false);
+            let result = judge.judge(&dependency, &versions);
+
+            assert!(matches!(
+                result,
+                UpdateResult::Skip {
+                    reason: SkipReason::AlreadyLatest,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
     fn test_judge_skip_pinned() {
         let filter = UpdateFilter::new();
         let judge = UpdateJudge::new(filter);

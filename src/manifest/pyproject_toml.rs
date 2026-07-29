@@ -1,12 +1,12 @@
 //! Python プロジェクト向けの `pyproject.toml` パーサ。
 //!
 //! 対応対象:
-//! - `project.dependencies`（PEP 621）
-//! - `project.optional-dependencies`（PEP 621）
-//! - `dependency-groups`（PEP 735）
-//! - `tool.poetry.dependencies`（Poetry）
-//! - `tool.poetry.dev-dependencies`（Poetry）
-//! - `tool.rye.dev-dependencies`（Rye）
+//! - PEP 621 の `project.dependencies`
+//! - PEP 621 の `project.optional-dependencies`
+//! - PEP 735 の `dependency-groups`
+//! - Poetry の `tool.poetry.dependencies`
+//! - Poetry の `tool.poetry.dev-dependencies`
+//! - Rye の `tool.rye.dev-dependencies`
 
 use crate::domain::{Dependency, Language};
 use crate::error::ManifestError;
@@ -329,11 +329,11 @@ enum TomlSectionKind {
     /// Poetry の依存セクション (`name = "^1.0"` / inline table 置換の対象)
     PoetryDependencies,
     /// セクション全体が PEP 508 依存配列 (の集合) で全行が置換対象
-    /// (`[project.optional-dependencies]` / `[dependency-groups]`)
+    /// 対象セクション: `[project.optional-dependencies]` / `[dependency-groups]`
     Pep508Dependencies,
     /// セクション内の特定の依存配列 (`dependencies` / `dev-dependencies`) だけが置換対象で、
     /// `name` / `keywords` / `description` 等の他キーは書き換えてはいけないセクション
-    /// (`[project]` / `[tool.rye]`)
+    /// 対象セクション: `[project]` / `[tool.rye]`
     Pep508ScopedArrays,
     /// 依存セクション以外 (`[build-system]` 等。書き換え対象外)
     Other,

@@ -156,7 +156,7 @@ serde = "1.0"
         )
         .unwrap();
 
-        // Go
+        // Go 言語
         fs::write(
             temp_dir.path().join("go.mod"),
             r#"module example.com/test
@@ -386,7 +386,7 @@ let package = Package(
         )
         .unwrap();
 
-        // Go
+        // Go 言語
         fs::write(
             temp_dir.path().join("go.mod"),
             "module example.com/test\n\ngo 1.21\n\nrequire github.com/gin-gonic/gin v1.9.0\n",

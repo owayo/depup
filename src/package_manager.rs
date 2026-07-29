@@ -233,7 +233,7 @@ impl SystemPackageManager {
             "pipenv" => vec!["pipenv", "install"],
             // Rust の処理
             "cargo" => vec!["cargo", "update"],
-            // Go
+            // Go 言語
             "go" => vec!["go", "mod", "download"],
             // Ruby の処理
             "bundle" => vec!["bundle", "install"],

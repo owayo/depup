@@ -88,8 +88,8 @@ pub(crate) fn map_send_error(
 
 /// HTTP ステータスコードを `RegistryError` へ変換する共通マッピング
 ///
-/// - 429 Too Many Requests → `RateLimitExceeded`
-/// - 404 Not Found → `PackageNotFound`
+/// - 429 Too Many Requests は `RateLimitExceeded` に変換する
+/// - 404 Not Found は `PackageNotFound` に変換する
 /// - その他の非成功ステータス (5xx = レジストリの一時障害を含む) → `NetworkError`
 /// - 成功ステータス → `None`
 ///

@@ -29,10 +29,10 @@ enum GemfileBlock {
 // `gem 'name'` / `gem "name"` / `gem('name')` を解釈する正規表現
 static GEM_RE: LazyLock<Regex> = LazyLock::new(|| {
     // 例:
-    // gem 'rails', '~> 7.0'
-    // gem "pg", ">= 0.18", "< 2.0"
-    // gem("rack", "~> 3.0")
-    // gem 'bcrypt'
+    // 解析対象の例: gem 'rails', '~> 7.0'
+    // 複合制約の例: gem "pg", ">= 0.18", "< 2.0"
+    // 括弧付き呼び出しの例: gem("rack", "~> 3.0")
+    // バージョン指定なしの例: gem 'bcrypt'
     // 末尾コンテキストは `,` / 行末 / `)` / コメント `#` に加え、行末条件修飾子
     // (`gem 'wdm', '>= 0.1.0' if Gem.win_platform?`) も許容する。これがないと
     // ` if ...` でバックトラックして version 引数を取りこぼし Any と誤分類する。
@@ -45,8 +45,8 @@ static GEM_RE: LazyLock<Regex> = LazyLock::new(|| {
 // `group ... do` 開始行
 static GROUP_START_RE: LazyLock<Regex> = LazyLock::new(|| {
     // 例:
-    // group :development do
-    // group :development, :test do
+    // 単一グループの例: group :development do
+    // 複数グループの例: group :development, :test do
     // group :development do # security gems  <- 行末コメントも許容する
     Regex::new(r"^\s*group\s+(.+?)\s+do\s*(?:#.*)?$").unwrap()
 });

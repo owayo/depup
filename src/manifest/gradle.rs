@@ -1226,7 +1226,7 @@ dependencies {
 dependencies {
     implementation("org.slf4j:slf4j-api") {
         version {
-            // prefer("1.7.25")
+            // 優先バージョン指定の例: prefer("1.7.25")
         }
     }
 }

@@ -228,8 +228,8 @@ impl ManifestParser for CargoTomlParser {
                 }
             } else if is_cargo_package_dependency_table(&section, package) {
                 // 複数行テーブル:
-                // [dependencies.package]
-                // version = "1.0.0"
+                // テーブル形式の例: [dependencies.package]
+                // バージョン指定の例: version = "1.0.0"
                 // [workspace.dependencies.package] や target 固有テーブルも、セクション名と
                 // パッケージ名の完全一致で追跡しながら `version` キー行だけを置換する。
                 // `features = [...]` が `version` より前にあっても更新でき、コメント行や

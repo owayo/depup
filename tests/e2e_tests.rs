@@ -8,33 +8,11 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::OnceLock;
 use tempfile::TempDir;
 
-static BINARY_PATH: OnceLock<PathBuf> = OnceLock::new();
-
-/// コンパイル済みバイナリのパスを取得する
+/// Cargo が統合テスト用にコンパイルしたバイナリのパスを取得する
 fn get_binary_path() -> PathBuf {
-    BINARY_PATH
-        .get_or_init(|| {
-            // E2E テストは既定で並列実行されるため、release build はプロセス内で1回だけ行う。
-            let output = Command::new("cargo")
-                .args(["build", "--release"])
-                .output()
-                .expect("Failed to build project");
-
-            if !output.status.success() {
-                panic!(
-                    "Failed to build: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-
-            let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            path.push("target/release/depup");
-            path
-        })
-        .clone()
+    PathBuf::from(env!("CARGO_BIN_EXE_depup"))
 }
 
 /// サンプルマニフェストを持つテスト用ディレクトリを作成する

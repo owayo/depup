@@ -98,8 +98,8 @@ enum AgeNotice {
 ///
 /// 優先順位:
 ///   1. minimumReleaseAge (pnpm-workspace.yaml / bunfig.toml) — プロジェクトポリシー強制
-///   2. CLI `--age`
-///   3. CLI `--no-age`
+///   2. CLI の `--age`
+///   3. CLI の `--no-age`
 ///   4. グローバル設定 (~/.config/depup/config.toml)
 ///   5. 組み込みデフォルト (`DEFAULT_AGE`)
 fn resolve_age_policy(

@@ -589,7 +589,7 @@ pub fn compare_semver_versions(a: &str, b: &str) -> std::cmp::Ordering {
         semver::Version::parse(strip_ascii_v_prefix(a)),
         semver::Version::parse(strip_ascii_v_prefix(b)),
     ) {
-        return a.cmp(&b);
+        return a.cmp_precedence(&b);
     }
 
     compare_core_pre_post(
@@ -1566,7 +1566,7 @@ mod tests {
     #[test]
     fn test_compare_versions_both_prerelease_numeric_identifier_ordered() {
         // 両方ともプレリリースの場合、プレリリース部の数値識別子で順序付けする
-        // (canary-123 < canary-456, rc.1 < rc.2)
+        // 識別子内の数値は数値順で比較する（canary-123 < canary-456、rc.1 < rc.2）
         assert_eq!(
             compare_versions("1.0.0-rc.1", "1.0.0-rc.2"),
             std::cmp::Ordering::Less
