@@ -640,6 +640,85 @@ mod tests {
         }
     }
 
+    /// 回帰テスト: JVM 系の milestone 版 (`-M1` / `.M3`) が安定版として採用され、
+    /// 安定版利用者が milestone へ更新されていた (Java/PHP は semver 判定ではなく
+    /// 識別子リストを使うため、`M<数字>` が prerelease として認識されていなかった)。
+    #[test]
+    fn test_judge_java_milestone_excluded_from_stable() {
+        let judge = UpdateJudge::new(UpdateFilter::new());
+
+        // AssertJ 実データ相当: 3.24.2 の利用者は 4.0.0-M1 ではなく 3.27.3 へ
+        let dep = make_dependency("org.assertj:assertj-core", "3.24.2", Language::Java, false);
+        let versions = vec![
+            make_version_info("3.24.2", 400),
+            make_version_info("3.27.3", 100),
+            make_version_info("4.0.0-M1", 10),
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_update(), "{:?}", result);
+        if let UpdateResult::Update { new_version, .. } = result {
+            assert_eq!(new_version, "3.27.3");
+        }
+    }
+
+    /// 旧 Spring Boot のドット区切り milestone (`2.0.0.M1`) も除外する。
+    /// 一方 `.Final` / `-jre` のような JVM の安定版 qualifier は候補に残す。
+    #[test]
+    fn test_judge_java_milestone_dot_form_and_stable_qualifiers() {
+        let judge = UpdateJudge::new(UpdateFilter::new());
+
+        let dep = make_dependency(
+            "org.springframework:spring-core",
+            "5.3.23",
+            Language::Java,
+            false,
+        );
+        let versions = vec![
+            make_version_info("5.3.23", 400),
+            make_version_info("6.2.8", 100),
+            make_version_info("7.0.0.M1", 10),
+        ];
+        let result = judge.judge(&dep, &versions);
+        if let UpdateResult::Update { new_version, .. } = result {
+            assert_eq!(new_version, "6.2.8");
+        } else {
+            panic!("更新されるべき: {:?}", result);
+        }
+
+        // 安定版 qualifier (`.Final`) は milestone 判定に巻き込まれない
+        let dep = make_dependency("io.netty:netty-bom", "4.1.100.Final", Language::Java, false);
+        let versions = vec![
+            make_version_info("4.1.100.Final", 400),
+            make_version_info("4.2.1.Final", 10),
+        ];
+        let result = judge.judge(&dep, &versions);
+        if let UpdateResult::Update { new_version, .. } = result {
+            assert_eq!(new_version, "4.2.1.Final");
+        } else {
+            panic!("安定版 qualifier は更新されるべき: {:?}", result);
+        }
+    }
+
+    /// 現在版が milestone なら、従来のプレリリース規則どおり候補に milestone を残す
+    /// (milestone 利用者が次の milestone へ進めなくなるのを防ぐ)。
+    #[test]
+    fn test_judge_java_milestone_current_keeps_milestone_candidates() {
+        let judge = UpdateJudge::new(UpdateFilter::new());
+
+        let dep = make_dependency("org.junit:junit-bom", "5.13.0-M1", Language::Java, false);
+        let versions = vec![
+            make_version_info("5.13.0-M1", 100),
+            make_version_info("5.13.0-M3", 10),
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_update(), "{:?}", result);
+        if let UpdateResult::Update { new_version, .. } = result {
+            assert_eq!(new_version, "5.13.0-M3");
+        }
+    }
+
     #[test]
     fn test_judge_already_latest() {
         let filter = UpdateFilter::new();

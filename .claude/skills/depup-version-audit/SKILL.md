@@ -88,8 +88,14 @@ depup はバージョン指定を「パースして分類」→「レジスト�
 ## depup が意図的にスキップする構文
 
 - npm の `workspace:*`, `file:`, `git://` 等のプロトコル参照
-- Swift の `branch:`, `revision:`, `path:` 依存
+- Swift の `branch:`, `revision:`, `path:` 依存、Swift Package Registry の `id:` 依存（レジストリアダプタ未実装）
 - Go の `replace` ディレクティブ
-- Composer の platform packages (`php`, `ext-*`)
-- Gradle の `platform()`, `enforcedPlatform()`, version catalogs (libs.xxx)
+- Composer の platform packages (`php`, `ext-*`)、インラインエイリアス (`1.0.0 as 1.1.0`)
+- Gradle の build.gradle 内 version catalog アクセサ (`libs.xxx`)。実体は `gradle/*.versions.toml` 側で更新するため、build.gradle 側は書き換えない
+- Cargo / Poetry の path 依存、`[tool.uv.sources]` の workspace / git / path / url 指定
+- pnpm-workspace.yaml の catalogs（`package.json` 側の `catalog:` 参照ごとスキップ）
+- Poetry のマルチプル制約配列形式（`foo = [{version = "<=1.9", python = "..."}, ...]`）
 - Python の環境マーカー（パース後に除去）
+
+> **注**: `platform()` / `enforcedPlatform()` / `testFixtures()` は以前スキップ対象だったが、
+> BOM は推移依存のバージョンを一括決定する要の宣言のため**対応済み**に変更した。

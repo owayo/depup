@@ -876,4 +876,27 @@ mod tests {
         assert_eq!(spec.kind, VersionSpecKind::Exact);
         assert_eq!(spec.prefix, Some("===".to_string()));
     }
+
+    /// 回帰テスト: Poetry の Tilde のセグメント数保持を「実パーサ経由」で検証する。
+    ///
+    /// Poetry の `~1.2` は `>=1.2.0 <1.3.0`、`~1` は `>=1.0.0 <2.0.0` (major 幅)。
+    /// PEP 440 の `~=` は `format_range_like` が別途セグメント数を保持している。
+    #[test]
+    fn test_format_updated_tilde_preserves_segment_count_via_parser() {
+        for (input, new_version, expected) in [
+            ("~2.28", "2.34.1", "~2.34"),
+            ("~8", "8.4.2", "~8"),
+            ("~1.2.3", "1.8.9", "~1.8.9"),
+        ] {
+            let spec = parse(input).expect(input);
+            assert_eq!(spec.kind, VersionSpecKind::Tilde, "input={}", input);
+            assert_eq!(
+                spec.format_updated(new_version),
+                expected,
+                "input={} new={}",
+                input,
+                new_version
+            );
+        }
+    }
 }

@@ -118,6 +118,25 @@ impl Language {
             Language::Swift => None,
         }
     }
+
+    /// `--age` を transitive (推移) 依存にも効かせる手段があるかを返す。
+    ///
+    /// `false` の言語では direct 依存にしか age 制約がかからないため、
+    /// `--verbose` でその旨を通知する。内訳:
+    /// - Node: pnpm v10.16+ の `npm_config_minimum_release_age` env var
+    /// - Python: uv の `--exclude-newer`
+    /// - Rust: `cargo update` 後の Cargo.lock 監査 (post-install audit)
+    ///
+    /// 判定を `Language` 側に置くことで、言語を追加したときに
+    /// 通知漏れが起きないようにする (match の網羅性検査が効く)。
+    pub fn has_native_transitive_age_support(&self) -> bool {
+        match self {
+            Language::Node | Language::Python | Language::Rust => true,
+            Language::Go | Language::Ruby | Language::Php | Language::Java | Language::Swift => {
+                false
+            }
+        }
+    }
 }
 
 impl fmt::Display for Language {
@@ -292,5 +311,26 @@ mod tests {
         assert!(!Language::Ruby.always_pinned());
         assert!(!Language::Php.always_pinned());
         assert!(!Language::Swift.always_pinned());
+    }
+
+    #[test]
+    fn test_has_native_transitive_age_support() {
+        // ネイティブ手段あり: pnpm の env var / uv の --exclude-newer /
+        // Rust の post-install lock 監査
+        assert!(Language::Node.has_native_transitive_age_support());
+        assert!(Language::Python.has_native_transitive_age_support());
+        assert!(Language::Rust.has_native_transitive_age_support());
+
+        // direct 依存にしか age がかからない (--verbose で通知される) 言語
+        assert!(!Language::Go.has_native_transitive_age_support());
+        assert!(!Language::Ruby.has_native_transitive_age_support());
+        assert!(!Language::Php.has_native_transitive_age_support());
+        assert!(!Language::Java.has_native_transitive_age_support());
+        assert!(!Language::Swift.has_native_transitive_age_support());
+
+        // 通知文には display_name を使うため、全言語で空でないこと
+        for language in Language::all() {
+            assert!(!language.display_name().is_empty());
+        }
     }
 }

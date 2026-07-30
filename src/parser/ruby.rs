@@ -505,4 +505,30 @@ mod tests {
         let spec = parse("~> 7.0.0.alpha.2").unwrap();
         assert_eq!(spec.format_updated("7.0.0.alpha.3"), "~> 7.0.0.alpha.3");
     }
+
+    /// 回帰テスト: Tilde (`~>`) のセグメント数保持を「実パーサ経由」で検証する。
+    ///
+    /// RubyGems の `~> 7.0` は `>= 7.0, < 8.0` (major 幅)、`~> 7.1.3` は
+    /// `>= 7.1.3, < 7.2` (minor 幅)。完全版へ展開すると許容幅が黙って狭まり、
+    /// 以後の `bundle update` がマイナー系列を跨げなくなる。
+    #[test]
+    fn test_format_updated_pessimistic_preserves_segment_count_via_parser() {
+        for (input, new_version, expected) in [
+            ("~> 7.0", "8.1.4", "~> 8.1"),
+            ("~> 13", "13.3.1", "~> 13"),
+            ("~> 7.1.3", "7.2.9", "~> 7.2.9"),
+            // 更新先が短い場合は 0 埋めして幅を保つ
+            ("~> 1.2.3.4", "1.9", "~> 1.9.0.0"),
+        ] {
+            let spec = parse(input).expect(input);
+            assert_eq!(spec.kind, VersionSpecKind::Tilde, "input={}", input);
+            assert_eq!(
+                spec.format_updated(new_version),
+                expected,
+                "input={} new={}",
+                input,
+                new_version
+            );
+        }
+    }
 }

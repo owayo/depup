@@ -119,7 +119,9 @@
 | Multiple requirements | `>=1.2, <1.5` | AND 結合 | Range |
 | Bare partial | `1.2`, `1` | 部分バージョン（caret相当） | Caret |
 | Pre-release | `1.0.0-alpha` | プレリリース | Caret/Exact（prefix次第） |
-| Build metadata | `1.0.0+build` | ビルドメタデータ | 未対応（現実装） |
+| Build metadata | `1.0.0+build` | ビルドメタデータ | 対応（比較時は semver 仕様どおり無視） |
+| Dotted key | `tokio.version = "1.38"` | TOML dotted key 形式 | 対応（依存セクション限定） |
+| Path 依存 | `{ path = "../x", version = "0.1" }` | ローカル path 依存 | スキップ（`version` 併記でも） |
 
 ### Cargo の特殊ケース
 
@@ -258,8 +260,11 @@
 | Strict version | `1.2.3!!` | 厳密バージョン（サフィックス形式） | Exact (suffix `!!` 保持) |
 | Reject version | `1.2.+` reject `1.2.5` | 拒否指定 | ー |
 | Prefer version | `1.+` prefer `1.2.3` | 優先指定 | ー |
-| Version catalog | `libs.xxx` | バージョンカタログ | ー |
-| Platform | `platform()`, `enforcedPlatform()` | BOM/Platform | ー |
+| Version catalog | `libs.xxx` | バージョンカタログ | `gradle/*.versions.toml` 側で更新 |
+| Platform | `platform()`, `enforcedPlatform()` | BOM/Platform | 対応（ラッパを剥がして解析） |
+| Test fixtures | `testFixtures()` | テストフィクスチャ変種 | 対応（ラッパを剥がして解析） |
+| ext ドット代入 | `ext.ver = '1.0'` | ext ブロック外の変数定義 | 変数展開 |
+| 修飾付き参照 | `"g:n:${Versions.ver}"` | オブジェクト経由の参照 | 変数展開（曖昧な短名はスキップ） |
 | Variable (Groovy) | `def ver = '1.0'` | Groovy 変数 | 変数展開 |
 | Variable (Kotlin) | `val ver = "1.0"` | Kotlin 変数 | 変数展開 |
 | ext block | `ext { ver = '1.0' }` | ext ブロック変数 | 変数展開 |

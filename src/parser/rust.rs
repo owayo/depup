@@ -712,4 +712,28 @@ mod tests {
         assert_eq!(spec.version, "1.2.3-rc.1+build123");
         assert_eq!(spec.format_updated("1.2.3"), "=1.2.3");
     }
+
+    /// 回帰テスト: Tilde のセグメント数保持を「実パーサ経由」で検証する。
+    ///
+    /// Cargo の `~1` は `>=1.0.0, <2.0.0` (major 幅) なので、完全版へ展開すると
+    /// minor 幅へ狭まる。`~1.2` / `~1.2.3` はどちらも minor 幅だが、著者が
+    /// 表明した粒度を勝手に増やさない。
+    #[test]
+    fn test_format_updated_tilde_preserves_segment_count_via_parser() {
+        for (input, new_version, expected) in [
+            ("~1", "2.5.3", "~2"),
+            ("~1.0", "1.9.7", "~1.9"),
+            ("~1.2.3", "1.8.9", "~1.8.9"),
+        ] {
+            let spec = parse(input).expect(input);
+            assert_eq!(spec.kind, VersionSpecKind::Tilde, "input={}", input);
+            assert_eq!(
+                spec.format_updated(new_version),
+                expected,
+                "input={} new={}",
+                input,
+                new_version
+            );
+        }
+    }
 }

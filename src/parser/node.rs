@@ -693,10 +693,46 @@ mod tests {
         assert_eq!(spec.format_updated("2.10.0"), "^2.10.0");
     }
 
+    /// Tilde は元の指定のセグメント数を保つ。npm では `~2.1` も `~2.2.0` も
+    /// 同じ minor 幅 (`<2.3.0` / `<2.3.0`) だが、著者が表明した粒度を勝手に
+    /// 増やさない (Composer / RubyGems では 2 セグメントが major 幅なので、
+    /// 同じ規則が許容幅の縮小を防ぐ実害のある修正になる)。
     #[test]
     fn test_format_updated_tilde_partial() {
         let spec = parse("~2.1").unwrap();
-        assert_eq!(spec.format_updated("2.2.0"), "~2.2.0");
+        assert_eq!(spec.format_updated("2.2.0"), "~2.2");
+    }
+
+    /// 回帰テスト: Node のパーサは比較用バージョンを 3 セグメントへ 0 埋め
+    /// 正規化する (`~1` → `version = "1.0.0"`) ため、セグメント数を `version` から
+    /// 数えると Node だけ保持が効かず `~1` → `~2.5.3` になっていた。
+    /// これは major 幅 (`>=1.0.0 <2.0.0`) から minor 幅 (`>=2.5.3 <2.6.0`) への
+    /// 実害のある縮小。セグメント数は生表記 (`raw`) から数える。
+    #[test]
+    fn test_format_updated_tilde_preserves_raw_segment_count() {
+        for (input, new_version, expected) in [
+            ("~1", "2.5.3", "~2"),
+            ("~10.3", "13.0.6", "~13.0"),
+            ("~1.2.3", "1.8.9", "~1.8.9"),
+            // 更新先が短い場合は 0 埋めして幅を保つ
+            ("~1.2.3", "2.0", "~2.0.0"),
+        ] {
+            let spec = parse(input).unwrap();
+            assert_eq!(
+                spec.format_updated(new_version),
+                expected,
+                "input={} new={}",
+                input,
+                new_version
+            );
+        }
+    }
+
+    /// プレリリース / ビルドメタデータ付きの更新先は切り詰めず完全版を使う。
+    #[test]
+    fn test_format_updated_tilde_partial_keeps_prerelease() {
+        let spec = parse("~2.1").unwrap();
+        assert_eq!(spec.format_updated("3.0.0-rc.1"), "~3.0.0-rc.1");
     }
 
     #[test]

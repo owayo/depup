@@ -177,28 +177,14 @@ fn run_package_installs(
         eprintln!();
         eprintln!("Running package manager install...");
         if min_age.is_some() {
-            // age が有効な場合、ネイティブ対応 PM とそうでないものを通知する
-            let mut unsupported: Vec<&str> = Vec::new();
-            for (_dir, langs) in &install_map {
-                for lang in langs {
-                    match lang {
-                        Language::Node => {
-                            // Node.js は pnpm のみネイティブ対応 (install 時に判定)
-                        }
-                        Language::Python => {
-                            // Python は uv のみネイティブ対応
-                        }
-                        Language::Rust => {
-                            // Rust は post-install audit (enforce_lock_age_rust) で対応
-                        }
-                        Language::Go => unsupported.push("Go"),
-                        Language::Ruby => unsupported.push("Ruby"),
-                        Language::Php => unsupported.push("PHP"),
-                        Language::Java => unsupported.push("Java"),
-                        Language::Swift => unsupported.push("Swift"),
-                    }
-                }
-            }
+            // age が有効な場合、transitive 依存へネイティブ対応しない言語を通知する
+            // (どの言語が対応済みかは Language 側が単一の情報源)
+            let mut unsupported: Vec<&str> = install_map
+                .iter()
+                .flat_map(|(_dir, langs)| langs)
+                .filter(|lang| !lang.has_native_transitive_age_support())
+                .map(|lang| lang.display_name())
+                .collect();
             unsupported.sort();
             unsupported.dedup();
             if !unsupported.is_empty() {

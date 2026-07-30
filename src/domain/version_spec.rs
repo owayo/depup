@@ -178,6 +178,24 @@ fn format_partial_version_like(raw: &str, new_version: &str) -> Option<String> {
     ))
 }
 
+/// 文字列の先頭にある数値セグメント列 (`1.2.3`) のセグメント数を数える。
+///
+/// 演算子・空白・`v` 接頭辞は読み飛ばし、数値と `.` 以外が現れた時点で打ち切る。
+/// `~> 7.0` → 2、`~1.2.3@beta` → 3、`~> 1.0.0.pre` → 3、`^1.x` → 1。
+/// 数値が 1 つも無ければ `None`。
+fn leading_numeric_segment_count(text: &str) -> Option<usize> {
+    let start = text.find(|c: char| c.is_ascii_digit())?;
+    let token = text[start..]
+        .split(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .next()
+        .unwrap_or_default();
+    let count = token
+        .split('.')
+        .take_while(|segment| !segment.is_empty() && segment.bytes().all(|b| b.is_ascii_digit()))
+        .count();
+    (count > 0).then_some(count)
+}
+
 /// Tilde 制約を、元の指定と同じセグメント数へ揃えた更新後バージョンにする。
 ///
 /// Tilde の許容幅は元のセグメント数で決まる:
@@ -191,11 +209,17 @@ fn format_partial_version_like(raw: &str, new_version: &str) -> Option<String> {
 /// PEP 440 の `~=` では既にセグメント数を保持しているため (`format_range_like`)、
 /// Tilde もそれに揃える。
 ///
+/// セグメント数の根拠には比較用の `version` ではなく生表記 (`raw`) を使う。
+/// Node のパーサは比較用バージョンを 3 セグメントへ 0 埋め正規化する
+/// (`~10.3` → `version = "10.3.0"`) ため、`version` から数えると元の粒度が失われ、
+/// Node だけこの保持が無効化されていた (`~1` → `~2.5.3` で major 幅 `<2.0.0` が
+/// minor 幅 `<2.6.0` へ縮む)。書き戻しの根拠は常に生表記側から取る。
+///
 /// 次の場合は情報を落とさないよう `None` を返し、呼び出し側で完全版を使う:
-/// - 元の指定が数値のみのセグメント列でない (Ruby の `1.2.3.pre` 等)
+/// - 元の指定からセグメント数を数えられない
 /// - 更新先がプレリリース / ビルドメタデータを含む (`2.0.0-rc.1` 等。
 ///   切り詰めると識別子ごと消えて別の制約になる)
-fn format_tilde_like(current_version: &str, new_version: &str) -> Option<String> {
+fn format_tilde_like(raw: &str, current_version: &str, new_version: &str) -> Option<String> {
     fn numeric_segments(value: &str) -> Option<Vec<&str>> {
         if value.is_empty() {
             return None;
@@ -208,14 +232,17 @@ fn format_tilde_like(current_version: &str, new_version: &str) -> Option<String>
     }
 
     let current = current_version.trim();
-    let (version_prefix, current_core) = if let Some(rest) = current.strip_prefix('v') {
-        ("v", rest)
-    } else if let Some(rest) = current.strip_prefix('V') {
-        ("V", rest)
+    let version_prefix = if current.starts_with('v') {
+        "v"
+    } else if current.starts_with('V') {
+        "V"
     } else {
-        ("", current)
+        ""
     };
-    let segment_count = numeric_segments(current_core)?.len();
+    // 演算子・空白・`v` 接頭辞を読み飛ばし、先頭の数値セグメント列だけを数える
+    // (`~> 7.0` → 2、`~1.2.3@beta` → 3、`~> 1.0.0.pre` → 3)。
+    let segment_count = leading_numeric_segment_count(raw)
+        .or_else(|| leading_numeric_segment_count(current_version))?;
 
     let new_core = new_version
         .trim()
@@ -542,7 +569,7 @@ impl VersionSpec {
             // Tilde は元のセグメント数が許容幅を決めるため、部分指定 (`~1.2` / `~> 7.0`)
             // は更新後もセグメント数を保つ。切り詰められない入力では完全版を使う。
             VersionSpecKind::Tilde => {
-                let body = format_tilde_like(&self.version, new_version)
+                let body = format_tilde_like(&self.raw, &self.version, new_version)
                     .unwrap_or_else(|| new_version.to_string());
                 Some(self.wrap_with_affixes(&body))
             }

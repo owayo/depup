@@ -1006,4 +1006,33 @@ mod tests {
         assert_eq!(spec.version, "1.2.3");
         assert_eq!(spec.try_format_updated("2.0.0"), None);
     }
+
+    /// 回帰テスト: Tilde のセグメント数保持を「実パーサ経由」で検証する。
+    ///
+    /// `VersionSpec` を手組みするテストだけだと、パーサ側が比較用バージョンを
+    /// 0 埋め正規化している場合に保持が効かないことを検出できない
+    /// (実際に Node がこれで穴を素通ししていた)。
+    ///
+    /// Composer の `~1.2` は `>=1.2 <2.0` (major 幅)、`~1.2.3` は `>=1.2.3 <1.3.0`
+    /// (minor 幅) なので、セグメント数を増やすと許容幅が黙って狭まる。
+    #[test]
+    fn test_format_updated_tilde_preserves_segment_count_via_parser() {
+        for (input, new_version, expected) in [
+            ("~2.0", "3.10.5", "~3.10"),
+            ("~1", "3.4.5", "~3"),
+            ("~1.2.3", "1.8.9", "~1.8.9"),
+            // stability flag を保持したままセグメント数も保つ
+            ("~4.4@beta", "6.4.7", "~6.4@beta"),
+        ] {
+            let spec = parse(input).expect(input);
+            assert_eq!(spec.kind, VersionSpecKind::Tilde, "input={}", input);
+            assert_eq!(
+                spec.format_updated(new_version),
+                expected,
+                "input={} new={}",
+                input,
+                new_version
+            );
+        }
+    }
 }

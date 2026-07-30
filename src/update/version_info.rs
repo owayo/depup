@@ -60,6 +60,9 @@ const PRERELEASE_IDENTIFIERS: &[&str] = &[
     "pre",
     "insiders",
     "experimental",
+    // JVM 系の milestone 版 (`1.0.0-milestone1`)。短縮形 `M1` は
+    // `contains_milestone_identifier` が別途判定する
+    "milestone",
     // 非推奨マーカー (crates.io などで作者が自発的に付与)
     "deprecated",
     "obsolete",
@@ -94,6 +97,23 @@ fn contains_identifier_word(haystack: &str, needle: &str) -> bool {
     false
 }
 
+/// JVM 系の milestone 短縮表記 (`4.0.0-M1` / `2.0.0.M3`) を判定する。
+///
+/// Spring / JUnit / AssertJ / Micronaut など JVM 系は安定版前の公開に `M<数字>` を使う。
+/// Gradle の version ordering でも qualifier 付きは無印より小さい (= プレリリース) ため、
+/// `alpha` / `rc` と同様に安定版利用者の更新候補からは除外する。
+/// これが無いと `3.24.2` の利用者が `4.0.0-M1` へ、`5.10.0` が `5.13.0-M3` へ更新されていた。
+///
+/// `m` の直後が数字のトークンだけを対象にするため、`macos1` / `m2m` のような
+/// 通常の識別子は milestone と誤判定しない。`.Final` / `-jre` / `.RELEASE` のような
+/// JVM の安定版 qualifier も当然対象外 (Java で「qualifier があれば一律プレリリース」と
+/// すると、これらを巻き込んで安定版が全滅する)。
+fn contains_milestone_identifier(scan: &str) -> bool {
+    scan.split(['-', '.', '_', ' ']).any(|token| {
+        token.len() >= 2 && token.starts_with('m') && token[1..].bytes().all(|b| b.is_ascii_digit())
+    })
+}
+
 /// 先頭の ASCII `v` / `V` 接頭辞を 1 文字だけ取り除く。
 ///
 /// `v1.2.3` / `V1.2.3` のような接頭辞付きバージョン表記を比較・正規化の前に
@@ -120,6 +140,11 @@ pub fn is_prerelease_version(version: &str) -> bool {
         .iter()
         .any(|id| contains_identifier_word(scan, id))
     {
+        return true;
+    }
+
+    // JVM 系の milestone 短縮表記 (`4.0.0-M1` / `2.0.0.M3`)
+    if contains_milestone_identifier(scan) {
         return true;
     }
 
@@ -1169,6 +1194,67 @@ mod tests {
         assert!(is_prerelease_version("1.0.0-pre.1"));
         assert!(is_prerelease_version("1.0.0-insiders"));
         assert!(is_prerelease_version("1.0.0-experimental"));
+    }
+
+    /// 回帰テスト: JVM 系の milestone 版が安定版として扱われ、`3.24.2` の利用者が
+    /// `4.0.0-M1` へ、`5.10.0` が `5.13.0-M3` へ、`5.3.23` が `7.0.0-M6` へ
+    /// 更新されていた (Java/PHP は semver 判定ではなく識別子リストを使うため)。
+    #[test]
+    fn test_is_prerelease_jvm_milestone() {
+        // ハイフン区切り (JUnit / AssertJ / Micronaut)
+        assert!(is_prerelease_version("4.0.0-M1"));
+        assert!(is_prerelease_version("5.13.0-M3"));
+        assert!(is_prerelease_version("7.0.0-M6"));
+        // ドット区切り (旧 Spring Boot の `2.0.0.M1` 表記)
+        assert!(is_prerelease_version("2.0.0.M1"));
+        assert!(is_prerelease_version("1.5.0.M7"));
+        // 小文字・複数桁
+        assert!(is_prerelease_version("3.0.0-m12"));
+        // 綴りきりの milestone
+        assert!(is_prerelease_version("1.0.0-milestone1"));
+        assert!(is_prerelease_version("1.0.0-milestone"));
+    }
+
+    /// milestone 判定が JVM の「安定版 qualifier」を巻き込まないこと。
+    /// Java で「qualifier があれば一律プレリリース」にすると、これらが全滅する。
+    #[test]
+    fn test_is_prerelease_jvm_stable_qualifiers_not_matched() {
+        assert!(!is_prerelease_version("4.1.100.Final"));
+        assert!(!is_prerelease_version("31.1-jre"));
+        assert!(!is_prerelease_version("33.4.8-jre"));
+        assert!(!is_prerelease_version("31.1-android"));
+        assert!(!is_prerelease_version("5.3.23.RELEASE"));
+        assert!(!is_prerelease_version("1.0.0.GA"));
+        assert!(!is_prerelease_version("1.0.0-SP1"));
+        // `m` の直後が数字でないトークンは milestone ではない
+        assert!(!is_prerelease_version("1.0.0-macos1"));
+        assert!(!is_prerelease_version("1.0.0-m2m"));
+        assert!(!is_prerelease_version("1.0.0-mysql8"));
+        // 数値のみのセグメントは当然対象外
+        assert!(!is_prerelease_version("20030203.000550"));
+    }
+
+    /// 回帰テスト: milestone 判定は `token[1..]` でバイトスライスするため、
+    /// 多バイト UTF-8 の文字境界を割らないこと。過去に同じスライスパターンで
+    /// 非 ASCII のバージョン文字列 1 件がプロセス全体をクラッシュさせた事例がある。
+    #[test]
+    fn test_is_prerelease_multibyte_does_not_panic() {
+        for version in [
+            "1.0.0-mé",
+            "1.0.0-m1é",
+            "1.0.0.0abcé",
+            "1.0.0-日本語",
+            "m",
+            "mé",
+            "1.0.0-m",
+            "é",
+            "",
+        ] {
+            // panic しないことが本質 (戻り値は問わない)
+            let _ = is_prerelease_version(version);
+        }
+        // 多バイト文字が続くトークンは milestone ではない
+        assert!(!is_prerelease_version("1.0.0-mé"));
     }
 
     #[test]

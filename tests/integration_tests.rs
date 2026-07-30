@@ -470,6 +470,42 @@ mod manifest_update_format_preservation {
         );
     }
 
+    /// 回帰テスト: 部分指定の tilde はマニフェスト書き換え経路でもセグメント数を保つ。
+    ///
+    /// Node のパーサは比較用バージョンを 3 セグメントへ 0 埋め正規化するため、
+    /// セグメント数を比較用バージョンから数えていた頃は Node だけ保持が効かず、
+    /// `~1` (= `>=1.0.0 <2.0.0`) が `~2.5.3` (= `>=2.5.3 <2.6.0`) へ狭まっていた。
+    #[test]
+    fn test_package_json_partial_tilde_preserves_segment_count() {
+        let content = r#"{
+  "dependencies": {
+    "glob": "~10.3",
+    "chalk": "~4"
+  }
+}"#;
+
+        let parser = get_parser(Language::Node);
+
+        let updated = parser.update_version(content, "glob", "13.0.6").unwrap();
+        assert!(
+            updated.contains(r#""glob": "~13.0""#),
+            "2 セグメントの tilde はセグメント数を保つべき: {}",
+            updated
+        );
+        assert!(
+            !updated.contains("~13.0.6"),
+            "セグメント数を増やしてはいけない: {}",
+            updated
+        );
+
+        let updated = parser.update_version(content, "chalk", "5.6.2").unwrap();
+        assert!(
+            updated.contains(r#""chalk": "~5""#),
+            "1 セグメントの tilde は major 幅を保つべき: {}",
+            updated
+        );
+    }
+
     /// pyproject.toml の書式保持をテストする
     #[test]
     fn test_pyproject_toml_gte_preservation() {
