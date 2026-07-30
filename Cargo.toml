@@ -7,8 +7,8 @@ description = "Multi-language dependency updater CLI tool"
 license = "MIT"
 
 [dependencies]
-clap = { version = "4.6.1", features = ["derive"] }
-tokio = { version = "1.52.3", features = ["full"] }
+clap = { version = "4.6.2", features = ["derive"] }
+tokio = { version = "1.52.4", features = ["full"] }
 reqwest = { version = "0.13.4", features = ["json"] }
 toml = "1.1.3"
 serde = { version = "1.0.228", features = ["derive"] }
@@ -18,7 +18,7 @@ semver = "1.0.28"
 pep440_rs = "0.7.3"
 thiserror = "2.0.18"
 anyhow = "1.0.103"
-regex = "1.13.0"
+regex = "1.13.1"
 async-trait = "0.1.89"
 indicatif = "0.18.6"
 colored = "3.1.1"
