@@ -42,6 +42,14 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
         .checked_mul(unit_secs)
         .ok_or_else(|| format!("duration is too large: {}", s))?;
 
+    // chrono の DateTime が表現できる年範囲 (±262143 年) を超える age は、
+    // `Utc::now() - Duration` が内部で panic するため受け付けない。
+    // u64 の乗算オーバーフローだけでは 26 万年〜2.9 億年の帯域が素通りしていた。
+    const MAX_AGE_SECS: u64 = 100_000 * 365 * 24 * 60 * 60; // 10 万年
+    if seconds > MAX_AGE_SECS {
+        return Err(format!("duration is too large: {}", s));
+    }
+
     Ok(Duration::from_secs(seconds))
 }
 
@@ -464,6 +472,23 @@ mod tests {
         // 乗算オーバーフローは panic せずエラーになる
         assert!(parse_duration("213503982334602d").is_err());
         assert!(parse_duration(&format!("{}w", u64::MAX)).is_err());
+    }
+
+    /// 回帰テスト: u64 の乗算はオーバーフローしないが chrono の DateTime 範囲
+    /// (±262143 年) を超える値は、`Utc::now() - Duration` が内部で panic していた。
+    /// 26 万年〜2.9 億年の帯域を parse 時点で弾く。
+    #[test]
+    fn test_parse_duration_rejects_values_outside_chrono_range() {
+        // 1e8 日 ≒ 273,785 年 (u64 乗算は成功するが chrono の範囲外)
+        assert!(parse_duration("100000000d").is_err());
+        assert!(parse_duration("100000000w").is_err());
+
+        // 減算しても panic しないことを実際に確認する
+        for input in ["1w", "52w", "3650d", "1200m"] {
+            let duration = parse_duration(input).unwrap();
+            let chrono_duration = chrono::Duration::from_std(duration).unwrap();
+            let _ = chrono::Utc::now() - chrono_duration;
+        }
     }
 
     #[test]

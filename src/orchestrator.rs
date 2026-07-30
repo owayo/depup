@@ -1478,6 +1478,15 @@ fn apply_sync_adjustment(
     original: &UpdateResult,
     target: String,
 ) {
+    // 同期先が現在版と同一なら Update を作らない。
+    // judge 側は「書き換え結果が現在の raw と同一なら AlreadyLatest」という不変条件を
+    // 持つが (phantom update 防止)、Tauri 同期はそれを迂回するため同じ判定をここで行う。
+    // これがないと npm 側が crates.io より先行しているとき `2.9.6 → 2.9.6` が毎回
+    // 「更新」として報告され、writer は何も書かないのに `--install` だけが走る。
+    if original.dependency().version() == target {
+        return;
+    }
+
     let adjusted = UpdateResult::update(original.dependency().clone(), target);
     summary.manifests[manifest_idx].results[result_idx] = adjusted;
     if matches!(original, UpdateResult::Skip { .. }) {

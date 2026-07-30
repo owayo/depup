@@ -627,9 +627,16 @@ gem 'pg', '~> 1.5'
         assert_eq!(rails.version_spec.kind, VersionSpecKind::Tilde);
 
         let updated = parser.update_version(content, "rails", "7.1.0").unwrap();
+        // `~> 7.0` は `>= 7.0, < 8.0`。許容幅を保つためセグメント数も維持する
+        // (`~> 7.1.0` にすると上限が `< 7.2` へ黙って縮まる)
         assert!(
-            updated.contains("'~> 7.1.0'"),
-            "Should preserve pessimistic operator: {}",
+            updated.contains("'~> 7.1'"),
+            "悲観的制約の演算子とセグメント数を保持すべき: {}",
+            updated
+        );
+        assert!(
+            !updated.contains("'~> 7.1.0'"),
+            "セグメント数を増やして許容幅を狭めてはいけない: {}",
             updated
         );
     }
@@ -655,9 +662,10 @@ gem 'pg', '~> 1.5'
 
         let parser = get_parser(Language::Ruby);
         let updated = parser.update_version(content, "rails", "7.1.0").unwrap();
+        // 二重引用符と併せて `~>` のセグメント数も維持する
         assert!(
-            updated.contains("\"~> 7.1.0\""),
-            "Should preserve double quotes: {}",
+            updated.contains("\"~> 7.1\""),
+            "二重引用符を保持すべき: {}",
             updated
         );
     }
@@ -701,9 +709,16 @@ gem 'pg', '~> 1.5'
         let updated = parser
             .update_version(content, "symfony/console", "6.4.0")
             .unwrap();
+        // Composer の `~6.0` は `>=6.0 <7.0`。セグメント数を保って `~6.4` にする
+        // (`~6.4.0` にすると上限が `<6.5.0` へ縮まってしまう)
         assert!(
-            updated.contains("\"~6.4.0\""),
-            "Should preserve tilde prefix: {}",
+            updated.contains("\"~6.4\""),
+            "tilde 接頭辞とセグメント数を保持すべき: {}",
+            updated
+        );
+        assert!(
+            !updated.contains("\"~6.4.0\""),
+            "セグメント数を増やして許容幅を狭めてはいけない: {}",
             updated
         );
     }

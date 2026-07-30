@@ -426,4 +426,67 @@ mod tests {
         assert!(output_str.contains("--- a/package.json"));
         assert!(output_str.contains("--- a/Cargo.toml"));
     }
+
+    /// 回帰テスト: Go の `VersionSpec` は `v` を prefix に持ち、Go Proxy は `v` 込みの
+    /// バージョンを返すため、素朴に連結すると diff が `vv1.9.1` という go.mod として
+    /// 無効な文字列を表示していた。実書き込み (`go_mod::update_version`) と一致させる。
+    #[test]
+    fn test_go_diff_does_not_duplicate_v_prefix() {
+        let spec = VersionSpec::new(VersionSpecKind::Exact, "v1.8.0", "1.8.0").with_prefix("v");
+        let dep = Dependency::new("github.com/spf13/cobra", spec, false, Language::Go);
+
+        let mut summary = UpdateSummary::new(false);
+        let mut manifest = ManifestUpdateResult::new(PathBuf::from("go.mod"), Language::Go);
+        manifest.add_result(UpdateResult::update(dep, "v1.9.1"));
+        summary.add_manifest(manifest);
+
+        let result = OrchestratorResult {
+            summary,
+            write_results: Vec::new(),
+            errors: Vec::new(),
+        };
+
+        let formatter = DiffFormatter::new(false);
+        let mut output = Vec::new();
+        formatter.format(&result, &mut output).unwrap();
+        let output_str = String::from_utf8(output).unwrap();
+
+        assert!(
+            output_str.contains(r#"+  "github.com/spf13/cobra": "v1.9.1""#),
+            "{}",
+            output_str
+        );
+        assert!(!output_str.contains("vv1.9.1"), "{}", output_str);
+    }
+
+    /// `+incompatible` を suffix に持つ Go 依存でも二重付与しない。
+    #[test]
+    fn test_go_diff_does_not_duplicate_incompatible_suffix() {
+        let spec = VersionSpec::new(VersionSpecKind::Exact, "v2.0.0+incompatible", "2.0.0")
+            .with_prefix("v")
+            .with_suffix("+incompatible");
+        let dep = Dependency::new("example.com/mod", spec, false, Language::Go);
+
+        let mut summary = UpdateSummary::new(false);
+        let mut manifest = ManifestUpdateResult::new(PathBuf::from("go.mod"), Language::Go);
+        manifest.add_result(UpdateResult::update(dep, "v2.1.0+incompatible"));
+        summary.add_manifest(manifest);
+
+        let result = OrchestratorResult {
+            summary,
+            write_results: Vec::new(),
+            errors: Vec::new(),
+        };
+
+        let formatter = DiffFormatter::new(false);
+        let mut output = Vec::new();
+        formatter.format(&result, &mut output).unwrap();
+        let output_str = String::from_utf8(output).unwrap();
+
+        assert!(
+            output_str.contains(r#"+  "example.com/mod": "v2.1.0+incompatible""#),
+            "{}",
+            output_str
+        );
+    }
 }

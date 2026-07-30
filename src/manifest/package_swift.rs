@@ -98,14 +98,20 @@ static RANGE_CLOSED_RE: LazyLock<Regex> = LazyLock::new(|| {
 fn extract_github_owner_repo(url: &str) -> Option<String> {
     // owner/repo に `?` `#` 空白等の不正文字が混ざると、後段の GitHub API URL 構築で
     // クエリ汚染やパストラバーサルを誘発しうるため、ここで文字種を GitHub 準拠に限定する。
-    fn is_valid_segment(s: &str) -> bool {
-        !s.is_empty()
-            && s.chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    // 判定はレジストリ層と同じ実装を共有し、二層防御が同じ穴を持たないようにする
+    // (以前は両方が個別実装で、どちらも `..` を通していた)。
+    use crate::registry::is_valid_registry_id_segment as is_valid_segment;
+
+    // ホスト名は大小文字を区別しないため `https://GitHub.com/...` も GitHub として扱う
+    // (区別すると非 GitHub URL 扱いになり無言でスキップされる)
+    fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+        s.get(..prefix.len())
+            .filter(|head| head.eq_ignore_ascii_case(prefix))
+            .and_then(|_| s.get(prefix.len()..))
     }
 
     // HTTPS URL パターン
-    if let Some(rest) = url.strip_prefix("https://github.com/") {
+    if let Some(rest) = strip_prefix_ignore_ascii_case(url, "https://github.com/") {
         let path = rest.trim_end_matches(".git");
         let parts: Vec<&str> = path.splitn(3, '/').collect();
         if parts.len() >= 2 && is_valid_segment(parts[0]) && is_valid_segment(parts[1]) {
@@ -114,7 +120,7 @@ fn extract_github_owner_repo(url: &str) -> Option<String> {
     }
 
     // SSH URL パターン
-    if let Some(rest) = url.strip_prefix("git@github.com:") {
+    if let Some(rest) = strip_prefix_ignore_ascii_case(url, "git@github.com:") {
         let path = rest.trim_end_matches(".git");
         let parts: Vec<&str> = path.splitn(3, '/').collect();
         if parts.len() >= 2 && is_valid_segment(parts[0]) && is_valid_segment(parts[1]) {

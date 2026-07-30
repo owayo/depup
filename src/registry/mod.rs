@@ -55,6 +55,11 @@ pub trait RegistryAdapter: Send + Sync {
 /// (URL インジェクション防止)。
 pub(crate) fn is_valid_registry_id_segment(s: &str) -> bool {
     !s.is_empty()
+        // `.` / `..` は URL のパス正規化で経路を書き換えるため、`.` を許可文字に
+        // 含めている以上ここで明示的に弾く必要がある
+        // (例: `https://api.github.com/repos/../swift-nio/tags` → `/swift-nio/tags`)
+        && s != "."
+        && s != ".."
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
 }
@@ -84,5 +89,17 @@ mod tests {
         assert!(!is_valid_registry_id_segment("a:b"));
         // 非 ASCII は不可
         assert!(!is_valid_registry_id_segment("café"));
+    }
+
+    /// 回帰テスト: `.` を許可文字に含めているため `..` 単体が素通りし、
+    /// `https://api.github.com/repos/../swift-nio/tags` が URL 正規化で
+    /// `/swift-nio/tags` へ化けていた (doc が謳うパストラバーサル防御が無効だった)。
+    #[test]
+    fn test_is_valid_registry_id_segment_rejects_dot_segments() {
+        assert!(!is_valid_registry_id_segment("."));
+        assert!(!is_valid_registry_id_segment(".."));
+        // 通常のドット入り識別子は引き続き許可する
+        assert!(is_valid_registry_id_segment("a..b"));
+        assert!(is_valid_registry_id_segment("org.apache.wicket"));
     }
 }

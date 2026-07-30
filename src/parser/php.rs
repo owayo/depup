@@ -106,6 +106,29 @@ fn extract_first_version(raw: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Composer の stability flag (`^1.0@dev` / `1.2.3@RC`) を `raw` と `suffix` に保持する。
+///
+/// 制約本体の解釈はフラグを外した文字列で行うが、フラグを捨ててしまうと
+/// `--diff` の before/after が実ファイルと食い違う (表示は `^1.0` → `^1.5.0`、
+/// 実際の書き込みは `^1.0@dev` → `^1.5.0@dev`)。元表記を残して表示と書き込みを揃える。
+///
+/// Wildcard は `.*` を suffix として既に使っており、Range は `raw` そのものを整形に
+/// 使うため対象外にする (これらは書き込み側の `composer_json` がフラグを退避・再付与する)。
+fn attach_stability_flag(spec: VersionSpec, full: &str) -> VersionSpec {
+    if matches!(
+        spec.kind,
+        VersionSpecKind::Wildcard | VersionSpecKind::Range
+    ) {
+        return spec;
+    }
+    let Some(at) = full.find('@') else {
+        return spec;
+    };
+    let mut spec = spec;
+    spec.raw = full.to_string();
+    spec.with_suffix(&full[at..])
+}
+
 impl PhpVersionParser {
     /// 単一制約を解釈する
     fn parse_single(&self, version_str: &str) -> Option<VersionSpec> {
@@ -114,7 +137,14 @@ impl PhpVersionParser {
         if version_str.contains(" as ") {
             return None;
         }
-        let trimmed = version_str.trim().split('@').next().unwrap_or("").trim();
+        let full = version_str.trim();
+        let spec = self.parse_constraint(full)?;
+        Some(attach_stability_flag(spec, full))
+    }
+
+    /// stability flag を外した制約本体を解釈する
+    fn parse_constraint(&self, version_str: &str) -> Option<VersionSpec> {
+        let trimmed = version_str.split('@').next().unwrap_or("").trim();
 
         if trimmed.is_empty() {
             return None;
@@ -831,12 +861,29 @@ mod tests {
 
     #[test]
     fn test_parse_caret_stability_flag_uppercase_rc() {
-        // 大文字の stability flag (`@RC`) も `@` 分割で除去される
-        // (composer の stability flag は dev/alpha/beta/RC/stable のうち RC が大文字慣習)
+        // 大文字の stability flag (`@RC`) も制約本体からは除去される
+        // (composer の stability flag は dev/alpha/beta/RC/stable のうち RC が大文字慣習)。
+        // フラグは raw / suffix に保持し、更新後の表記でも維持する。
         let spec = parse("^1.0.0@RC").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Caret);
         assert_eq!(spec.version, "1.0.0");
-        assert_eq!(spec.format_updated("1.5.0"), "^1.5.0");
+        assert_eq!(spec.raw, "^1.0.0@RC");
+        assert_eq!(spec.format_updated("1.5.0"), "^1.5.0@RC");
+    }
+
+    /// 回帰テスト: stability flag を捨てると `--diff` の before/after が実ファイルと
+    /// 食い違う (表示 `^1.0` → `^1.5.0` / 実書き込み `^1.0@dev` → `^1.5.0@dev`)。
+    #[test]
+    fn test_parse_stability_flag_preserved_in_raw_and_output() {
+        for (input, expected) in [
+            ("^1.0@dev", "^1.5.0@dev"),
+            ("~1.2.3@beta", "~1.5.0@beta"),
+            ("1.2.3@stable", "1.5.0@stable"),
+        ] {
+            let spec = parse(input).unwrap();
+            assert_eq!(spec.raw, input, "raw が元表記を保持すべき: {}", input);
+            assert_eq!(spec.format_updated("1.5.0"), expected, "input={}", input);
+        }
     }
 
     #[test]

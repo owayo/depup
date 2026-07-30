@@ -359,7 +359,10 @@ mod tests {
         let result = ComposerJsonParser
             .update_version(content, "symfony/console", "6.4.0")
             .unwrap();
-        assert!(result.contains("~6.4.0"));
+        // Composer の `~6.0` は `>=6.0 <7.0`。セグメント数を保って `~6.4` にする
+        // (`~6.4.0` にすると上限が `<6.5.0` へ縮まってしまう)
+        assert!(result.contains("~6.4"));
+        assert!(!result.contains("~6.4.0"));
     }
 
     #[test]
@@ -487,7 +490,7 @@ mod tests {
         let result = ComposerJsonParser
             .update_version(content, "foo/bar", "3.4.0")
             .unwrap();
-        assert!(result.contains(r#""foo/bar": "~3.4.0@RC""#));
+        assert!(result.contains(r#""foo/bar": "~3.4@RC""#));
     }
 
     #[test]

@@ -25,8 +25,14 @@ use std::time::Duration;
 ///
 /// 解決に失敗した場合は元のプログラム名をそのまま返し、呼び出し側で
 /// 従来どおりの `program not found` エラーを返せるようにする。
-fn resolve_program(program: &str) -> PathBuf {
-    which::which(program).unwrap_or_else(|_| PathBuf::from(program))
+///
+/// `./gradlew` のようにセパレータを含む名前は `working_dir` 基準で解決する。
+/// `which::which` はプロセスの CWD 基準で絶対化するため、モノレポで
+/// `depup --install` をルートから実行するとサブプロジェクトの wrapper ではなく
+/// ルートの `gradlew` (別の Gradle ディストリビューション) を起動していた。
+fn resolve_program(program: &str, working_dir: &Path) -> PathBuf {
+    which::which_in(program, std::env::var_os("PATH"), working_dir)
+        .unwrap_or_else(|_| PathBuf::from(program))
 }
 
 /// パッケージマネージャのインストール結果
@@ -266,13 +272,61 @@ impl SystemPackageManager {
             ));
         }
 
-        let program = resolve_program(command[0]);
+        let program = resolve_program(command[0], working_dir);
         let mut cmd = Command::new(&program);
         cmd.args(&command[1..]).current_dir(working_dir);
         for (key, value) in env {
             cmd.env(key, value);
         }
         cmd.output()
+    }
+}
+
+impl SystemPackageManager {
+    /// 言語に対応するパッケージマネージャと、その実行ディレクトリを決める。
+    ///
+    /// 実行ディレクトリは通常 `working_dir` と同じだが、Tauri プロジェクトの Rust だけは
+    /// `src-tauri` を使う。対応するマニフェストが無ければ `None` (= スキップ)。
+    fn resolve_package_manager(
+        &self,
+        language: Language,
+        working_dir: &Path,
+    ) -> Option<(PathBuf, &'static str)> {
+        /// マニフェストのいずれかが存在すれば指定の PM を選ぶ
+        fn pm_if_any_exists(
+            working_dir: &Path,
+            manifests: &[&str],
+            pm: &'static str,
+        ) -> Option<&'static str> {
+            manifests
+                .iter()
+                .any(|manifest| working_dir.join(manifest).exists())
+                .then_some(pm)
+        }
+
+        let pm = match language {
+            Language::Node => self.detect_node_pm(working_dir),
+            Language::Python => self.detect_python_pm(working_dir),
+            Language::Rust => {
+                // Tauri プロジェクトでは src-tauri 側の Cargo.toml を対象にする
+                if self.detect_tauri_project(working_dir) {
+                    return Some((working_dir.join("src-tauri"), "cargo"));
+                }
+                pm_if_any_exists(working_dir, &["Cargo.toml"], "cargo")
+            }
+            Language::Go => pm_if_any_exists(working_dir, &["go.mod"], "go"),
+            Language::Ruby => pm_if_any_exists(working_dir, &["Gemfile"], "bundle"),
+            Language::Php => pm_if_any_exists(working_dir, &["composer.json"], "composer"),
+            // gradlew が利用可能ならそちらを優先し、なければ gradle にフォールバック
+            Language::Java => {
+                pm_if_any_exists(working_dir, &["gradlew"], "./gradlew").or_else(|| {
+                    pm_if_any_exists(working_dir, &["build.gradle", "build.gradle.kts"], "gradle")
+                })
+            }
+            Language::Swift => pm_if_any_exists(working_dir, &["Package.swift"], "swift"),
+        }?;
+
+        Some((working_dir.to_path_buf(), pm))
     }
 }
 
@@ -283,71 +337,7 @@ impl PackageManagerRunner for SystemPackageManager {
         working_dir: &Path,
         min_age: Option<Duration>,
     ) -> InstallResult {
-        // Tauri プロジェクトの Rust では src-tauri ディレクトリを使用
-        let (effective_dir, pm) = match language {
-            Language::Node => (working_dir.to_path_buf(), self.detect_node_pm(working_dir)),
-            Language::Python => (
-                working_dir.to_path_buf(),
-                self.detect_python_pm(working_dir),
-            ),
-            Language::Rust => {
-                // まず Tauri プロジェクトかチェック
-                if self.detect_tauri_project(working_dir) {
-                    (working_dir.join("src-tauri"), Some("cargo"))
-                } else if working_dir.join("Cargo.toml").exists() {
-                    (working_dir.to_path_buf(), Some("cargo"))
-                } else {
-                    (working_dir.to_path_buf(), None)
-                }
-            }
-            Language::Go => {
-                let pm = if working_dir.join("go.mod").exists() {
-                    Some("go")
-                } else {
-                    None
-                };
-                (working_dir.to_path_buf(), pm)
-            }
-            Language::Ruby => {
-                let pm = if working_dir.join("Gemfile").exists() {
-                    Some("bundle")
-                } else {
-                    None
-                };
-                (working_dir.to_path_buf(), pm)
-            }
-            Language::Php => {
-                let pm = if working_dir.join("composer.json").exists() {
-                    Some("composer")
-                } else {
-                    None
-                };
-                (working_dir.to_path_buf(), pm)
-            }
-            Language::Java => {
-                // gradlew が利用可能ならそちらを優先し、なければ gradle にフォールバック
-                let pm = if working_dir.join("gradlew").exists() {
-                    Some("./gradlew")
-                } else if working_dir.join("build.gradle").exists()
-                    || working_dir.join("build.gradle.kts").exists()
-                {
-                    Some("gradle")
-                } else {
-                    None
-                };
-                (working_dir.to_path_buf(), pm)
-            }
-            Language::Swift => {
-                let pm = if working_dir.join("Package.swift").exists() {
-                    Some("swift")
-                } else {
-                    None
-                };
-                (working_dir.to_path_buf(), pm)
-            }
-        };
-
-        let Some(pm) = pm else {
+        let Some((effective_dir, pm)) = self.resolve_package_manager(language, working_dir) else {
             return InstallResult::skipped(language);
         };
 
@@ -823,7 +813,7 @@ mod tests {
         // `cargo` は cargo test を実行している時点で PATH 上に存在する前提。
         // which 経由で絶対パスに解決され、`Command::new(full_path)` で起動できる。
         // Windows ではこれが `.cmd`/`.bat` シムのフルパス、Unix では実体 (`.../cargo`)。
-        let resolved = resolve_program("cargo");
+        let resolved = resolve_program("cargo", Path::new("."));
         assert!(
             resolved.is_absolute(),
             "PATH 上に存在する cargo は which で絶対パスに解決されるべき: {:?}",
@@ -837,11 +827,114 @@ mod tests {
         // そのまま PathBuf として返し、後段の Command::new で従来通り
         // `program not found` 系の `io::ErrorKind::NotFound` が返るようにする。
         let bogus = "__depup_definitely_nonexistent_command_xyz__";
-        let resolved = resolve_program(bogus);
+        let resolved = resolve_program(bogus, Path::new("."));
         assert_eq!(
             resolved,
             PathBuf::from(bogus),
             "解決失敗時は元の program 名をそのまま返してフォールバックさせるべき"
+        );
+    }
+
+    /// `resolve_package_manager` は言語ごとのマニフェスト検出と実行ディレクトリ決定を
+    /// 単独で検証できる (以前は `run_install` に埋め込まれていた)。
+    #[test]
+    fn test_resolve_package_manager_detects_per_language() {
+        let pm = SystemPackageManager::new();
+
+        for (manifest, language, expected) in [
+            ("Cargo.toml", Language::Rust, "cargo"),
+            ("go.mod", Language::Go, "go"),
+            ("Gemfile", Language::Ruby, "bundle"),
+            ("composer.json", Language::Php, "composer"),
+            ("Package.swift", Language::Swift, "swift"),
+            ("build.gradle", Language::Java, "gradle"),
+            ("build.gradle.kts", Language::Java, "gradle"),
+            ("gradlew", Language::Java, "./gradlew"),
+        ] {
+            let temp_dir = tempfile::tempdir().unwrap();
+            std::fs::write(temp_dir.path().join(manifest), "").unwrap();
+            let resolved = pm.resolve_package_manager(language, temp_dir.path());
+            assert_eq!(
+                resolved.as_ref().map(|(dir, pm)| (dir.as_path(), *pm)),
+                Some((temp_dir.path(), expected)),
+                "manifest={} language={:?}",
+                manifest,
+                language
+            );
+        }
+    }
+
+    /// マニフェストが無ければ None (= スキップ) を返す。
+    #[test]
+    fn test_resolve_package_manager_returns_none_without_manifest() {
+        let pm = SystemPackageManager::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        for language in [
+            Language::Rust,
+            Language::Go,
+            Language::Ruby,
+            Language::Php,
+            Language::Java,
+            Language::Swift,
+        ] {
+            assert!(
+                pm.resolve_package_manager(language, temp_dir.path())
+                    .is_none(),
+                "{:?}",
+                language
+            );
+        }
+    }
+
+    /// gradlew があれば gradle より優先する。
+    #[test]
+    fn test_resolve_package_manager_prefers_gradle_wrapper() {
+        let pm = SystemPackageManager::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(temp_dir.path().join("build.gradle"), "").unwrap();
+        std::fs::write(temp_dir.path().join("gradlew"), "").unwrap();
+        let (_, resolved) = pm
+            .resolve_package_manager(Language::Java, temp_dir.path())
+            .unwrap();
+        assert_eq!(resolved, "./gradlew");
+    }
+
+    /// Tauri プロジェクトの Rust は src-tauri を実行ディレクトリにする。
+    #[test]
+    fn test_resolve_package_manager_uses_src_tauri_for_tauri_project() {
+        let pm = SystemPackageManager::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let src_tauri = temp_dir.path().join("src-tauri");
+        std::fs::create_dir_all(&src_tauri).unwrap();
+        std::fs::write(src_tauri.join("Cargo.toml"), "").unwrap();
+        std::fs::write(src_tauri.join("tauri.conf.json"), "{}").unwrap();
+
+        let (dir, resolved) = pm
+            .resolve_package_manager(Language::Rust, temp_dir.path())
+            .unwrap();
+        assert_eq!(resolved, "cargo");
+        assert_eq!(dir, src_tauri);
+    }
+
+    /// 回帰テスト: `./gradlew` のようにセパレータを含む名前は working_dir 基準で
+    /// 解決する。プロセスの CWD 基準だと、モノレポでルートから `--install` したとき
+    /// サブプロジェクトではなくルートの wrapper を起動していた。
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_program_relative_path_uses_working_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let wrapper = temp_dir.path().join("gradlew");
+        std::fs::write(&wrapper, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let resolved = resolve_program("./gradlew", temp_dir.path());
+        assert_eq!(
+            resolved.canonicalize().unwrap(),
+            wrapper.canonicalize().unwrap(),
+            "相対 program は working_dir 基準で解決されるべき: {:?}",
+            resolved
         );
     }
 

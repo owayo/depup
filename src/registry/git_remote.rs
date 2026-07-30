@@ -137,16 +137,62 @@ fn is_allowed_git_url(url: &str) -> bool {
         || lower.starts_with("git@")
 }
 
+/// URL の userinfo (`scheme://user:pass@host/...`) を伏せる。
+///
+/// git 依存の URL には CI 用のアクセストークンを埋め込む書き方
+/// (`https://x-access-token:TOKEN@github.com/org/private.git`) があり、
+/// fetch 失敗時のスキップ理由はテキスト出力・JSON 出力の両方でそのまま表示される。
+/// 生の URL をエラーに保持するとトークンが CI ログや成果物へ残るため、
+/// 表示経路に載る値だけ伏せる (キャッシュキーには生 URL を使い続ける)。
+fn redact_url(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        // `git@host:path` 形式は userinfo にパスワードを持たない慣習なのでそのまま
+        return url.to_string();
+    };
+    let authority_start = scheme_end + 3;
+    let authority_end = url[authority_start..]
+        .find('/')
+        .map_or(url.len(), |idx| authority_start + idx);
+    let authority = &url[authority_start..authority_end];
+    match authority.rfind('@') {
+        Some(at) => format!(
+            "{}***@{}{}",
+            &url[..authority_start],
+            &authority[at + 1..],
+            &url[authority_end..]
+        ),
+        None => url.to_string(),
+    }
+}
+
+/// git のサブプロセス出力に混ざった URL / userinfo を伏せる。
+fn redact_secrets(text: &str, url: &str) -> String {
+    let mut redacted = text.replace(url, &redact_url(url));
+    if let Some(scheme_end) = url.find("://") {
+        let authority_start = scheme_end + 3;
+        let authority_end = url[authority_start..]
+            .find('/')
+            .map_or(url.len(), |idx| authority_start + idx);
+        if let Some(at) = url[authority_start..authority_end].rfind('@') {
+            let userinfo = &url[authority_start..authority_start + at];
+            if !userinfo.is_empty() {
+                redacted = redacted.replace(userinfo, "***");
+            }
+        }
+    }
+    redacted
+}
+
 async fn run_ls_remote(url: &str) -> Result<GitRemoteRefs, GitRemoteError> {
     // 許可リスト外のスキーム (ext:: 等) は実行せず警告してスキップ
     // (呼び出し側がこのエラーを fetch failed として警告付きスキップ扱いにする)
     if !is_allowed_git_url(url) {
         eprintln!(
             "⚠ skipping git dependency with unsupported URL scheme: {} (allowed: https://, http://, ssh://, git://, git@, file://)",
-            url
+            redact_url(url)
         );
         return Err(GitRemoteError::UnsupportedUrlScheme {
-            url: url.to_string(),
+            url: redact_url(url),
         });
     }
 
@@ -163,21 +209,22 @@ async fn run_ls_remote(url: &str) -> Result<GitRemoteRefs, GitRemoteError> {
 
     let output = match tokio::time::timeout(LS_REMOTE_TIMEOUT, output_future).await {
         Ok(result) => result.map_err(|e| GitRemoteError::SpawnFailed {
-            url: url.to_string(),
+            url: redact_url(url),
             message: e.to_string(),
         })?,
         Err(_) => {
             return Err(GitRemoteError::Timeout {
-                url: url.to_string(),
+                url: redact_url(url),
                 seconds: LS_REMOTE_TIMEOUT.as_secs(),
             });
         }
     };
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        // git は失敗時に URL をそのままエコーすることがあるため出力側も伏せる
+        let stderr = redact_secrets(String::from_utf8_lossy(&output.stderr).trim(), url);
         return Err(GitRemoteError::CommandFailed {
-            url: url.to_string(),
+            url: redact_url(url),
             status: output
                 .status
                 .code()
@@ -189,7 +236,7 @@ async fn run_ls_remote(url: &str) -> Result<GitRemoteRefs, GitRemoteError> {
 
     let stdout =
         std::str::from_utf8(&output.stdout).map_err(|e| GitRemoteError::InvalidOutput {
-            url: url.to_string(),
+            url: redact_url(url),
             message: e.to_string(),
         })?;
 
@@ -360,5 +407,58 @@ not-a-sha\trefs/heads/bogus
     fn test_ls_remote_timeout_constant() {
         // 実行全体の安全弁は 30 秒
         assert_eq!(LS_REMOTE_TIMEOUT, Duration::from_secs(30));
+    }
+
+    /// 回帰テスト: git 依存の URL に埋め込まれたアクセストークンは、fetch 失敗時の
+    /// スキップ理由としてテキスト出力・JSON 出力にそのまま載っていた。
+    #[test]
+    fn test_redact_url_hides_userinfo() {
+        assert_eq!(
+            redact_url("https://x-access-token:ghp_SECRETVALUE@github.com/org/private.git"),
+            "https://***@github.com/org/private.git"
+        );
+        assert_eq!(
+            redact_url("https://user@gitlab.example.com/group/repo.git"),
+            "https://***@gitlab.example.com/group/repo.git"
+        );
+        // userinfo が無い URL はそのまま
+        assert_eq!(
+            redact_url("https://github.com/org/public.git"),
+            "https://github.com/org/public.git"
+        );
+        // `git@host:path` 形式のユーザ名はトークンではないので保持する
+        assert_eq!(
+            redact_url("git@github.com:org/repo.git"),
+            "git@github.com:org/repo.git"
+        );
+    }
+
+    /// git の stderr に URL や userinfo がエコーされてもトークンを残さない。
+    #[test]
+    fn test_redact_secrets_scrubs_stderr() {
+        let url = "https://x-access-token:ghp_SECRETVALUE@github.com/org/private.git";
+        let stderr = format!("fatal: unable to access '{}': 403", url);
+        let redacted = redact_secrets(&stderr, url);
+        assert!(!redacted.contains("ghp_SECRETVALUE"), "{}", redacted);
+        assert!(
+            redacted.contains("***@github.com/org/private.git"),
+            "{}",
+            redacted
+        );
+
+        // userinfo だけがエコーされる場合も伏せる
+        let partial = "remote: rejected for x-access-token:ghp_SECRETVALUE";
+        assert!(!redact_secrets(partial, url).contains("ghp_SECRETVALUE"));
+    }
+
+    /// エラー表示 (Display) にも生の URL が出ないこと。
+    #[test]
+    fn test_git_remote_error_display_is_redacted() {
+        let url = "https://x-access-token:ghp_SECRETVALUE@github.com/org/private.git";
+        let err = GitRemoteError::Timeout {
+            url: redact_url(url),
+            seconds: 30,
+        };
+        assert!(!err.to_string().contains("ghp_SECRETVALUE"), "{}", err);
     }
 }

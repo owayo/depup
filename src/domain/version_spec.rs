@@ -178,6 +178,65 @@ fn format_partial_version_like(raw: &str, new_version: &str) -> Option<String> {
     ))
 }
 
+/// Tilde 制約を、元の指定と同じセグメント数へ揃えた更新後バージョンにする。
+///
+/// Tilde の許容幅は元のセグメント数で決まる:
+/// - npm / Cargo / Poetry: `~1.2` = `>=1.2.0 <1.3.0`、`~1` = `>=1.0.0 <2.0.0`
+/// - Composer: `~1.2` = `>=1.2 <2.0.0`、`~1.2.3` = `>=1.2.3 <1.3.0`
+/// - RubyGems: `~> 7.0` = `>= 7.0, < 8.0`、`~> 7.1.3` = `>= 7.1.3, < 7.2`
+///
+/// レジストリの完全版 (3 セグメント) をそのまま書き戻すと、`~4.4` → `~6.4.7` や
+/// `~> 7.0` → `~> 7.1.3.2` のように許容幅が黙って狭まり、以後の
+/// `composer update` / `bundle update` がマイナー系列を跨げなくなる。
+/// PEP 440 の `~=` では既にセグメント数を保持しているため (`format_range_like`)、
+/// Tilde もそれに揃える。
+///
+/// 次の場合は情報を落とさないよう `None` を返し、呼び出し側で完全版を使う:
+/// - 元の指定が数値のみのセグメント列でない (Ruby の `1.2.3.pre` 等)
+/// - 更新先がプレリリース / ビルドメタデータを含む (`2.0.0-rc.1` 等。
+///   切り詰めると識別子ごと消えて別の制約になる)
+fn format_tilde_like(current_version: &str, new_version: &str) -> Option<String> {
+    fn numeric_segments(value: &str) -> Option<Vec<&str>> {
+        if value.is_empty() {
+            return None;
+        }
+        let segments: Vec<&str> = value.split('.').collect();
+        segments
+            .iter()
+            .all(|segment| !segment.is_empty() && segment.bytes().all(|byte| byte.is_ascii_digit()))
+            .then_some(segments)
+    }
+
+    let current = current_version.trim();
+    let (version_prefix, current_core) = if let Some(rest) = current.strip_prefix('v') {
+        ("v", rest)
+    } else if let Some(rest) = current.strip_prefix('V') {
+        ("V", rest)
+    } else {
+        ("", current)
+    };
+    let segment_count = numeric_segments(current_core)?.len();
+
+    let new_core = new_version
+        .trim()
+        .strip_prefix('v')
+        .or_else(|| new_version.trim().strip_prefix('V'))
+        .unwrap_or_else(|| new_version.trim());
+    let mut parts: Vec<String> = numeric_segments(new_core)?
+        .into_iter()
+        .map(ToString::to_string)
+        .collect();
+    while parts.len() < segment_count {
+        parts.push("0".to_string());
+    }
+
+    Some(format!(
+        "{}{}",
+        version_prefix,
+        parts[..segment_count].join(".")
+    ))
+}
+
 fn preserve_version_prefix(template: &str, new_version: &str) -> String {
     let stripped = new_version
         .strip_prefix('v')
@@ -480,22 +539,46 @@ impl VersionSpec {
             VersionSpecKind::Wildcard => format_wildcard_like(&self.raw, new_version),
             VersionSpecKind::Range => format_range_like(&self.raw, new_version),
             VersionSpecKind::Greater | VersionSpecKind::LessOrEqual | VersionSpecKind::Less => None,
-            _ => {
-                let mut result = String::new();
-
-                if let Some(ref prefix) = self.prefix {
-                    result.push_str(prefix);
-                }
-
-                result.push_str(new_version);
-
-                if let Some(ref suffix) = self.suffix {
-                    result.push_str(suffix);
-                }
-
-                Some(result)
+            // Tilde は元のセグメント数が許容幅を決めるため、部分指定 (`~1.2` / `~> 7.0`)
+            // は更新後もセグメント数を保つ。切り詰められない入力では完全版を使う。
+            VersionSpecKind::Tilde => {
+                let body = format_tilde_like(&self.version, new_version)
+                    .unwrap_or_else(|| new_version.to_string());
+                Some(self.wrap_with_affixes(&body))
             }
+            _ => Some(self.wrap_with_affixes(new_version)),
         }
+    }
+
+    /// バージョン本体を元の接頭辞・接尾辞で挟んで書き戻し用の文字列にする。
+    ///
+    /// 本体が既に接頭辞・接尾辞を含んでいる場合は二重付与しない。Go のレジストリは
+    /// `v1.9.1` / `v2.1.0+incompatible` のように接頭辞・接尾辞込みのバージョンを返すが、
+    /// Go の `VersionSpec` は `v` を prefix、`+incompatible` を suffix に持つため、
+    /// 素朴に連結すると `--diff` が `vv1.9.1` という go.mod として無効な文字列を
+    /// 表示してしまう (実書き込み側の `go_mod::update_version` は正規化済み)。
+    fn wrap_with_affixes(&self, body: &str) -> String {
+        let mut body = body;
+        if let Some(prefix) = self.prefix.as_deref().filter(|p| !p.is_empty())
+            && let Some(rest) = body.strip_prefix(prefix)
+        {
+            body = rest;
+        }
+        if let Some(suffix) = self.suffix.as_deref().filter(|s| !s.is_empty())
+            && let Some(rest) = body.strip_suffix(suffix)
+        {
+            body = rest;
+        }
+
+        let mut result = String::new();
+        if let Some(ref prefix) = self.prefix {
+            result.push_str(prefix);
+        }
+        result.push_str(body);
+        if let Some(ref suffix) = self.suffix {
+            result.push_str(suffix);
+        }
+        result
     }
 
     /// 元の書式を保ちながら新しいバージョン文字列を組み立てる
@@ -591,6 +674,61 @@ mod tests {
     fn test_format_updated_tilde() {
         let spec = VersionSpec::new(VersionSpecKind::Tilde, "~1.2.3", "1.2.3").with_prefix("~");
         assert_eq!(spec.format_updated("1.3.0"), "~1.3.0");
+    }
+
+    /// 回帰テスト: Tilde の許容幅は元のセグメント数で決まるため、部分指定を
+    /// 完全版へ展開して制約を黙って狭めない。
+    /// - Composer `~4.4` = `>=4.4 <5.0` を `~6.4.7` (= `<6.5.0`) にしない
+    /// - RubyGems `~> 7.0` = `>= 7.0, < 8.0` を `~> 7.1.3.2` (= `< 7.1.4`) にしない
+    /// - npm / Cargo `~1` = `>=1.0.0 <2.0.0` を `~2.5.3` (= `<2.6.0`) にしない
+    #[test]
+    fn test_format_updated_tilde_preserves_segment_count() {
+        let two_segment = VersionSpec::new(VersionSpecKind::Tilde, "~4.4", "4.4").with_prefix("~");
+        assert_eq!(two_segment.format_updated("6.4.7"), "~6.4");
+
+        let ruby = VersionSpec::new(VersionSpecKind::Tilde, "~> 7.0", "7.0").with_prefix("~> ");
+        assert_eq!(ruby.format_updated("7.1.3.2"), "~> 7.1");
+
+        let one_segment = VersionSpec::new(VersionSpecKind::Tilde, "~1", "1").with_prefix("~");
+        assert_eq!(one_segment.format_updated("2.5.3"), "~2");
+    }
+
+    /// 更新先より元の指定の方がセグメントが多い場合は 0 埋めして幅を保つ。
+    #[test]
+    fn test_format_updated_tilde_pads_shorter_new_version() {
+        let spec =
+            VersionSpec::new(VersionSpecKind::Tilde, "~> 1.2.3.4", "1.2.3.4").with_prefix("~> ");
+        assert_eq!(spec.format_updated("1.9"), "~> 1.9.0.0");
+    }
+
+    /// 更新先がプレリリース / ビルドメタデータを含む場合は、切り詰めで識別子を
+    /// 落とさないよう完全版をそのまま使う。
+    #[test]
+    fn test_format_updated_tilde_keeps_full_version_for_prerelease() {
+        let spec = VersionSpec::new(VersionSpecKind::Tilde, "~1.2", "1.2").with_prefix("~");
+        assert_eq!(spec.format_updated("2.0.0-rc.1"), "~2.0.0-rc.1");
+        assert_eq!(spec.format_updated("2.0.0+build.5"), "~2.0.0+build.5");
+    }
+
+    /// 元の指定が数値のみのセグメント列でない (Ruby のドット区切りプレリリース等)
+    /// 場合も従来どおり完全版を使う。
+    #[test]
+    fn test_format_updated_tilde_keeps_full_version_for_non_numeric_current() {
+        let spec = VersionSpec::new(VersionSpecKind::Tilde, "~> 1.0.0.pre", "1.0.0.pre")
+            .with_prefix("~> ");
+        assert_eq!(spec.format_updated("1.2.0"), "~> 1.2.0");
+    }
+
+    /// Swift の `.upToNextMinor` は常に 3 セグメントなので挙動が変わらない。
+    #[test]
+    fn test_format_updated_tilde_swift_three_segment_unchanged() {
+        let spec = VersionSpec::new(VersionSpecKind::Tilde, "1.0.0", "1.0.0")
+            .with_prefix(".upToNextMinor(from: \"")
+            .with_suffix("\")");
+        assert_eq!(
+            spec.format_updated("2.1.0"),
+            ".upToNextMinor(from: \"2.1.0\")"
+        );
     }
 
     #[test]

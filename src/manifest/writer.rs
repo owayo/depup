@@ -11,6 +11,7 @@ use crate::error::ManifestError;
 use crate::manifest::ManifestParser;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Write as _;
 use std::path::Path;
 
 /// マニフェストへの更新を書き戻すライター
@@ -285,12 +286,25 @@ fn write_atomically(path: &Path, content: &str) -> std::io::Result<()> {
         .unwrap_or("manifest");
     let tmp_path = dir.join(format!(".{}.depup-tmp-{}", file_name, std::process::id()));
 
-    let result = (|| {
-        fs::write(&tmp_path, content)?;
+    let result = (|| -> std::io::Result<()> {
+        {
+            // rename の前にデータを永続化する。`fs::write` はページキャッシュへ書くだけなので、
+            // fsync しないと rename のメタデータだけが先に永続化され、電源断で
+            // ゼロ長または部分内容のマニフェストが残りうる (元の内容も失われる)。
+            let mut file = fs::File::create(&tmp_path)?;
+            file.write_all(content.as_bytes())?;
+            file.sync_all()?;
+        }
         if let Ok(metadata) = fs::metadata(target) {
             let _ = fs::set_permissions(&tmp_path, metadata.permissions());
         }
-        fs::rename(&tmp_path, target)
+        fs::rename(&tmp_path, target)?;
+        // rename エントリ自体の永続化 (best-effort。ディレクトリを開けない
+        // プラットフォームでは無視する)
+        if let Ok(dir_handle) = fs::File::open(dir) {
+            let _ = dir_handle.sync_all();
+        }
+        Ok(())
     })();
 
     if result.is_err() {

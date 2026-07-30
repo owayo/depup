@@ -23,6 +23,10 @@ pub struct GemfileParser;
 
 enum GemfileBlock {
     Group(bool),
+    /// `git ... do` / `github ... do` / `path ... do` / `source ... do` ブロック。
+    /// 内側の gem は RubyGems のレジストリ依存ではないため更新対象から除外する
+    /// (行オプション形式 `gem 'x', git: '...'` と同じ方針)
+    NonRegistry,
     Other,
 }
 
@@ -58,6 +62,15 @@ static GROUP_END_RE: LazyLock<Regex> =
 // `do` で終わるブロック開始行（group 以外）
 static DO_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bdo\s*(?:#.*)?$").unwrap());
 
+// 非レジストリソースのブロック開始行:
+//   git "https://github.com/rails/rails.git", branch: "main" do
+//   path "components" do
+//   source "https://gems.example.com" do
+// これらのブロック内の gem は rubygems.org の版で書き換えてはいけない
+// (git/path なら `bundle install` が壊れ、private source なら同名の公開 gem の版が入る)
+static NON_REGISTRY_BLOCK_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*(?:git|github|bitbucket|gist|path|source)\b").unwrap());
+
 // 開発用グループかどうかを判定する
 fn is_dev_group(group_line: &str) -> bool {
     let lowered = group_line.to_lowercase();
@@ -80,14 +93,19 @@ fn has_dev_group_option(line: &str) -> bool {
             || lowered.contains("'test'"))
 }
 
+/// Ruby のオプションキーは `key: value` と `:key => value` の 2 通りで書ける。
+/// 両綴りを検出する (`has_dev_group_option` が `:group =>` を見ているのと揃える)。
+fn has_option_key(lowered: &str, key: &str) -> bool {
+    lowered.contains(&format!("{key}:"))
+        || lowered.contains(&format!(":{key} =>"))
+        || lowered.contains(&format!(":{key}=>"))
+}
+
 fn has_non_registry_source(line: &str) -> bool {
     let lowered = line.to_lowercase();
-    lowered.contains("git:")
-        || lowered.contains("github:")
-        || lowered.contains("bitbucket:")
-        || lowered.contains("gist:")
-        || lowered.contains("path:")
-        || lowered.contains("source:")
+    ["git", "github", "bitbucket", "gist", "path", "source"]
+        .iter()
+        .any(|key| has_option_key(&lowered, key))
 }
 
 /// クォート外の `#` 以降 (行コメント) を取り除いた部分文字列を返す。
@@ -122,9 +140,13 @@ impl ManifestParser for GemfileParser {
                 continue;
             }
 
-            // group 以外の `do` ブロック（platforms, source 等）を追跡する
+            // group 以外の `do` ブロック（platforms, git, path, source 等）を追跡する
             if DO_BLOCK_RE.is_match(code) {
-                block_stack.push(GemfileBlock::Other);
+                block_stack.push(if NON_REGISTRY_BLOCK_RE.is_match(code) {
+                    GemfileBlock::NonRegistry
+                } else {
+                    GemfileBlock::Other
+                });
                 continue;
             }
 
@@ -150,9 +172,24 @@ impl ManifestParser for GemfileParser {
                     }
                 }
 
+                // git / path / source ブロックの内側は RubyGems のレジストリ依存ではない
+                if block_stack
+                    .iter()
+                    .any(|block| matches!(block, GemfileBlock::NonRegistry))
+                {
+                    continue;
+                }
+
                 // バージョン指定から `VersionSpec` を組み立てる
                 let spec = if version_parts.is_empty() {
                     if has_non_registry_source(code) {
+                        continue;
+                    }
+                    // 引数が次行へ続く宣言 (`gem "devise",` で行が終わる形) は、
+                    // 実際には次行に version や `git:` がある。この行だけを見て
+                    // 「バージョンなしのレジストリ依存」と報告すると、書き込み側は
+                    // 挿入位置を見つけられず必ず失敗する。安全側で取りこぼす。
+                    if code.trim_end().ends_with(',') {
                         continue;
                     }
                     // バージョン指定がなければ `Any`
@@ -200,7 +237,7 @@ impl ManifestParser for GemfileParser {
         // report/apply が矛盾する (GEM_RE 側は既に if/unless を許容済み)。
         // if/unless の直前までを一致させ、修飾子本体は line[matched_range.end..] で保持する。
         let no_version_pattern = format!(
-            r#"(gem(?:\s+|\s*\(\s*))(['"])({escaped_name})(['"])(\s*(?:(?:\)\s*)?(?:#|$)|,\s*(?:require|groups?|git|path|branch|ref|tag|source|platforms?|install_if|force_ruby_platform)\s*:|(?:\)\s*)?(?:if|unless)\b))"#
+            r#"(gem(?:\s+|\s*\(\s*))(['"])({escaped_name})(['"])(\s*(?:(?:\)\s*)?(?:#|$)|,\s*(?::\w+\s*=>|\w+\s*:)|(?:\)\s*)?(?:if|unless)\b))"#
         );
 
         let no_version_re =
@@ -598,7 +635,9 @@ gem 'pg', '~> 1.1'
         let result = GemfileParser
             .update_version(content, "rails", "7.1.0")
             .unwrap();
-        assert!(result.contains("'~> 7.1.0'"));
+        // `~> 7.0` は `>= 7.0, < 8.0`。セグメント数を保って `~> 7.1` にする
+        // (`~> 7.1.0` にすると上限が `< 7.2` へ縮まってしまう)
+        assert!(result.contains("'~> 7.1'"));
         assert!(result.contains("gem 'pg'")); // 他の gem は変更しない
     }
 
@@ -671,7 +710,7 @@ gem 'pg', '~> 1.1'
         let result = GemfileParser
             .update_version(content, "rails", "7.1.0")
             .unwrap();
-        assert!(result.contains("\"~> 7.1.0\""));
+        assert!(result.contains("\"~> 7.1\""));
     }
 
     #[test]
@@ -680,7 +719,7 @@ gem 'pg', '~> 1.1'
         let result = GemfileParser
             .update_version(content, "rack", "3.1.0")
             .unwrap();
-        assert_eq!(result, r#"gem("rack", "~> 3.1.0")"#);
+        assert_eq!(result, r#"gem("rack", "~> 3.1")"#);
     }
 
     #[test]
@@ -836,7 +875,7 @@ gem 'nokogiri'
         let result = GemfileParser
             .update_version(content, "rails", "7.1.0")
             .unwrap();
-        assert!(result.contains("'~> 7.1.0'"));
+        assert!(result.contains("'~> 7.1'"));
 
         // バージョンなし gem の更新
         let result2 = GemfileParser
@@ -962,7 +1001,9 @@ gem 'pg', '~> 1.5'
 
     #[test]
     fn test_parse_source_do_end_in_group() {
-        // group 内の source do...end がグループスタックを壊さないこと
+        // group 内の source do...end がグループスタックを壊さないこと。
+        // source ブロック内の gem は rubygems.org の依存ではないため除外し、
+        // ブロックを抜けた後の gem は従来どおり開発依存として拾う。
         let content = r#"
 group :development do
   source 'https://gems.example.com' do
@@ -972,20 +1013,121 @@ group :development do
 end
 "#;
         let deps = parse(content).unwrap();
-        assert_eq!(deps.len(), 2);
+        assert_eq!(deps.len(), 1);
 
-        let private = deps.iter().find(|d| d.name == "private-gem").unwrap();
         let debug = deps.iter().find(|d| d.name == "debug").unwrap();
-
-        assert!(private.is_dev);
         assert!(debug.is_dev);
     }
 
+    /// 回帰テスト: git / path / source ブロック内の gem に rubygems.org の版を
+    /// 書き込むと `bundle install` が壊れる (private source なら同名の公開 gem の
+    /// 版が入る)。行オプション形式と同じく除外する。
     #[test]
-    fn test_parse_group_inside_source_does_not_leak() {
-        // source do の内側で閉じた group が、後続の gem に漏れないこと
+    fn test_parse_non_registry_blocks_excluded() {
         let content = r#"
-source 'https://gems.example.com' do
+git "https://github.com/rails/rails.git", branch: "main" do
+  gem "activesupport"
+  gem "actionpack"
+end
+
+path "components" do
+  gem "admin_ui"
+end
+
+source "https://gems.example.com" do
+  gem "private-gem"
+end
+
+gem "rails", "~> 7.0"
+"#;
+        let deps = parse(content).unwrap();
+        let names: Vec<&str> = deps.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["rails"]);
+    }
+
+    /// `platforms` / `install_if` のような通常のブロックは従来どおり対象にする。
+    #[test]
+    fn test_parse_platforms_block_still_included() {
+        let content = r#"
+platforms :ruby do
+  gem 'pg', '~> 1.5'
+end
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "pg");
+    }
+
+    /// 回帰テスト: hash-rocket 記法 (`:git => '...'`) も非レジストリ依存として除外する。
+    /// 以前は `git:` 綴りしか見ておらず、git 依存を更新候補として誤って報告した上で
+    /// 書き込み時に必ずエラーになっていた。
+    #[test]
+    fn test_parse_hash_rocket_git_option_excluded() {
+        let content = r#"
+gem 'rails', :git => 'https://github.com/rails/rails.git'
+gem 'pg', '~> 1.5'
+"#;
+        let deps = parse(content).unwrap();
+        let names: Vec<&str> = deps.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["pg"]);
+    }
+
+    /// hash-rocket の無害なオプション付きバージョンなし gem には version を挿入できる。
+    #[test]
+    fn test_update_version_add_to_unversioned_gem_with_hash_rocket_option() {
+        let content = "gem 'sidekiq', :require => false\n";
+        let result = GemfileParser
+            .update_version(content, "sidekiq", "7.3.0")
+            .unwrap();
+        assert_eq!(result, "gem 'sidekiq', '7.3.0', :require => false\n");
+    }
+
+    /// `git_source` で定義した独自ショートハンド付きの gem にも挿入できる
+    /// (キーワード列挙ではなく `key:` の一般形で判定するため)。
+    #[test]
+    fn test_update_version_add_to_unversioned_gem_with_custom_shorthand() {
+        let content = "gem 'my-gem', codeberg: 'user/my-gem'\n";
+        let result = GemfileParser
+            .update_version(content, "my-gem", "2.0.0")
+            .unwrap();
+        assert_eq!(result, "gem 'my-gem', '2.0.0', codeberg: 'user/my-gem'\n");
+    }
+
+    /// 回帰テスト: 引数が次行へ続く宣言はこの行だけでは版を決められないため、
+    /// 「バージョンなしのレジストリ依存」と誤報告せず取りこぼす
+    /// (以前は更新を報告した上で書き込みが必ず失敗していた)。
+    #[test]
+    fn test_parse_multiline_gem_declaration_skipped() {
+        let content = r#"
+gem "sidekiq",
+    "~> 7.2"
+
+gem "devise",
+    git: "https://github.com/heartcombo/devise.git",
+    branch: "main"
+
+gem "pg", "~> 1.5"
+"#;
+        let deps = parse(content).unwrap();
+        let names: Vec<&str> = deps.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["pg"]);
+    }
+
+    /// 同一行に version がある場合は、末尾に `,` が続いても従来どおり更新対象。
+    #[test]
+    fn test_parse_versioned_gem_with_trailing_comma_still_parsed() {
+        let content = "gem \"sidekiq\", \"~> 7.2\",\n    require: false\n";
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "sidekiq");
+        assert_eq!(deps[0].version_spec.version, "7.2");
+    }
+
+    #[test]
+    fn test_parse_group_inside_block_does_not_leak() {
+        // ブロックの内側で閉じた group が、後続の gem に漏れないこと
+        let content = r#"
+platforms :ruby do
   group :development do
     gem 'debug', '~> 1.0'
   end
@@ -1086,7 +1228,7 @@ gem 'rails', '~> 7.0' # more things to do
         let result = GemfileParser
             .update_version(content, "rails", "7.1.0")
             .unwrap();
-        assert_eq!(result, "gem 'rails', '~> 7.1.0' # more things to do\n");
+        assert_eq!(result, "gem 'rails', '~> 7.1' # more things to do\n");
     }
 
     #[test]
@@ -1132,12 +1274,14 @@ gem 'pg', '~> 1.5'
 
     #[test]
     fn test_parse_quoted_hash_is_not_comment() {
-        // 文字列リテラル内の `#` はコメント扱いされないこと
-        let content =
-            "source 'https://example.com#fragment' do\n  gem 'private-gem', '~> 1.0'\nend\n";
+        // 文字列リテラル内の `#` はコメント扱いされないこと。
+        // `#fragment` がコメント扱いされると行末の `do` が消えてブロックが積まれず、
+        // 続く `end` が別のブロックを pop してしまう。source ブロック内の gem が
+        // 除外され、`end` の後の gem が拾えることで正しい追跡を確認する。
+        let content = "source 'https://example.com#fragment' do\n  gem 'private-gem', '~> 1.0'\nend\ngem 'pg', '~> 1.5'\n";
         let deps = parse(content).unwrap();
         assert_eq!(deps.len(), 1);
-        assert_eq!(deps[0].name, "private-gem");
+        assert_eq!(deps[0].name, "pg");
     }
 
     // --- バージョンなし gem のオプションキーワードに対する回帰テスト ---
@@ -1196,8 +1340,9 @@ end
         let result = GemfileParser
             .update_version(content, "rails", "7.1.0")
             .unwrap();
+        // `~> 7.0` はセグメント数を保って `~> 7.1` になる
         assert_eq!(
-            result.matches("7.1.0").count(),
+            result.matches("'~> 7.1'").count(),
             2,
             "同名 gem の全出現が更新されるべき:\n{}",
             result
@@ -1216,7 +1361,7 @@ end
             .unwrap();
         assert_eq!(
             result,
-            "source 'https://rubygems.org'\r\n\r\ngem 'rails', '~> 7.1.0'\r\ngem 'pg', '~> 1.1'\r\n"
+            "source 'https://rubygems.org'\r\n\r\ngem 'rails', '~> 7.1'\r\ngem 'pg', '~> 1.1'\r\n"
         );
     }
 
@@ -1237,6 +1382,6 @@ end
         let result = GemfileParser
             .update_version(content, "pg", "1.5.0")
             .unwrap();
-        assert_eq!(result, "gem 'rails', '~> 7.0'\r\ngem 'pg', '~> 1.5.0'\n");
+        assert_eq!(result, "gem 'rails', '~> 7.0'\r\ngem 'pg', '~> 1.5'\n");
     }
 }

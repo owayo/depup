@@ -170,6 +170,14 @@ impl ManifestParser for CargoTomlParser {
             r#"^(\s*{}\s*=\s*\{{[^\n}}]*?\bversion\s*=\s*)(?:"([^"]+)"|'([^']+)')"#,
             regex::escape(package)
         );
+        // TOML の dotted key 形式: `tokio.version = "1.38"`
+        // toml クレートは dotted key を inline table と同じ構造へ畳むため parse は
+        // 依存として surface する。ここを書き換えないと「更新あり」と報告した後に
+        // 書き込みが失敗し、report/apply が矛盾する。
+        let dotted_pattern = format!(
+            r#"^(\s*{}\s*\.\s*version\s*=\s*)(?:"([^"]+)"|'([^']+)')"#,
+            regex::escape(package)
+        );
         let simple_re =
             Regex::new(&simple_pattern).map_err(|e| ManifestError::InvalidVersionSpec {
                 path: PathBuf::from("Cargo.toml"),
@@ -178,6 +186,12 @@ impl ManifestParser for CargoTomlParser {
             })?;
         let table_re =
             Regex::new(&table_pattern).map_err(|e| ManifestError::InvalidVersionSpec {
+                path: PathBuf::from("Cargo.toml"),
+                spec: package.to_string(),
+                message: format!("invalid regex pattern: {}", e),
+            })?;
+        let dotted_re =
+            Regex::new(&dotted_pattern).map_err(|e| ManifestError::InvalidVersionSpec {
                 path: PathBuf::from("Cargo.toml"),
                 spec: package.to_string(),
                 message: format!("invalid regex pattern: {}", e),
@@ -213,6 +227,16 @@ impl ManifestParser for CargoTomlParser {
                     {
                         let replacement = format!("{}{}{}{}", &caps[1], quote, new_ver, quote);
                         Some(table_re.replace(line, replacement.as_str()).to_string())
+                    } else {
+                        None
+                    }
+                } else if let Some(caps) = dotted_re.captures(line) {
+                    let (quote, old_version) = captured_quote_and_version(&caps);
+                    if let Some(spec) = parser.parse(old_version)
+                        && let Some(new_ver) = spec.try_format_updated(new_version)
+                    {
+                        let replacement = format!("{}{}{}{}", &caps[1], quote, new_ver, quote);
+                        Some(dotted_re.replace(line, replacement.as_str()).to_string())
                     } else {
                         None
                     }
@@ -362,6 +386,14 @@ fn parse_cargo_dependencies(
                         manifest_name,
                         Some(git_source),
                     );
+                    continue;
+                }
+                if t.contains_key("path") {
+                    // path 依存はローカルのクレートで解決されるため crates.io の候補で
+                    // 書き換えてはいけない。publish 用に `version` を併記していても、
+                    // 公開済み最新版へ引き上げるとローカルクレートの実バージョンが
+                    // 要求を満たさなくなり `cargo build` が壊れる
+                    // (Cargo.lock 側が source 無しエントリを path 依存として除外するのと同じ方針)。
                     continue;
                 }
                 if t.get("registry")
@@ -726,6 +758,58 @@ local-crate = { path = "../local-crate" }
         let deps = parse(content).unwrap();
         // バージョンを持たない path 依存はスキップする
         assert!(deps.is_empty());
+    }
+
+    /// 回帰テスト: publish 用に `version` を併記した path 依存も crates.io の候補で
+    /// 書き換えてはいけない。ローカルクレートの実バージョンが要求を満たさなくなり
+    /// `cargo build` が壊れるため (crates.io に同名クレートが実在する場合は
+    /// まったく無関係なクレートの版で上書きされる)。
+    #[test]
+    fn test_parse_path_dependency_with_version_skipped() {
+        let content = r#"
+[dependencies]
+common = { path = "../common", version = "0.1.0" }
+tokio = { version = "1.0" }
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "tokio");
+    }
+
+    /// 回帰テスト: TOML の dotted key (`tokio.version = "1.38"`) は parse が依存として
+    /// 読むため、update も同じ範囲を書き換えられること (report/apply の整合)。
+    #[test]
+    fn test_dotted_key_dependency_parse_and_update() {
+        let content = r#"
+[dependencies]
+tokio.version = "1.38"
+tokio.features = ["full"]
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "tokio");
+        assert_eq!(deps[0].version_spec.version, "1.38");
+
+        let result = CargoTomlParser
+            .update_version(content, "tokio", "1.52.4")
+            .unwrap();
+        assert!(result.contains(r#"tokio.version = "1.52.4""#), "{}", result);
+        // 他の dotted key は触らない
+        assert!(result.contains(r#"tokio.features = ["full"]"#));
+    }
+
+    /// 依存セクション外の dotted key は書き換えない。
+    #[test]
+    fn test_dotted_key_outside_dependency_section_not_updated() {
+        let content = r#"
+[package.metadata.custom]
+tokio.version = "1.38"
+"#;
+
+        let result = CargoTomlParser.update_version(content, "tokio", "1.52.4");
+        assert!(result.is_err());
     }
 
     #[test]

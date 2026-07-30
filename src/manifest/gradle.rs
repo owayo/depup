@@ -27,6 +27,11 @@ struct VariableDefinition {
     value: String,
     /// 行番号 (1-based)
     line_number: usize,
+    /// 同名の定義が異なる値で複数存在するか。
+    /// `object Versions { ... }` と `object Deps { ... }` が同じ短名を持つ場合、
+    /// 修飾付き参照 (`${Versions.x}`) を最終セグメントで引き当てると別オブジェクトの
+    /// 値を拾いうるため、曖昧な短名では解決しない (誤更新を防ぐ安全側のスキップ)。
+    ambiguous: bool,
 }
 
 /// Gradle rich version の宣言種別
@@ -73,6 +78,14 @@ static VAR_DEF_KOTLIN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"^\s*(?:const\s+)?val\s+(\w+)\s*(?::\s*\w+)?\s*=\s*"([^"]+)""#).unwrap()
 });
 
+// ext のドット代入: ext.wicketVersion = '1.2.3' / project.ext.wicketVersion = "1.2.3"。
+// ext ブロックの外に書かれるため EXT_VAR_* (ブロック内限定) では拾えないが、
+// 同一ファイル内に静的に書かれた解決可能な定義なので変数表へ載せる。
+static EXT_DOT_VAR_SINGLE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"^\s*(?:project\.)?ext\.(\w+)\s*=\s*'([^']+)'"#).unwrap());
+static EXT_DOT_VAR_DOUBLE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"^\s*(?:project\.)?ext\.(\w+)\s*=\s*"([^"]+)""#).unwrap());
+
 // ext ブロック内変数: wicketVersion = '1.2.3' または "1.2.3"
 static EXT_VAR_SINGLE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"^\s*(\w+)\s*=\s*'([^']+)'"#).unwrap());
@@ -82,33 +95,48 @@ static EXT_VAR_DOUBLE: LazyLock<Regex> =
 // ext ブロック開始
 static EXT_BLOCK_START: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*ext\s*\{").unwrap());
 
+// configuration 名と依存座標の間に挟まる宣言ラッパ。
+// BOM は `implementation platform('g:a:1.0')` / `implementation(platform("g:a:1.0"))` と
+// 書くのが Gradle の標準で、これを取りこぼすと推移依存のバージョンを一括決定する
+// 宣言だけが無言で更新対象外になる (書き戻し側は行頭アンカーが無いため既に対応済み)。
+const DEP_WRAPPER: &str = r"(?:(?:enforcedPlatform|platform|testFixtures)\s*\(\s*)?";
+
 // map 記法依存: implementation group: 'x', name: 'y', version: 'z'
 // implementation(group: 'x', name: 'y', version: 'z') も処理
 // 非後方参照パターンを使用 (シングル/ダブルクォート両対応)
 static DEP_MAP: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"^\s*(\w+)\s*[\(\s]+group\s*[:=]\s*['"]([^'"]+)['"]\s*,\s*name\s*[:=]\s*['"]([^'"]+)['"]\s*,\s*version\s*[:=]\s*['"]?([^'",\)\s]+)['"]?"#,
-    )
+    Regex::new(&format!(
+        r#"^\s*(\w+)\s*[\(\s]+{DEP_WRAPPER}group\s*[:=]\s*['"]([^'"]+)['"]\s*,\s*name\s*[:=]\s*['"]([^'"]+)['"]\s*,\s*version\s*[:=]\s*['"]?([^'",\)\s]+)['"]?"#,
+    ))
     .unwrap()
 });
 
 // 文字列記法依存: implementation 'group:name:version'
 // 非後方参照パターンを使用 (シングル/ダブルクォート両対応)
 static DEP_STRING: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"^\s*(\w+)\s*[\(\s]*['"]([^:'"]+):([^:'"]+):([^:'"@]+)(?::[^'"]+)?(?:@[^'"]+)?['"]"#,
-    )
+    Regex::new(&format!(
+        r#"^\s*(\w+)\s*[\(\s]*{DEP_WRAPPER}['"]([^:'"]+):([^:'"]+):([^:'"@]+)(?::[^'"]+)?(?:@[^'"]+)?['"]"#,
+    ))
     .unwrap()
 });
 
 // 変数展開あり文字列記法: implementation "group:name:$version"
+// 参照名は `${Versions.retrofit}` / `${rootProject.ext.springVersion}` のように
+// 修飾付きでも書けるため `.` を許容し、解決時に最終セグメントで引き当てる。
 static DEP_STRING_VAR: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"^\s*(\w+)\s*[\(\s]*"([^:"]+):([^:"]+):\$\{?(\w+)\}?""#).unwrap()
+    Regex::new(&format!(
+        r#"^\s*(\w+)\s*[\(\s]*{DEP_WRAPPER}"([^:"]+):([^:"]+):\$\{{?([\w.]+)\}}?""#
+    ))
+    .unwrap()
 });
 
 // rich version ブロックを持つ文字列記法依存: implementation("group:name") { ... }
+// `implementation(platform("g:a")) { ... }` のようにラッパで括弧が増える形にも対応する
 static DEP_STRING_NO_VERSION: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"^\s*(\w+)\s*[\(\s]*['"]([^:'"]+):([^:'"]+)['"]\s*\)?\s*(?:\{|$)"#).unwrap()
+    Regex::new(&format!(
+        r#"^\s*(\w+)\s*[\(\s]*{DEP_WRAPPER}['"]([^:'"]+):([^:'"]+)['"]\s*\)*\s*(?:\{{|$)"#
+    ))
+    .unwrap()
 });
 
 // rich version 宣言: strictly("1.2.3") / require '1.2.3' / prefer "1.2.3" / reject("1.2.3")
@@ -278,13 +306,40 @@ fn insert_captured_variable(
         return;
     }
 
+    let ambiguous = variables
+        .get(name)
+        .is_some_and(|existing| existing.value != value);
+
     variables.insert(
         name.to_string(),
         VariableDefinition {
             value: value.to_string(),
             line_number,
+            ambiguous,
         },
     );
+}
+
+/// `$var` / `${var}` の参照名から変数定義を引き当て、実キーと定義を返す。
+///
+/// 完全一致を優先し、見つからなければ `Versions.retrofit` / `rootProject.ext.springVersion`
+/// のような修飾付き参照とみなして最終セグメントで引く。書き戻し側は返された実キーで
+/// 変数定義行を探すため、参照表記ではなくキー名を返す。
+fn lookup_variable<'a>(
+    variables: &'a HashMap<String, VariableDefinition>,
+    reference: &str,
+) -> Option<(&'a str, &'a VariableDefinition)> {
+    if let Some((key, def)) = variables.get_key_value(reference) {
+        return Some((key.as_str(), def));
+    }
+    let last = reference.rsplit('.').next()?;
+    if last == reference {
+        return None;
+    }
+    variables
+        .get_key_value(last)
+        .filter(|(_, def)| !def.ambiguous)
+        .map(|(key, def)| (key.as_str(), def))
 }
 
 impl GradleParser {
@@ -326,6 +381,14 @@ impl GradleParser {
                 if brace_depth == 0 {
                     in_ext_block = false;
                 }
+            }
+
+            // `ext.<name> = '...'` / `project.ext.<name> = "..."` のドット代入を先に判定する
+            // (ext ブロック外に書けるため EXT_VAR_* では拾えない)
+            let ext_dot_regexes: [&Regex; 2] = [&*EXT_DOT_VAR_SINGLE, &*EXT_DOT_VAR_DOUBLE];
+            if let Some(caps) = ext_dot_regexes.into_iter().find_map(|re| re.captures(line)) {
+                insert_captured_variable(&mut variables, &caps, line_number, true);
+                continue;
             }
 
             // 変数定義 (Groovy def シングル/ダブルクォート, Kotlin val) を従来の判定順で試し、
@@ -400,14 +463,15 @@ impl GradleParser {
             let config = caps.get(1).map(|m| m.as_str())?;
             let group = caps.get(2).map(|m| m.as_str())?;
             let artifact = caps.get(3).map(|m| m.as_str())?;
-            let var_name = caps.get(4).map(|m| m.as_str())?;
+            let var_ref = caps.get(4).map(|m| m.as_str())?;
 
             // 変数参照を解決する。depup が追跡しない場所 (gradle.properties / `by extra(...)` /
             // 計算値など) で定義された変数は解決できない。その場合に空の `Any` 依存を作ると、
             // judge は「更新あり」と報告する一方で writer は書き換え先 (リテラル version も
             // 変数定義も) を見つけられず失敗し、「更新を報告したのに適用エラー」という
             // 矛盾した結果になる。更新できないことが確定しているため依存ごとスキップする。
-            let version = variables.get(var_name)?.value.clone();
+            let (var_name, definition) = lookup_variable(variables, var_ref)?;
+            let version = definition.value.clone();
 
             let spec = parser.parse(&version)?;
 
@@ -999,10 +1063,14 @@ fn replace_variable_version_value(
     active_line: &str,
     formatted_version: &str,
 ) -> Option<String> {
-    let regexes: [&Regex; 5] = [
+    let regexes: [&Regex; 7] = [
         &*VAR_DEF_GROOVY_SINGLE,
         &*VAR_DEF_GROOVY_DOUBLE,
         &*VAR_DEF_KOTLIN,
+        // parse 側が拾う `ext.<name> = '...'` も書き戻せるようにする
+        // (ここを欠くと report/apply が矛盾する)
+        &*EXT_DOT_VAR_SINGLE,
+        &*EXT_DOT_VAR_DOUBLE,
         &*EXT_VAR_SINGLE,
         &*EXT_VAR_DOUBLE,
     ];
@@ -2137,26 +2205,142 @@ dependencies {
     }
 
     #[test]
-    fn test_parse_platform_dependency_not_matched() {
-        // platform() ラッパー付き依存は通常の文字列記法正規表現にマッチしない
-        // （platform がコンフィグ名として解釈されるため、実際の configuration とは異なる）
+    fn test_parse_platform_dependency() {
+        // 回帰テスト: BOM は `platform(...)` / `enforcedPlatform(...)` で宣言するのが
+        // Gradle の標準。これを取りこぼすと推移依存のバージョンを一括決定する宣言だけが
+        // 無言で更新対象外になっていた。configuration 名 (dev 判定) も保持する。
+        let content = r#"
+dependencies {
+    implementation platform('com.google.cloud:libraries-bom:26.1.0')
+    implementation(platform("org.springframework.boot:spring-boot-dependencies:3.2.0"))
+    testImplementation(platform("org.junit:junit-bom:5.10.0"))
+    implementation enforcedPlatform("io.netty:netty-bom:4.1.100.Final")
+}
+"#;
+        let deps = parse(content).unwrap();
+
+        let bom = deps
+            .iter()
+            .find(|d| d.name == "com.google.cloud:libraries-bom")
+            .expect("platform 依存が検出されるべき");
+        assert!(!bom.is_dev);
+        assert_eq!(bom.version_spec.version, "26.1.0");
+
+        let boot = deps
+            .iter()
+            .find(|d| d.name == "org.springframework.boot:spring-boot-dependencies")
+            .expect("括弧付き platform 依存が検出されるべき");
+        assert_eq!(boot.version_spec.version, "3.2.0");
+
+        let junit = deps
+            .iter()
+            .find(|d| d.name == "org.junit:junit-bom")
+            .expect("testImplementation の platform 依存が検出されるべき");
+        assert!(junit.is_dev, "configuration 名が platform に潰されていない");
+
+        let netty = deps
+            .iter()
+            .find(|d| d.name == "io.netty:netty-bom")
+            .expect("enforcedPlatform 依存が検出されるべき");
+        assert_eq!(netty.version_spec.version, "4.1.100.Final");
+    }
+
+    /// platform 依存も文字列記法と同じ経路で書き戻せること (report/apply の整合)。
+    #[test]
+    fn test_update_platform_dependency() {
         let content = r#"
 dependencies {
     implementation platform('com.google.cloud:libraries-bom:26.1.0')
 }
 "#;
+        let result = GradleParser
+            .update_version(content, "com.google.cloud:libraries-bom", "26.30.0")
+            .unwrap();
+        assert!(
+            result.contains("platform('com.google.cloud:libraries-bom:26.30.0')"),
+            "{}",
+            result
+        );
+    }
+
+    /// 回帰テスト: `ext.<name> = '...'` のドット代入も変数として解決・書き戻しできること。
+    /// `ext { ... }` ブロック形式と意味が同じなのに挙動が割れていた。
+    #[test]
+    fn test_ext_dot_variable_parse_and_update() {
+        let content = r#"
+ext.springVersion = '5.3.23'
+
+dependencies {
+    implementation "org.springframework:spring-core:$springVersion"
+}
+"#;
         let deps = parse(content).unwrap();
-        // platform() ラッパーの中身は独立した行としてパースされる
-        // "platform" が configuration 名として解釈される
-        let platform_dep = deps
+        let dep = deps
             .iter()
-            .find(|d| d.name == "com.google.cloud:libraries-bom");
-        if let Some(dep) = platform_dep {
-            // パースされた場合、本番依存として扱われる（platform は DEV_CONFIGURATIONS に含まれない）
-            assert!(!dep.is_dev);
-            assert_eq!(dep.version_spec.version, "26.1.0");
-        }
-        // パースされない場合もテスト自体は成功（実装の振る舞いを記録）
+            .find(|d| d.name == "org.springframework:spring-core")
+            .expect("ext.<name> 参照の依存が検出されるべき");
+        assert_eq!(dep.version_spec.version, "5.3.23");
+
+        let result = GradleParser
+            .update_version(content, "org.springframework:spring-core", "6.1.0")
+            .unwrap();
+        assert!(result.contains("ext.springVersion = '6.1.0'"), "{}", result);
+    }
+
+    /// 回帰テスト: `${Versions.x}` のような修飾付き変数参照も最終セグメントで解決する。
+    /// 解決に必要な定義が同一ファイル内にあるのに依存ごと落としていた。
+    #[test]
+    fn test_qualified_variable_reference_parse_and_update() {
+        let content = r#"
+object Versions {
+    const val retrofit = "2.9.0"
+}
+
+dependencies {
+    implementation("com.squareup.retrofit2:retrofit:${Versions.retrofit}")
+}
+"#;
+        let deps = parse(content).unwrap();
+        let dep = deps
+            .iter()
+            .find(|d| d.name == "com.squareup.retrofit2:retrofit")
+            .expect("修飾付き変数参照の依存が検出されるべき");
+        assert_eq!(dep.version_spec.version, "2.9.0");
+
+        let result = GradleParser
+            .update_version(content, "com.squareup.retrofit2:retrofit", "2.11.0")
+            .unwrap();
+        assert!(
+            result.contains(r#"const val retrofit = "2.11.0""#),
+            "{}",
+            result
+        );
+    }
+
+    /// 同じ短名が異なる値で複数定義されている場合、修飾付き参照は解決しない
+    /// (別オブジェクトの値を拾う誤更新を防ぐ安全側のスキップ)。
+    #[test]
+    fn test_qualified_variable_reference_ambiguous_short_name_skipped() {
+        let content = r#"
+object Versions {
+    const val retrofit = "2.9.0"
+}
+object Legacy {
+    const val retrofit = "1.9.0"
+}
+
+dependencies {
+    implementation("com.squareup.retrofit2:retrofit:${Versions.retrofit}")
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert!(
+            !deps
+                .iter()
+                .any(|d| d.name == "com.squareup.retrofit2:retrofit"),
+            "曖昧な短名は解決せずスキップされるべき: {:?}",
+            deps.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
     }
 
     // --- コメント除去の文字列リテラル対応 (回帰テスト) ---
