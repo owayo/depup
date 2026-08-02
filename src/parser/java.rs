@@ -2,7 +2,7 @@
 //!
 //! 対応する構文:
 //! - 固定バージョン: `1.2.3`, `1.2.3-SNAPSHOT`, `1.2.3-alpha1`
-//! - strict 記法: `1.2.3!!`
+//! - strict 記法: `1.2.3!!`, `1.2.+!!`, `[1.0,2.0[!!`
 //! - プレフィックス指定: `1.2.+` (`1.2` 系を許可)
 //! - 動的指定: `latest.release`, `latest.integration` (更新対象外)
 //! - Maven 形式レンジ: `[1.0,2.0]`, `[1.0,)`, `(,2.0]`, `[1.0,2.0)`, `]1.0,2.0[`
@@ -40,9 +40,9 @@ static STRICT_RANGE_WITH_PREFER_RE: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
-// プレフィックス指定: 1.2.+ / 1.+
+// プレフィックス指定: 1.2.+ / 1.+（末尾の strict 記法 `!!` も許可）
 static PREFIX_VERSION_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(\d+(?:\.\d+)*)\.\+$").unwrap());
+    LazyLock::new(|| Regex::new(r"^(\d+(?:\.\d+)*)\.\+(!!)?$").unwrap());
 
 // 動的指定: latest.release / latest.integration / latest.milestone / latest.<custom-status>
 // Gradle 公式仕様では任意の status 識別子を取れる (status scheme で定義可能)。
@@ -51,10 +51,10 @@ static DYNAMIC_VERSION_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(latest\.[a-zA-Z][A-Za-z0-9_-]*)$").unwrap());
 
 // Maven 形式レンジ: [1.0,2.0], [1.0,), (,2.0], [1.0,2.0)
-// 形式: [(] lower , upper [)] (lower/upper は空またはバージョン)
+// 形式: [(] lower , upper [)] (lower/upper は空またはバージョン、末尾の `!!` も許可)
 static MAVEN_RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r"^[\[\(\]]({GRADLE_VERSION_TOKEN})?\s*,\s*({GRADLE_VERSION_TOKEN})?[\]\)\[]$"
+        r"^[\[\(\]]({GRADLE_VERSION_TOKEN})?\s*,\s*({GRADLE_VERSION_TOKEN})?[\]\)\[](?:!!)?$"
     ))
     .unwrap()
 });
@@ -120,14 +120,14 @@ impl VersionParser for JavaVersionParser {
             );
         }
 
-        // プレフィックス指定を判定: 1.2.+
+        // プレフィックス指定を判定: 1.2.+ / 1.2.+!!
         if let Some(caps) = PREFIX_VERSION_RE.captures(trimmed) {
             let version = caps.get(1)?.as_str();
-            return Some(VersionSpec::new(
-                VersionSpecKind::Wildcard,
-                trimmed,
-                version,
-            ));
+            let mut spec = VersionSpec::new(VersionSpecKind::Wildcard, trimmed, version);
+            if caps.get(2).is_some() {
+                spec = spec.with_suffix("!!");
+            }
+            return Some(spec);
         }
 
         // `latest.release` は常に移動する参照なので更新対象にしない
@@ -416,6 +416,23 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_strict_prefix_version() {
+        let spec = parse("1.2.+!!").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Wildcard);
+        assert_eq!(spec.version, "1.2");
+        assert_eq!(spec.suffix.as_deref(), Some("!!"));
+        assert_eq!(spec.format_updated("2.3.4"), "2.3.+!!");
+    }
+
+    #[test]
+    fn test_parse_strict_maven_range_without_prefer() {
+        let spec = parse("[1.7, 1.8[!!").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1.7");
+        assert_eq!(spec.format_updated("1.7.36"), "[1.7.36, 1.8[!!");
+    }
+
+    #[test]
     fn test_format_updated_prefix_version() {
         // プレフィックス指定の更新
         let spec = parse("5.3.+").unwrap();
@@ -607,5 +624,7 @@ mod tests {
         assert!(parse("(,)").is_none());
         assert!(parse("[,)").is_none());
         assert!(parse("(,]").is_none());
+        assert!(parse("[,]!!").is_none());
+        assert!(parse("(,)!!").is_none());
     }
 }

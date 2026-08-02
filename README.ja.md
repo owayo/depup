@@ -293,7 +293,9 @@ depupは元のバージョン範囲形式を維持します：
 "~1.2.x" → "~2.3.x" （npm の tilde + x-range、演算子を維持）
 "=1.2" → "=2.3" （npm の partial comparator、演算子を維持）
 "5.3.+" → "5.4.+" （Gradle プレフィックスを維持）
+"5.3.+!!" → "6.1.+!!" （Gradle strict 動的プレフィックスを維持）
 "1.2.3!!" → "2.0.0!!" （Gradle strict を維持）
+"[1.7, 1.8[!!" → "[1.7.36, 1.8[!!" （prefer なしの Gradle strict 範囲）
 "[1.0]" → "[2.0]" （Maven Hard requirement を維持）
 "[1.2.3.Final]" → "[1.3.0]" （qualifier 付き Maven Hard requirement）
 group = "com.google.guava", name = "guava", version = "32.1.2-jre" → version = "33.4.0-jre" （Gradle Kotlin map 記法）
@@ -314,7 +316,7 @@ npm の partial comparator では、`=1.2` や `=1` を固定バージョンで�
 
 Node.js は node-semver 互換の従来形式 `~>1.2.3` も受理し、更新後も `~>` を保持します。Composer は明示的な等価演算子（`=1.2.3` / `==1.2.3`）を保持して更新します。除外指定の `<>1.2.3` は解析しますが、安全のため自動書き換えません。
 
-Gradle の `strictly` / `require` / `prefer` / `reject` を使う rich version 宣言は、`implementation("org.slf4j:slf4j-api") { version { ... } }` のような依存ブロック内でも解析対象になります。`group:name:[1.7, 1.8[!!1.7.25` のような文字列記法の短縮構文も解析できます。`strictly` または `require` が範囲を指定し、`prefer` が選好バージョンを指定している場合、depup は範囲を上限制約として維持しつつ `prefer` の値を更新します。`reject` に列挙されたバージョンは更新候補から除外され、`2.+` のような動的 reject と `[1.5,1.9)` のようなレンジ reject も考慮します。
+Gradle の `strictly` / `require` / `prefer` / `reject` を使う rich version 宣言は、`implementation("org.slf4j:slf4j-api") { version { ... } }` のような依存ブロック内でも解析対象になります。文字列記法の短縮構文は、`group:name:1.2.3!!`、`group:name:5.3.+!!`、`group:name:[1.7, 1.8[!!`、prefer 付き strict 範囲の `group:name:[1.7, 1.8[!!1.7.25` のように、固定値・動的プレフィックス・範囲を解析できます。`strictly` または `require` が範囲を指定し、`prefer` が選好バージョンを指定している場合、depup は範囲を上限制約として維持しつつ `prefer` の値を更新します。`reject` に列挙されたバージョンは更新候補から除外され、`2.+` のような動的 reject と `[1.5,1.9)` のようなレンジ reject も考慮します。
 
 Gradle の宣言ラッパ `platform(...)` / `enforcedPlatform(...)` / `testFixtures(...)` に対応しています。`implementation platform('com.google.cloud:libraries-bom:26.1.0')` や `testImplementation(platform("org.junit:junit-bom:5.10.0"))` のような BOM 宣言も解析・更新でき、dev / 本番の判定にはラッパではなく本来の configuration 名を使います。`ext.<name> = '...'` / `project.ext.<name> = "..."` のドット代入も `ext { ... }` ブロックと同様に変数として解決し、`${Versions.retrofit}` のような修飾付き参照は最終セグメントで解決します。同じ短名が異なる値で複数定義されている場合は、別オブジェクトの値を拾う誤更新を避けて更新しません。
 

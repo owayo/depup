@@ -563,7 +563,14 @@ impl VersionSpec {
     /// 安全に更新後の文字列表現を組み立てられる場合だけ返す
     pub fn try_format_updated(&self, new_version: &str) -> Option<String> {
         match self.kind {
-            VersionSpecKind::Wildcard => format_wildcard_like(&self.raw, new_version),
+            VersionSpecKind::Wildcard => {
+                let raw = self
+                    .suffix
+                    .as_deref()
+                    .and_then(|suffix| self.raw.strip_suffix(suffix))
+                    .unwrap_or(&self.raw);
+                format_wildcard_like(raw, new_version).map(|body| self.wrap_with_affixes(&body))
+            }
             VersionSpecKind::Range => format_range_like(&self.raw, new_version),
             VersionSpecKind::Greater | VersionSpecKind::LessOrEqual | VersionSpecKind::Less => None,
             // Tilde は元のセグメント数が許容幅を決めるため、部分指定 (`~1.2` / `~> 7.0`)

@@ -293,7 +293,9 @@ depup preserves the original version range format:
 "~1.2.x" → "~2.3.x" (npm tilde + x-range, operator preserved)
 "=1.2" → "=2.3" (npm partial comparator, operator preserved)
 "5.3.+" → "5.4.+" (Gradle prefix preserved)
+"5.3.+!!" → "6.1.+!!" (Gradle strict dynamic prefix preserved)
 "1.2.3!!" → "2.0.0!!" (Gradle strict preserved)
+"[1.7, 1.8[!!" → "[1.7.36, 1.8[!!" (Gradle strict range without a preferred version)
 "[1.0]" → "[2.0]" (Maven Hard requirement preserved)
 "[1.2.3.Final]" → "[1.3.0]" (Maven Hard requirement with qualifier)
 group = "com.google.guava", name = "guava", version = "32.1.2-jre" → version = "33.4.0-jre" (Gradle Kotlin map notation)
@@ -314,7 +316,7 @@ Version candidates are ordered with ecosystem-specific rules. Node.js, Rust, Go,
 
 Node.js also accepts the node-semver-compatible legacy tilde spelling `~>1.2.3` and preserves `~>` when updating. Composer accepts explicit equality (`=1.2.3`, `==1.2.3`) while preserving the operator. Its `<>1.2.3` exclusion spelling is parsed but intentionally not rewritten.
 
-Gradle rich version declarations using `strictly`, `require`, `prefer`, and `reject` are parsed in dependency blocks such as `implementation("org.slf4j:slf4j-api") { version { ... } }`. String notation shorthand such as `group:name:[1.7, 1.8[!!1.7.25` is also parsed. When `strictly` or `require` declares a range and `prefer` declares the selected version, depup keeps the range as the upper-bound constraint and updates the `prefer` value. Versions listed with `reject` are excluded from update candidates, including dynamic rejects such as `2.+` and ranges such as `[1.5,1.9)`.
+Gradle rich version declarations using `strictly`, `require`, `prefer`, and `reject` are parsed in dependency blocks such as `implementation("org.slf4j:slf4j-api") { version { ... } }`. String notation shorthand supports exact, dynamic-prefix, and range constraints, including `group:name:1.2.3!!`, `group:name:5.3.+!!`, `group:name:[1.7, 1.8[!!`, and a strict range with a preferred version such as `group:name:[1.7, 1.8[!!1.7.25`. When `strictly` or `require` declares a range and `prefer` declares the selected version, depup keeps the range as the upper-bound constraint and updates the `prefer` value. Versions listed with `reject` are excluded from update candidates, including dynamic rejects such as `2.+` and ranges such as `[1.5,1.9)`.
 
 Gradle declaration wrappers are supported: `platform(...)`, `enforcedPlatform(...)`, and `testFixtures(...)`. BOM declarations such as `implementation platform('com.google.cloud:libraries-bom:26.1.0')` and `testImplementation(platform("org.junit:junit-bom:5.10.0"))` are parsed and updated, and the surrounding configuration name is still used for the dev/production classification. Gradle variables declared with `ext.<name> = '...'` / `project.ext.<name> = "..."` are resolved alongside `ext { ... }` blocks, and qualified references such as `${Versions.retrofit}` resolve by their final segment. A short name defined more than once with different values is left untouched to avoid picking the wrong object's value.
 

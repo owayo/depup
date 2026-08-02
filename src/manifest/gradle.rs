@@ -1767,6 +1767,40 @@ dependencies {
     }
 
     #[test]
+    fn test_parse_and_update_strict_prefix_version() {
+        let content = r#"dependencies {
+    implementation "org.springframework:spring-core:5.3.+!!"
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Wildcard);
+        assert_eq!(deps[0].version_spec.version, "5.3");
+
+        let result = GradleParser
+            .update_version(content, "org.springframework:spring-core", "6.1.2")
+            .unwrap();
+        assert!(result.contains("\"org.springframework:spring-core:6.1.+!!\""));
+    }
+
+    #[test]
+    fn test_parse_and_update_strict_range_without_prefer() {
+        let content = r#"dependencies {
+    implementation "org.slf4j:slf4j-api:[1.7, 1.8[!!"
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Range);
+        assert_eq!(deps[0].version_spec.version, "1.7");
+
+        let result = GradleParser
+            .update_version(content, "org.slf4j:slf4j-api", "1.7.36")
+            .unwrap();
+        assert!(result.contains("\"org.slf4j:slf4j-api:[1.7.36, 1.8[!!\""));
+    }
+
+    #[test]
     fn test_update_string_notation_strict_range_with_prefer() {
         let content = r#"
 dependencies {
@@ -1886,6 +1920,26 @@ commons-lang3 = { group = "org.apache.commons", name = "commons-lang3", version 
         assert_eq!(deps[0].version_spec.raw, "[3.8, 4.0[");
         assert_eq!(deps[0].version_spec.version, "3.9");
         assert_eq!(deps[0].version_spec.rejected_versions, vec!["3.10"]);
+    }
+
+    #[test]
+    fn test_update_version_catalog_strict_dynamic_version() {
+        let content = r#"
+[versions]
+spring = { strictly = "5.3.+" }
+
+[libraries]
+spring-core = { module = "org.springframework:spring-core", version.ref = "spring" }
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Wildcard);
+        assert_eq!(deps[0].version_spec.version, "5.3");
+
+        let result = GradleParser
+            .update_version(content, "org.springframework:spring-core", "6.1.2")
+            .unwrap();
+        assert!(result.contains(r#"strictly = "6.1.+""#));
     }
 
     #[test]
