@@ -23,7 +23,9 @@ use regex::Regex;
 use std::sync::LazyLock;
 
 /// レンジの上限制約抽出で共通利用するバージョントークン。
-const VERSION_TOKEN: &str = r"[vV]?\d+(?:\.\d+)*(?:[-+][0-9A-Za-z.-]+)?";
+/// PEP 440 の epoch (`1!2.0`) も 1 トークンとして扱う。これがないと
+/// `<1!2.0` の上限が `1` に丸まり、epoch 付きの候補が全滅する。
+const VERSION_TOKEN: &str = r"[vV]?(?:\d+!)?\d+(?:\.\d+)*(?:[-+][0-9A-Za-z.-]+)?";
 /// Maven レンジ専用のバージョントークン。
 /// Gradle の順序付け規則に合わせ、`.`, `-`, `_`, `+` 区切りと英数字混在パートを許容する。
 const MAVEN_VERSION_TOKEN: &str = r"[vV]?\d[0-9A-Za-z]*(?:[.\-_+][0-9A-Za-z]+)*";
@@ -64,6 +66,15 @@ static PEP440_PREFIX_MATCH_RE: LazyLock<Regex> =
 /// 2 セグメント未満 (`~=1`) は PEP 440 上無効なので parser がスキップ済み。
 static PEP440_COMPATIBLE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^~=\s*[vV]?((?:\d+!)?\d+(?:\.\d+)+)$").unwrap());
+/// 複合制約 (`~=1.2, <5.0`) の中に現れる compatible release / prefix-match を拾う
+/// アンカーなし版。完全アンカー版だけだと `~=1.2` が持つ暗黙上限 `<2.0` が落ち、
+/// `<5.0` だけが上限になって元の制約が一度も許可していない版へ更新してしまう。
+/// `~=` は npm / Cargo / Composer / Maven / Swift のいずれの構文にも現れないため
+/// 他エコシステムの Range 文字列へは誤マッチしない。
+static PEP440_COMPATIBLE_TOKEN_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"~=\s*[vV]?((?:\d+!)?\d+(?:\.\d+)+)").unwrap());
+static PEP440_PREFIX_MATCH_TOKEN_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"==\s*[vV]?((?:\d+!)?\d+(?:\.\d+)*)\.\*").unwrap());
 
 fn normalize_bound_version(version: &str) -> String {
     version_info::strip_ascii_v_prefix(version).to_string()
@@ -233,6 +244,24 @@ fn extract_upper_bound(raw: &str) -> Option<(String, bool)> {
             best = stricter_upper_bound(best, (normalize_bound_version(m.as_str()), false));
         }
     }
+    // 複合制約に混ざった PEP 440 の暗黙上限 (`~=1.2` の `<2.0`、`==1.2.*` の `<1.3`) も
+    // 明示的な `<` / `<=` と同じ土俵で比較し、最も厳しいものを採用する。
+    for caps in PEP440_COMPATIBLE_TOKEN_RE.captures_iter(trimmed) {
+        if let Some(upper) = caps
+            .get(1)
+            .and_then(|m| compatible_release_upper_bound(m.as_str()))
+        {
+            best = stricter_upper_bound(best, (upper, false));
+        }
+    }
+    for caps in PEP440_PREFIX_MATCH_TOKEN_RE.captures_iter(trimmed) {
+        if let Some(upper) = caps
+            .get(1)
+            .and_then(|m| increment_release_prefix(m.as_str()))
+        {
+            best = stricter_upper_bound(best, (upper, false));
+        }
+    }
     if best.is_some() {
         return best;
     }
@@ -379,6 +408,7 @@ impl UpdateJudge {
             }
             Language::Python => version_info::is_python_prerelease_version(version),
             Language::Ruby => version_info::is_ruby_prerelease_version(version),
+            Language::Php => version_info::is_composer_prerelease_version(version),
             _ => is_prerelease_version(version),
         };
 
@@ -397,11 +427,12 @@ impl UpdateJudge {
         let Some(min_age) = self.filter.min_age else {
             return candidates;
         };
-        // chrono::Duration は i64 ナノ秒 (約292年) が上限。変換失敗時は age 制約を無視して全候補を通す。
-        let Ok(chrono_duration) = chrono::Duration::from_std(min_age) else {
+        // カットオフ算出は domain::age の checked 実装に委ねる。
+        // chrono の `DateTime` 範囲 (±262143 年) を超える age は `None` になり、
+        // その場合は age 制約を無視して全候補を通す (panic させない)。
+        let Some(min_release_time) = crate::domain::cutoff_from(self.now, min_age) else {
             return candidates;
         };
-        let min_release_time = self.now - chrono_duration;
         candidates
             .into_iter()
             .filter(|v| v.released_at <= min_release_time)

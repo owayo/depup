@@ -140,9 +140,14 @@ static DEP_STRING_NO_VERSION: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 // rich version 宣言: strictly("1.2.3") / require '1.2.3' / prefer "1.2.3" / reject("1.2.3")
+//
+// メソッド名の後ろにも語境界 (`\b`) を要求する。これがないと
+// `capabilities { requireCapability("com.example:lib-feature") }` の
+// `requireCapability` が `require` 宣言として誤マッチし、パースできない引数で
+// `strong` が上書きされて依存ごと消える (警告なしの取りこぼし)。
 static RICH_VERSION_DECL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"\b(strictly|require|prefer|reject)\s*(?:\(\s*)?((?:"[^"]+"|'[^']+')(?:\s*,\s*(?:"[^"]+"|'[^']+'))*)\s*\)?"#,
+        r#"\b(strictly|require|prefer|reject)\b\s*(?:\(\s*)?((?:"[^"]+"|'[^']+')(?:\s*,\s*(?:"[^"]+"|'[^']+'))*)\s*\)?"#,
     )
     .unwrap()
 });

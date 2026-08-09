@@ -184,8 +184,7 @@ impl SystemPackageManager {
         {
             // uv: `--exclude-newer <RFC3339>` で指定日時以降にリリースされた
             // バージョンを resolve から除外する (transitive 含む)。
-            if let Ok(chrono_dur) = chrono::Duration::from_std(age) {
-                let cutoff = chrono::Utc::now() - chrono_dur;
+            if let Some(cutoff) = crate::domain::cutoff_now(age) {
                 out.push("--exclude-newer".to_string());
                 out.push(cutoff.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
             }
@@ -243,8 +242,13 @@ impl SystemPackageManager {
             "go" => vec!["go", "mod", "download"],
             // Ruby の処理
             "bundle" => vec!["bundle", "install"],
-            // PHP の処理
-            "composer" => vec!["composer", "install"],
+            // PHP の処理。
+            // `composer install` は composer.lock があるとそこに書かれた版をそのまま入れる
+            // ため、depup が composer.json へ書いた新しい制約が反映されない
+            // (「lock ファイルが composer.json と一致しない」警告を出して旧版を入れるか、
+            // lock が root 要件を満たせない場合はエラーで失敗する)。制約変更を lock へ
+            // 反映できるのは `composer update` だけなので、Rust の `cargo update` と同じ方針にする。
+            "composer" => vec!["composer", "update"],
             // Java/Gradle の処理
             "gradle" => vec!["gradle", "dependencies"],
             "./gradlew" => vec!["./gradlew", "dependencies"],
@@ -957,7 +961,8 @@ mod tests {
         // SAFETY: テストはシングルスレッドで PATH を一時的に書き換える。
         // テスト終了前に元に戻す。
         unsafe { std::env::set_var("PATH", &joined) };
-        let resolved = resolve_program("pnpm_test_shim");
+        // セパレータを含まない名前なので working_dir は PATH 探索に影響しない
+        let resolved = resolve_program("pnpm_test_shim", Path::new("."));
         unsafe { std::env::set_var("PATH", &original_path) };
 
         assert!(
@@ -1028,7 +1033,7 @@ mod tests {
     fn test_get_install_command_composer() {
         let pm = SystemPackageManager::new();
         let cmd = pm.get_install_command("composer");
-        assert_eq!(cmd, vec!["composer", "install"]);
+        assert_eq!(cmd, vec!["composer", "update"]);
     }
 
     #[test]

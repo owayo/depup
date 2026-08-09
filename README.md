@@ -257,7 +257,7 @@ Use `--include-pinned` to update pinned versions.
 >
 > **Note**: Gemfile compound and exclusion constraints such as `gem "pg", ">= 0.18", "< 2.0"` and `gem "rack", "!= 2.2.4"` are parsed, but depup does not rewrite them automatically. Replacing only part of those constraints can change their meaning, so depup reports them instead of applying an unsafe edit.
 >
-> **Note**: Gemfile entries that point to non-registry sources without a version (`git:`, `github:`, `bitbucket:`, `gist:`, `path:`, `source:`) are skipped instead of being converted into RubyGems registry constraints. Both Ruby option spellings are recognised — `git: '...'` and the hash-rocket form `:git => '...'`. Gems declared inside `git ... do` / `github ... do` / `path ... do` / `source ... do` blocks are skipped for the same reason, while ordinary blocks such as `platforms` and `install_if` are still processed. Declarations whose arguments continue on the next line (`gem "devise",`) are skipped rather than reported as versionless registry gems, because that line alone cannot determine the version. Inline `group:` / `groups:` options are used to classify development dependencies.
+> **Note**: Gemfile entries that point to non-registry sources without a version (`git:`, `github:`, `bitbucket:`, `gist:`, `path:`, `source:`) are skipped instead of being converted into RubyGems registry constraints. If such an entry explicitly includes a version, depup treats it as Bundler's gemspec constraint and can parse and update it while preserving the source option. Both Ruby option spellings are recognised — `git: '...'` and the hash-rocket form `:git => '...'`. Gems declared inside `git ... do` / `github ... do` / `path ... do` / `source ... do` blocks are skipped for the same reason, while ordinary blocks such as `platforms` and `install_if` are still processed. Declarations whose arguments continue on the next line (`gem "devise",`) are skipped rather than reported as versionless registry gems, because that line alone cannot determine the version. Inline `group:` / `groups:` options are used to classify development dependencies.
 >
 > **Note**: Gemfile declarations can use either the common Ruby DSL form (`gem "rack", "~> 3.0"`) or parenthesized method-call form (`gem("rack", "~> 3.0")`). Both forms are parsed and updated while preserving the original call style. When the same gem is declared in multiple places (for example both at the top level and inside a `group :test` block), depup refuses the ambiguous write.
 >
@@ -482,7 +482,7 @@ depup --max-change minor
 depup --max-change major
 ```
 
-When a newer candidate exists but exceeds the cap, that dependency is skipped with reason `max-change=<LEVEL>` instead of being updated.
+When a newer candidate exists but exceeds the cap, that dependency is skipped with reason `max-change=<LEVEL>` instead of being updated. The same cap also applies to Cargo git dependencies that track a tag.
 
 ### Global Configuration
 
@@ -566,6 +566,8 @@ When `--install` triggers `uv sync` for a Python project, depup always sets `UV_
 - Always on — no opt-in flag required.
 - Older uv releases that pre-date the feature simply do not act on the variable, so enabling it unconditionally does not break existing builds.
 - Astral marks the feature as preview, so its exact behavior may change. The check runs inside uv, and uv's exit code propagates through depup. A malware match terminates the sync with a uv-side error message.
+
+When `--install` processes a PHP project, depup runs `composer update` rather than `composer install`. `composer install` reuses the existing lock file and cannot reflect constraints that depup has just changed in `composer.json`; `composer update` resolves those constraints and refreshes `composer.lock`.
 
 ## Output
 

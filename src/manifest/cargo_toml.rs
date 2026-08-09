@@ -80,6 +80,75 @@ fn is_cargo_git_tag_inline_section(section: &str) -> bool {
 static VERSION_LINE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"^(\s*version\s*=\s*)(?:"([^"]+)"|'([^']+)')"#).unwrap());
 
+// 依存宣言内の `path` キー (inline table 内・複数行テーブル内の両方)
+static PATH_KEY_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:^|[{,])\s*path\s*=").unwrap());
+// 依存宣言内の `registry = "..."` キーとその値
+static REGISTRY_KEY_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?:^|[{,])\s*registry\s*=\s*(?:"([^"]*)"|'([^']*)')"#).unwrap());
+
+/// 行が crates.io 以外のソースを指す依存宣言かどうかを返す。
+///
+/// parse 側 (`parse_cargo_dependencies`) は path 依存と `registry` 指定 (crates-io 以外) を
+/// 依存として surface しない。writer 側にも同じ除外が無いと、同名クレートが別セクションに
+/// 宣言されている場合 (`[dependencies] my-lib = "0.4"` + `[dev-dependencies] my-lib =
+/// { path = "../my-lib", version = "0.4" }`) に writer の曖昧判定が「宣言 1 個」と見なして
+/// 発火せず、path 依存まで crates.io の最新版で黙って書き換えてしまう。
+fn declares_non_crates_io_source(line: &str) -> bool {
+    if PATH_KEY_RE.is_match(line) {
+        return true;
+    }
+    REGISTRY_KEY_RE.captures(line).is_some_and(|caps| {
+        let registry = caps
+            .get(1)
+            .or_else(|| caps.get(2))
+            .map(|m| m.as_str())
+            .unwrap_or("");
+        registry != "crates-io"
+    })
+}
+
+/// 対象パッケージが crates.io 以外のソースを指す依存セクションの集合を返す。
+///
+/// 複数行テーブルと dotted key のどちらも、`version` より後ろに `path` / `registry` が
+/// 書かれ得るため、書き換えの前に 1 パス走査する。
+fn non_crates_io_dependency_sections(
+    content: &str,
+    package: &str,
+) -> std::collections::HashSet<String> {
+    let mut excluded = std::collections::HashSet::new();
+    let mut section = String::new();
+    let escaped_package = regex::escape(package);
+    let dotted_path_re = Regex::new(&format!(r"^\s*{}\s*\.\s*path\s*=", escaped_package)).unwrap();
+    let dotted_registry_re = Regex::new(&format!(
+        r#"^\s*{}\s*\.\s*registry\s*=\s*(?:"([^"]*)"|'([^']*)')"#,
+        escaped_package
+    ))
+    .unwrap();
+
+    for line in content.lines() {
+        if let Some(name) = cargo_section_name(line) {
+            section.clear();
+            section.push_str(name);
+            continue;
+        }
+        let package_table_is_excluded = is_cargo_package_dependency_table(&section, package)
+            && declares_non_crates_io_source(line);
+        let dotted_key_is_excluded = is_cargo_dependency_section(&section)
+            && (dotted_path_re.is_match(line)
+                || dotted_registry_re.captures(line).is_some_and(|caps| {
+                    caps.get(1)
+                        .or_else(|| caps.get(2))
+                        .is_none_or(|value| value.as_str() != "crates-io")
+                }));
+        if package_table_is_excluded || dotted_key_is_excluded {
+            excluded.insert(section.clone());
+        }
+    }
+
+    excluded
+}
+
 // 複数行テーブル内の `tag` キー行にマッチする (git 依存のタグ更新用)
 static TAG_LINE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"^(\s*tag\s*=\s*)(?:"([^"]+)"|'([^']+)')"#).unwrap());
@@ -196,6 +265,9 @@ impl ManifestParser for CargoTomlParser {
                 spec: package.to_string(),
                 message: format!("invalid regex pattern: {}", e),
             })?;
+        // path / 別レジストリを指す複数行テーブルと dotted key は
+        // 書き換え対象から外す (parse と同じ範囲)
+        let excluded_sections = non_crates_io_dependency_sections(content, package);
         let mut section = String::new();
         let mut rebuilt = String::new();
         for segment in content.split_inclusive('\n') {
@@ -209,6 +281,16 @@ impl ManifestParser for CargoTomlParser {
             }
 
             if is_cargo_dependency_section(&section) {
+                if excluded_sections.contains(&section) {
+                    rebuilt.push_str(segment);
+                    continue;
+                }
+                // inline table が path / 別レジストリを指す場合は parse も依存として
+                // 拾わないため、writer も触らない
+                if declares_non_crates_io_source(line) {
+                    rebuilt.push_str(segment);
+                    continue;
+                }
                 let replacement = if let Some(caps) = simple_re.captures(line) {
                     let (quote, old_version) = captured_quote_and_version(&caps);
                     if !old_version.contains('/')
@@ -250,7 +332,9 @@ impl ManifestParser for CargoTomlParser {
                     updated = true;
                     continue;
                 }
-            } else if is_cargo_package_dependency_table(&section, package) {
+            } else if is_cargo_package_dependency_table(&section, package)
+                && !excluded_sections.contains(&section)
+            {
                 // 複数行テーブル:
                 // テーブル形式の例: [dependencies.package]
                 // バージョン指定の例: version = "1.0.0"
@@ -801,6 +885,26 @@ tokio.features = ["full"]
     }
 
     /// 依存セクション外の dotted key は書き換えない。
+    #[test]
+    fn test_dotted_key_path_dependency_is_not_updated() {
+        let content = r#"
+[dependencies]
+tokio.version = "1.38"
+
+[dev-dependencies]
+tokio.path = "../tokio"
+tokio.version = "1.0"
+"#;
+
+        let result = CargoTomlParser
+            .update_version(content, "tokio", "1.52.4")
+            .unwrap();
+
+        assert!(result.contains(r#"tokio.version = "1.52.4""#));
+        assert!(result.contains(r#"tokio.path = "../tokio""#));
+        assert!(result.contains(r#"tokio.version = "1.0""#));
+    }
+
     #[test]
     fn test_dotted_key_outside_dependency_section_not_updated() {
         let content = r#"

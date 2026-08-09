@@ -80,6 +80,31 @@ fn extract_numeric_parts(new_version: &str) -> Option<Vec<String>> {
     if parts.is_empty() { None } else { Some(parts) }
 }
 
+/// バージョントークンがワイルドカードセグメント (`x` / `X` / `*` / `+`) を含むかを判定する。
+///
+/// `format_wildcard_like` が受理する形と同じ基準 (演算子と `v`/`V` 接頭辞を除いた
+/// ドット区切りセグメントが厳密に `x` / `X` / `*` / `+` のいずれか) で判定するため、
+/// 「ワイルドカードとして再構成できるか」の判断が呼び出し側とずれない。
+///
+/// 単純な `contains(['x', 'X', '*'])` にすると `1.0.0-linux` のように英字 `x` を含む
+/// 通常のバージョンまでワイルドカード扱いになり、`format_wildcard_like` が `None` を
+/// 返して更新ごと落ちる。
+fn has_wildcard_segment(token: &str) -> bool {
+    let trimmed = token.trim();
+    let op_len = trimmed
+        .bytes()
+        .take_while(|b| matches!(b, b'^' | b'~' | b'='))
+        .count();
+    let body = trimmed[op_len..].trim_start();
+    let body = body
+        .strip_prefix('v')
+        .or_else(|| body.strip_prefix('V'))
+        .unwrap_or(body);
+
+    body.split('.')
+        .any(|segment| matches!(segment, "*" | "x" | "X" | "+"))
+}
+
 fn format_wildcard_like(raw: &str, new_version: &str) -> Option<String> {
     let trimmed = raw.trim();
     // npm の `^1.x` / `~1.2.*` や Cargo の `=1.*` / `^1.*` のような演算子付きワイルドカードでは、
@@ -305,8 +330,13 @@ fn find_first_version_token(raw: &str) -> Option<(usize, usize)> {
                 end = candidate_end;
                 break;
             }
+            // `!` は PEP 440 の epoch 区切り (`1!1.0`)。これを許可しないと
+            // `>=1!1.0,<3` の下限トークンが `1` で切れ、比較基準が壊れるうえ
+            // `>=2.5!1.0,<3` のような不正な制約を書き戻す。
+            // `!=` を含む raw は `contains_not_equal_operator` が先に弾くため、
+            // ここで `!` を許容しても除外制約を書き換える経路は増えない。
             if !(candidate.is_ascii_alphanumeric()
-                || matches!(candidate, '.' | '*' | '+' | '-' | '_'))
+                || matches!(candidate, '.' | '*' | '+' | '-' | '_' | '!'))
             {
                 end = candidate_end;
                 break;
@@ -321,7 +351,11 @@ fn find_first_version_token(raw: &str) -> Option<(usize, usize)> {
 
 fn replace_version_token(raw: &str, start: usize, end: usize, new_version: &str) -> Option<String> {
     let token = &raw[start..end];
-    let replacement = if token.contains('*') {
+    // ワイルドカード判定は `has_wildcard_segment` に一本化する。以前ここだけが
+    // `contains('*')` で `x` / `X` を見落としており、`~1.x <2.0.0` の下限が
+    // `~1.9.3` へ展開されて Tilde の許容幅が黙って縮んでいた
+    // (同義の `~1.* <2.0.0` は形が保たれるという非対称があった)。
+    let replacement = if has_wildcard_segment(token) {
         format_wildcard_like(token, new_version)?
     } else {
         preserve_version_prefix(token, new_version)
@@ -337,7 +371,7 @@ fn replace_version_token_preserving_shape(
     new_version: &str,
 ) -> Option<String> {
     let token = &raw[start..end];
-    let replacement = if token.contains(['x', 'X', '*']) {
+    let replacement = if has_wildcard_segment(token) {
         format_wildcard_like(token, new_version)?
     } else {
         format_partial_version_like(token, new_version)?
@@ -369,7 +403,11 @@ fn find_gradle_strict_prefer_token(raw: &str) -> Option<(usize, usize)> {
     find_version_token_at(raw, bang_index + 2)
 }
 
-fn find_inclusive_lower_bound_token(raw: &str) -> Option<(usize, usize)> {
+/// 包含下限のトークンを、直前の演算子とともに返す。
+///
+/// 演算子を返すのは、PEP 440 の compatible release (`~=`) だけセグメント数を保って
+/// 書き換える必要があるため (セグメント数が暗黙上限の幅を決める)。
+fn find_inclusive_lower_bound_token(raw: &str) -> Option<(&'static str, usize, usize)> {
     let operators = [">=", "~=", "==", "=", "^", "~"];
     let mut index = 0;
 
@@ -386,8 +424,8 @@ fn find_inclusive_lower_bound_token(raw: &str) -> Option<(usize, usize)> {
         for operator in operators {
             if rest.starts_with(operator) {
                 let after_operator = index + operator.len();
-                if let Some(token) = find_version_token_at(raw, after_operator) {
-                    return Some(token);
+                if let Some((start, end)) = find_version_token_at(raw, after_operator) {
+                    return Some((operator, start, end));
                 }
             }
         }
@@ -414,8 +452,9 @@ fn find_bare_lower_bound_token(raw: &str) -> Option<(usize, usize)> {
 /// 更新取りこぼしを防ぐ。包含下限が無い場合 (厳密下限 `>1.0` のみ等) は `None` を返し、
 /// 呼び出し側の従来ロジックにフォールバックさせる。
 pub fn range_lower_bound_version(raw: &str) -> Option<String> {
-    let (start, end) =
-        find_inclusive_lower_bound_token(raw).or_else(|| find_bare_lower_bound_token(raw))?;
+    let (start, end) = find_inclusive_lower_bound_token(raw)
+        .map(|(_, start, end)| (start, end))
+        .or_else(|| find_bare_lower_bound_token(raw))?;
     Some(raw[start..end].to_string())
 }
 
@@ -511,7 +550,14 @@ fn format_range_like(raw: &str, new_version: &str) -> Option<String> {
         return None;
     }
 
-    if let Some((start, end)) = find_inclusive_lower_bound_token(raw) {
+    if let Some((operator, start, end)) = find_inclusive_lower_bound_token(raw) {
+        // PEP 440 の compatible release はセグメント数が暗黙上限の幅を決めるため、
+        // 複合制約 (`~=1.2, <5.0`) でもセグメント数を保って書き換える。
+        // 完全版をそのまま埋めると `~=1.2` (上限 <2.0) が `~=4.9.0` (上限 <4.10.0) へ
+        // 黙って狭まり、以後マイナー系列を跨げなくなる。
+        if operator == "~=" {
+            return replace_version_token_preserving_shape(raw, start, end, new_version);
+        }
         return replace_version_token(raw, start, end, new_version);
     }
 

@@ -8,6 +8,7 @@
 //!
 //! 参考: <https://bun.com/docs/runtime/bunfig>
 
+use crate::domain::checked_age;
 use std::path::Path;
 use std::time::Duration;
 
@@ -44,7 +45,9 @@ impl BunSettings {
             .map(|n| n as u64);
 
         Self {
-            minimum_release_age: seconds.map(Duration::from_secs),
+            // chrono の DateTime 範囲を超える巨大値はカットオフ算出で panic するため、
+            // CLI の `--age` と同じ上限で弾く。
+            minimum_release_age: seconds.and_then(checked_age),
         }
     }
 }

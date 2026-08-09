@@ -41,6 +41,18 @@ static BLOCK_ENTRY_RE: LazyLock<Regex> = LazyLock::new(|| {
 // `//` 直後でない場合も拾う)。単語境界 `\b` で `repinned` / `unpinned` への誤マッチは防ぐ。
 static PINNED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"//.*\bpinned\b").unwrap());
 
+/// `require (` のようなブロック開始行かどうかを判定する。
+///
+/// キーワードの後ろが `(` だけで終わっている行のみをブロック開始とみなす。
+/// `require ()` のように同じ行で閉じている場合は開始として扱わない
+/// (単独の `)` 行が現れず、ブロック状態が解除されないため)。
+fn is_go_block_start(logical: &str, keyword: &str) -> bool {
+    logical
+        .strip_prefix(keyword)
+        .map(str::trim_start)
+        .is_some_and(|rest| rest == "(")
+}
+
 impl ManifestParser for GoModParser {
     fn parse(&self, content: &str) -> Result<Vec<Dependency>, ManifestError> {
         let mut dependencies = Vec::new();
@@ -58,13 +70,16 @@ impl ManifestParser for GoModParser {
                 continue;
             }
 
-            // ブロックの開始/終了を確認する
-            if logical.starts_with("require (") || logical == "require (" {
+            // ブロックの開始/終了を確認する。
+            // `require ()` (空ブロック) は開いて即閉じるため、開始として扱うと
+            // 単独の `)` 行が現れず in_require_block が立ちっぱなしになり、
+            // 以降の `exclude` / `retract` ブロックの行を依存として誤検出する。
+            if is_go_block_start(logical, "require") {
                 in_require_block = true;
                 continue;
             }
 
-            if logical.starts_with("replace (") || logical == "replace (" {
+            if is_go_block_start(logical, "replace") {
                 in_replace_block = true;
                 continue;
             }
@@ -146,9 +161,9 @@ impl ManifestParser for GoModParser {
             let logical = trimmed.split("//").next().unwrap_or("").trim();
 
             // replace ブロックの開始/終了を追跡する
-            if logical.starts_with("replace (") || logical == "replace (" {
+            if is_go_block_start(logical, "replace") {
                 in_replace_block = true;
-            } else if logical.starts_with("exclude (") || logical == "exclude (" {
+            } else if is_go_block_start(logical, "exclude") {
                 in_exclude_block = true;
             } else if (in_replace_block || in_exclude_block) && logical == ")" {
                 in_replace_block = false;
@@ -262,7 +277,7 @@ fn collect_excluded_versions(content: &str) -> HashMap<String, Vec<String>> {
             continue;
         }
 
-        if logical.starts_with("exclude (") || logical == "exclude (" {
+        if is_go_block_start(logical, "exclude") {
             in_exclude_block = true;
             continue;
         }

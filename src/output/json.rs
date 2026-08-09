@@ -181,7 +181,11 @@ impl JsonFormatter {
                             from,
                             to: new_version.clone(),
                             dev: dependency.is_dev,
-                            source: Some(git.url.clone()),
+                            // URL に埋め込まれたアクセストークンを伏せる。
+                            // fetch 成功時の Update は GitRemoteError を経由しないため、
+                            // エラー側の伏せ字が効かず、ここが唯一の未伏せ出力経路だった
+                            // (CI の JSON 成果物・ログにトークンが残る)。
+                            source: Some(crate::registry::redact_url(&git.url)),
                             reference: Some(JsonGitReference::from_reference(&git.reference)),
                         })
                     } else {
@@ -317,7 +321,7 @@ impl OutputFormatter for JsonFormatter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Dependency, VersionSpec, VersionSpecKind};
+    use crate::domain::{Dependency, GitSource, VersionSpec, VersionSpecKind};
     use std::path::PathBuf;
 
     fn sample_dependency(name: &str, version: &str) -> Dependency {
@@ -537,6 +541,24 @@ mod tests {
         assert_eq!(
             JsonFormatter::skip_reason_to_string(&SkipReason::ParseError("invalid".into())),
             "parse_error: invalid"
+        );
+    }
+
+    #[test]
+    fn test_git_update_source_redacts_embedded_credentials() {
+        let dependency =
+            sample_dependency("private-crate", "1.0.0").with_git_source(GitSource::new(
+                "https://user:secret-token@example.com/org/repo.git",
+                GitReference::Tag("v1.0.0".to_string()),
+            ));
+        let mut manifest = ManifestUpdateResult::new(PathBuf::from("Cargo.toml"), Language::Rust);
+        manifest.add_result(UpdateResult::update(dependency, "v1.1.0"));
+
+        let output = JsonFormatter::new(Verbosity::Normal).manifest_to_json(&manifest);
+
+        assert_eq!(
+            output.updates[0].source.as_deref(),
+            Some("https://***@example.com/org/repo.git")
         );
     }
 

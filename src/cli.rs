@@ -45,12 +45,9 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
     // chrono の DateTime が表現できる年範囲 (±262143 年) を超える age は、
     // `Utc::now() - Duration` が内部で panic するため受け付けない。
     // u64 の乗算オーバーフローだけでは 26 万年〜2.9 億年の帯域が素通りしていた。
-    const MAX_AGE_SECS: u64 = 100_000 * 365 * 24 * 60 * 60; // 10 万年
-    if seconds > MAX_AGE_SECS {
-        return Err(format!("duration is too large: {}", s));
-    }
-
-    Ok(Duration::from_secs(seconds))
+    // 上限は domain::age に集約し、プロジェクト設定 (minimumReleaseAge) 経路と
+    // 同じ値で検証する。
+    crate::domain::checked_age(seconds).ok_or_else(|| format!("duration is too large: {}", s))
 }
 
 /// 多言語対応の依存関係アップデーター

@@ -94,8 +94,20 @@ impl RegistryAdapter for PackagistAdapter {
         let mut versions = Vec::new();
 
         // レスポンス内からパッケージを検索
-        // キーは完全なパッケージ名 (vendor/package)
-        if let Some(version_list) = response.packages.get(package) {
+        // キーは完全なパッケージ名 (vendor/package)。
+        // Packagist はリクエスト URL の綴りに関わらず小文字へ正規化したキーで返すため、
+        // composer.json 側が大文字混じり (`Laravel/Framework`) の場合に完全一致では
+        // 引けない。大小無視のフォールバックを入れて「取得成功なのに候補 0 件 =
+        // FetchFailed」と誤報告するのを防ぐ。
+        let version_list = response.packages.get(package).or_else(|| {
+            response
+                .packages
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(package))
+                .map(|(_, list)| list)
+        });
+
+        if let Some(version_list) = version_list {
             for version_info in version_list {
                 // dev バージョンをスキップ
                 if Self::is_dev_version(&version_info.version) {

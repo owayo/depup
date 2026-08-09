@@ -299,10 +299,9 @@ impl Orchestrator {
         project_dir: &Path,
         min_age: Duration,
     ) -> Vec<LockAgeAdjustment> {
-        let Ok(chrono_duration) = chrono::Duration::from_std(min_age) else {
+        let Some(cutoff) = crate::domain::cutoff_now(min_age) else {
             return Vec::new();
         };
-        let cutoff = chrono::Utc::now() - chrono_duration;
         let adapter = CratesIoAdapter::new(self.client.clone());
 
         let mut aggregated: Vec<LockAgeAdjustment> = Vec::new();
@@ -512,6 +511,17 @@ impl Orchestrator {
                 };
                 if compare_versions(&latest_tag, current_tag) != std::cmp::Ordering::Greater {
                     return UpdateResult::skip_already_latest(dep.clone());
+                }
+                // git tag 依存はマニフェストの tag 文字列を実際に書き換えるため、
+                // レジストリ依存と同じく `--max-change` を尊重する。git 依存は
+                // `UpdateJudge::judge` を通らないので、ここで明示的に適用しないと
+                // `--max-change patch` でも major タグへ更新されてしまう。
+                // 判定不能なタグは `apply_max_change_filter` と同じく通す。
+                if let Some(max) = self.args.max_change
+                    && crate::domain::ChangeLevel::from_versions(current_tag, &latest_tag)
+                        .is_some_and(|level| level > max)
+                {
+                    return UpdateResult::skip(dep.clone(), SkipReason::ChangeLevelLimited(max));
                 }
                 UpdateResult::update(dep.clone(), latest_tag)
             }
@@ -1062,11 +1072,7 @@ impl Orchestrator {
 
         // 同期先の候補にも judge と同じ解決済み age を適用する
         // (同期が age ポリシーを迂回して新しすぎるバージョンを書かないように)
-        let cutoff = self.resolved_min_age().and_then(|age| {
-            chrono::Duration::from_std(age)
-                .ok()
-                .map(|d| chrono::Utc::now() - d)
-        });
+        let cutoff = self.resolved_min_age().and_then(crate::domain::cutoff_now);
         Some((
             filter_versions_by_cutoff(npm_versions, cutoff),
             filter_versions_by_cutoff(crate_versions, cutoff),

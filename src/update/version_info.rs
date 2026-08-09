@@ -108,9 +108,22 @@ fn contains_identifier_word(haystack: &str, needle: &str) -> bool {
 /// 通常の識別子は milestone と誤判定しない。`.Final` / `-jre` / `.RELEASE` のような
 /// JVM の安定版 qualifier も当然対象外 (Java で「qualifier があれば一律プレリリース」と
 /// すると、これらを巻き込んで安定版が全滅する)。
+///
+/// JBoss / Hibernate / Quarkus 系が使う candidate release (`6.2.0.CR1`) も同じ形式で
+/// 判定する。`rc` の転置綴りで安定版直前の段階を示すため、これを見逃すと
+/// `hibernate-core 6.1.7.Final` の利用者が `6.2.0.CR1` へ更新されてしまう。
 fn contains_milestone_identifier(scan: &str) -> bool {
     scan.split(['-', '.', '_', ' ']).any(|token| {
-        token.len() >= 2 && token.starts_with('m') && token[1..].bytes().all(|b| b.is_ascii_digit())
+        // `M1` (milestone) と `CR1` (candidate release) の 2 系統
+        for prefix in ["m", "cr"] {
+            if let Some(rest) = token.strip_prefix(prefix)
+                && !rest.is_empty()
+                && rest.bytes().all(|b| b.is_ascii_digit())
+            {
+                return true;
+            }
+        }
+        false
     })
 }
 
@@ -637,24 +650,77 @@ pub(crate) fn is_semver_prerelease_version(version: &str) -> bool {
         || is_prerelease_version(version)
 }
 
-/// Composer の patch alias をポストリリースへ正規化して比較する。
-pub(crate) fn compare_composer_versions(a: &str, b: &str) -> std::cmp::Ordering {
-    fn normalize(value: &str) -> String {
-        let Some((base, suffix)) = value.rsplit_once('-') else {
-            return value.to_string();
-        };
-        let lower = suffix.to_ascii_lowercase();
-        for prefix in ["patch", "pl", "p"] {
-            if let Some(number) = lower.strip_prefix(prefix)
-                && NumericIdentifier::parse(number).is_some()
-            {
-                return format!("{base}.post{number}");
-            }
+/// Composer の stability 修飾子を、共通の比較・判定ロジックが解釈できる形へ正規化する。
+///
+/// composer/semver の `VersionParser` は末尾の修飾子を
+/// `[._-]?(stable|beta|b|RC|alpha|a|patch|pl|p)((?:[.-]?\d+)*)?([.-]?dev)?` で読み、
+/// `expandStability()` が短縮綴りを `a` → alpha / `b` → beta / `p`,`pl` → patch
+/// へ展開する。depup 側の共通判定は
+/// - 短縮綴り `-a1` / `-b1` を prerelease と認識できない
+/// - `-beta10` を 1 個の識別子として ASCII 辞書順で比べるため `beta10 < beta9` になる
+///
+/// という 2 つの穴を持つので、ここで正規形へ展開してから共通ロジックへ渡す。
+///
+/// - `alpha` / `beta` / `rc` → `-<識別子>.<数値>` (数値を分離して数値比較させる)
+/// - `patch` / `pl` / `p` → `.post<数値>` (Composer では安定版の一種)
+///
+/// 短縮綴り (`a` / `b` / `p` / `pl`) は数値が続く場合のみ展開する。`1.0.0-arm64` や
+/// `1.0.0-alpine` のような通常の suffix を prerelease と誤判定しないため。
+fn normalize_composer_version(value: &str) -> String {
+    let Some((base, suffix)) = value.rsplit_once('-') else {
+        return value.to_string();
+    };
+    let lower = suffix.to_ascii_lowercase();
+
+    // patch alias は安定版の後発リリース (post) として扱う
+    for prefix in ["patch", "pl", "p"] {
+        if let Some(number) = lower.strip_prefix(prefix)
+            && NumericIdentifier::parse(number).is_some()
+        {
+            return format!("{base}.post{number}");
         }
-        value.to_string()
     }
 
-    compare_versions(&normalize(a), &normalize(b))
+    // プレリリース修飾子。長い綴りを先に試す (`alpha` の前に `a` を試すと誤爆する)
+    for (prefix, expanded, requires_number) in [
+        ("alpha", "alpha", false),
+        ("beta", "beta", false),
+        ("rc", "rc", false),
+        ("a", "alpha", true),
+        ("b", "beta", true),
+    ] {
+        let Some(rest) = lower.strip_prefix(prefix) else {
+            continue;
+        };
+        let number = rest.trim_start_matches(['.', '-']);
+        if number.is_empty() {
+            if requires_number {
+                continue;
+            }
+            return format!("{base}-{expanded}");
+        }
+        if number.bytes().all(|b| b.is_ascii_digit()) {
+            return format!("{base}-{expanded}.{number}");
+        }
+    }
+
+    value.to_string()
+}
+
+/// Composer (composer/semver) の規則でプレリリースかどうかを判定する。
+///
+/// 共通判定に加えて短縮綴り (`1.0.0-a1` = alpha / `1.0.0-b1` = beta) を認識する。
+/// `-p1` / `-pl1` / `-patch1` は Composer では安定版なので prerelease にしない。
+pub(crate) fn is_composer_prerelease_version(version: &str) -> bool {
+    is_prerelease_version(&normalize_composer_version(version))
+}
+
+/// Composer の stability 修飾子を正規化して比較する。
+pub(crate) fn compare_composer_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    compare_versions(
+        &normalize_composer_version(a),
+        &normalize_composer_version(b),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

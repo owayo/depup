@@ -6,7 +6,9 @@
 //! - 依存関係情報の構造体
 //! - 更新判定結果
 //! - サマリと結果の構造体
+//! - リリース経過時間 (age) の範囲検証とカットオフ算出
 
+mod age;
 mod change_level;
 mod dependency;
 mod git_source;
@@ -15,6 +17,7 @@ mod summary;
 mod update_result;
 mod version_spec;
 
+pub use age::{MAX_AGE_SECS, checked_age, checked_age_from_minutes, cutoff_from, cutoff_now};
 pub use change_level::ChangeLevel;
 pub use dependency::Dependency;
 pub use git_source::{GitReference, GitSource};

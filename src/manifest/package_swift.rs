@@ -402,8 +402,12 @@ impl ManifestParser for PackageSwiftParser {
         // `grpc/grpc-swift` の更新が先に宣言された `grpc/grpc-swift-nio` の URL へ
         // 前方一致して別依存を書き換えるのを防ぐ (前方一致は境界で弾かれるため、
         // 最初のマッチが境界一致した正しい宣言になる)。
+        // ホスト名は大小文字を区別しないため `(?i:...)` で囲む。`extract_github_owner_repo`
+        // が `https://GitHub.com/...` を受理する一方でここが大小区別のままだと、parse は
+        // 依存として surface するのに書き換え先が見つからず report/apply が矛盾する。
+        // owner/repo 側まで大小無視にすると別リポジトリへ誤爆するため、ホスト部だけを囲む。
         let url_pattern = format!(
-            r#"(github\.com[/:]{}(?:\.git)?)["'/?#\s)]"#,
+            r#"((?i:github\.com)[/:]{}(?:\.git)?)["'/?#\s)]"#,
             escaped_package
         );
         let masked = mask_comments(content);

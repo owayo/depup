@@ -144,7 +144,7 @@ fn is_allowed_git_url(url: &str) -> bool {
 /// fetch 失敗時のスキップ理由はテキスト出力・JSON 出力の両方でそのまま表示される。
 /// 生の URL をエラーに保持するとトークンが CI ログや成果物へ残るため、
 /// 表示経路に載る値だけ伏せる (キャッシュキーには生 URL を使い続ける)。
-fn redact_url(url: &str) -> String {
+pub(crate) fn redact_url(url: &str) -> String {
     let Some(scheme_end) = url.find("://") else {
         // `git@host:path` 形式は userinfo にパスワードを持たない慣習なのでそのまま
         return url.to_string();
@@ -175,8 +175,15 @@ fn redact_secrets(text: &str, url: &str) -> String {
             .map_or(url.len(), |idx| authority_start + idx);
         if let Some(at) = url[authority_start..authority_end].rfind('@') {
             let userinfo = &url[authority_start..authority_start + at];
-            if !userinfo.is_empty() {
-                redacted = redacted.replace(userinfo, "***");
+            // 秘密情報は `user:pass@` のパスワード部だけ。`ssh://git@github.com/...` の
+            // ような `user@` 形式のユーザ名 (`git`) を全文置換すると、`github.com` が
+            // `***hub.com` に、`repo.git` が `repo.***` に化けてメッセージ自体が壊れる。
+            // AGENTS.md の「`git@host:path` 形式のユーザ名はトークンではないので保持する」
+            // という方針とも整合させる。
+            if let Some((_, password)) = userinfo.split_once(':')
+                && !password.is_empty()
+            {
+                redacted = redacted.replace(password, "***");
             }
         }
     }

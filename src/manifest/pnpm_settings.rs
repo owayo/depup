@@ -5,6 +5,7 @@
 //! - pnpm-workspace.yaml (minimumReleaseAge: 14400) - 値は分単位
 //! - package.json (pnpm.minimumReleaseAge / pnpm.settings.minimumReleaseAge) - 数値は分単位
 
+use crate::domain::{checked_age, checked_age_from_minutes};
 use std::path::Path;
 use std::time::Duration;
 
@@ -73,7 +74,9 @@ fn parse_duration(s: &str) -> Option<Duration> {
         _ => return None,
     };
 
-    Some(Duration::from_secs(seconds))
+    // 乗算が通っても chrono の DateTime 範囲を超える値 (例: `999999999d`) は
+    // カットオフ算出で panic するため、CLI の `--age` と同じ上限で弾く。
+    checked_age(seconds)
 }
 
 /// minimumReleaseAge の設定値をパースする
@@ -83,8 +86,8 @@ fn parse_duration(s: &str) -> Option<Duration> {
 fn parse_release_age_value(value: &str) -> Option<Duration> {
     let value = value.trim();
     if let Ok(minutes) = value.parse::<u64>() {
-        // オーバーフロー防止: checked_mul で安全に変換する
-        return minutes.checked_mul(60).map(Duration::from_secs);
+        // オーバーフローと上限超過の両方を弾く (巨大値でカットオフ算出が panic しないように)
+        return checked_age_from_minutes(minutes);
     }
     parse_duration(value)
 }
@@ -160,8 +163,8 @@ fn read_package_json_minimum_release_age(dir: &Path) -> Option<Duration> {
 
     // 数値型は分として解釈する
     if let Some(minutes) = value.as_u64() {
-        // オーバーフロー防止: checked_mul で安全に変換する
-        return minutes.checked_mul(60).map(Duration::from_secs);
+        // オーバーフローと上限超過の両方を弾く (巨大値でカットオフ算出が panic しないように)
+        return checked_age_from_minutes(minutes);
     }
     parse_release_age_value(value.as_str()?)
 }

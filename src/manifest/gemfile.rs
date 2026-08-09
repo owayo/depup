@@ -59,8 +59,21 @@ static GROUP_START_RE: LazyLock<Regex> = LazyLock::new(|| {
 static GROUP_END_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*end\s*(?:#.*)?$").unwrap());
 
-// `do` で終わるブロック開始行（group 以外）
-static DO_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bdo\s*(?:#.*)?$").unwrap());
+// `do` で終わるブロック開始行（group 以外）。
+// `%w[...].each do |name|` / `git_source(:github) do |repo|` のようなブロック引数付きも
+// ブロック開始として扱う。これを取りこぼすと、対応する `end` が別のブロックを pop して
+// `source ... do` などの非レジストリブロックが早期に閉じ、内側の gem が
+// rubygems.org の版で書き換えられてしまう。
+static DO_BLOCK_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\bdo(?:\s*\|[^|]*\|)?\s*(?:#.*)?$").unwrap());
+
+// `end` を必要とするブロック開始キーワード (行頭のもののみ)。
+// これらを push しないと、内側の `if ... end` の `end` が
+// `group` / `source` ブロックを誤って pop してしまう。
+// `else` / `elsif` / `rescue` / `ensure` / `when` / `in` は push も pop もしない。
+static BLOCK_KEYWORD_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?:if|unless|while|until|for|case|begin|def|class|module)\b").unwrap()
+});
 
 // 非レジストリソースのブロック開始行:
 //   git "https://github.com/rails/rails.git", branch: "main" do
@@ -115,6 +128,52 @@ fn strip_line_comment(line: &str) -> &str {
     strip_hash_line_comment(line, HashCommentMode::BackslashEscapes)
 }
 
+/// クォート外に Ruby の `end` キーワードがあるかを判定する。
+///
+/// `if condition then ... end` のように同一行で完結するブロックをスタックへ
+/// 積まないために使う。文字列中の `"end"` は終端として扱わない。
+fn has_unquoted_end_keyword(code: &str) -> bool {
+    let bytes = code.as_bytes();
+    let mut quote = None;
+    let mut escaped = false;
+
+    for index in 0..bytes.len() {
+        let byte = bytes[index];
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if quote.is_some() && byte == b'\\' {
+            escaped = true;
+            continue;
+        }
+        if matches!(byte, b'\'' | b'"') {
+            if quote == Some(byte) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(byte);
+            }
+            continue;
+        }
+        if quote.is_some() || bytes.get(index..index + 3) != Some(b"end") {
+            continue;
+        }
+
+        // Ruby の識別子は Unicode も許容するため、非 ASCII バイトも境界にはしない。
+        let is_identifier_byte =
+            |value: u8| value.is_ascii_alphanumeric() || value == b'_' || !value.is_ascii();
+        let has_left_boundary = index == 0 || !is_identifier_byte(bytes[index - 1]);
+        let has_right_boundary = bytes
+            .get(index + 3)
+            .is_none_or(|value| !is_identifier_byte(*value));
+        if has_left_boundary && has_right_boundary {
+            return true;
+        }
+    }
+
+    false
+}
+
 impl ManifestParser for GemfileParser {
     fn parse(&self, content: &str) -> Result<Vec<Dependency>, ManifestError> {
         let mut dependencies = Vec::new();
@@ -150,6 +209,15 @@ impl ManifestParser for GemfileParser {
                 continue;
             }
 
+            // `if` / `case` / `begin` 等も `end` を消費するため、スタックの深さを合わせる。
+            // (行末修飾子の `... if cond` は行頭が `if` ではないので該当しない)
+            if BLOCK_KEYWORD_RE.is_match(code) {
+                if !has_unquoted_end_keyword(code) {
+                    block_stack.push(GemfileBlock::Other);
+                }
+                continue;
+            }
+
             // 対応する `end` で適切なスタック/カウンタを戻す
             if GROUP_END_RE.is_match(code) {
                 block_stack.pop();
@@ -182,6 +250,9 @@ impl ManifestParser for GemfileParser {
 
                 // バージョン指定から `VersionSpec` を組み立てる
                 let spec = if version_parts.is_empty() {
+                    // バージョン指定のない git / path / private source は
+                    // RubyGems のレジストリ依存ではないため除外する。
+                    // version が明示されている場合は Bundler の gemspec 検証用制約として扱える。
                     if has_non_registry_source(code) {
                         continue;
                     }
@@ -276,6 +347,7 @@ impl ManifestParser for GemfileParser {
 
                 match version_parts.len() {
                     0 => {
+                        // parse と同じく、バージョンなしの非レジストリ依存だけを除外する。
                         if has_non_registry_source(strip_line_comment(line)) {
                             lines.push(raw_line.to_string());
                             continue;
@@ -753,6 +825,19 @@ gem 'pg', '~> 1.1'
     }
 
     #[test]
+    fn test_update_versioned_gem_with_git_source() {
+        let content = r#"gem 'rails', '~> 7.0', git: 'https://github.com/rails/rails'"#;
+        let result = GemfileParser
+            .update_version(content, "rails", "7.1.0")
+            .unwrap();
+
+        assert_eq!(
+            result,
+            r#"gem 'rails', '~> 7.1', git: 'https://github.com/rails/rails'"#
+        );
+    }
+
+    #[test]
     fn test_parse_unversioned_gem_with_git_source_skipped() {
         let content = r#"
 gem 'rails', git: 'https://github.com/rails/rails'
@@ -1142,6 +1227,61 @@ end
 
         assert!(debug.is_dev);
         assert!(!pg.is_dev);
+    }
+
+    #[test]
+    fn test_parse_single_line_keyword_block_does_not_shift_group_end() {
+        let content = r#"
+group :development do
+  if RUBY_VERSION.start_with?('3') then puts 'supported' end
+end
+gem 'rails', '~> 7.0'
+"#;
+        let deps = parse(content).unwrap();
+
+        let rails = deps
+            .iter()
+            .find(|dependency| dependency.name == "rails")
+            .unwrap();
+        assert!(!rails.is_dev);
+    }
+
+    #[test]
+    fn test_parse_keyword_block_ignores_end_inside_string() {
+        let content = r#"
+group :development do
+  if ENV['MODE'] == 'frontend'
+    puts 'development'
+  end
+end
+gem 'rails', '~> 7.0'
+"#;
+        let deps = parse(content).unwrap();
+
+        let rails = deps
+            .iter()
+            .find(|dependency| dependency.name == "rails")
+            .unwrap();
+        assert!(!rails.is_dev);
+    }
+
+    #[test]
+    fn test_parse_keyword_block_ignores_end_inside_unicode_identifier() {
+        let content = r#"
+group :development do
+  if éend
+    puts 'development'
+  end
+end
+gem 'rails', '~> 7.0'
+"#;
+        let deps = parse(content).unwrap();
+
+        let rails = deps
+            .iter()
+            .find(|dependency| dependency.name == "rails")
+            .unwrap();
+        assert!(!rails.is_dev);
     }
 
     #[test]

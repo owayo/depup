@@ -257,7 +257,7 @@ depup --cd ./projects/myapp -n
 >
 > **注意**: `gem "pg", ">= 0.18", "< 2.0"` や `gem "rack", "!= 2.2.4"` のような Gemfile の複合制約・除外制約は解析対象ですが、自動では書き換えません。制約の一部だけを更新すると意味が壊れるため、unsafe な編集は適用せずに報告します。
 >
-> **注意**: バージョンなしで `git:` / `github:` / `bitbucket:` / `gist:` / `path:` / `source:` を指定した Gemfile 依存は、RubyGems のレジストリ制約へ変換せずにスキップします。オプションキーは Ruby の 2 通りの綴り（`git: '...'` と hash-rocket 形式 `:git => '...'`）の両方を認識します。`git ... do` / `github ... do` / `path ... do` / `source ... do` ブロック内の gem も同じ理由でスキップし、`platforms` / `install_if` のような通常のブロックは従来どおり処理します。引数が次行へ続く宣言（`gem "devise",`）は、その行だけでは版を決められないため「バージョンなしのレジストリ依存」として報告せずスキップします。行単位の `group:` / `groups:` オプションは開発依存の判定に使います。
+> **注意**: バージョンなしで `git:` / `github:` / `bitbucket:` / `gist:` / `path:` / `source:` を指定した Gemfile 依存は、RubyGems のレジストリ制約へ変換せずにスキップします。同じ形式でもバージョンが明示されていれば、Bundler が gemspec を検証する制約として、source オプションを保持したまま解析・更新できます。オプションキーは Ruby の 2 通りの綴り（`git: '...'` と hash-rocket 形式 `:git => '...'`）の両方を認識します。`git ... do` / `github ... do` / `path ... do` / `source ... do` ブロック内の gem も同じ理由でスキップし、`platforms` / `install_if` のような通常のブロックは従来どおり処理します。引数が次行へ続く宣言（`gem "devise",`）は、その行だけでは版を決められないため「バージョンなしのレジストリ依存」として報告せずスキップします。行単位の `group:` / `groups:` オプションは開発依存の判定に使います。
 >
 > **注意**: Gemfile の依存宣言は、一般的な Ruby DSL 形式（`gem "rack", "~> 3.0"`）と括弧付きメソッド呼び出し形式（`gem("rack", "~> 3.0")`）のどちらも解析・更新できます。更新時は元の呼び出し形式を保持します。同じ gem が複数箇所（例: トップレベルと `group :test` ブロックの両方）に宣言されている場合は、曖昧な書き込みとして拒否します。
 >
@@ -482,7 +482,7 @@ depup --max-change minor
 depup --max-change major
 ```
 
-候補が上限を超える場合、その依存は `max-change=<LEVEL>` でスキップとして表示されます。
+候補が上限を超える場合、その依存は `max-change=<LEVEL>` でスキップとして表示されます。Cargo の git tag 追従依存にも同じ上限を適用します。
 
 ### グローバル設定
 
@@ -566,6 +566,8 @@ Python プロジェクトに対して `--install` が `uv sync` を呼び出す�
 - 常時 ON。opt-in フラグは不要です。
 - 機能未対応の古い uv バージョンではこの env var が単に作用しないため、強制 ON でも既存環境のビルドを壊しません。
 - Astral 公式は preview 機能と位置づけており、将来挙動が変わる可能性があります。検査自体は uv 側で実行され、マルウェアにマッチすると uv が sync をエラー終了し、その終了コードがそのまま depup に伝搬します。
+
+PHP プロジェクトを `--install` で処理するとき、depup は `composer install` ではなく `composer update` を実行します。`composer install` は既存 lock を再利用するため、depup が直前に `composer.json` へ書いた制約を反映できません。`composer update` で制約を再解決し、`composer.lock` を更新します。
 
 ## 出力
 

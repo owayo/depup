@@ -33,9 +33,12 @@ const PHP_VERSION_CORE: &str = r"[vV]?\d+(?:\.\d+){0,3}(?:-[\w.-]+)?(?:\+[\w.-]+
 static CARET_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&anchored_op_pattern(r"\^", PHP_VERSION_CORE)).unwrap());
 
-// チルダ: ~1.2.3 / ~1.2.3.4
+// チルダ: ~1.2.3 / ~1.2.3.4 / ~>1.2.3
+// composer/semver の tilde 分岐は `{^~>?<version>$}i` で `~` と `~>` の両方を受理する。
+// `~>` を弾くと依存が None になり Skip 行にも出ず一覧から完全に消えるため、
+// Node パーサ (`~>` 対応済み) と同じく両綴りを受理し、更新後も元の綴りを保つ。
 static TILDE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&anchored_op_pattern(r"~", PHP_VERSION_CORE)).unwrap());
+    LazyLock::new(|| Regex::new(&anchored_op_pattern(r"~>?", PHP_VERSION_CORE)).unwrap());
 
 // 以上: >=1.2.3 / >=1.2.3.4
 static GTE_RE: LazyLock<Regex> =
@@ -158,11 +161,12 @@ impl PhpVersionParser {
             );
         }
 
-        // チルダ
+        // チルダ (`~` / `~>` の両綴り。更新後も元の綴りを保つ)
         if let Some(caps) = TILDE_RE.captures(trimmed) {
             let version = normalize_version(caps.get(1)?.as_str());
+            let prefix = if trimmed.starts_with("~>") { "~>" } else { "~" };
             return Some(
-                VersionSpec::new(VersionSpecKind::Tilde, trimmed, version).with_prefix("~"),
+                VersionSpec::new(VersionSpecKind::Tilde, trimmed, version).with_prefix(prefix),
             );
         }
 
