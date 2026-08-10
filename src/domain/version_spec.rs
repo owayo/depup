@@ -979,6 +979,12 @@ mod tests {
     }
 
     #[test]
+    fn test_try_format_updated_range_rejects_single_pipe_or_constraint() {
+        let spec = VersionSpec::new(VersionSpecKind::Range, "^1 | ^2", "1");
+        assert!(spec.try_format_updated("2.0.0").is_none());
+    }
+
+    #[test]
     fn test_try_format_updated_range_maven_lower_open_returns_none() {
         // Maven 下限なし `(,2.0]` は安全に書き換えられないため None を返す
         let spec = VersionSpec::new(VersionSpecKind::Range, "(,2.0]", "0.0");

@@ -363,7 +363,7 @@ When a dependency has a range with an upper bound (e.g., `>=3.5.0,<4.0.0`, `>=1.
 - **Preserve** the original constraint shape in the manifest file
 - **Update only the lower-bound side** to the newest compatible version within the range
 
-Constraints that cannot be rewritten safely are skipped instead of being rewritten partially. This includes examples such as npm/Composer OR constraints (`^1 || ^2`), any exclusion constraint containing `!=` (`!=1.2.3`, `>=1.0, !=1.5.0, <2.0`), upper-bound-only constraints (`<4.0.0`, `<=2.0`), strict lower bounds (`>1.0.0`), Maven-style ranges without a lower bound (`(,2.0]`), and Maven ranges with an exclusive lower bound (`]1.0,2.0[`). Composer (composer/semver) also spells not-equal as `<>`, so exclusion constraints using it (`>=1.0 <>1.5.0 <2.0`, `>=1.0,<>1.5.0,<2.0`) are skipped just like their `!=` equivalents.
+Constraints that cannot be rewritten safely are skipped instead of being rewritten partially. This includes examples such as npm/Composer OR constraints (`^1 || ^2`) and Composer's backward-compatible single-pipe spelling (`^1 | ^2`), any exclusion constraint containing `!=` (`!=1.2.3`, `>=1.0, !=1.5.0, <2.0`), upper-bound-only constraints (`<4.0.0`, `<=2.0`), strict lower bounds (`>1.0.0`), Maven-style ranges without a lower bound (`(,2.0]`), and Maven ranges with an exclusive lower bound (`]1.0,2.0[`). Composer (composer/semver) also spells not-equal as `<>`, so exclusion constraints using it (`>=1.0 <>1.5.0 <2.0`, `>=1.0,<>1.5.0,<2.0`) are skipped just like their `!=` equivalents.
 
 For JSON manifests, depup only rewrites dependency sections it parses. In `package.json`, `overrides` is left untouched; in `composer.json`, sections such as `replace`, `provide`, and `conflict` are left untouched.
 
