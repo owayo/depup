@@ -381,7 +381,7 @@ Gradle の文字列記法では `:resources@zip` や `@aar` のような classif
 
 npm の comparator set では、`1.2 <2.0.0` のような bare partial lower bound も扱い、下限側を更新するときは partial の形を維持します。
 
-Swift の GitHub 依存では、GitHub タグとして `v1.2.3` と `V1.2.3` の両方を認識します。一方、`Package.swift` の version requirement 文字列は厳格な SemVer (`X.Y.Z`、先頭ゼロなし) として検証します。また、`Package.swift` では `//` 行コメントや `/* ... */` ブロックコメント内に書かれた依存宣言は解析対象から除外します。
+Swift の GitHub 依存では、HTTPS URL、scp形式のSSH URL（`git@github.com:owner/repo.git`）、標準SSH URL（`ssh://git@github.com/owner/repo.git`）、GitHubのSSH over 443 URL（`ssh://git@ssh.github.com:443/owner/repo.git`）を解析できます。GitHub タグとして `v1.2.3` と `V1.2.3` の両方を認識する一方、`Package.swift` の version requirement 文字列は厳格な SemVer (`X.Y.Z`、先頭ゼロなし) として検証します。また、`Package.swift` では `//` 行コメントや `/* ... */` ブロックコメント内に書かれた依存宣言は解析対象から除外します。
 SPM の semver 2.0.0 仕様に合わせ、プレリリース識別子付きバージョン（`1.0.0-beta.1`）、ビルドメタデータ付き（`1.0.0+build.123`）、両者を組み合わせた形式（`1.0.0-rc.1+sha.abc`）も解析・更新できます。
 `.package(...)` の末尾に `traits: [...]`（SPM 6.1 の Package Traits）や `moduleAliases: [...]` のような追加引数があっても、version requirement だけを置換して追加引数を保持します。Swift Package Registry の `id:` 依存（`.package(id: "scope.name", ...)`）は registry API アダプタが未実装のため現状未対応でスキップされます（GitHub URL 依存のみ対象。将来対応予定）。
 

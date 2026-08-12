@@ -173,6 +173,7 @@ make help                # Makefileヘルプ
 - Tauriプロジェクトでは npm/crate のバージョンを自動同期
 - Swift は GitHub Tags API を使用 (`GITHUB_TOKEN`/`GH_TOKEN` で認証可能)。GitHub Tags API はリリース日を返さないため、各バージョンの `released_at` には UNIX_EPOCH を使う (= 「十分古い」として扱う)。これにより `--age` 指定時でも Swift パッケージの更新が抑制されない
 - Swift の GitHub タグは `v1.2.3` と `V1.2.3` の両方を認識する
+- Swift の GitHub URL は HTTPS、scp 形式 (`git@github.com:owner/repo.git`)、標準 SSH (`ssh://git@github.com/owner/repo.git`)、GitHub の SSH over 443 (`ssh://git@ssh.github.com:443/owner/repo.git`) を owner/repo へ正規化する。`github.com.evil` 等の類似ホストは拒否する
 - Swift の非 GitHub URL はスキップされる (警告なし)
 - Swift の `branch:` / `revision:` 依存はバージョンなしとしてスキップ
 - Swift の `Package.swift` では `//` 行コメントと `/* ... */` ブロックコメント内の依存宣言をスキップする
@@ -227,6 +228,7 @@ make help                # Makefileヘルプ
 - `--max-change` で候補が空になったとき、`ChangeLevelLimited` を返すのは「現在版より新しい候補が max-change で除外された」場合のみ。新しい候補がそもそも無ければ `AlreadyLatest`
 - レジストリ層の一貫性: PyPI は yanked リリース (全ファイル yanked または ファイル 0 件) を候補から除外。Packagist の `time` 欠損は `UNIX_EPOCH` フォールバック (age フィルタで永久除外されない)。npm の dist-tags.latest 超のバージョンは prerelease と判定できるもののみ候補に残す (canary/beta 利用者の更新を妨げない)。GitHub Tags は Link ヘッダの `rel="next"` を辿って全ページ取得 (最大10ページ)、403 + `X-RateLimit-Remaining: 0` はレート制限として報告。RubyGems は `platform != "ruby"` のエントリを除外。Go proxy の `.info` / `.mod` URL はバージョン側も case-encode (Go 仕様どおり ASCII 大文字のみ対象、`v1.0.0-RC1` → `v1.0.0-!r!c1`)。HTTP クライアントは 5xx もリトライし `Retry-After` を尊重 (上限10秒)
 - `git ls-remote` は `GIT_TERMINAL_PROMPT=0` + 30秒タイムアウト付きで実行され、認証プロンプトでハングしない。URL スキームは許可リスト (https/http/ssh/git/git@/file) で検証され、`ext::` 等は拒否される
+- `git ls-remote` の取得結果は URL ごとのロックで single-flight 化し、同じ URL への並行要求を1回のプロセス起動へ集約する。異なる URL は並行実行を維持する
 - git 依存の URL に埋め込まれたアクセストークン (`https://x-access-token:<TOKEN>@github.com/org/private.git`) は、エラー・スキップ理由として表示される経路で userinfo を `***` に伏せる。fetch 失敗時のスキップ理由はテキスト出力・JSON 出力の両方に出るため、生の URL をエラーへ保持すると CI ログや成果物にトークンが残る。git が stderr へ URL をエコーする場合に備えて出力側も伏せる。キャッシュキーには生 URL を使い続ける (`git@host:path` 形式のユーザ名はトークンではないので保持する)
 - PM 検出: Bun はテキスト形式 `bun.lock` (Bun 1.2+) と旧 `bun.lockb` の両方を検出。Rye は `requirements.lock` / `requirements-dev.lock` で検出 (`rye.lock` というファイルは存在しない)
 - Cargo workspace の glob 形式 members (`members = ["crates/*"]`、末尾セグメントの `util-*` も可) を展開し、`[workspace] exclude` を除外する。pnpm-workspace.yaml の packages は block-style (`- 'packages/*'`) に加えて flow-style 配列 (`packages: ['packages/*', 'apps/*']`、`]` が次行以降にある複数行形式も可) を解析し、いずれもインラインコメント付き行 (`- 'packages/*' # apps`) と否定パターン (`- '!packages/legacy'` / flow 内の `'!packages/legacy'`) に対応。検出されたマニフェストは重複排除される (`.depup` にルートとサブディレクトリを併記しても二重処理されない)

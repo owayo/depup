@@ -381,7 +381,7 @@ For Gradle string notation, depup preserves classifier and extension suffixes su
 
 For npm comparator sets, depup supports bare partial lower bounds such as `1.2 <2.0.0` and preserves the partial shape when updating the lower side.
 
-For Swift GitHub dependencies, depup recognizes both `v1.2.3` and `V1.2.3` tag prefixes from GitHub tags, while `Package.swift` version requirement strings are validated as strict SemVer (`X.Y.Z`, no leading zeroes). depup also skips `Package.swift` dependencies that appear inside `//` line comments or `/* ... */` block comments.
+For Swift GitHub dependencies, depup accepts HTTPS URLs, scp-style SSH URLs (`git@github.com:owner/repo.git`), standard SSH URLs (`ssh://git@github.com/owner/repo.git`), and GitHub's SSH-over-443 URLs (`ssh://git@ssh.github.com:443/owner/repo.git`). It recognizes both `v1.2.3` and `V1.2.3` tag prefixes from GitHub tags, while `Package.swift` version requirement strings are validated as strict SemVer (`X.Y.Z`, no leading zeroes). depup also skips `Package.swift` dependencies that appear inside `//` line comments or `/* ... */` block comments.
 Per the SPM semver 2.0.0 specification, depup parses and updates dependencies that include prerelease identifiers (`1.0.0-beta.1`) and build metadata (`1.0.0+build.123`), including combined forms (`1.0.0-rc.1+sha.abc`).
 depup also parses `.package(...)` declarations with trailing arguments such as `traits: [...]` (SPM 6.1) or `moduleAliases: [...]`, updating only the version requirement while preserving the extra arguments. Swift Package Registry `id:` dependencies (`.package(id: "scope.name", ...)`) are not yet supported and are skipped; only GitHub URL dependencies are processed.
 

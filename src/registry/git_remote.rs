@@ -92,6 +92,7 @@ pub enum GitRemoteError {
 #[derive(Clone, Default)]
 pub struct GitRemote {
     cache: Arc<Mutex<HashMap<String, Result<GitRemoteRefs, GitRemoteError>>>>,
+    fetch_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 impl GitRemote {
@@ -103,6 +104,19 @@ impl GitRemote {
     /// `git ls-remote <url>` を実行して refs を取得する。
     /// 同一 URL に対する以降の呼び出しはキャッシュ結果を返す。
     pub async fn fetch(&self, url: &str) -> Result<GitRemoteRefs, GitRemoteError> {
+        self.fetch_cached(url, || run_ls_remote(url)).await
+    }
+
+    /// 同じ URL の並行取得を 1 回に集約して結果をキャッシュする。
+    async fn fetch_cached<F, Fut>(
+        &self,
+        url: &str,
+        fetch: F,
+    ) -> Result<GitRemoteRefs, GitRemoteError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<GitRemoteRefs, GitRemoteError>>,
+    {
         {
             let cache = self.cache.lock().await;
             if let Some(cached) = cache.get(url) {
@@ -110,7 +124,25 @@ impl GitRemote {
             }
         }
 
-        let result = run_ls_remote(url).await;
+        let fetch_lock = {
+            let mut locks = self.fetch_locks.lock().await;
+            Arc::clone(
+                locks
+                    .entry(url.to_string())
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+        let _fetch_guard = fetch_lock.lock().await;
+
+        // ロック待ちの間に先行タスクが登録した結果を再確認する。
+        {
+            let cache = self.cache.lock().await;
+            if let Some(cached) = cache.get(url) {
+                return cached.clone();
+            }
+        }
+
+        let result = fetch().await;
 
         {
             let mut cache = self.cache.lock().await;
@@ -397,6 +429,57 @@ not-a-sha\trefs/heads/bogus
             result,
             Err(GitRemoteError::UnsupportedUrlScheme { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_cached_coalesces_concurrent_requests() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let remote = GitRemote::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let first_calls = Arc::clone(&calls);
+        let second_calls = Arc::clone(&calls);
+
+        let first = remote.fetch_cached("https://example.com/repo.git", move || async move {
+            first_calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok(GitRemoteRefs::default())
+        });
+        let second = remote.fetch_cached("https://example.com/repo.git", move || async move {
+            second_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(GitRemoteRefs::default())
+        });
+
+        let (first_result, second_result) = tokio::join!(first, second);
+        assert!(first_result.is_ok());
+        assert!(second_result.is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_cached_keeps_different_urls_concurrent() {
+        let remote = GitRemote::new();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let first_barrier = Arc::clone(&barrier);
+        let second_barrier = Arc::clone(&barrier);
+
+        let requests = async {
+            let first = remote.fetch_cached("https://example.com/one.git", move || async move {
+                first_barrier.wait().await;
+                Ok(GitRemoteRefs::default())
+            });
+            let second = remote.fetch_cached("https://example.com/two.git", move || async move {
+                second_barrier.wait().await;
+                Ok(GitRemoteRefs::default())
+            });
+            tokio::join!(first, second)
+        };
+
+        let (first_result, second_result) = tokio::time::timeout(Duration::from_secs(2), requests)
+            .await
+            .expect("異なる URL の取得が並行実行される");
+        assert!(first_result.is_ok());
+        assert!(second_result.is_ok());
     }
 
     #[test]

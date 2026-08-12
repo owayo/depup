@@ -95,6 +95,8 @@ static RANGE_CLOSED_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// - URL 例: https://github.com/owner/repo.git
 /// - URL 例: https://github.com/owner/repo
 /// - SSH URL 例: git@github.com:owner/repo.git
+/// - SSH URL 例: ssh://git@github.com/owner/repo.git
+/// - SSH over 443 URL 例: ssh://git@ssh.github.com:443/owner/repo.git
 fn extract_github_owner_repo(url: &str) -> Option<String> {
     // owner/repo に `?` `#` 空白等の不正文字が混ざると、後段の GitHub API URL 構築で
     // クエリ汚染やパストラバーサルを誘発しうるため、ここで文字種を GitHub 準拠に限定する。
@@ -111,21 +113,40 @@ fn extract_github_owner_repo(url: &str) -> Option<String> {
     }
 
     // HTTPS URL パターン
-    if let Some(rest) = strip_prefix_ignore_ascii_case(url, "https://github.com/") {
-        let path = rest.trim_end_matches(".git");
+    fn owner_repo_from_path(path: &str) -> Option<String> {
+        let path = path.trim_end_matches(".git");
         let parts: Vec<&str> = path.splitn(3, '/').collect();
         if parts.len() >= 2 && is_valid_segment(parts[0]) && is_valid_segment(parts[1]) {
             return Some(format!("{}/{}", parts[0], parts[1]));
+        }
+        None
+    }
+
+    if let Some(rest) = strip_prefix_ignore_ascii_case(url, "https://github.com/") {
+        return owner_repo_from_path(rest);
+    }
+
+    // Git の標準 SSH URL 形式。GitHub の SSH over 443 用ホストも同じリポジトリへ対応する。
+    if let Some(rest) = strip_prefix_ignore_ascii_case(url, "ssh://")
+        && let Some((authority, path)) = rest.split_once('/')
+    {
+        let host_with_port = authority
+            .rsplit_once('@')
+            .map(|(_, host)| host)
+            .unwrap_or(authority);
+        let host = host_with_port
+            .split_once(':')
+            .map(|(host, _)| host)
+            .unwrap_or(host_with_port);
+
+        if host.eq_ignore_ascii_case("github.com") || host.eq_ignore_ascii_case("ssh.github.com") {
+            return owner_repo_from_path(path);
         }
     }
 
     // SSH URL パターン
     if let Some(rest) = strip_prefix_ignore_ascii_case(url, "git@github.com:") {
-        let path = rest.trim_end_matches(".git");
-        let parts: Vec<&str> = path.splitn(3, '/').collect();
-        if parts.len() >= 2 && is_valid_segment(parts[0]) && is_valid_segment(parts[1]) {
-            return Some(format!("{}/{}", parts[0], parts[1]));
-        }
+        return owner_repo_from_path(rest);
     }
 
     None
@@ -670,6 +691,46 @@ let package = Package(
         assert_eq!(
             extract_github_owner_repo("git@github.com:apple/swift-argument-parser.git"),
             Some("apple/swift-argument-parser".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_github_owner_repo_standard_ssh_url() {
+        assert_eq!(
+            extract_github_owner_repo("ssh://git@github.com/apple/swift-argument-parser.git"),
+            Some("apple/swift-argument-parser".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_github_owner_repo_ssh_over_443_url() {
+        assert_eq!(
+            extract_github_owner_repo(
+                "ssh://git@ssh.github.com:443/apple/swift-argument-parser.git"
+            ),
+            Some("apple/swift-argument-parser".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_standard_ssh_url_dependency() {
+        let content = r#"
+            .package(
+                url: "ssh://git@github.com/apple/swift-argument-parser.git",
+                from: "1.2.0"
+            )
+        "#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "apple/swift-argument-parser");
+        assert_eq!(deps[0].version_spec.raw, "1.2.0");
+    }
+
+    #[test]
+    fn test_extract_github_owner_repo_rejects_lookalike_ssh_host() {
+        assert_eq!(
+            extract_github_owner_repo("ssh://git@github.com.example/owner/repo.git"),
+            None
         );
     }
 
