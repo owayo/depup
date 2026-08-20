@@ -89,8 +89,9 @@ static EQUAL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&anchored_op_pattern(r"=", NODE_VERSION_PATTERN)).unwrap());
 static EXACT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&format!(r"^({NODE_VERSION_PATTERN})$")).unwrap());
-static WILDCARD_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(?:v?(?:\d+|[xX*])(?:\.(?:\d+|[xX*])){0,2}|\*)$").unwrap());
+static WILDCARD_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?:=\s*)?(?:v?(?:\d+|[xX*])(?:\.(?:\d+|[xX*])){0,2}|\*)$").unwrap()
+});
 // `^1.x` / `~1.2.*` のような caret/tilde + x-range。
 // `^1` / `^1.2.3` は先に CARET_RE / TILDE_RE が消費するため、ここに到達するのは
 // ワイルドカード文字 (x/X/*) を含むものだけ。
@@ -252,7 +253,7 @@ fn has_digit_after_wildcard(body: &str) -> bool {
 fn build_wildcard_spec(trimmed: &str, body: &str) -> Option<VersionSpec> {
     // `^x` / `~*` / `x.x` のような完全浮動指定は意味を変えないため更新対象にしない
     // (version が空の Wildcard を作ると phantom update の原因になる)
-    if is_fully_floating_wildcard(trimmed) {
+    if is_fully_floating_wildcard(body) {
         return None;
     }
     // `1.x.3` / `^x.0.0` のように一度ワイルドカードが出た後に数値セグメントが続く形は
@@ -380,7 +381,13 @@ impl VersionParser for NodeVersionParser {
         if WILDCARD_RE.is_match(trimmed)
             && (trimmed.contains('x') || trimmed.contains('X') || trimmed.contains('*'))
         {
-            return build_wildcard_spec(trimmed, trimmed);
+            // `=1.x` も node-semver の primitive として有効なので、
+            // ワイルドカード位置の検査では `=` を剥がした本体を使う。
+            let body = trimmed
+                .strip_prefix('=')
+                .map(str::trim_start)
+                .unwrap_or(trimmed);
+            return build_wildcard_spec(trimmed, body);
         }
 
         // 固定バージョンまたは部分指定
@@ -620,6 +627,28 @@ mod tests {
         assert_eq!(major.kind, VersionSpecKind::Range);
         assert_eq!(major.version, "1.0.0");
         assert_eq!(major.format_updated("2.3.4"), "=2");
+    }
+
+    #[test]
+    fn test_parse_equal_wildcard() {
+        let major = parse("=1.x").unwrap();
+        assert_eq!(major.kind, VersionSpecKind::Wildcard);
+        assert_eq!(major.version, "1.0.0");
+        assert_eq!(major.format_updated("2.3.4"), "=2.x");
+
+        let minor = parse("= 1.2.*").unwrap();
+        assert_eq!(minor.kind, VersionSpecKind::Wildcard);
+        assert_eq!(minor.version, "1.2.0");
+        assert_eq!(minor.format_updated("2.3.4"), "=2.3.*");
+
+        let prefixed = parse("=v1.x").unwrap();
+        assert_eq!(prefixed.format_updated("2.3.4"), "=v2.x");
+    }
+
+    #[test]
+    fn test_parse_equal_fully_floating_wildcard_is_none() {
+        assert!(parse("=x").is_none());
+        assert!(parse("=*").is_none());
     }
 
     #[test]

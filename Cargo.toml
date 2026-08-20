@@ -7,7 +7,7 @@ description = "Multi-language dependency updater CLI tool"
 license = "MIT"
 
 [dependencies]
-clap = { version = "4.6.4", features = ["derive"] }
+clap = { version = "4.6.5", features = ["derive"] }
 tokio = { version = "1.53.1", features = ["full"] }
 reqwest = { version = "0.13.4", features = ["json"] }
 toml = "1.1.4"

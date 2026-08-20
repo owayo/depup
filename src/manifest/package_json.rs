@@ -494,6 +494,20 @@ mod tests {
     }
 
     #[test]
+    fn test_update_version_preserves_equal_wildcard_shape() {
+        let content = r#"{
+  "dependencies": {
+    "pkg": "=1.x"
+  }
+}"#;
+
+        let result = PackageJsonParser
+            .update_version(content, "pkg", "2.3.4")
+            .unwrap();
+        assert!(result.contains("\"pkg\": \"=2.x\""));
+    }
+
+    #[test]
     fn test_update_version_preserves_full_tuple_wildcard_shape() {
         let content = r#"{
   "dependencies": {

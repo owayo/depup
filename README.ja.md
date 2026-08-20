@@ -291,6 +291,7 @@ depupは元のバージョン範囲形式を維持します：
 "V1.*" → "V2.*" （Composer の大文字 `V` を維持）
 "^1.x" → "^2.x" （npm の caret + x-range、演算子を維持）
 "~1.2.x" → "~2.3.x" （npm の tilde + x-range、演算子を維持）
+"=1.x" → "=2.x" （npm の equality + x-range、演算子を維持）
 "=1.2" → "=2.3" （npm の partial comparator、演算子を維持）
 "5.3.+" → "5.4.+" （Gradle プレフィックスを維持）
 "5.3.+!!" → "6.1.+!!" （Gradle strict 動的プレフィックスを維持）

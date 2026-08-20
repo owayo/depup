@@ -291,6 +291,7 @@ depup preserves the original version range format:
 "V1.*" → "V2.*" (Composer uppercase `V` preserved)
 "^1.x" → "^2.x" (npm caret + x-range, operator preserved)
 "~1.2.x" → "~2.3.x" (npm tilde + x-range, operator preserved)
+"=1.x" → "=2.x" (npm equality + x-range, operator preserved)
 "=1.2" → "=2.3" (npm partial comparator, operator preserved)
 "5.3.+" → "5.4.+" (Gradle prefix preserved)
 "5.3.+!!" → "6.1.+!!" (Gradle strict dynamic prefix preserved)
