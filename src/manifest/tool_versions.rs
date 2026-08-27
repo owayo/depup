@@ -280,6 +280,49 @@ mod tests {
         assert_eq!(updated, "ruby 3.4\n");
     }
 
+    /// タブ区切りやマルチバイトのコメントでもバイト範囲計算がずれない
+    #[test]
+    fn test_update_handles_tabs_and_multibyte_comments() {
+        let updated = ToolVersionsParser
+            .update_version("node\t26.7.0\t# 本番と揃える\n", "node", "26.8.1")
+            .unwrap();
+        assert_eq!(updated, "node\t26.8.1\t# 本番と揃える\n");
+    }
+
+    /// parse が依存として surface した行は、必ず update でも書き換えられること
+    #[test]
+    fn test_every_parsed_form_is_updatable() {
+        let manifests = [
+            "node 26.7.0\n",
+            "node    26.7.0   # comment\n",
+            "node\t26.7.0\n",
+            "ruby 3\n",
+            "go prefix:1.19\n",
+            "java temurin-21.0.5\n",
+            "# 先頭コメント\n\nnode 26.7.0\n",
+            // 最終行に改行がない
+            "node 26.7.0",
+        ];
+
+        for content in manifests {
+            let deps = ToolVersionsParser.parse(content).unwrap();
+            assert!(!deps.is_empty(), "no dependency parsed from: {content:?}");
+            for dep in deps {
+                let result = ToolVersionsParser.update_version(content, &dep.name, "99.0.0");
+                assert!(
+                    result.is_ok(),
+                    "parsed {} but could not update it in: {content:?}",
+                    dep.name
+                );
+                assert_ne!(
+                    result.unwrap(),
+                    content,
+                    "update was a no-op for: {content:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_update_missing_tool_is_error() {
         assert!(

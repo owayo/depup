@@ -76,7 +76,7 @@
 | <img src="https://img.shields.io/badge/-777BB4?logo=php&logoColor=white" height="16"> PHP | composer.json | Packagist | composer.lock |
 | <img src="https://img.shields.io/badge/-ED8B00?logo=openjdk&logoColor=white" height="16"> Java | build.gradle, build.gradle.kts, gradle/*.versions.toml | Maven Central | gradle.lockfile |
 | <img src="https://img.shields.io/badge/-F05138?logo=swift&logoColor=white" height="16"> Swift | Package.swift | GitHub Tags | Package.resolved |
-| <img src="https://img.shields.io/badge/-EC4899?logo=mise&logoColor=white" height="16"> mise | mise.toml, .mise.toml, .config/mise/config.toml, .tool-versions | `mise ls-remote` | mise.lock |
+| mise | mise.toml, .mise.toml, .config/mise/config.toml, .tool-versions | `mise ls-remote` | mise.lock |
 
 ## 動作要件
 

@@ -56,41 +56,84 @@ fn extract_version_value(value: &toml::Value) -> Option<&str> {
     }
 }
 
-/// 行がツールキーの定義行かどうかを判定し、値部分の範囲を返す。
+/// 行頭が `key` / `"key"` / `'key'` であればその長さを返す。
 ///
-/// 生キー (`node = ...`) と TOML のクォート付きキー (`"npm:prettier" = ...`、
-/// `'npm:prettier' = ...`) の両方を受け付ける。ドットを含む名前や `:` を含む
-/// バックエンド指定はクォートが必須なので、両方を見ないと取りこぼす。
+/// 直後は空白 / `=` / `.` のいずれかでなければならない
+/// (`node` が `node_extra` のような別キーへ前方一致しないようにする。
+/// `.` を許すのは dotted key (`node.version = "..."`) を続けて読むため)。
+fn match_key_len(text: &str, key: &str) -> Option<usize> {
+    let candidates = [key.to_string(), format!("\"{key}\""), format!("'{key}'")];
+    candidates.iter().find_map(|candidate| {
+        let after = text.strip_prefix(candidate.as_str())?;
+        after
+            .starts_with(|c: char| c.is_whitespace() || c == '=' || c == '.')
+            .then_some(candidate.len())
+    })
+}
+
+/// 行がツールキーの定義行かどうかを判定し、値部分の開始位置を返す。
+///
+/// 受け付ける形:
+/// - `node = "26.7.0"` (生キー)
+/// - `"npm:prettier" = "3.9.6"` (クォート付きキー。`:` や `.` を含む名前は必須)
+/// - `node.version = "26.7.0"` (dotted key)
+///
+/// dotted key は toml クレートが inline table と同じ構造へ畳むため、parse 側は
+/// 依存として surface する。書き換え側が対応していないと「更新あり」と報告した
+/// 後に書き込みが失敗して report/apply が矛盾する (Cargo.toml と同じ経路)。
 fn tool_key_value_start(line: &str, tool: &str) -> Option<usize> {
-    let trimmed_start = line.len() - line.trim_start().len();
-    let rest = &line[trimmed_start..];
+    let mut pos = line.len() - line.trim_start().len();
+    pos += match_key_len(&line[pos..], tool)?;
 
-    let key_len = if let Some(after) = rest.strip_prefix(tool) {
-        // 生キー: 直後は空白か `=` のみ (`node_extra` のような別キーに前方一致しない)
-        if after.starts_with(|c: char| c.is_whitespace() || c == '=') {
-            tool.len()
-        } else {
-            return None;
-        }
-    } else {
-        let quoted_double = format!("\"{tool}\"");
-        let quoted_single = format!("'{tool}'");
-        if rest.starts_with(&quoted_double) {
-            quoted_double.len()
-        } else if rest.starts_with(&quoted_single) {
-            quoted_single.len()
-        } else {
-            return None;
-        }
-    };
+    // dotted key (`node.version = "..."`) なら `.version` まで読み進める
+    let after_key = &line[pos..];
+    let ws = after_key.len() - after_key.trim_start().len();
+    if line[pos + ws..].starts_with('.') {
+        pos += ws + 1;
+        let after_dot = &line[pos..];
+        pos += after_dot.len() - after_dot.trim_start().len();
+        pos += match_key_len(&line[pos..], VERSION_KEY)?;
+    }
 
-    let after_key = &rest[key_len..];
-    let eq_offset = after_key.find('=')?;
+    let rest = &line[pos..];
+    let eq_offset = rest.find('=')?;
     // キーと `=` の間に空白以外があれば別の構文
-    if !after_key[..eq_offset].chars().all(char::is_whitespace) {
+    if !rest[..eq_offset].chars().all(char::is_whitespace) {
         return None;
     }
-    Some(trimmed_start + key_len + eq_offset + 1)
+    Some(pos + eq_offset + 1)
+}
+
+/// TOML のセクションキー (`tools."npm:prettier"`) をセグメントへ分解し、
+/// クォートを剥がす。
+///
+/// `:` や `.` を含むツール名はテーブルヘッダでクォートが必須
+/// (`[tools."npm:prettier"]`) なので、素朴な文字列比較では一致しない。
+fn split_section_key(key: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+
+    for ch in key.chars() {
+        match quote {
+            Some(q) => {
+                if ch == q {
+                    quote = None;
+                } else {
+                    current.push(ch);
+                }
+            }
+            None => match ch {
+                '"' | '\'' => quote = Some(ch),
+                '.' => {
+                    segments.push(std::mem::take(&mut current).trim().to_string());
+                }
+                _ => current.push(ch),
+            },
+        }
+    }
+    segments.push(current.trim().to_string());
+    segments
 }
 
 /// 値部分の文字列リテラルを新しいバージョンへ置き換える。
@@ -159,22 +202,25 @@ impl ManifestParser for MiseTomlParser {
         package: &str,
         new_version: &str,
     ) -> Result<String, ManifestError> {
-        let table_section = format!("{TOOLS_SECTION}.{package}");
         let mut result = String::with_capacity(content.len());
-        let mut current_section: Option<String> = None;
+        // セクションキーはクォートを剥がしたセグメント列で保持する
+        // (`[tools."npm:prettier"]` を `["tools", "npm:prettier"]` として比較する)
+        let mut current_section: Option<Vec<String>> = None;
         let mut updated = false;
 
         for raw_line in content.split_inclusive('\n') {
             let (line, line_ending) = split_line_ending(raw_line);
 
             if let Some(section) = parse_toml_section_header(line) {
-                current_section = Some(section.to_string());
+                current_section = Some(split_section_key(section));
                 result.push_str(raw_line);
                 continue;
             }
 
-            let in_tools_section = current_section.as_deref() == Some(TOOLS_SECTION);
-            let in_tool_table = current_section.as_deref() == Some(table_section.as_str());
+            let segments = current_section.as_deref().unwrap_or(&[]);
+            let in_tools_section = segments.len() == 1 && segments[0] == TOOLS_SECTION;
+            let in_tool_table =
+                segments.len() == 2 && segments[0] == TOOLS_SECTION && segments[1] == package;
 
             if !updated && (in_tools_section || in_tool_table) {
                 // `[tools]` 直下は `<tool> = <value>`、`[tools.<tool>]` 配下は
@@ -224,19 +270,70 @@ impl ManifestParser for MiseTomlParser {
     }
 }
 
-/// inline table の `version = "..."` だけを置換する (他のオプションは保持)
-fn replace_inline_table_version(value_part: &str, new_version: &str) -> Option<String> {
-    if !INLINE_VERSION_RE.is_match(value_part) {
-        return None;
+/// 文字列リテラル (`"..."` / `'...'`) の範囲を列挙する。
+///
+/// 返す範囲は `(開始クォート位置, 終了クォート位置)`。閉じられていない場合は
+/// 行末までを範囲とする。basic string (`"`) はバックスラッシュエスケープを
+/// 解釈し、literal string (`'`) は解釈しない (TOML 仕様どおり)。
+fn string_literal_ranges(text: &str) -> Vec<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut ranges = Vec::new();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let quote = bytes[i];
+        if quote != b'"' && quote != b'\'' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        i += 1;
+        while i < bytes.len() {
+            if quote == b'"' && bytes[i] == b'\\' {
+                i += 2;
+                continue;
+            }
+            if bytes[i] == quote {
+                break;
+            }
+            i += 1;
+        }
+        if i < bytes.len() {
+            ranges.push((start, i));
+            i += 1;
+        } else {
+            ranges.push((start, text.len()));
+            break;
+        }
     }
-    Some(
-        INLINE_VERSION_RE
-            .replace(value_part, |caps: &regex::Captures| {
-                let formatted = format_mise_version(&caps[3], new_version);
-                format!("{}{}{}{}", &caps[1], &caps[2], formatted, &caps[4])
-            })
-            .into_owned(),
-    )
+    ranges
+}
+
+/// inline table の `version = "..."` だけを置換する (他のオプションは保持)。
+///
+/// 正規表現の一致位置が別フィールドの文字列リテラルの内側にある場合は飛ばす。
+/// 例えば `java = { postinstall = 'echo version = "x"', version = "temurin-21" }`
+/// では `postinstall` の中身が先に一致するため、素朴に最初の一致を置換すると
+/// ツールのバージョンではなくコマンド文字列を書き換えてしまう。
+fn replace_inline_table_version(value_part: &str, new_version: &str) -> Option<String> {
+    let literals = string_literal_ranges(value_part);
+    let is_inside_literal = |pos: usize| literals.iter().any(|(s, e)| pos > *s && pos < *e);
+
+    let caps = INLINE_VERSION_RE
+        .captures_iter(value_part)
+        .find(|caps| !is_inside_literal(caps.get(0).expect("group 0 always exists").start()))?;
+
+    let whole = caps.get(0).expect("group 0 always exists");
+    let formatted = format_mise_version(&caps[3], new_version);
+    Some(format!(
+        "{}{}{}{}{}{}",
+        &value_part[..whole.start()],
+        &caps[1],
+        &caps[2],
+        formatted,
+        &caps[4],
+        &value_part[whole.end()..]
+    ))
 }
 
 #[cfg(test)]
@@ -344,6 +441,87 @@ minimum_release_age = "7d"
             .update_version(content, "node", "26.8.1")
             .unwrap();
         assert_eq!(updated, "[tools]\nnode = \"26.8.1\"\npnpm = \"11.23.0\"\n");
+    }
+
+    /// 回帰: dotted key (`node.version = "..."`) は toml クレートが inline table と
+    /// 同じ構造へ畳むため parse が依存として surface する。書き換え側が対応して
+    /// いないと「更新あり」と報告した後に書き込みが失敗する。
+    #[test]
+    fn test_update_dotted_key() {
+        let content = "[tools]\nnode.version = \"26.7.0\"\n";
+        let updated = MiseTomlParser
+            .update_version(content, "node", "26.8.1")
+            .unwrap();
+        assert_eq!(updated, "[tools]\nnode.version = \"26.8.1\"\n");
+    }
+
+    #[test]
+    fn test_update_quoted_dotted_key() {
+        let content = "[tools]\n\"npm:prettier\".version = \"3.9.0\"\n";
+        let updated = MiseTomlParser
+            .update_version(content, "npm:prettier", "3.9.6")
+            .unwrap();
+        assert_eq!(updated, "[tools]\n\"npm:prettier\".version = \"3.9.6\"\n");
+    }
+
+    /// 回帰: `:` を含むツール名はテーブルヘッダでクォートが必須なので、
+    /// 素朴な文字列比較 (`tools.npm:prettier`) ではセクションが一致しない
+    #[test]
+    fn test_update_quoted_table_section() {
+        let content = "[tools.\"npm:prettier\"]\nversion = \"3.9.0\"\n";
+        let updated = MiseTomlParser
+            .update_version(content, "npm:prettier", "3.9.6")
+            .unwrap();
+        assert_eq!(updated, "[tools.\"npm:prettier\"]\nversion = \"3.9.6\"\n");
+    }
+
+    /// 回帰: inline table の別フィールドに `version = "..."` を含む文字列が
+    /// あっても、そちらを書き換えない (正規表現の最初の一致を素朴に使うと
+    /// コマンド文字列の中身を破壊していた)
+    #[test]
+    fn test_update_inline_table_ignores_version_inside_other_string() {
+        let content = "[tools]\njava = { postinstall = 'echo version = \"do-not-touch\"', version = \"temurin-21.0.5\" }\n";
+        let updated = MiseTomlParser
+            .update_version(content, "java", "21.0.9")
+            .unwrap();
+        assert_eq!(
+            updated,
+            "[tools]\njava = { postinstall = 'echo version = \"do-not-touch\"', version = \"temurin-21.0.9\" }\n"
+        );
+    }
+
+    /// parse が依存として surface した記法は、必ず update でも書き換えられること
+    /// (report と apply が食い違わないことの網羅チェック)
+    #[test]
+    fn test_every_parsed_form_is_updatable() {
+        let manifests = [
+            "[tools]\nnode = \"26.7.0\"\n",
+            "[tools]\nnode = '26.7.0'\n",
+            "[tools]\nnode = \"26\"\n",
+            "[tools]\nnode = \"prefix:26\"\n",
+            "[tools]\nnode.version = \"26.7.0\"\n",
+            "[tools]\nnode = { version = \"26.7.0\", postinstall = \"echo hi\" }\n",
+            "[tools.node]\nversion = \"26.7.0\"\n",
+            "[tools]\n\"npm:prettier\" = \"3.9.0\"\n",
+            "[tools]\n'npm:prettier' = \"3.9.0\"\n",
+            "[tools.\"npm:prettier\"]\nversion = \"3.9.0\"\n",
+            "[tools]\njava = \"temurin-21.0.5\"\n",
+        ];
+
+        for content in manifests {
+            let deps = MiseTomlParser.parse(content).unwrap();
+            assert!(!deps.is_empty(), "no dependency parsed from: {content}");
+            for dep in deps {
+                let result = MiseTomlParser.update_version(content, &dep.name, "99.0.0");
+                assert!(
+                    result.is_ok(),
+                    "parsed {} but could not update it in: {content}",
+                    dep.name
+                );
+                let updated = result.unwrap();
+                assert_ne!(updated, content, "update was a no-op for: {content}");
+            }
+        }
     }
 
     #[test]
