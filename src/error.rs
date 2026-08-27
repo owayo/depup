@@ -201,6 +201,7 @@ impl RegistryError {
             Language::Php => "Packagist",
             Language::Java => "Maven Central",
             Language::Swift => "GitHub Tags",
+            Language::Mise => "mise",
         }
     }
 }

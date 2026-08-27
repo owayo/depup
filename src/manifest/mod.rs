@@ -17,10 +17,14 @@ mod gradle;
 mod gradle_version_catalog;
 mod json_sections;
 mod line_utils;
+mod mise;
+mod mise_settings;
+mod mise_toml;
 mod package_json;
 mod package_swift;
 mod pnpm_settings;
 mod pyproject_toml;
+mod tool_versions;
 mod writer;
 
 pub use bun_settings::{BunSettings, has_bunfig};
@@ -34,10 +38,13 @@ pub use detector::{ManifestFile, ManifestInfo, detect_manifests};
 pub use gemfile::GemfileParser;
 pub use go_mod::GoModParser;
 pub use gradle::GradleParser;
+pub use mise::MiseParser;
+pub use mise_settings::{MISE_CONFIG_FILENAMES, MiseSettings, has_mise_config, mise_config_paths};
 pub use package_json::PackageJsonParser;
 pub use package_swift::PackageSwiftParser;
 pub use pnpm_settings::{PnpmSettings, has_pnpm_workspace};
 pub use pyproject_toml::PyprojectTomlParser;
+pub use tool_versions::TOOL_VERSIONS_FILENAME;
 pub use writer::{ManifestWriter, WriteResult, read_manifest, write_manifest};
 
 use crate::domain::{Dependency, Language};
@@ -82,6 +89,7 @@ pub fn get_parser(language: Language) -> Box<dyn ManifestParser> {
         Language::Php => Box::new(ComposerJsonParser),
         Language::Java => Box::new(GradleParser),
         Language::Swift => Box::new(PackageSwiftParser),
+        Language::Mise => Box::new(MiseParser),
     }
 }
 

@@ -116,6 +116,10 @@ pub struct CliArgs {
     #[arg(long)]
     pub swift: bool,
 
+    /// mise（mise.toml / .tool-versions）のツールバージョンだけを更新する
+    #[arg(long)]
+    pub mise: bool,
+
     // パッケージフィルタ
     /// 指定したパッケージを更新対象から除外する（複数回指定可）
     #[arg(long, action = ArgAction::Append)]
@@ -175,10 +179,11 @@ impl CliArgs {
         !self.selected_languages().is_empty()
     }
 
-    /// CLI フラグで選択された言語の一覧を返す (順序: Node, Python, Rust, Go, Ruby, PHP, Java, Swift)
+    /// CLI フラグで選択された言語の一覧を返す
+    /// (順序: Node, Python, Rust, Go, Ruby, PHP, Java, Swift, mise)
     pub fn selected_languages(&self) -> Vec<crate::domain::Language> {
         use crate::domain::Language;
-        let flags: [(bool, Language); 8] = [
+        let flags: [(bool, Language); 9] = [
             (self.node, Language::Node),
             (self.python, Language::Python),
             (self.rust_lang, Language::Rust),
@@ -187,6 +192,7 @@ impl CliArgs {
             (self.php, Language::Php),
             (self.java, Language::Java),
             (self.swift, Language::Swift),
+            (self.mise, Language::Mise),
         ];
         flags
             .into_iter()
@@ -297,6 +303,14 @@ mod tests {
         let args = CliArgs::parse_from(["depup", "--java"]);
         assert!(args.java);
         assert!(!args.node);
+
+        let args = CliArgs::parse_from(["depup", "--mise"]);
+        assert!(args.mise);
+        assert!(!args.node);
+        assert_eq!(
+            args.selected_languages(),
+            vec![crate::domain::Language::Mise]
+        );
     }
 
     #[test]

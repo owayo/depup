@@ -360,6 +360,22 @@ impl UpdateJudge {
             );
         }
 
+        // mise は同じツールの候補にベンダー違いの版が混ざる
+        // (`mise ls-remote java` は 3000 件超のうち大半が `temurin-` /
+        // `graalvm-community-` / `zulu-` などの接頭辞付き)。接頭辞を無視して
+        // 最新を選ぶと `temurin-21` の利用者が `zulu-27` へ飛ばされるため、
+        // 現在版と同じ接頭辞の候補だけに絞り、比較・書き戻しに使う数値部へ揃える。
+        let mise_normalized;
+        let available_versions = if dependency.language == Language::Mise {
+            mise_normalized = mise_flavor_candidates(dependency, available_versions);
+            if mise_normalized.is_empty() {
+                return UpdateResult::skip(dependency.clone(), SkipReason::NoSuitableVersion);
+            }
+            mise_normalized.as_slice()
+        } else {
+            available_versions
+        };
+
         let stable = self.stable_candidates(dependency, available_versions);
         let age_filtered = self.apply_age_filter(stable);
         let range_filtered = apply_range_upper_bound(dependency, age_filtered);
@@ -551,6 +567,33 @@ fn apply_max_change_filter<'a>(
         .collect()
 }
 
+/// mise の候補バージョンを、現在版と同じベンダー接頭辞のものだけに絞り、
+/// 数値部 (`temurin-21.0.9` → `21.0.9`) へ正規化する。
+///
+/// 依存側の接頭辞は `VersionSpec::prefix` に入っている
+/// (`temurin-` / `prefix:temurin-` / `prefix:`)。`prefix:` は mise の
+/// 「前方一致セレクタ」であってベンダー名ではないので取り除いてから比較する。
+///
+/// 正規化後の値は判定・書き戻しの両方で使われる。書き戻し時は各パーサが
+/// マニフェスト上の元の表記から接頭辞を復元するため、ここで数値部へ揃えても
+/// `temurin-` が失われることはない。
+fn mise_flavor_candidates(dependency: &Dependency, versions: &[VersionInfo]) -> Vec<VersionInfo> {
+    let flavor = dependency
+        .version_spec
+        .prefix
+        .as_deref()
+        .map(|prefix| prefix.strip_prefix("prefix:").unwrap_or(prefix))
+        .unwrap_or("");
+
+    versions
+        .iter()
+        .filter_map(|info| {
+            let (candidate_flavor, core) = crate::parser::split_mise_flavor(&info.version)?;
+            (candidate_flavor == flavor).then(|| VersionInfo::new(core, info.released_at))
+        })
+        .collect()
+}
+
 pub fn compare_dependency_versions(
     dependency: &Dependency,
     a: &str,
@@ -563,7 +606,12 @@ pub fn compare_dependency_versions(
         Language::Python => version_info::compare_python_versions(a, b),
         Language::Ruby => version_info::compare_ruby_versions(a, b),
         Language::Php => version_info::compare_composer_versions(a, b),
-        Language::Java => version_info::compare_gradle_versions(a, b),
+        // mise のバージョンはバックエンドごとに体系が違い、semver とは限らない
+        // (java の `26.0.2.1`、python の `3.15.0rc1` / `3.15-dev` など)。
+        // Gradle の version ordering は「数値と英字を分割し、数値は数値として、
+        // qualifier は既知の順序で比較する」汎用規則なので、semver 厳格パースが
+        // 失敗する版でも破綻せずに順序を付けられる。
+        Language::Java | Language::Mise => version_info::compare_gradle_versions(a, b),
     }
 }
 
@@ -2594,6 +2642,109 @@ mod tests {
             compare_dependency_versions(&java, "1.0-zeta", "1.0-rc"),
             Ordering::Less
         );
+
+        // mise は semver でない版 (4 セグメント) も順序付けできる必要がある
+        let mise = make_dependency("mise", "26.0.2", Language::Mise, false);
+        assert_eq!(
+            compare_dependency_versions(&mise, "26.0.2", "26.0.2.1"),
+            Ordering::Less
+        );
+    }
+
+    /// mise 用の依存を組み立てる (ベンダー接頭辞は `prefix` に入る)
+    fn make_mise_dependency(name: &str, raw: &str) -> Dependency {
+        use crate::parser::VersionParser as _;
+        let spec = crate::parser::MiseVersionParser
+            .parse(raw)
+            .expect("parsable mise version");
+        Dependency::new(name, spec, false, Language::Mise)
+    }
+
+    /// `temurin-21.0.5` の利用者が別ベンダー (`zulu-`) や接頭辞なしの版へ
+    /// 飛ばされないこと。`mise ls-remote java` は 3000 件超の大半が
+    /// ベンダー付きなので、ここを外すと毎回まったく別の JDK に書き換わる。
+    #[test]
+    fn test_judge_mise_keeps_vendor_prefix() {
+        let judge = UpdateJudge::new(UpdateFilter::new());
+        let dep = make_mise_dependency("java", "temurin-21.0.5");
+        let versions = vec![
+            make_version_info("temurin-21.0.9", 30),
+            make_version_info("zulu-27.0.0", 10),
+            make_version_info("27.0.0", 10),
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        match result {
+            UpdateResult::Update { new_version, .. } => {
+                // 判定・書き戻しに使うのは数値部。接頭辞はマニフェスト書き込み時に復元される
+                assert_eq!(new_version, "21.0.9");
+                assert_eq!(
+                    dep.version_spec.format_updated(&new_version),
+                    "temurin-21.0.9"
+                );
+            }
+            other => panic!("expected update, got {:?}", other),
+        }
+    }
+
+    /// 接頭辞なしの指定はベンダー付きの候補を拾わない
+    #[test]
+    fn test_judge_mise_plain_version_ignores_vendor_candidates() {
+        let judge = UpdateJudge::new(UpdateFilter::new());
+        let dep = make_mise_dependency("java", "21.0.5");
+        let versions = vec![
+            make_version_info("21.0.9", 30),
+            make_version_info("zulu-27.0.0", 10),
+        ];
+
+        match judge.judge(&dep, &versions) {
+            UpdateResult::Update { new_version, .. } => assert_eq!(new_version, "21.0.9"),
+            other => panic!("expected update, got {:?}", other),
+        }
+    }
+
+    /// 同じベンダーの候補が 1 件も無ければ更新しない (別ベンダーへ乗り換えない)
+    #[test]
+    fn test_judge_mise_without_matching_vendor_skips() {
+        let judge = UpdateJudge::new(UpdateFilter::new());
+        let dep = make_mise_dependency("java", "temurin-21.0.5");
+        let versions = vec![make_version_info("zulu-27.0.0", 10)];
+
+        assert!(matches!(
+            judge.judge(&dep, &versions),
+            UpdateResult::Skip {
+                reason: SkipReason::NoSuitableVersion,
+                ..
+            }
+        ));
+    }
+
+    /// 部分指定 (`node = "26"`) は更新後もセグメント数を保つ
+    #[test]
+    fn test_judge_mise_prefix_keeps_segment_count() {
+        let judge = UpdateJudge::new(UpdateFilter::new());
+        let dep = make_mise_dependency("node", "26");
+        let versions = vec![make_version_info("27.1.0", 30)];
+
+        match judge.judge(&dep, &versions) {
+            UpdateResult::Update { new_version, .. } => {
+                assert_eq!(dep.version_spec.format_updated(&new_version), "27");
+            }
+            other => panic!("expected update, got {:?}", other),
+        }
+    }
+
+    /// mise は always_pinned なので `--include-pinned` なしでも完全一致指定を更新する
+    #[test]
+    fn test_judge_mise_exact_pin_updates_without_include_pinned() {
+        let judge = UpdateJudge::new(UpdateFilter::new());
+        let dep = make_mise_dependency("node", "26.7.0");
+        let versions = vec![make_version_info("26.8.1", 30)];
+
+        assert!(matches!(
+            judge.judge(&dep, &versions),
+            UpdateResult::Update { .. }
+        ));
     }
 
     #[test]

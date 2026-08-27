@@ -146,7 +146,33 @@ pub fn detect_manifests(dir: &Path) -> Vec<ManifestInfo> {
         }
     }
 
+    // mise の設定ファイルを検出する。`mise.toml` は Language::all() のループで
+    // 拾えるが、mise は同じディレクトリの複数ファイルを読むので残りも足す。
+    for mise_path in detect_mise_manifests(dir) {
+        if !manifests.iter().any(|m| m.path == mise_path) {
+            manifests.push(ManifestInfo::new(mise_path, Language::Mise));
+        }
+    }
+
     manifests
+}
+
+/// ディレクトリ直下の mise 設定ファイルを検出する。
+///
+/// mise が読むファイルのうち、depup が更新対象にするのは次の 2 系統:
+/// - TOML 形式 (`MISE_CONFIG_FILENAMES`)
+/// - asdf 互換の `.tool-versions`
+///
+/// `mise.local.toml` / `.mise.local.toml` は個人のローカル上書き
+/// (通常 gitignore 対象) なので更新しない。`mise.<env>.toml` も特定環境だけの
+/// overlay なので、意図しない環境の書き換えを避けて対象外にする。
+fn detect_mise_manifests(dir: &Path) -> Vec<PathBuf> {
+    let mut paths = super::mise_settings::mise_config_paths(dir);
+    let tool_versions = dir.join(super::tool_versions::TOOL_VERSIONS_FILENAME);
+    if tool_versions.is_file() {
+        paths.push(tool_versions);
+    }
+    paths
 }
 
 /// gradle ディレクトリ直下の version catalog を検出する
@@ -456,6 +482,63 @@ mod tests {
         assert!(languages.contains(&Language::Rust));
         assert!(languages.contains(&Language::Python));
         assert!(languages.contains(&Language::Go));
+    }
+
+    #[test]
+    fn test_detect_mise_toml() {
+        let dir = create_temp_dir();
+        fs::write(dir.path().join("mise.toml"), "[tools]\nnode = \"26.7.0\"\n").unwrap();
+
+        let manifests = detect_manifests(dir.path());
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(manifests[0].language, Language::Mise);
+        assert_eq!(manifests[0].path, dir.path().join("mise.toml"));
+    }
+
+    #[test]
+    fn test_detect_mise_alternate_locations() {
+        let dir = create_temp_dir();
+        fs::create_dir_all(dir.path().join(".config/mise")).unwrap();
+        fs::write(dir.path().join(".mise.toml"), "[tools]\n").unwrap();
+        fs::write(dir.path().join(".config/mise/config.toml"), "[tools]\n").unwrap();
+        fs::write(dir.path().join(".tool-versions"), "node 26.7.0\n").unwrap();
+
+        let paths: Vec<_> = detect_manifests(dir.path())
+            .into_iter()
+            .filter(|m| m.language == Language::Mise)
+            .map(|m| m.path)
+            .collect();
+        assert_eq!(paths.len(), 3);
+        assert!(paths.contains(&dir.path().join(".mise.toml")));
+        assert!(paths.contains(&dir.path().join(".config/mise/config.toml")));
+        assert!(paths.contains(&dir.path().join(".tool-versions")));
+    }
+
+    /// `mise.local.toml` は個人のローカル上書き (通常 gitignore) なので更新しない。
+    /// `mise.<env>.toml` も特定環境だけの overlay なので対象外。
+    #[test]
+    fn test_detect_mise_skips_local_and_env_overlays() {
+        let dir = create_temp_dir();
+        fs::write(dir.path().join("mise.local.toml"), "[tools]\n").unwrap();
+        fs::write(dir.path().join(".mise.local.toml"), "[tools]\n").unwrap();
+        fs::write(dir.path().join("mise.production.toml"), "[tools]\n").unwrap();
+
+        let manifests = detect_manifests(dir.path());
+        assert!(manifests.iter().all(|m| m.language != Language::Mise));
+    }
+
+    /// mise.toml は Language::all() のループと mise 専用検出の両方に該当するので、
+    /// 二重に登録されていないこと
+    #[test]
+    fn test_detect_mise_toml_is_not_duplicated() {
+        let dir = create_temp_dir();
+        fs::write(dir.path().join("mise.toml"), "[tools]\n").unwrap();
+
+        let mise_manifests: Vec<_> = detect_manifests(dir.path())
+            .into_iter()
+            .filter(|m| m.language == Language::Mise)
+            .collect();
+        assert_eq!(mise_manifests.len(), 1);
     }
 
     #[test]

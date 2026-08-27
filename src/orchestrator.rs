@@ -14,15 +14,15 @@ use crate::domain::{
 };
 use crate::global_config::{DEFAULT_AGE, GlobalConfig};
 use crate::manifest::{
-    BunSettings, ManifestInfo, ManifestWriter, PnpmSettings, WriteResult, detect_manifests,
-    find_cargo_lock_upward, get_parser, has_bunfig, has_pnpm_workspace, read_git_entries,
-    read_registry_entries,
+    BunSettings, ManifestInfo, ManifestWriter, MiseSettings, PnpmSettings, WriteResult,
+    detect_manifests, find_cargo_lock_upward, get_parser, has_bunfig, has_mise_config,
+    has_pnpm_workspace, read_git_entries, read_registry_entries,
 };
 use crate::osv::{OsvCheck, OsvChecker};
 use crate::progress::Progress;
 use crate::registry::{
     CratesIoAdapter, GitHubTagsAdapter, GitRemote, GoProxyAdapter, HttpClient, MavenCentralAdapter,
-    NpmAdapter, PackagistAdapter, PyPIAdapter, RegistryAdapter, RubyGemsAdapter,
+    MiseAdapter, NpmAdapter, PackagistAdapter, PyPIAdapter, RegistryAdapter, RubyGemsAdapter,
 };
 use crate::tauri_sync::{TAURI_CRATE, TAURI_NPM_PACKAGES, TauriVersionSync};
 use crate::update::{
@@ -592,6 +592,11 @@ impl Orchestrator {
 
         let judge = UpdateJudge::new(self.build_filter());
 
+        // mise のバージョン解決は `mise` コマンドに委譲するため、未インストールなら
+        // 依存ごとに同じ fetch エラーを並べる前にマニフェストごと外す。
+        let manifests = self.filter_out_unusable_mise_manifests(manifests);
+        let manifests = manifests.as_slice();
+
         let parsed = self.parse_phase(manifests, progress, &mut errors);
         self.check_phase(parsed, &judge, progress, &mut summary, &mut errors)
             .await;
@@ -789,6 +794,8 @@ impl Orchestrator {
         if let Some(age) = resolved.duration {
             filter = filter.with_min_age(age);
         }
+        // mise の除外設定は depup 側で解釈しないため、食い違いを通知する
+        self.warn_mise_age_excludes();
 
         // 変更レベル上限
         if let Some(level) = self.args.max_change {
@@ -820,32 +827,92 @@ impl Orchestrator {
     }
 
     /// プロジェクト直下の minimumReleaseAge 設定を読む。
-    /// pnpm (`pnpm-workspace.yaml` / `.npmrc` / `package.json`) と
-    /// bun (`bunfig.toml`) の両方を見て、両方ある場合はより厳しい方 (max) を採用する。
+    /// pnpm (`pnpm-workspace.yaml` / `.npmrc` / `package.json`)、
+    /// bun (`bunfig.toml`)、mise (`mise.toml` などの `[settings]`) を見て、
+    /// 複数ある場合はより厳しい方 (max) を採用する。
+    ///
+    /// mise 側の既定値 (24h) は「明示設定なし」なので採用しない。ファイルに
+    /// `minimum_release_age` が書かれている場合だけプロジェクトポリシーとして扱う。
     fn read_project_minimum_release_age(&self) -> Option<ProjectAge> {
-        let mut candidates: Vec<(Duration, &'static str)> = Vec::new();
+        let mut candidates: Vec<(Duration, String)> = Vec::new();
 
         if has_pnpm_workspace(&self.args.path)
             && let Some((age, source)) =
                 PnpmSettings::minimum_release_age_with_source(&self.args.path)
         {
             // source は実際に値が読まれたファイル (.npmrc / pnpm-workspace.yaml / package.json)
-            candidates.push((age, source));
+            candidates.push((age, source.to_string()));
         }
         if has_bunfig(&self.args.path) {
             let bun = BunSettings::from_dir(&self.args.path);
             if let Some(age) = bun.minimum_release_age {
-                candidates.push((age, "bunfig.toml"));
+                candidates.push((age, "bunfig.toml".to_string()));
+            }
+        }
+        if has_mise_config(&self.args.path) {
+            let mise = MiseSettings::from_dir(&self.args.path);
+            if let Some(age) = mise.minimum_release_age {
+                let source = mise.source.unwrap_or_else(|| "mise.toml".to_string());
+                candidates.push((age, source));
             }
         }
 
         candidates
             .into_iter()
             .max_by_key(|(d, _)| *d)
-            .map(|(duration, source)| ProjectAge {
-                duration,
-                source: source.to_string(),
-            })
+            .map(|(duration, source)| ProjectAge { duration, source })
+    }
+
+    /// `mise` コマンドが無い環境では mise マニフェストを処理対象から外す。
+    ///
+    /// mise のバージョン解決は `mise ls-remote` に委譲しているため、コマンドが
+    /// 無ければ全ツールが同じ理由で fetch 失敗する。依存の数だけ同じエラーを
+    /// 並べても情報量がないので、マニフェスト単位で外して警告を 1 回だけ出す。
+    fn filter_out_unusable_mise_manifests(&self, manifests: &[ManifestInfo]) -> Vec<ManifestInfo> {
+        use colored::Colorize as _;
+
+        let mise_manifests = manifests
+            .iter()
+            .filter(|m| m.language == Language::Mise)
+            .count();
+        if mise_manifests == 0 || MiseAdapter::is_available() {
+            return manifests.to_vec();
+        }
+
+        let msg = format!(
+            "⚠ skipping {} mise manifest(s): `mise` command not found in PATH (see https://mise.jdx.dev)",
+            mise_manifests
+        );
+        eprintln!("{}", msg.yellow());
+
+        manifests
+            .iter()
+            .filter(|m| m.language != Language::Mise)
+            .cloned()
+            .collect()
+    }
+
+    /// mise の `minimum_release_age_excludes` は depup 側では解釈しないため、
+    /// 設定されている場合に一度だけ注意を促す。
+    ///
+    /// mise は excludes に挙げたツールを age 制約から外すが、depup は
+    /// 全ツールへ一律に age を適用する。両者の食い違い (depup では「更新なし」
+    /// なのに `mise install` では新しい版が入る、など) を黙って起こさないよう、
+    /// 差があること自体を伝える。
+    fn warn_mise_age_excludes(&self) {
+        use colored::Colorize as _;
+        if !has_mise_config(&self.args.path) {
+            return;
+        }
+        let mise = MiseSettings::from_dir(&self.args.path);
+        if mise.minimum_release_age_excludes.is_empty() {
+            return;
+        }
+        let msg = format!(
+            "⚠ mise's minimum_release_age_excludes ({}) is not applied by depup: age is enforced for all tools",
+            mise.minimum_release_age_excludes.join(", ")
+        );
+        eprintln!("{}", msg.yellow());
     }
 
     /// CLI引数に基づいて言語を処理すべきかチェックする
@@ -862,6 +929,7 @@ impl Orchestrator {
             Language::Php => self.args.php,
             Language::Java => self.args.java,
             Language::Swift => self.args.swift,
+            Language::Mise => self.args.mise,
         }
     }
 
@@ -876,6 +944,8 @@ impl Orchestrator {
             Language::Php => Box::new(PackagistAdapter::new(self.client.clone())),
             Language::Java => Box::new(MavenCentralAdapter::new(self.client.clone())),
             Language::Swift => Box::new(GitHubTagsAdapter::new(self.client.clone())),
+            // mise は HTTP レジストリではなく `mise ls-remote` の呼び出しで解決する
+            Language::Mise => Box::new(MiseAdapter::new()),
         }
     }
 

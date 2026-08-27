@@ -14,6 +14,7 @@ mod git_remote;
 mod github_tags;
 mod go_proxy;
 mod maven_central;
+mod mise_registry;
 mod npm;
 mod packagist;
 mod pypi;
@@ -26,6 +27,7 @@ pub use git_remote::{GitRemote, GitRemoteError, GitRemoteRefs, parse_ls_remote_o
 pub use github_tags::GitHubTagsAdapter;
 pub use go_proxy::GoProxyAdapter;
 pub use maven_central::MavenCentralAdapter;
+pub use mise_registry::MiseAdapter;
 pub use npm::NpmAdapter;
 pub use packagist::PackagistAdapter;
 pub use pypi::PyPIAdapter;

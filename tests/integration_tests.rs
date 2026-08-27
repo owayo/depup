@@ -1480,6 +1480,112 @@ mod pipeline_tests {
         assert!(updated.contains("^4.18.0"));
     }
 
+    /// mise の一連の処理 (検出→解析→判定→書き込み) をネットワークなしでテストする。
+    /// ベンダー接頭辞の保持と前方一致指定のセグメント数保持が、実際の
+    /// judge → writer 経路で成立することを確認する。
+    #[test]
+    fn test_pipeline_updates_mise_manifest() {
+        let dir = create_test_dir();
+        let path = dir.path().join("mise.toml");
+        fs::write(
+            &path,
+            "[tools]\nnode = \"26.7.0\"\njava = \"temurin-21.0.5\"\npython = \"3.13\"\ngh = \"latest\"\n",
+        )
+        .unwrap();
+
+        let manifests = detect_manifests(dir.path());
+        let mise = manifests
+            .iter()
+            .find(|m| m.language == depup::domain::Language::Mise)
+            .expect("mise manifest detected");
+
+        let parser = get_parser(mise.language);
+        let content = fs::read_to_string(&path).unwrap();
+        let deps = parser.parse(&content).unwrap();
+        // `gh = "latest"` は浮動指定なので依存として surface しない
+        assert_eq!(deps.len(), 3);
+
+        // `mise ls-remote <tool>` の出力を模したツール別バージョン一覧。
+        // java だけは同じツールの中でベンダーが混ざる (mise の実挙動)。
+        let versions_for = |tool: &str| -> Vec<VersionInfo> {
+            match tool {
+                "node" => vec![
+                    VersionInfo::new("26.8.1", Utc::now() - chrono::Duration::days(30)),
+                    VersionInfo::new("27.1.0", Utc::now() - chrono::Duration::days(20)),
+                ],
+                "java" => vec![
+                    VersionInfo::new("temurin-21.0.9", Utc::now() - chrono::Duration::days(40)),
+                    VersionInfo::new("zulu-27.0.0", Utc::now() - chrono::Duration::days(20)),
+                    VersionInfo::new("27.0.0", Utc::now() - chrono::Duration::days(20)),
+                ],
+                "python" => vec![VersionInfo::new(
+                    "3.14.7",
+                    Utc::now() - chrono::Duration::days(25),
+                )],
+                other => panic!("unexpected tool {other}"),
+            }
+        };
+
+        let judge = UpdateJudge::new(UpdateFilter::new());
+        let mut manifest_result = ManifestUpdateResult::new(&path, mise.language);
+        for dep in &deps {
+            manifest_result.add_result(judge.judge(dep, &versions_for(&dep.name)));
+        }
+
+        let writer = ManifestWriter::new(false);
+        let write_result = writer
+            .apply_updates(&manifest_result, parser.as_ref())
+            .unwrap();
+        assert_eq!(write_result.updates_applied, 3);
+
+        let updated = fs::read_to_string(&path).unwrap();
+        // node は完全一致指定なので完全版へ
+        assert!(updated.contains("node = \"27.1.0\""), "{updated}");
+        // java は temurin 系に留まり、別ベンダー (zulu) へ飛ばない
+        assert!(updated.contains("java = \"temurin-21.0.9\""), "{updated}");
+        // python は前方一致指定なのでセグメント数を保つ
+        assert!(updated.contains("python = \"3.14\""), "{updated}");
+        // 浮動指定は書き換えない
+        assert!(updated.contains("gh = \"latest\""), "{updated}");
+    }
+
+    /// `.tool-versions` も同じ経路で更新できる
+    #[test]
+    fn test_pipeline_updates_tool_versions_file() {
+        let dir = create_test_dir();
+        let path = dir.path().join(".tool-versions");
+        fs::write(&path, "node    26.7.0   # CI 用\nshellcheck latest\n").unwrap();
+
+        let manifests = detect_manifests(dir.path());
+        let mise = manifests
+            .iter()
+            .find(|m| m.language == depup::domain::Language::Mise)
+            .expect("tool-versions manifest detected");
+
+        let parser = get_parser(mise.language);
+        let content = fs::read_to_string(&path).unwrap();
+        let deps = parser.parse(&content).unwrap();
+        assert_eq!(deps.len(), 1);
+
+        let versions = vec![VersionInfo::new(
+            "26.8.1",
+            Utc::now() - chrono::Duration::days(30),
+        )];
+        let judge = UpdateJudge::new(UpdateFilter::new());
+        let mut manifest_result = ManifestUpdateResult::new(&path, mise.language);
+        manifest_result.add_result(judge.judge(&deps[0], &versions));
+
+        let writer = ManifestWriter::new(false);
+        let write_result = writer
+            .apply_updates(&manifest_result, parser.as_ref())
+            .unwrap();
+        assert_eq!(write_result.updates_applied, 1);
+
+        // 空白の並びと行末コメントを保つ
+        let updated = fs::read_to_string(&path).unwrap();
+        assert_eq!(updated, "node    26.8.1   # CI 用\nshellcheck latest\n");
+    }
+
     /// 複数言語を含む処理をテストする
     #[test]
     fn test_pipeline_multi_language() {

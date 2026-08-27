@@ -53,6 +53,7 @@
 ## Features
 
 - **Multi-Language Support**: Node.js, Python, Rust, Go, Ruby, PHP, Java, Swift
+- **mise Support**: Updates tool versions in `mise.toml` / `.tool-versions` through the same workflow
 - **Manifest Updates**: Directly updates version specifications in manifest files
 - **Smart Version Handling**: Preserves version range formats (^, ~, >=) while keeping upper bounds intact
 - **Pinned Version Detection**: Skips intentionally pinned versions by default
@@ -75,11 +76,13 @@
 | <img src="https://img.shields.io/badge/-777BB4?logo=php&logoColor=white" height="16"> PHP | composer.json | Packagist | composer.lock |
 | <img src="https://img.shields.io/badge/-ED8B00?logo=openjdk&logoColor=white" height="16"> Java | build.gradle, build.gradle.kts, gradle/*.versions.toml | Maven Central | gradle.lockfile |
 | <img src="https://img.shields.io/badge/-F05138?logo=swift&logoColor=white" height="16"> Swift | Package.swift | GitHub Tags | Package.resolved |
+| <img src="https://img.shields.io/badge/-EC4899?logo=mise&logoColor=white" height="16"> mise | mise.toml, .mise.toml, .config/mise/config.toml, .tool-versions | `mise ls-remote` | mise.lock |
 
 ## Requirements
 
 - **OS**: macOS, Linux, Windows
 - **Rust**: 1.85+ (for building from source)
+- **mise**: only needed to update mise tool versions (version lists come from `mise ls-remote`). Without it, depup skips mise config files, warns once, and continues with the other languages
 
 ## Installation
 
@@ -173,6 +176,7 @@ depup [OPTIONS] [PATH]
 | `--php` | | Update only PHP dependencies |
 | `--java` | | Update only Java dependencies |
 | `--swift` | | Update only Swift dependencies |
+| `--mise` | | Update only mise tool versions (mise.toml / .tool-versions) |
 | `--exclude <PKG>` | | Exclude specific packages (repeatable) |
 | `--only <PKG>` | | Update only specific packages (repeatable) |
 | `--include-pinned` | | Include pinned versions in update |
@@ -213,6 +217,9 @@ depup --java
 
 # Update Swift (Package.swift) dependencies
 depup --swift
+
+# Update mise tool versions (mise.toml / .tool-versions)
+depup --mise
 
 # JSON output for CI/CD
 depup --json
@@ -390,6 +397,49 @@ For `go.mod`, depup treats block endings with trailing comments such as `) // di
 Quoted `go.mod` module paths and versions, such as `require "golang.org/x/text" "v0.14.0"`, are parsed and updated while preserving the quotes.
 `go.mod` updates preserve the original LF or CRLF line endings in both single-line and block `require` declarations.
 
+## mise Tool Versions
+
+Tool versions declared in [mise](https://mise.jdx.dev) config files go through the same workflow as every other language (detect → parse → judge → write). Version lists come from `mise ls-remote <tool> --json`, so every backend mise supports (core / aqua / ubi / asdf / `npm:` / `cargo:` / `go:` / `pipx:` …) works out of the box.
+
+### Files
+
+`mise.toml`, `.mise.toml`, `mise/config.toml`, `.mise/config.toml`, `.config/mise.toml`, `.config/mise/config.toml`, `.tool-versions`
+
+`mise.local.toml` (personal local override, usually gitignored) and `mise.<env>.toml` (per-environment overlay) are intentionally left alone so depup never rewrites a single environment behind your back.
+
+### Version Specifiers
+
+| Form | Example | Handling |
+|------|---------|----------|
+| Exact | `node = "26.7.0"` | Updated to the latest version |
+| Prefix | `node = "26"` / `"26.7"` | Segment count preserved (`26` → `27`, `26.7` → `26.8`) |
+| Explicit selector | `go = "prefix:1.19"` | `prefix:` preserved (`prefix:1.24`) |
+| Vendored | `java = "temurin-21.0.5"` | Stays within the same vendor (`temurin-21.0.9`) |
+| Inline table | `python = { version = "3.13", virtualenv = ".venv" }` | Only `version` is rewritten; other options are preserved |
+| Table form | `[tools.terraform]` + `version = "1.15.0"` | Same as above |
+| Floating | `latest` / `lts` / `system` | Left as-is — updating would not change the meaning |
+| Non-version | `ref:master` / `path:./shfmt` / `sub-2:lts` | Left as-is |
+| Multiple versions | `python = ["3.12", "3.13"]` | Skipped — there is no single version to rewrite |
+
+Most of the 3000+ entries `mise ls-remote java` returns carry a vendor prefix (`temurin-`, `graalvm-community-`, `zulu-`, …). depup only considers candidates with the same prefix as the current value, so a project on `temurin-21` is never rewritten to `zulu-27`.
+
+Only the `[tools]` section is rewritten; identically named keys under `[settings]`, `[env]`, `[tasks]`, or `[alias]` are untouched. Quote style (`"` / `'`), trailing comments, CRLF line endings, and the column alignment of `.tool-versions` are all preserved.
+
+### mise and the Age Filter
+
+When `[settings] minimum_release_age` is **explicitly set**, depup treats it as a project policy — the same way it treats pnpm's and bun's `minimumReleaseAge` — and it takes precedence over the CLI `--age` (mise's built-in 24h default counts as "unset" and is not adopted).
+
+```toml
+[settings]
+minimum_release_age = "7d"   # s / m (minutes) / h / d / w / M / y
+```
+
+> **Note**: mise's `m` means **minutes** (humantime convention), unlike depup's `--age 1m`, which means one month.
+
+`mise ls-remote` applies mise's own `minimum_release_age` by default and hides newer releases, so depup passes `--minimum-release-age 0` to fetch everything and keeps age evaluation in one place. `minimum_release_age_excludes` is not interpreted by depup; if it is set, depup prints a warning.
+
+With `--install`, depup runs `mise install` and passes the resolved age as `MISE_MINIMUM_RELEASE_AGE`.
+
 ## Age Filter
 
 The `--age` option ensures stability by only updating to versions that have been released for a certain period. **A 1 week (`1w`) age filter is applied by default** to all runs unless overridden:
@@ -462,7 +512,13 @@ To bypass the project setting, remove or override it in the project file.
 minimumReleaseAge = 259200  # seconds (e.g. 3 days)
 ```
 
-When both pnpm and bun sources exist, depup uses the **stricter** (larger) value.
+**mise** (`[settings]` in `mise.toml` and friends):
+```toml
+[settings]
+minimum_release_age = "7d"  # s / m (minutes) / h / d / w / M / y
+```
+
+When several sources exist, depup uses the **stricter** (larger) value.
 
 ### Swift and Age Filter
 
@@ -513,6 +569,7 @@ depup --no-osv
 
 - The OSV.dev API is public and **does not require any authentication token**.
 - Swift packages are skipped — OSV indexes packages by GitHub repository URL rather than by GitHub Tags–style names, so Swift queries from depup would not match.
+- mise tools are skipped — each backend has its own version scheme and namespace, so they cannot be mapped onto a single OSV ecosystem.
 - API errors do not block updates; affected versions remain in the candidate list and the failure is reported in `--verbose`.
 
 ### Fallback Example

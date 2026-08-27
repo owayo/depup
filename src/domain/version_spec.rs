@@ -33,6 +33,13 @@ pub enum VersionSpecKind {
     Range,
     /// `// pinned` コメント付き Go バージョン
     GoPinned,
+    /// プレフィックス選択。例: mise の `node = "26"` / `"26.7"` / `"prefix:26"`
+    ///
+    /// ワイルドカード文字を持たずに部分バージョンだけを書き、
+    /// 「その前方一致に当てはまる最新版」を指す形式。更新時は元のセグメント数を保つ
+    /// (`26` → `27`、`26.7` → `26.8`)。セグメント数が許容幅そのものなので、
+    /// レジストリの完全版をそのまま書き戻すと制約が黙って狭まる。
+    Prefix,
     /// 制約なし。例: `gem 'rails'`
     Any,
 }
@@ -201,6 +208,33 @@ fn format_partial_version_like(raw: &str, new_version: &str) -> Option<String> {
         version_prefix,
         parts[..segment_count].join(".")
     ))
+}
+
+/// プレフィックス選択 (mise の `node = "26"` / `"26.7"`) を、元のセグメント数を
+/// 保ったまま新しいバージョンへ書き換える。
+///
+/// `current_version` は演算子・`prefix:` セレクタ・ベンダー接頭辞を取り除いた
+/// 数値部 (`26` / `26.7`) を渡す。接頭辞・接尾辞の再付与は呼び出し側
+/// (`wrap_with_affixes`) が行う。
+///
+/// 更新先から数値セグメントを取り出せない場合は `None` を返し、
+/// 呼び出し側で元の表記を保つ (捏造した値を書き戻さない)。
+fn format_prefix_like(current_version: &str, new_version: &str) -> Option<String> {
+    let segment_count = current_version
+        .split('.')
+        .take_while(|segment| !segment.is_empty() && segment.bytes().all(|b| b.is_ascii_digit()))
+        .count();
+    if segment_count == 0 {
+        return None;
+    }
+
+    let mut parts = extract_numeric_parts(new_version)?;
+    // 更新先が元より短い場合 (`26.7` → `27`) は 0 埋めして幅を保つ
+    while parts.len() < segment_count {
+        parts.push("0".to_string());
+    }
+
+    Some(parts[..segment_count].join("."))
 }
 
 /// 文字列の先頭にある数値セグメント列 (`1.2.3`) のセグメント数を数える。
@@ -619,6 +653,14 @@ impl VersionSpec {
             }
             VersionSpecKind::Range => format_range_like(&self.raw, new_version),
             VersionSpecKind::Greater | VersionSpecKind::LessOrEqual | VersionSpecKind::Less => None,
+            // Prefix は元のセグメント数が「どこまで固定するか」を表すため、更新後も
+            // セグメント数を保つ (`26` → `27`、`26.7` → `26.8`)。完全版を書き戻すと
+            // mise の `node = "26"` (26 系の最新を都度解決) が `node = "27.1.0"` の
+            // 完全ピンへ黙って変わってしまう。
+            VersionSpecKind::Prefix => {
+                let body = format_prefix_like(&self.version, new_version)?;
+                Some(self.wrap_with_affixes(&body))
+            }
             // Tilde は元のセグメント数が許容幅を決めるため、部分指定 (`~1.2` / `~> 7.0`)
             // は更新後もセグメント数を保つ。切り詰められない入力では完全版を使う。
             VersionSpecKind::Tilde => {

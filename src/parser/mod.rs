@@ -12,6 +12,7 @@
 
 mod go;
 mod java;
+mod mise;
 mod node;
 mod php;
 mod python;
@@ -21,6 +22,8 @@ mod swift;
 
 pub use go::GoVersionParser;
 pub use java::JavaVersionParser;
+pub use mise::MiseVersionParser;
+pub(crate) use mise::{format_mise_version, split_mise_flavor};
 pub use node::NodeVersionParser;
 pub use php::PhpVersionParser;
 pub use python::PythonVersionParser;
@@ -75,6 +78,7 @@ pub fn get_parser(language: Language) -> Box<dyn VersionParser> {
         Language::Php => Box::new(PhpVersionParser),
         Language::Java => Box::new(JavaVersionParser),
         Language::Swift => Box::new(SwiftVersionParser),
+        Language::Mise => Box::new(MiseVersionParser),
     }
 }
 

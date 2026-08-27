@@ -204,6 +204,10 @@ impl SystemPackageManager {
     ///   ライトウェイトなマルウェアチェックを有効化する (Astral の preview
     ///   機能。`uv audit` 機能の一部)。未対応の uv バージョンではこの
     ///   env var は未知の設定として無視される (graceful no-op)。
+    /// - **mise**: `MISE_MINIMUM_RELEASE_AGE=<期間>` で、`mise install` が
+    ///   前方一致指定 (`node = "26"`) を解決するときにも age 制約を効かせる。
+    ///   depup が完全版へ書き換えた依存には影響しないが、部分指定のまま残る
+    ///   ツールでは mise 側の解決に効く。
     /// - 他 PM: 現状追加なし。
     fn get_install_env(&self, pm: &str, min_age: Option<Duration>) -> Vec<(String, String)> {
         let mut env: Vec<(String, String)> = Vec::new();
@@ -214,6 +218,15 @@ impl SystemPackageManager {
             env.push((
                 "npm_config_minimum_release_age".to_string(),
                 minutes.to_string(),
+            ));
+        }
+        if let Some(age) = min_age
+            && pm == "mise"
+        {
+            // mise は humantime 表記を受け付ける (`604800s` のような秒指定も可)
+            env.push((
+                "MISE_MINIMUM_RELEASE_AGE".to_string(),
+                format!("{}s", age.as_secs()),
             ));
         }
         if pm == "uv" {
@@ -254,6 +267,10 @@ impl SystemPackageManager {
             "./gradlew" => vec!["./gradlew", "dependencies"],
             // Swift の処理
             "swift" => vec!["swift", "package", "resolve"],
+            // mise の処理。`mise install` は設定ファイルに書かれたバージョンを
+            // そのまま入れる (`mise upgrade` と違い、depup が書いた版を尊重する)。
+            // lockfile 設定が有効なら mise.lock もここで更新される。
+            "mise" => vec!["mise", "install"],
             _ => vec![],
         }
     }
@@ -328,6 +345,13 @@ impl SystemPackageManager {
                 })
             }
             Language::Swift => pm_if_any_exists(working_dir, &["Package.swift"], "swift"),
+            // mise 設定ファイル (TOML 形式 / .tool-versions) のいずれかがあれば
+            // `mise install` でツールを入れ直す
+            Language::Mise => {
+                let mut candidates: Vec<&str> = crate::manifest::MISE_CONFIG_FILENAMES.to_vec();
+                candidates.push(crate::manifest::TOOL_VERSIONS_FILENAME);
+                pm_if_any_exists(working_dir, &candidates, "mise")
+            }
         }?;
 
         Some((working_dir.to_path_buf(), pm))
@@ -606,6 +630,67 @@ mod tests {
         let pm = SystemPackageManager::new();
         let env = pm.get_install_env("pnpm", None);
         assert!(env.is_empty());
+    }
+
+    #[test]
+    fn test_get_install_command_mise() {
+        // `mise upgrade` ではなく `mise install` を使う。depup がマニフェストへ
+        // 書いた版をそのまま入れる (upgrade は mise 自身が版を選び直してしまう)。
+        let pm = SystemPackageManager::new();
+        assert_eq!(pm.get_install_command("mise"), vec!["mise", "install"]);
+    }
+
+    #[test]
+    fn test_get_install_env_mise_with_age() {
+        let pm = SystemPackageManager::new();
+        let age = Duration::from_secs(7 * 24 * 60 * 60);
+        let env = pm.get_install_env("mise", Some(age));
+        assert_eq!(
+            env,
+            vec![(
+                "MISE_MINIMUM_RELEASE_AGE".to_string(),
+                "604800s".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn test_get_install_env_mise_without_age() {
+        let pm = SystemPackageManager::new();
+        assert!(pm.get_install_env("mise", None).is_empty());
+    }
+
+    #[test]
+    fn test_resolve_package_manager_mise() {
+        use tempfile::TempDir;
+
+        let pm = SystemPackageManager::new();
+        let dir = TempDir::new().unwrap();
+        assert!(
+            pm.resolve_package_manager(Language::Mise, dir.path())
+                .is_none()
+        );
+
+        std::fs::write(dir.path().join("mise.toml"), "[tools]\nnode = \"26.7.0\"\n").unwrap();
+        let (working_dir, command) = pm
+            .resolve_package_manager(Language::Mise, dir.path())
+            .unwrap();
+        assert_eq!(working_dir, dir.path());
+        assert_eq!(command, "mise");
+    }
+
+    /// `.tool-versions` しか無いディレクトリでも mise install を選ぶ
+    #[test]
+    fn test_resolve_package_manager_mise_tool_versions() {
+        use tempfile::TempDir;
+
+        let pm = SystemPackageManager::new();
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".tool-versions"), "node 26.7.0\n").unwrap();
+        let (_, command) = pm
+            .resolve_package_manager(Language::Mise, dir.path())
+            .unwrap();
+        assert_eq!(command, "mise");
     }
 
     #[test]

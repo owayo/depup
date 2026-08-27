@@ -53,6 +53,7 @@
 ## 特徴
 
 - **マルチ言語対応**: Node.js, Python, Rust, Go, Ruby, PHP, Java, Swift
+- **mise 対応**: `mise.toml` / `.tool-versions` のツールバージョンも同じワークフローで更新
 - **マニフェスト更新**: マニフェストファイル内のバージョン指定を直接更新
 - **スマートバージョン処理**: バージョン範囲形式（^, ~, >=）を維持しつつ、上限を壊さずに更新
 - **固定バージョン検出**: 意図的に固定されたバージョンはデフォルトでスキップ
@@ -75,11 +76,13 @@
 | <img src="https://img.shields.io/badge/-777BB4?logo=php&logoColor=white" height="16"> PHP | composer.json | Packagist | composer.lock |
 | <img src="https://img.shields.io/badge/-ED8B00?logo=openjdk&logoColor=white" height="16"> Java | build.gradle, build.gradle.kts, gradle/*.versions.toml | Maven Central | gradle.lockfile |
 | <img src="https://img.shields.io/badge/-F05138?logo=swift&logoColor=white" height="16"> Swift | Package.swift | GitHub Tags | Package.resolved |
+| <img src="https://img.shields.io/badge/-EC4899?logo=mise&logoColor=white" height="16"> mise | mise.toml, .mise.toml, .config/mise/config.toml, .tool-versions | `mise ls-remote` | mise.lock |
 
 ## 動作要件
 
 - **OS**: macOS, Linux, Windows
 - **Rust**: 1.85以上（ソースからビルドする場合）
+- **mise**: mise のツールバージョンを更新する場合のみ必要（バージョン一覧は `mise ls-remote` から取得します）。未インストールの環境では mise の設定ファイルをスキップし、警告を 1 回表示して他の言語の更新を続行します
 
 ## インストール
 
@@ -173,6 +176,7 @@ depup [OPTIONS] [PATH]
 | `--php` | | PHPの依存関係のみ更新 |
 | `--java` | | Javaの依存関係のみ更新 |
 | `--swift` | | Swiftの依存関係のみ更新 |
+| `--mise` | | mise（mise.toml / .tool-versions）のツールバージョンのみ更新 |
 | `--exclude <PKG>` | | 特定パッケージを除外（複数指定可） |
 | `--only <PKG>` | | 特定パッケージのみ更新（複数指定可） |
 | `--include-pinned` | | 固定バージョンも更新対象に含める |
@@ -213,6 +217,9 @@ depup --java
 
 # Swift（Package.swift）の依存関係のみ更新
 depup --swift
+
+# mise（mise.toml / .tool-versions）のツールバージョンのみ更新
+depup --mise
 
 # CI/CD用にJSON出力
 depup --json
@@ -390,6 +397,49 @@ SPM の semver 2.0.0 仕様に合わせ、プレリリース識別子付きバ�
 `require "golang.org/x/text" "v0.14.0"` のような quoted module path / version も解析し、引用符を維持して更新します。
 `go.mod` の単一行・ブロック形式の `require` 更新では、元の LF / CRLF 改行を維持します。
 
+## mise のツールバージョン
+
+mise（[jdx/mise](https://mise.jdx.dev)）の設定ファイルに書かれたツールバージョンも、他の言語と同じワークフロー（検出 → 解析 → 判定 → 書き込み）で更新します。バージョン一覧は `mise ls-remote <tool> --json` から取得するため、mise が対応するすべてのバックエンド（core / aqua / ubi / asdf / npm: / cargo: / go: / pipx: など）をそのまま扱えます。
+
+### 対象ファイル
+
+`mise.toml` / `.mise.toml` / `mise/config.toml` / `.mise/config.toml` / `.config/mise.toml` / `.config/mise/config.toml` / `.tool-versions`
+
+`mise.local.toml`（個人のローカル上書き。通常 gitignore 対象）と `mise.<env>.toml`（環境別 overlay）は、意図しない環境だけを書き換えないよう対象外です。
+
+### バージョン指定の扱い
+
+| 記法 | 例 | 扱い |
+|------|-----|------|
+| 完全一致 | `node = "26.7.0"` | 最新版へ更新 |
+| 前方一致 | `node = "26"` / `"26.7"` | セグメント数を保って更新（`26` → `27`、`26.7` → `26.8`） |
+| 明示セレクタ | `go = "prefix:1.19"` | `prefix:` を保持して更新（`prefix:1.24`） |
+| ベンダー付き | `java = "temurin-21.0.5"` | 同じベンダー内で更新（`temurin-21.0.9`） |
+| inline table | `python = { version = "3.13", virtualenv = ".venv" }` | `version` だけ更新し他のオプションは保持 |
+| テーブル形式 | `[tools.terraform]` + `version = "1.15.0"` | 同上 |
+| 浮動指定 | `latest` / `lts` / `system` | 意味が変わらないため更新対象外 |
+| 非バージョン | `ref:master` / `path:./shfmt` / `sub-2:lts` | 更新対象外 |
+| 複数バージョン | `python = ["3.12", "3.13"]` | どれを更新すべきか決められないため対象外 |
+
+`mise ls-remote java` が返す 3000 件超のうち大半は `temurin-` / `graalvm-community-` / `zulu-` などのベンダー接頭辞付きです。depup は現在の指定と同じ接頭辞の候補だけを対象にするため、`temurin-21` を使っているプロジェクトが `zulu-27` に書き換わることはありません。
+
+`[tools]` セクションだけを書き換え、`[settings]` / `[env]` / `[tasks]` / `[alias]` に同名のキーがあっても変更しません。引用符の種別（`"` / `'`）、行末コメント、CRLF、`.tool-versions` の空白の並びはすべて保持します。
+
+### mise とエイジフィルター
+
+mise の `[settings] minimum_release_age` が **明示的に書かれている** 場合は、pnpm / bun の `minimumReleaseAge` と同じ「プロジェクトポリシー」として CLI の `--age` より優先します（mise 既定の 24h は「未設定」なので採用しません）。
+
+```toml
+[settings]
+minimum_release_age = "7d"   # s / m（分）/ h / d / w / M / y
+```
+
+> **注意**: mise の `m` は **分**（humantime 準拠）で、depup CLI の `--age 1m`（1 か月）とは単位が違います。
+
+`mise ls-remote` は既定で mise 側の `minimum_release_age` を適用して新しい版を隠しますが、depup は `--minimum-release-age 0` を渡して全件取得し、age 判定を depup 側に一本化します。`minimum_release_age_excludes` は depup では解釈しないため、設定されている場合は警告を表示します。
+
+`--install` では `mise install` を実行し、解決済みの age を `MISE_MINIMUM_RELEASE_AGE` として渡します。
+
 ## エイジフィルター
 
 `--age` オプションは、一定期間リリースされているバージョンのみに更新することで安定性を確保します。**デフォルトで 1 週間（`1w`）の age フィルターが適用されます**（明示的に上書きしない限り）：
@@ -462,7 +512,13 @@ age = "1w"
 minimumReleaseAge = 259200  # 秒単位（例: 3日）
 ```
 
-pnpm と bun の両方にソースがある場合は、**より厳しい**（大きい）値を採用します。
+**mise**（`mise.toml` などの `[settings]`）:
+```toml
+[settings]
+minimum_release_age = "7d"  # s / m（分）/ h / d / w / M / y
+```
+
+複数のソースに値がある場合は、**より厳しい**（大きい）値を採用します。
 
 ### Swift とエイジフィルター
 
@@ -513,6 +569,7 @@ depup --no-osv
 
 - OSV.dev API はパブリックで、**認証トークンは不要**。
 - Swift パッケージは対象外（OSV は GitHub リポジトリ URL でインデックスしており、depup が扱う Swift パッケージ名形式とは一致しないため）。
+- mise のツールは対象外（バックエンドごとにバージョン体系も名前空間も異なり、単一の OSV ecosystem へ対応付けられないため）。
 - API エラー時は更新を止めません。該当バージョンは candidate に残し、`--verbose` で警告を表示します。
 
 ### フォールバック例
