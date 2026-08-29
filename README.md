@@ -182,8 +182,8 @@ depup [OPTIONS] [PATH]
 | `--include-pinned` | | Include pinned versions in update |
 | `--age <DURATION>` | | Minimum release age (e.g., 2w, 10d, 1m). Overrides global config |
 | `--no-age` | | Disable age filter for this run (overrides global config and default) |
-| `--osv` | | Check candidates against the OSV.dev vulnerability database and skip versions with known vulnerabilities |
-| `--no-osv` | | Disable OSV vulnerability check for this run (overrides global config) |
+| `--osv` | | Check candidates against the OSV.dev vulnerability database and skip versions with known vulnerabilities (enabled by default) |
+| `--no-osv` | | Disable OSV vulnerability check for this run (overrides global config and default) |
 | `--max-change <LEVEL>` | | Limit allowed bumps: `patch` (patch only), `minor` (patch + minor), `major` (default — all) |
 | `--json` | | Output results in JSON format |
 | `--diff` | | Show changes in diff format |
@@ -472,8 +472,9 @@ depup auto-generates `~/.config/depup/config.toml` on first run with commented d
 # Accepts the same format as --age (Nd / Nw / Nm). Omit to use the built-in default (1w).
 age = "1w"
 
-# Enable OSV vulnerability check by default (commented out by default).
-# osv = false
+# Check candidates against the OSV.dev vulnerability database (built-in default: true).
+# Set to false to opt out of the check on every run.
+osv = true
 ```
 
 **Priority order (highest first):**
@@ -557,13 +558,16 @@ max_change = "minor"
 
 ## Vulnerability Check (OSV.dev)
 
-The `--osv` flag queries the public [OSV.dev](https://osv.dev/) database for each candidate version and skips versions with known vulnerabilities. Combined with the age filter, depup naturally falls back to the next safe, mature version:
+depup queries the public [OSV.dev](https://osv.dev/) database for each candidate version and skips versions with known vulnerabilities. **This check is enabled by default** — no flag required. Combined with the age filter, depup naturally falls back to the next safe, mature version:
 
 ```bash
-# Check candidates against OSV and skip vulnerable versions
+# OSV check runs by default
+depup
+
+# Same as above (explicit opt-in, overrides `osv = false` in global config)
 depup --osv
 
-# Disable OSV check for this run (overrides global config)
+# Disable OSV check for this run (overrides global config and default)
 depup --no-osv
 ```
 
@@ -602,20 +606,22 @@ The `falling back` message is an expected notification of safe behavior and does
 
 ### Global Configuration
 
-Enable OSV checking by default in the auto-generated `~/.config/depup/config.toml`:
+The check is on by default. Opt out permanently in the auto-generated `~/.config/depup/config.toml`:
 
 ```toml
 # ~/.config/depup/config.toml
 
-# Default to skipping vulnerable versions on every run.
-osv = true
+# Skip the OSV lookup on every run (built-in default is true).
+osv = false
 ```
 
 **Priority order (highest first):**
 1. `--no-osv` (disables the check)
 2. `--osv` CLI flag
 3. `~/.config/depup/config.toml` `osv` value
-4. Built-in default (`false` — OSV check disabled)
+4. Built-in default (`true` — OSV check enabled)
+
+If the config file is missing, or it has no `osv` key, the built-in default applies and the check runs.
 
 ## uv Malware Check (preview)
 

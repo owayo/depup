@@ -17,11 +17,18 @@ use crate::domain::ChangeLevel;
 /// 未指定のときに使用される。
 pub const DEFAULT_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
+/// 組み込みデフォルトの OSV 脆弱性チェック (有効)。
+///
+/// グローバル設定ファイルが存在しないとき、または存在しても `osv` が
+/// 未指定のときに使用される。`--no-osv` またはグローバル設定の
+/// `osv = false` で無効化できる。
+pub const DEFAULT_OSV: bool = true;
+
 /// 初回起動時に書き出されるデフォルト設定の TOML 内容。
 ///
-/// 組み込みデフォルト (age=1w, osv=false) と一致するキーを生成する。
-/// オプトイン項目 (osv) はコメントアウトしておき、ユーザーが必要時に
-/// アンコメントできるようにする。
+/// 組み込みデフォルト (age=1w, osv=true) と一致するキーを生成する。
+/// オプトアウト項目 (max_change) はコメントアウトしておき、ユーザーが
+/// 必要時にアンコメントできるようにする。
 pub const DEFAULT_CONFIG_CONTENT: &str = r#"# depup global configuration
 # https://github.com/owayo/depup
 #
@@ -34,9 +41,10 @@ pub const DEFAULT_CONFIG_CONTENT: &str = r#"# depup global configuration
 age = "1w"
 
 # Check candidate versions against the OSV.dev vulnerability database
-# and skip versions with known vulnerabilities.
+# and skip versions with known vulnerabilities (enabled by default).
+# Requires network access; on API errors depup keeps the original candidate.
 # Override per-run with --osv / --no-osv.
-# osv = false
+osv = true
 
 # Limit the maximum allowed version change.
 # Accepts: "patch" (allow only patch bumps), "minor" (allow patch + minor),
@@ -56,7 +64,8 @@ pub struct GlobalConfig {
     pub age: Option<String>,
 
     /// OSV.dev による脆弱性チェックをデフォルトで有効にするか。
-    /// 未指定または `false` の場合は OSV チェック無効 (組み込みデフォルト)。
+    /// 未指定の場合は組み込みデフォルト (`true` = OSV チェック有効) が使われる。
+    /// 明示的に `false` を書けば無効化できる。
     #[serde(default)]
     pub osv: Option<bool>,
 
@@ -183,7 +192,7 @@ pub fn resolve_max_change(
 /// 1. `--no-osv` が指定されていれば `false`
 /// 2. `--osv` が指定されていれば `true`
 /// 3. グローバル設定の `osv` が指定されていればその値
-/// 4. それ以外は `false` (組み込みデフォルト = OSV チェック無効)
+/// 4. それ以外は `true` (組み込みデフォルト = OSV チェック有効)
 pub fn resolve_osv(cli_osv: bool, no_osv: bool, config: Option<&GlobalConfig>) -> bool {
     if no_osv {
         return false;
@@ -196,7 +205,7 @@ pub fn resolve_osv(cli_osv: bool, no_osv: bool, config: Option<&GlobalConfig>) -
     {
         return v;
     }
-    false
+    DEFAULT_OSV
 }
 
 #[cfg(test)]
@@ -219,9 +228,9 @@ mod tests {
         assert!(!path.exists());
 
         let cfg = GlobalConfig::load_from(&path).expect("missing file should be auto-created");
-        // 雛形のデフォルトでは age=1w が書かれ、osv はコメントアウト
+        // 雛形のデフォルトでは age=1w / osv=true が書かれる
         assert_eq!(cfg.age.as_deref(), Some("1w"));
-        assert!(cfg.osv.is_none());
+        assert_eq!(cfg.osv, Some(true));
         assert!(path.exists(), "file should be created");
     }
 
@@ -258,7 +267,7 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("depup global configuration"));
         assert!(content.contains("age = \"1w\""));
-        assert!(content.contains("# osv = false"));
+        assert!(content.contains("\nosv = true"));
     }
 
     #[test]
@@ -266,9 +275,10 @@ mod tests {
         // 自動生成テンプレートが GlobalConfig としてパース可能であることを保証
         let cfg: GlobalConfig = toml::from_str(DEFAULT_CONFIG_CONTENT).unwrap();
         assert_eq!(cfg.age.as_deref(), Some("1w"));
-        assert!(
-            cfg.osv.is_none(),
-            "osv はコメントアウトされているため未指定"
+        assert_eq!(
+            cfg.osv,
+            Some(DEFAULT_OSV),
+            "雛形の osv は組み込みデフォルトと一致する"
         );
     }
 
@@ -350,10 +360,26 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_osv_default_false() {
-        assert!(!resolve_osv(false, false, None));
-        let cfg = GlobalConfig::default();
+    fn test_resolve_osv_config_false_disables_default() {
+        // 組み込みデフォルトが true でも、設定の明示的な false は尊重される
+        let cfg = GlobalConfig {
+            osv: Some(false),
+            ..Default::default()
+        };
         assert!(!resolve_osv(false, false, Some(&cfg)));
+    }
+
+    #[test]
+    fn test_resolve_osv_no_osv_wins_over_default() {
+        // 設定なし (= 組み込みデフォルト true) でも --no-osv で無効化できる
+        assert!(!resolve_osv(false, true, None));
+    }
+
+    #[test]
+    fn test_resolve_osv_default_true() {
+        assert!(resolve_osv(false, false, None));
+        let cfg = GlobalConfig::default();
+        assert!(resolve_osv(false, false, Some(&cfg)));
     }
 
     #[test]
