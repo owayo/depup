@@ -521,6 +521,18 @@ minimum_release_age = "7d"  # s / m（分）/ h / d / w / M / y
 
 複数のソースに値がある場合は、**より厳しい**（大きい）値を採用します。
 
+### 推移的依存とエイジフィルター（Rust）
+
+`--install` を指定すると、depup は install によって解決バージョンが変わった crate だけを対象に公開日を確認し、age ポリシーに違反するものを差し戻します：
+
+```
+Auditing transitive Rust dependencies [██████▒▒▒▒] 18/24 (Auditing hyper)
+  . — 13 transitive dep(s) rolled back to satisfy --age:
+    hyper 1.11.1 → 1.11.0
+```
+
+対象を「変わったもの」に限るのは、crates.io が 1 リクエスト/秒で応答するため、lockfile 全体（数百 crate）を舐めると画面に何も出ないまま数分止まってしまうからです。install 前に `Cargo.lock` が無かった場合は全エントリが新規扱いになるので、監査全体を 180 秒で打ち切り、残りは未検証として報告します（実行自体は失敗させません）。
+
 ### Swift とエイジフィルター
 
 GitHub Tags API はタグのリリース日時を返しません。そのため Swift パッケージは `--age` 指定時もエイジフィルターの対象外として扱われます（更新対象に含まれます）。

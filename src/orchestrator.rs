@@ -14,8 +14,8 @@ use crate::domain::{
 };
 use crate::global_config::{DEFAULT_AGE, GlobalConfig};
 use crate::manifest::{
-    BunSettings, ManifestInfo, ManifestWriter, MiseSettings, PnpmSettings, WriteResult,
-    detect_manifests, find_cargo_lock_upward, get_parser, has_bunfig, has_mise_config,
+    BunSettings, ManifestInfo, ManifestWriter, MiseSettings, PnpmSettings, RegistryLockEntries,
+    WriteResult, detect_manifests, find_cargo_lock_upward, get_parser, has_bunfig, has_mise_config,
     has_pnpm_workspace, read_git_entries, read_registry_entries,
 };
 use crate::osv::{OsvCheck, OsvChecker};
@@ -33,7 +33,7 @@ use indicatif::ProgressBar;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::sync::{Mutex, Semaphore};
 
@@ -58,6 +58,21 @@ fn version_check_concurrency(dep_count: usize) -> usize {
 /// 差し戻しの結果として別の依存が新たに age 違反になるケースがある。
 /// 反復することで連鎖を解消するが、無限ループを避けるため上限を設ける。
 const MAX_ENFORCE_LOCK_AGE_PASSES: usize = 5;
+
+/// `enforce_lock_age_rust` がレジストリ照会に使える時間の上限。
+///
+/// crates.io は crawler policy により 1 リクエスト/秒へ直列化されるため、監査対象が
+/// 数百件に膨らむと数分間ネットワーク待ちで無音になり、利用者からはハングと区別が
+/// つかない。通常は差分監査 (`changed_entries`) で数件に収まるが、Cargo.lock を
+/// 新規生成した直後など対象が大量になるケースの安全弁として上限を設ける。
+/// 予算切れの場合は監査済みの分を適用したうえで、未検証件数を呼び出し側へ返す。
+pub const LOCK_AGE_AUDIT_BUDGET: Duration = Duration::from_secs(180);
+
+/// age 監査の差し戻しで起動する `cargo update -p --precise` 1 回あたりの上限。
+///
+/// cargo 自身がレジストリアクセスで固まっても監査フェーズごと止まらないようにする。
+/// 通常はインデックス取得込みでも数秒で終わる。
+const CARGO_UPDATE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// バージョン情報のキャッシュ (言語, パッケージ名) をキーとする
 pub type VersionCache = Arc<Mutex<HashMap<(Language, String), Vec<VersionInfo>>>>;
@@ -293,32 +308,75 @@ impl Orchestrator {
     /// 新たに age 違反になる可能性があるため、最大 `MAX_ENFORCE_LOCK_AGE_PASSES` 回
     /// 反復する。変化がなくなった時点で終了する。
     ///
-    /// 戻り値: 反復全体で試行された調整のリスト (最終結果の集約)
+    /// 戻り値: 反復全体で試行された調整のリストと、時間予算切れで未検証に終わった件数
     pub async fn enforce_lock_age_rust(
         &self,
         project_dir: &Path,
         min_age: Duration,
-    ) -> Vec<LockAgeAdjustment> {
+        baseline: &RegistryLockEntries,
+        bar: Option<&ProgressBar>,
+    ) -> LockAgeAuditResult {
         let Some(cutoff) = crate::domain::cutoff_now(min_age) else {
-            return Vec::new();
+            return LockAgeAuditResult::default();
         };
         let adapter = CratesIoAdapter::new(self.client.clone());
 
         let mut aggregated: Vec<LockAgeAdjustment> = Vec::new();
         let mut previously_tried: std::collections::HashSet<(String, String)> =
             std::collections::HashSet::new();
+        let mut unchecked = 0usize;
+        let started = Instant::now();
 
-        for _pass in 0..MAX_ENFORCE_LOCK_AGE_PASSES {
+        for pass in 0..MAX_ENFORCE_LOCK_AGE_PASSES {
             let lock_path = project_dir.join("Cargo.lock");
             let entries = read_registry_entries(&lock_path);
-            if entries.is_empty() {
+            // install 前と同じバージョンで lock されていた依存は depup の更新で入った
+            // ものではないため監査しない。crates.io は 1 リクエスト/秒に直列化される
+            // ので、lock 全体 (数百件) を舐めると監査だけで数分の無音待ちになる。
+            let targets = changed_entries(&entries, baseline);
+            if targets.is_empty() {
                 break;
+            }
+            if let Some(b) = bar {
+                // 位置を先に戻す。長さを先に縮めると、前パスの位置が残っている間に
+                // 描画されて `14/1` のような不整合が一瞬見える
+                b.set_position(0);
+                b.set_length(targets.len() as u64);
+            }
+            if pass == 0 && self.args.verbose {
+                let message = format!(
+                    "  {} — {} crate(s) changed by install; checking release dates",
+                    project_dir.display(),
+                    targets.len()
+                );
+                match bar {
+                    Some(b) => b.suspend(|| eprintln!("{message}")),
+                    None => eprintln!("{message}"),
+                }
             }
 
             let mut pass_adjustments: Vec<LockAgeAdjustment> = Vec::new();
             let mut any_downgraded = false;
+            let mut budget_exhausted = false;
+            let mut completed = 0usize;
 
-            for (name, versions) in &entries {
+            for (index, (name, versions)) in targets.iter().enumerate() {
+                let elapsed = started.elapsed();
+                if elapsed >= LOCK_AGE_AUDIT_BUDGET {
+                    // 予算切れ: 監査済みの調整は活かしつつ、残件数を呼び出し側へ返す
+                    unchecked = targets.len() - index;
+                    budget_exhausted = true;
+                    break;
+                }
+                // 差し戻しの `cargo update` にも残り予算を渡す。ここでクランプしないと
+                // 予算切れ直前に始まった 1 件が上限を大きく踏み越える
+                let remaining = LOCK_AGE_AUDIT_BUDGET - elapsed;
+                // 位置はインデックスから設定する (fetch 失敗時の `continue` を挟んでも
+                // 進捗がずれない)
+                if let Some(b) = bar {
+                    b.set_position(index as u64);
+                    b.set_message(format!("Auditing {}", name));
+                }
                 let all_versions = match self.fetch_versions(&adapter, name).await {
                     Ok(v) => v,
                     Err(_) => {
@@ -365,9 +423,25 @@ impl Orchestrator {
                         continue;
                     };
 
+                    // 差し戻しの成否によらず試行済みとして記録する。resolver 制約で
+                    // 失敗した組合せは、別の差し戻しで制約が緩めば理論上は成功しうるが、
+                    // 再試行を許すとパスごとに同じ `cargo update` を繰り返し、
+                    // (失敗件数 × 最大 5 パス) 分だけ監査が伸びる。無言の長時間実行を
+                    // 減らすのが本来の目的なので 1 回で確定させる
                     previously_tried.insert(key.clone());
-                    let status =
-                        run_cargo_update_precise(project_dir, name, current, &target).await;
+                    // `cargo update --precise` は 1 件あたり数秒かかる。バーの位置は
+                    // 動かないため、何を差し戻し中かはメッセージで示す
+                    if let Some(b) = bar {
+                        b.set_message(format!("Rolling back {} {} → {}", name, current, target));
+                    }
+                    let status = run_cargo_update_precise(
+                        project_dir,
+                        name,
+                        current,
+                        &target,
+                        remaining.min(CARGO_UPDATE_TIMEOUT),
+                    )
+                    .await;
                     let (adjust_to, downgraded) = match &status {
                         LockAgeStatus::Downgraded => (Some(target.clone()), true),
                         _ => (None, false),
@@ -382,9 +456,19 @@ impl Orchestrator {
                         status,
                     });
                 }
+                completed = index + 1;
             }
 
             aggregated.extend(pass_adjustments);
+
+            // 予算切れで抜けた場合は実際に監査できた位置で止める (完走に見せない)
+            if let Some(b) = bar {
+                b.set_position(completed as u64);
+            }
+
+            if budget_exhausted {
+                break;
+            }
 
             if !any_downgraded {
                 // このパスで実際の差し戻しが発生しなかった → 収束
@@ -392,7 +476,10 @@ impl Orchestrator {
             }
         }
 
-        aggregated
+        LockAgeAuditResult {
+            adjustments: aggregated,
+            unchecked,
+        }
     }
 
     /// 1 つの依存を処理する: 早期スキップ判定 → fetch → OSV チェック → judge。
@@ -1211,6 +1298,46 @@ struct OnePassResult {
     osv_warnings: Vec<String>,
 }
 
+/// `enforce_lock_age_rust` の実行結果
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LockAgeAuditResult {
+    /// 反復全体で試行された調整のリスト
+    pub adjustments: Vec<LockAgeAdjustment>,
+    /// 時間予算 (`LOCK_AGE_AUDIT_BUDGET`) 切れで監査できずに残った件数 (0 なら完走)
+    pub unchecked: usize,
+}
+
+/// install 前の Cargo.lock (`baseline`) から見て、新規に入った / バージョンが変わった
+/// registry エントリだけを名前順で抽出する。
+///
+/// post-install age 監査の対象を「depup の更新によって lock に入ったもの」へ限定する
+/// ための絞り込み。lock 全体を監査すると crates.io の 1 リクエスト/秒 制限により
+/// 数百件 = 数分の無音待ちになるうえ、depup が触っていない既存の解決結果まで
+/// 差し戻し対象にしてしまう。
+///
+/// `baseline` が空の場合 (install 前に Cargo.lock が無かった等) は全エントリが
+/// 「新規に入ったもの」なので、結果的に全件が対象になる。
+fn changed_entries(
+    current: &RegistryLockEntries,
+    baseline: &RegistryLockEntries,
+) -> Vec<(String, Vec<String>)> {
+    let mut targets: Vec<(String, Vec<String>)> = current
+        .iter()
+        .filter_map(|(name, versions)| {
+            let known = baseline.get(name);
+            let changed: Vec<String> = versions
+                .iter()
+                .filter(|version| known.is_none_or(|locked| !locked.contains(version)))
+                .cloned()
+                .collect();
+            (!changed.is_empty()).then(|| (name.clone(), changed))
+        })
+        .collect();
+    // HashMap の反復順は非決定的なので、進捗表示と報告順を安定させる
+    targets.sort_by(|a, b| a.0.cmp(&b.0));
+    targets
+}
+
 /// `enforce_lock_age_rust` が 1 件の依存に対して実施した調整内容
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockAgeAdjustment {
@@ -1417,19 +1544,25 @@ async fn run_cargo_update_precise(
     name: &str,
     current: &str,
     version: &str,
+    timeout: Duration,
 ) -> LockAgeStatus {
     let spec = format!("{name}@{current}");
-    match Command::new("cargo")
+    let run = Command::new("cargo")
         .args(["update", "-p", &spec, "--precise", version])
         .current_dir(project_dir)
-        .output()
-        .await
-    {
-        Ok(output) if output.status.success() => LockAgeStatus::Downgraded,
-        Ok(output) => LockAgeStatus::UpdateCommandFailed(
+        // タイムアウトで待つのをやめたときに、レジストリ待ちの cargo を残さない
+        .kill_on_drop(true)
+        .output();
+
+    match tokio::time::timeout(timeout, run).await {
+        Ok(Ok(output)) if output.status.success() => LockAgeStatus::Downgraded,
+        Ok(Ok(output)) => LockAgeStatus::UpdateCommandFailed(
             String::from_utf8_lossy(&output.stderr).trim().to_string(),
         ),
-        Err(e) => LockAgeStatus::UpdateCommandFailed(e.to_string()),
+        Ok(Err(e)) => LockAgeStatus::UpdateCommandFailed(e.to_string()),
+        Err(_) => {
+            LockAgeStatus::UpdateCommandFailed(format!("timed out after {}s", timeout.as_secs()))
+        }
     }
 }
 
@@ -1867,6 +2000,94 @@ mod git_helper_tests {
             version,
             chrono::Utc::now() - chrono::Duration::days(days_ago),
         )
+    }
+
+    fn lock_entries(entries: &[(&str, &[&str])]) -> RegistryLockEntries {
+        entries
+            .iter()
+            .map(|(name, versions)| {
+                (
+                    (*name).to_string(),
+                    versions.iter().map(|v| (*v).to_string()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// install 前と同じバージョンで lock されている依存は監査対象に含めない。
+    /// crates.io は 1 リクエスト/秒 なので、lock 全体を舐めると数百件 = 数分かかる。
+    #[test]
+    fn test_changed_entries_excludes_unchanged() {
+        let baseline = lock_entries(&[("serde", &["1.0.200"]), ("tokio", &["1.40.0"])]);
+        let current = lock_entries(&[("serde", &["1.0.200"]), ("tokio", &["1.41.0"])]);
+
+        let targets = changed_entries(&current, &baseline);
+
+        assert_eq!(
+            targets,
+            vec![("tokio".to_string(), vec!["1.41.0".to_string()])]
+        );
+    }
+
+    /// install で新しく lock に入った依存は監査対象になる
+    #[test]
+    fn test_changed_entries_includes_newly_added() {
+        let baseline = lock_entries(&[("serde", &["1.0.200"])]);
+        let current = lock_entries(&[("serde", &["1.0.200"]), ("anyhow", &["1.0.90"])]);
+
+        let targets = changed_entries(&current, &baseline);
+
+        assert_eq!(
+            targets,
+            vec![("anyhow".to_string(), vec!["1.0.90".to_string()])]
+        );
+    }
+
+    /// 同名クレートが複数バージョン lock されている場合、新しく増えた版だけを対象にする
+    #[test]
+    fn test_changed_entries_picks_only_new_versions_of_same_crate() {
+        let baseline = lock_entries(&[("syn", &["1.0.109"])]);
+        let current = lock_entries(&[("syn", &["1.0.109", "2.0.90"])]);
+
+        let targets = changed_entries(&current, &baseline);
+
+        assert_eq!(
+            targets,
+            vec![("syn".to_string(), vec!["2.0.90".to_string()])]
+        );
+    }
+
+    /// install 前に Cargo.lock が無かった場合 (baseline が空) は全件が対象
+    #[test]
+    fn test_changed_entries_empty_baseline_audits_everything() {
+        let baseline = RegistryLockEntries::new();
+        let current = lock_entries(&[("serde", &["1.0.200"]), ("tokio", &["1.41.0"])]);
+
+        let targets = changed_entries(&current, &baseline);
+
+        assert_eq!(targets.len(), 2);
+    }
+
+    /// 進捗表示と報告順を安定させるため、対象は名前順で返る
+    /// (`HashMap` の反復順は非決定的)
+    #[test]
+    fn test_changed_entries_is_sorted_by_name() {
+        let baseline = RegistryLockEntries::new();
+        let current = lock_entries(&[("zerocopy", &["0.7.0"]), ("anyhow", &["1.0.90"])]);
+
+        let targets = changed_entries(&current, &baseline);
+
+        let names: Vec<&str> = targets.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, vec!["anyhow", "zerocopy"]);
+    }
+
+    /// lock が install 前後で変わっていなければ監査対象は空 (レジストリ照会ゼロ)
+    #[test]
+    fn test_changed_entries_no_changes_is_empty() {
+        let baseline = lock_entries(&[("serde", &["1.0.200"])]);
+        let current = lock_entries(&[("serde", &["1.0.200"])]);
+
+        assert!(changed_entries(&current, &baseline).is_empty());
     }
 
     #[test]

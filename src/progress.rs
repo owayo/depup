@@ -75,6 +75,18 @@ impl Progress {
         self.bar.clone()
     }
 
+    /// プログレスバーを一時的に隠してクロージャを実行する
+    ///
+    /// バーの描画中に `eprintln!` すると出力行とバーが混ざるため、進行中に
+    /// 警告や詳細ログを出したいときはこれで包む。バーが無い (quiet / 未開始) 場合は
+    /// クロージャをそのまま実行する。
+    pub fn suspend<F: FnOnce() -> R, R>(&self, f: F) -> R {
+        match self.bar {
+            Some(ref bar) => bar.suspend(f),
+            None => f(),
+        }
+    }
+
     /// メッセージを更新する
     pub fn set_message(&self, message: &str) {
         if let Some(ref bar) = self.bar {

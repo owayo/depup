@@ -17,6 +17,12 @@ const OSV_QUERY_URL: &str = "https://api.osv.dev/v1/query";
 /// API 呼び出しのタイムアウト
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// TCP 接続確立のタイムアウト
+///
+/// 全体タイムアウトとは別に接続確立だけを短く切り、経路が塞がれている環境で
+/// 依存 1 件ごとに `REQUEST_TIMEOUT` いっぱい待たされるのを防ぐ。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// 単一バージョンの脆弱性チェッカ。
 ///
 /// `reqwest::Client` を共有して keep-alive を効かせる。
@@ -65,6 +71,7 @@ impl OsvChecker {
     pub fn new() -> Result<Self, String> {
         let client = Client::builder()
             .timeout(REQUEST_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
             .user_agent(concat!("depup/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|e| format!("failed to build OSV HTTP client: {}", e))?;

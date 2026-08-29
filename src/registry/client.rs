@@ -228,7 +228,28 @@ impl HttpClient {
     ///
     /// `build_request` は試行ごとに呼ばれる (reqwest の `RequestBuilder` は
     /// 再利用できないため)。カスタムヘッダが必要なアダプタはここで付与する。
+    ///
+    /// リトライループ全体を `TOTAL_DEADLINE` で切る。reqwest 側のリクエスト単位
+    /// タイムアウトだけだと、リトライを使い切るまでの合計 (最悪 2 分超) が上限に
+    /// なるうえ、reqwest 内部のタイムアウトが効かず固まるケースを拾えないため。
     pub(crate) async fn get_response_with_retry(
+        &self,
+        build_request: impl Fn() -> reqwest::RequestBuilder,
+        package: &str,
+        registry: &str,
+    ) -> Result<reqwest::Response, RegistryError> {
+        let attempts = self.get_response_with_retry_inner(build_request, package, registry);
+        match tokio::time::timeout(TOTAL_DEADLINE, attempts).await {
+            Ok(result) => result,
+            Err(_) => Err(RegistryError::Timeout {
+                package: package.to_string(),
+                registry: registry.to_string(),
+            }),
+        }
+    }
+
+    /// `get_response_with_retry` のリトライ本体 (総デッドラインの適用前)
+    async fn get_response_with_retry_inner(
         &self,
         build_request: impl Fn() -> reqwest::RequestBuilder,
         package: &str,

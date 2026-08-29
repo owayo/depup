@@ -14,9 +14,11 @@ use depup::cli::CliArgs;
 use depup::config::DepupConfig;
 use depup::domain::Language;
 use depup::global_config::{GlobalConfig, resolve_max_change, resolve_osv};
-use depup::orchestrator::{Orchestrator, OrchestratorResult};
+use depup::manifest::RegistryLockEntries;
+use depup::orchestrator::{LOCK_AGE_AUDIT_BUDGET, Orchestrator, OrchestratorResult};
 use depup::output::{OutputConfig, create_formatter};
 use depup::package_manager::{SystemPackageManager, run_installs};
+use depup::progress::Progress;
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -135,11 +137,20 @@ async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
         // (CLI --age 未指定でもプロジェクト minimumReleaseAge / グローバル設定 / デフォルト 1w が反映される)。
         let install_min_age = orchestrator.resolved_min_age();
 
+        // install 前の Cargo.lock を控えておく。post-install の age 監査は
+        // 「install で新しく入った / 版が変わった」依存だけを対象にする
+        // (crates.io は 1 リクエスト/秒 のため lock 全体を舐めると数分かかる)。
+        let lock_baselines = if install_min_age.is_some() {
+            collect_rust_lock_baselines(&args, &result)
+        } else {
+            HashMap::new()
+        };
+
         run_package_installs(&args, &result, &monorepo_dirs, install_min_age)?;
 
         // Rust の transitive 依存も age 制約を満たすよう Cargo.lock を整える。
         if let Some(age) = install_min_age {
-            enforce_rust_lock_age(&args, &orchestrator, &result, age).await;
+            enforce_rust_lock_age(&args, &orchestrator, &result, &lock_baselines, age).await;
         }
     }
 
@@ -199,34 +210,44 @@ fn run_package_installs(
     let pm_runner = SystemPackageManager::new();
     let mut any_install_failed = false;
 
+    // install コマンドは出力をキャプチャするため完了まで何も表示されない。
+    // `cargo update` / `pnpm install` は分単位でかかることがあり、無表示だと
+    // フリーズと区別がつかないので、実行中の言語をスピナーで示す。
+    let mut progress = Progress::new(!args.quiet);
+
     for (dir, languages) in &install_map {
-        let install_results = run_installs(&pm_runner, languages, dir, min_age);
+        for language in languages {
+            progress.spinner(&format!("Running {} install...", language.display_name()));
+            let install_results =
+                run_installs(&pm_runner, std::slice::from_ref(language), dir, min_age);
+            progress.finish_and_clear();
 
-        for install_result in &install_results {
-            if install_result.command.is_empty() {
-                continue;
-            }
+            for install_result in &install_results {
+                if install_result.command.is_empty() {
+                    continue;
+                }
 
-            if install_result.success {
-                if args.verbose {
+                if install_result.success {
+                    if args.verbose {
+                        eprintln!(
+                            "  {} install completed: {} ({})",
+                            install_result.language.display_name(),
+                            install_result.command,
+                            dir.display()
+                        );
+                    }
+                } else {
                     eprintln!(
-                        "  {} install completed: {} ({})",
+                        "  {} install failed: {} ({})",
                         install_result.language.display_name(),
                         install_result.command,
                         dir.display()
                     );
+                    if !install_result.stderr.is_empty() {
+                        eprintln!("    {}", install_result.stderr);
+                    }
+                    any_install_failed = true;
                 }
-            } else {
-                eprintln!(
-                    "  {} install failed: {} ({})",
-                    install_result.language.display_name(),
-                    install_result.command,
-                    dir.display()
-                );
-                if !install_result.stderr.is_empty() {
-                    eprintln!("    {}", install_result.stderr);
-                }
-                any_install_failed = true;
             }
         }
     }
@@ -238,6 +259,35 @@ fn run_package_installs(
     Ok(())
 }
 
+/// 更新対象の Rust プロジェクトについて、install 前の Cargo.lock の内容を控える。
+///
+/// post-install の age 監査は「install によって新しく入った / 版が変わった」依存だけを
+/// 対象にする。その差分を取るための基準値。install 前に Cargo.lock がまだ無い
+/// ディレクトリは記録しない (install で生成された lock は全エントリが新規となり、
+/// 監査側で空のベースラインとして扱われる)。
+fn collect_rust_lock_baselines(
+    args: &CliArgs,
+    result: &OrchestratorResult,
+) -> HashMap<PathBuf, RegistryLockEntries> {
+    let mut baselines: HashMap<PathBuf, RegistryLockEntries> = HashMap::new();
+    for manifest in &result.summary.manifests {
+        if manifest.language != Language::Rust || !manifest.has_updates() {
+            continue;
+        }
+        let Some(parent) = manifest.path.parent() else {
+            continue;
+        };
+        let Some(lock_path) = depup::manifest::find_cargo_lock_upward(parent, &args.path) else {
+            continue;
+        };
+        let lock_dir = lock_path.parent().unwrap_or(parent).to_path_buf();
+        baselines
+            .entry(lock_dir)
+            .or_insert_with(|| depup::manifest::read_registry_entries(&lock_path));
+    }
+    baselines
+}
+
 /// Rust プロジェクト (Cargo.toml を含む) ディレクトリに対し、
 /// `--age` を transitive 依存にも適用する。install 済み Cargo.lock を走査し、
 /// age 違反の依存を `cargo update -p --precise` で古いバージョンへ差し戻す。
@@ -245,6 +295,7 @@ async fn enforce_rust_lock_age(
     args: &CliArgs,
     orchestrator: &Orchestrator,
     result: &OrchestratorResult,
+    baselines: &HashMap<PathBuf, RegistryLockEntries>,
     age: std::time::Duration,
 ) {
     use depup::orchestrator::LockAgeStatus;
@@ -286,11 +337,37 @@ async fn enforce_rust_lock_age(
         eprintln!("Enforcing --age on transitive Rust dependencies...");
     }
 
+    // 監査は crates.io の 1 リクエスト/秒 制限に律速される。何件目を照会中かを
+    // 出さないと、対象が多いときに無言のフリーズと区別がつかない。
+    let mut progress = Progress::new(!args.quiet);
+    progress.start(0, "Auditing transitive Rust dependencies");
+    let bar = progress.bar();
+
     for dir in &rust_dirs {
-        let adjustments = orchestrator.enforce_lock_age_rust(dir, age).await;
+        let baseline = baselines.get(dir).cloned().unwrap_or_default();
+        let audit = orchestrator
+            .enforce_lock_age_rust(dir, age, &baseline, bar.as_ref())
+            .await;
+        let adjustments = audit.adjustments;
+
+        if audit.unchecked > 0 {
+            progress.suspend(|| {
+                eprintln!(
+                    "  {} — transitive age audit stopped after {}s; {} crate(s) left unchecked",
+                    dir.display(),
+                    LOCK_AGE_AUDIT_BUDGET.as_secs(),
+                    audit.unchecked
+                );
+            });
+        }
+
         if adjustments.is_empty() {
-            if args.verbose {
-                eprintln!("  {} — all transitive deps within --age", dir.display());
+            // 予算切れで未検証が残っている場合は「全て age 内」とは言い切れない
+            // (直前に未検証件数を警告済み)
+            if args.verbose && audit.unchecked == 0 {
+                progress.suspend(|| {
+                    eprintln!("  {} — all transitive deps within --age", dir.display());
+                });
             }
             continue;
         }
@@ -305,40 +382,48 @@ async fn enforce_rust_lock_age(
             .collect();
 
         if !downgraded.is_empty() {
-            eprintln!(
-                "  {} — {} transitive dep(s) rolled back to satisfy --age:",
-                dir.display(),
-                downgraded.len()
-            );
-            for adj in &downgraded {
+            progress.suspend(|| {
                 eprintln!(
-                    "    {} {} → {}",
-                    adj.name,
-                    adj.from,
-                    adj.to.as_deref().unwrap_or("?")
+                    "  {} — {} transitive dep(s) rolled back to satisfy --age:",
+                    dir.display(),
+                    downgraded.len()
                 );
-            }
+                for adj in &downgraded {
+                    eprintln!(
+                        "    {} {} → {}",
+                        adj.name,
+                        adj.from,
+                        adj.to.as_deref().unwrap_or("?")
+                    );
+                }
+            });
         }
 
         if !failures.is_empty() && args.verbose {
-            eprintln!(
-                "  {} — {} transitive dep(s) could not be rolled back:",
-                dir.display(),
-                failures.len()
-            );
-            for adj in &failures {
-                let detail = match &adj.status {
-                    LockAgeStatus::NoOlderCandidate => "no older candidate".to_string(),
-                    LockAgeStatus::ReleaseDateUnavailable => "release date unavailable".to_string(),
-                    LockAgeStatus::UpdateCommandFailed(msg) => {
-                        format!("cargo update failed: {msg}")
-                    }
-                    LockAgeStatus::Downgraded => unreachable!(),
-                };
-                eprintln!("    {} ({}): {}", adj.name, adj.from, detail);
-            }
+            progress.suspend(|| {
+                eprintln!(
+                    "  {} — {} transitive dep(s) could not be rolled back:",
+                    dir.display(),
+                    failures.len()
+                );
+                for adj in &failures {
+                    let detail = match &adj.status {
+                        LockAgeStatus::NoOlderCandidate => "no older candidate".to_string(),
+                        LockAgeStatus::ReleaseDateUnavailable => {
+                            "release date unavailable".to_string()
+                        }
+                        LockAgeStatus::UpdateCommandFailed(msg) => {
+                            format!("cargo update failed: {msg}")
+                        }
+                        LockAgeStatus::Downgraded => unreachable!(),
+                    };
+                    eprintln!("    {} ({}): {}", adj.name, adj.from, detail);
+                }
+            });
         }
     }
+
+    progress.finish_and_clear();
 }
 
 /// 結果からディレクトリ -> install が必要な言語のマップを構築する

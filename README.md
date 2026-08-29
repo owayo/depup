@@ -521,6 +521,18 @@ minimum_release_age = "7d"  # s / m (minutes) / h / d / w / M / y
 
 When several sources exist, depup uses the **stricter** (larger) value.
 
+### Transitive Dependencies (Rust)
+
+With `--install`, depup audits the crates whose locked version the install actually changed, and rolls back any that violate the age policy:
+
+```
+Auditing transitive Rust dependencies [██████▒▒▒▒] 18/24 (Auditing hyper)
+  . — 13 transitive dep(s) rolled back to satisfy --age:
+    hyper 1.11.1 → 1.11.0
+```
+
+Only changed entries are audited. crates.io serves one request per second, so walking an entire lockfile (hundreds of crates) would stall the run for several minutes with nothing on screen. If `Cargo.lock` did not exist before the install, every entry counts as new — the audit is then capped at 180 seconds and whatever is left over is reported as unchecked without failing the run.
+
 ### Swift and Age Filter
 
 The GitHub Tags API does not return per-tag release timestamps, so Swift packages are exempt from the `--age` filter (they are always eligible for updates regardless of the cutoff).
