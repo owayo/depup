@@ -12,6 +12,28 @@ use std::time::Duration;
 /// HTTP リクエストのデフォルトタイムアウト (30秒)
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// TCP 接続確立のタイムアウト (10秒)
+///
+/// 全体タイムアウト (`DEFAULT_TIMEOUT`) とは別に接続確立だけを短く切る。
+/// 経路が塞がれている環境 (プロキシ配下・VPN 切断直後など) で、応答の来ない
+/// SYN を全体タイムアウトいっぱい待たされるのを防ぐ。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// TCP キープアライブの間隔 (60秒)
+///
+/// レート制限で数秒〜数十秒アイドルする接続 (crates.io は 1 リクエスト/秒) が
+/// 経路上の NAT / LB に黙って切られたまま生き残り、次の送信で応答が返らなく
+/// なるのを防ぐ。
+const TCP_KEEPALIVE: Duration = Duration::from_secs(60);
+
+/// リトライを含む 1 URL あたりの総デッドライン (120秒)
+///
+/// reqwest の `timeout` は 1 回の送受信にしか掛からないため、リトライを使い切ると
+/// 最悪 `DEFAULT_TIMEOUT × (MAX_RETRIES + 1)` + バックオフまで伸びる。さらに
+/// reqwest 側のタイムアウトが効かずに固まるケース (接続プール内の半死コネクションを
+/// 掴んだ場合など) の保険として、リトライループ全体を tokio 側でも切る二段構えにする。
+const TOTAL_DEADLINE: Duration = Duration::from_secs(120);
+
 /// デフォルトの User-Agent ヘッダ
 const DEFAULT_USER_AGENT: &str = concat!("depup/", env!("CARGO_PKG_VERSION"));
 
@@ -138,6 +160,8 @@ impl HttpClient {
     pub fn with_config(timeout: Duration, user_agent: &str) -> Result<Self, RegistryError> {
         let client = Client::builder()
             .timeout(timeout)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .tcp_keepalive(TCP_KEEPALIVE)
             .user_agent(user_agent)
             .build()
             .map_err(|e| RegistryError::NetworkError {
