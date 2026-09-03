@@ -600,3 +600,307 @@ pub(super) fn update_version(
         })
         .map(Some)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// テスト用のカタログを組み立てる (`looks_like_version_catalog` を通すため
+    /// 必ずセクションヘッダを含める)
+    fn deps(content: &str) -> Vec<Dependency> {
+        parse(content)
+            .expect("パースが成功するべき")
+            .expect("version catalog として認識されるべき")
+    }
+
+    /// カタログをパースし、指定した Maven 座標の依存を 1 件取り出す
+    fn find(content: &str, name: &str) -> Dependency {
+        deps(content)
+            .into_iter()
+            .find(|d| d.name == name)
+            .unwrap_or_else(|| panic!("{name} が抽出されるべき"))
+    }
+
+    // --- 判別 -------------------------------------------------------------
+
+    #[test]
+    fn test_non_catalog_content_returns_none() {
+        // build.gradle は version catalog ではないので None (呼び出し側が別パーサへ回す)
+        assert!(
+            parse("dependencies {\n  implementation 'a:b:1.0'\n}\n")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_catalog_detected_by_subsection_header() {
+        // `[libraries.foo]` のようなサブセクションだけでも catalog と判別する
+        let content =
+            "[libraries.guava]\nmodule = \"com.google.guava:guava\"\nversion = \"33.0.0\"\n";
+        assert_eq!(deps(content).len(), 1);
+    }
+
+    #[test]
+    fn test_invalid_toml_is_reported_as_error() {
+        // 壊れた TOML は黙って読み飛ばさずエラーにする
+        let result = parse("[libraries]\nguava = \"unterminated\n");
+        assert!(result.is_err(), "壊れた TOML はエラーになるべき");
+    }
+
+    #[test]
+    fn test_catalog_without_libraries_section_is_empty() {
+        // `[versions]` だけのカタログは依存 0 件 (None ではない)
+        let parsed = parse("[versions]\nguava = \"33.0.0\"\n").unwrap();
+        assert_eq!(parsed.expect("catalog として認識されるべき").len(), 0);
+    }
+
+    // --- パース ------------------------------------------------------------
+
+    #[test]
+    fn test_parse_coordinate_string_form() {
+        let dep = find(
+            "[libraries]\njunit = \"junit:junit:4.13.2\"\n",
+            "junit:junit",
+        );
+        assert_eq!(dep.version_spec.version, "4.13.2");
+        assert_eq!(dep.variable_name, None);
+    }
+
+    #[test]
+    fn test_parse_module_with_inline_version() {
+        let content = "[libraries]\nguava = { module = \"com.google.guava:guava\", version = \"33.0.0-jre\" }\n";
+        let dep = find(content, "com.google.guava:guava");
+        assert_eq!(dep.version_spec.version, "33.0.0-jre");
+    }
+
+    #[test]
+    fn test_parse_group_name_version_form() {
+        let content = "[libraries]\ncommons = { group = \"org.apache.commons\", name = \"commons-lang3\", version = \"3.14.0\" }\n";
+        let dep = find(content, "org.apache.commons:commons-lang3");
+        assert_eq!(dep.version_spec.version, "3.14.0");
+    }
+
+    #[test]
+    fn test_parse_version_ref_records_variable_name() {
+        let content = "[versions]\nguava = \"33.0.0\"\n\n[libraries]\nguava = { module = \"com.google.guava:guava\", version.ref = \"guava\" }\n";
+        let dep = find(content, "com.google.guava:guava");
+        assert_eq!(dep.version_spec.version, "33.0.0");
+        // version.ref 名は共有検出のため variable_name に載せる
+        assert_eq!(dep.variable_name.as_deref(), Some("guava"));
+    }
+
+    #[test]
+    fn test_parse_nested_version_ref_table_form() {
+        // `version = { ref = "..." }` は `version.ref = "..."` と同義
+        let content = "[versions]\nguava = \"33.0.0\"\n\n[libraries]\nguava = { module = \"com.google.guava:guava\", version = { ref = \"guava\" } }\n";
+        let dep = find(content, "com.google.guava:guava");
+        assert_eq!(dep.version_spec.version, "33.0.0");
+        assert_eq!(dep.variable_name.as_deref(), Some("guava"));
+    }
+
+    #[test]
+    fn test_parse_dangling_version_ref_is_skipped() {
+        // 参照先が `[versions]` に無いエントリは更新先を決められないので surface しない
+        let content = "[libraries]\nguava = { module = \"com.google.guava:guava\", version.ref = \"missing\" }\n";
+        assert!(deps(content).is_empty());
+    }
+
+    #[test]
+    fn test_parse_library_without_version_is_skipped() {
+        // BOM 管理下でバージョン省略された依存は更新対象にできない
+        let content = "[libraries]\nguava = { module = \"com.google.guava:guava\" }\n";
+        assert!(deps(content).is_empty());
+    }
+
+    #[test]
+    fn test_parse_plugins_are_excluded() {
+        // plugin ID は Maven 座標と一致しないため対象外
+        let content = "[libraries]\njunit = \"junit:junit:4.13.2\"\n\n[plugins]\nspotless = { id = \"com.diffplug.spotless\", version = \"6.25.0\" }\n";
+        let d = deps(content);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].name, "junit:junit");
+    }
+
+    #[test]
+    fn test_parse_rich_version_strictly() {
+        let content = "[versions]\nslf4j = { strictly = \"1.7.25\" }\n\n[libraries]\nslf4j = { module = \"org.slf4j:slf4j-api\", version.ref = \"slf4j\" }\n";
+        let dep = find(content, "org.slf4j:slf4j-api");
+        assert_eq!(dep.version_spec.version, "1.7.25");
+    }
+
+    #[test]
+    fn test_parse_rich_version_strictly_range_uses_prefer_as_current() {
+        // strictly が範囲なら上限制約として保持し、比較基準は prefer の値
+        let content = "[versions]\nslf4j = { strictly = \"[1.7, 1.8[\", prefer = \"1.7.25\" }\n\n[libraries]\nslf4j = { module = \"org.slf4j:slf4j-api\", version.ref = \"slf4j\" }\n";
+        let dep = find(content, "org.slf4j:slf4j-api");
+        assert_eq!(dep.version_spec.kind, VersionSpecKind::Range);
+        assert_eq!(dep.version_spec.version, "1.7.25");
+    }
+
+    #[test]
+    fn test_parse_reject_all_excludes_entry() {
+        // rejectAll = true は全バージョン拒否なので更新対象にしない
+        let content = "[versions]\nslf4j = { rejectAll = true }\n\n[libraries]\nslf4j = { module = \"org.slf4j:slf4j-api\", version.ref = \"slf4j\" }\n";
+        assert!(deps(content).is_empty());
+    }
+
+    #[test]
+    fn test_parse_reject_list_is_carried_into_spec() {
+        let content = "[versions]\nslf4j = { require = \"1.7.25\", reject = [\"1.7.36\", \"1.7.35\"] }\n\n[libraries]\nslf4j = { module = \"org.slf4j:slf4j-api\", version.ref = \"slf4j\" }\n";
+        let dep = find(content, "org.slf4j:slf4j-api");
+        assert_eq!(
+            dep.version_spec.rejected_versions,
+            vec!["1.7.36".to_string(), "1.7.35".to_string()]
+        );
+    }
+
+    // --- 更新 --------------------------------------------------------------
+
+    #[test]
+    fn test_update_coordinate_string_form() {
+        let content = "[libraries]\njunit = \"junit:junit:4.13.2\"\n";
+        let updated = update_version(content, "junit:junit", "4.13.3")
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated, "[libraries]\njunit = \"junit:junit:4.13.3\"\n");
+    }
+
+    #[test]
+    fn test_update_inline_version_member() {
+        let content =
+            "[libraries]\nguava = { module = \"com.google.guava:guava\", version = \"33.0.0\" }\n";
+        let updated = update_version(content, "com.google.guava:guava", "34.0.0")
+            .unwrap()
+            .unwrap();
+        assert!(updated.contains("version = \"34.0.0\""));
+        // module 側の座標は書き換えない
+        assert!(updated.contains("module = \"com.google.guava:guava\""));
+    }
+
+    #[test]
+    fn test_update_version_ref_rewrites_versions_section() {
+        let content = "[versions]\nguava = \"33.0.0\"\n\n[libraries]\nguava = { module = \"com.google.guava:guava\", version.ref = \"guava\" }\n";
+        let updated = update_version(content, "com.google.guava:guava", "34.0.0")
+            .unwrap()
+            .unwrap();
+        assert!(updated.contains("guava = \"34.0.0\""), "{updated}");
+        // libraries 側の宣言は触らない
+        assert!(updated.contains("version.ref = \"guava\""));
+    }
+
+    #[test]
+    fn test_update_preserves_single_quotes() {
+        let content = "[versions]\nguava = '33.0.0'\n\n[libraries]\nguava = { module = \"com.google.guava:guava\", version.ref = \"guava\" }\n";
+        let updated = update_version(content, "com.google.guava:guava", "34.0.0")
+            .unwrap()
+            .unwrap();
+        assert!(updated.contains("guava = '34.0.0'"), "{updated}");
+    }
+
+    #[test]
+    fn test_update_preserves_crlf() {
+        let content = "[versions]\r\nguava = \"33.0.0\"\r\n\r\n[libraries]\r\nguava = { module = \"com.google.guava:guava\", version.ref = \"guava\" }\r\n";
+        let updated = update_version(content, "com.google.guava:guava", "34.0.0")
+            .unwrap()
+            .unwrap();
+        assert!(updated.contains("guava = \"34.0.0\"\r\n"), "{updated:?}");
+        assert!(
+            !updated.contains("\n\n"),
+            "LF 化されていないこと: {updated:?}"
+        );
+    }
+
+    #[test]
+    fn test_update_preserves_missing_trailing_newline() {
+        let content = "[libraries]\njunit = \"junit:junit:4.13.2\"";
+        let updated = update_version(content, "junit:junit", "4.13.3")
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated, "[libraries]\njunit = \"junit:junit:4.13.3\"");
+    }
+
+    #[test]
+    fn test_update_dotted_key_form() {
+        let content = "[versions]\nguava = \"33.0.0\"\n\n[libraries]\nguava.module = \"com.google.guava:guava\"\nguava.version.ref = \"guava\"\n";
+        let updated = update_version(content, "com.google.guava:guava", "34.0.0")
+            .unwrap()
+            .unwrap();
+        assert!(updated.contains("guava = \"34.0.0\""), "{updated}");
+    }
+
+    #[test]
+    fn test_update_library_subsection_table_form() {
+        let content =
+            "[libraries.guava]\nmodule = \"com.google.guava:guava\"\nversion = \"33.0.0\"\n";
+        let updated = update_version(content, "com.google.guava:guava", "34.0.0")
+            .unwrap()
+            .unwrap();
+        assert!(updated.contains("version = \"34.0.0\""), "{updated}");
+    }
+
+    #[test]
+    fn test_update_versions_subsection_table_form() {
+        let content = "[versions.slf4j]\nrequire = \"1.7.25\"\n\n[libraries]\nslf4j = { module = \"org.slf4j:slf4j-api\", version.ref = \"slf4j\" }\n";
+        let updated = update_version(content, "org.slf4j:slf4j-api", "1.7.36")
+            .unwrap()
+            .unwrap();
+        assert!(updated.contains("require = \"1.7.36\""), "{updated}");
+    }
+
+    #[test]
+    fn test_update_rich_version_writes_prefer_member() {
+        // strictly が範囲のときに書き換えるのは prefer 側
+        let content = "[versions]\nslf4j = { strictly = \"[1.7, 1.8[\", prefer = \"1.7.25\" }\n\n[libraries]\nslf4j = { module = \"org.slf4j:slf4j-api\", version.ref = \"slf4j\" }\n";
+        let updated = update_version(content, "org.slf4j:slf4j-api", "1.7.30")
+            .unwrap()
+            .unwrap();
+        assert!(updated.contains("prefer = \"1.7.30\""), "{updated}");
+        // 上限制約である strictly の範囲は保持する
+        assert!(updated.contains("strictly = \"[1.7, 1.8[\""), "{updated}");
+    }
+
+    #[test]
+    fn test_update_unknown_package_returns_none() {
+        let content = "[libraries]\njunit = \"junit:junit:4.13.2\"\n";
+        assert!(
+            update_version(content, "org.unknown:missing", "1.0.0")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_update_skips_commented_out_lines() {
+        // コメント行の同名宣言を書き換えず、実宣言だけを更新する
+        let content = "[versions]\n# guava = \"1.0.0\"\nguava = \"33.0.0\"\n\n[libraries]\nguava = { module = \"com.google.guava:guava\", version.ref = \"guava\" }\n";
+        let updated = update_version(content, "com.google.guava:guava", "34.0.0")
+            .unwrap()
+            .unwrap();
+        assert!(updated.contains("# guava = \"1.0.0\""), "{updated}");
+        assert!(updated.contains("\nguava = \"34.0.0\""), "{updated}");
+    }
+
+    #[test]
+    fn test_update_does_not_touch_other_sections() {
+        // 同名 alias が `[plugins]` にもある場合、`[versions]` 側だけを書き換える
+        let content = "[versions]\nguava = \"33.0.0\"\n\n[libraries]\nguava = { module = \"com.google.guava:guava\", version.ref = \"guava\" }\n\n[plugins]\nguava = { id = \"com.example.guava\", version = \"33.0.0\" }\n";
+        let updated = update_version(content, "com.google.guava:guava", "34.0.0")
+            .unwrap()
+            .unwrap();
+        assert!(updated.contains("id = \"com.example.guava\", version = \"33.0.0\""));
+    }
+
+    #[test]
+    fn test_update_wildcard_keeps_shape() {
+        // `1.+` のような動的指定は形を保って更新する
+        let content = "[libraries]\nguava = \"com.google.guava:guava:33.+\"\n";
+        let updated = update_version(content, "com.google.guava:guava", "34.1.0")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            updated,
+            "[libraries]\nguava = \"com.google.guava:guava:34.+\"\n"
+        );
+    }
+}

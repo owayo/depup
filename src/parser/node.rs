@@ -42,14 +42,15 @@ fn normalize_version(version: &str) -> String {
 }
 
 fn has_leading_zero_numeric_prerelease_identifier(version: &str) -> bool {
-    let Some(prerelease_start) = version.find('-') else {
+    // build metadata (`+...`) を先に切り落とす。semver 仕様上 build 識別子は
+    // 先頭ゼロを許し (`1.2.3+00` は valid)、ハイフンも含みうるため、`-` を先に
+    // 探すと `1.0.0+2024-01` の build 部を prerelease と誤認して有効な版を弾く
+    // (parse 全体が None になり、その依存が無言で更新対象から消えていた)。
+    let public = version.split('+').next().unwrap_or(version);
+    let Some(prerelease_start) = public.find('-') else {
         return false;
     };
-    let prerelease_and_build = &version[prerelease_start + 1..];
-    let prerelease = prerelease_and_build
-        .split_once('+')
-        .map(|(pre, _)| pre)
-        .unwrap_or(prerelease_and_build);
+    let prerelease = &public[prerelease_start + 1..];
 
     prerelease.split('.').any(|identifier| {
         identifier.len() > 1
@@ -905,6 +906,34 @@ mod tests {
         let spec = parse("~1.2.3-rc.1+build").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Tilde);
         assert_eq!(spec.version, "1.2.3-rc.1+build");
+    }
+
+    #[test]
+    fn test_parse_build_metadata_containing_hyphen_is_accepted() {
+        // semver 仕様上 build metadata (`+...`) はハイフンを含んでよく、
+        // 先頭ゼロの数値識別子も許される。prerelease の先頭ゼロ判定が build 部を
+        // 先に見てしまうと、有効な版が丸ごと弾かれて依存が無言で消える
+        for raw in ["1.0.0+2024-01", "^1.0.0+2024-01", "~1.0.0+build-01"] {
+            let spec = parse(raw).unwrap_or_else(|| panic!("`{raw}` は valid semver"));
+            assert!(
+                spec.version.contains("+"),
+                "`{raw}` の build metadata が保持されるべき: {}",
+                spec.version
+            );
+        }
+
+        // build metadata 単独の先頭ゼロ数値識別子も valid (`1.2.3+00`)
+        let spec = parse("1.2.3+00").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.version, "1.2.3+00");
+    }
+
+    #[test]
+    fn test_parse_rejects_leading_zero_numeric_prerelease_with_build() {
+        // prerelease 側の先頭ゼロ数値識別子は build metadata が付いても invalid
+        assert!(parse("1.2.3-01").is_none());
+        assert!(parse("1.2.3-01+2024-01").is_none());
+        assert!(parse("^1.2.3-rc.01+build").is_none());
     }
 
     #[test]

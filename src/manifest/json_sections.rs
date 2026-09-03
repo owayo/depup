@@ -266,4 +266,57 @@ mod tests {
 
         assert!(ranges.is_empty());
     }
+
+    #[test]
+    fn test_multibyte_prefix_keeps_byte_offsets_aligned() {
+        // 対象セクションより手前に多バイト文字があると、byte offset と char index を
+        // 取り違えた実装では範囲が数バイトずれて文字境界違反で panic するか、
+        // 別のキーを書き換えてしまう
+        let content = r#"{
+  "description": "日本語の説明テキスト — em dash と絵文字 🎉 を含む",
+  "dependencies": { "serde": "1.0" }
+}"#;
+
+        let ranges = top_level_object_section_ranges(content, &["dependencies"]);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(&content[ranges[0].0..ranges[0].1], r#" "serde": "1.0" "#);
+
+        let (updated, changed) = replace_string_property_in_top_level_sections(
+            content,
+            &["dependencies"],
+            "serde",
+            |_| Some("2.0".to_string()),
+        )
+        .unwrap();
+        assert!(changed);
+        assert!(updated.contains(r#""serde": "2.0""#));
+        // 手前の多バイト文字列は無傷であること
+        assert!(updated.contains("日本語の説明テキスト — em dash と絵文字 🎉 を含む"));
+    }
+
+    #[test]
+    fn test_trailing_escaped_backslash_does_not_swallow_closing_quote() {
+        // `"...\\"` は「エスケープされたバックスラッシュ + 閉じ引用符」であり、
+        // エスケープ状態を持ち越すと閉じ引用符を食って以降の構造解析が崩れる
+        let content = r#"{
+  "description": "windows path C:\\",
+  "dependencies": { "serde": "1.0" }
+}"#;
+
+        let ranges = top_level_object_section_ranges(content, &["dependencies"]);
+
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(&content[ranges[0].0..ranges[0].1], r#" "serde": "1.0" "#);
+    }
+
+    #[test]
+    fn test_empty_and_unclosed_input_are_handled() {
+        assert!(top_level_object_section_ranges("", &["dependencies"]).is_empty());
+        // 閉じない文字列リテラルで break しても panic しない
+        assert!(top_level_object_section_ranges(r#"{ "depend"#, &["dependencies"]).is_empty());
+        assert!(
+            direct_child_object_section_ranges("", &[(0, 0)], None).is_empty(),
+            "空入力の親範囲でも panic しない"
+        );
+    }
 }

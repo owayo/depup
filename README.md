@@ -318,6 +318,8 @@ Floating selectors such as `"*"`, npm dist-tags like `"latest"`, and Gradle dyna
 
 For npm semver tokens, depup validates prerelease and build metadata identifiers before parsing them as updateable constraints. Identifiers with underscores (`1.2.3-rc_1`), empty identifier segments (`1.2.3-alpha..1`), and numeric prerelease identifiers with leading zeroes (`1.2.3-01`) are skipped instead of being normalized into malformed package.json constraints.
 
+Build metadata is stripped before the leading-zero prerelease check. SemVer allows build identifiers to contain hyphens and leading zeroes, so versions such as `1.0.0+2024-01` and `1.2.3+00` remain valid and updateable — only the prerelease segment is validated.
+
 For npm partial comparators, `=1.2` and `=1` follow node-semver's partial-version rules instead of being treated as pinned exact versions. depup keeps the `=` operator and updates only the visible segment shape (`=1.2` → `=2.3`, `=1` → `=2`).
 
 Version candidates are ordered with ecosystem-specific rules. Node.js, Rust, Go, and Swift use SemVer (including numeric prereleases such as `1.0.0-1`) and ignore build metadata when comparing precedence, so `1.1.3` and `1.1.3+spec-1.1.0` do not trigger a metadata-only update. Python uses PEP 440 normalization; Ruby follows RubyGems segment ordering and treats alphabetic or hyphenated versions as prereleases; Composer patch aliases (`-p1`, `-pl1`, `-patch1`) sort after the corresponding release; and Java uses Gradle's documented version ordering. Numeric components are compared without a fixed integer-size limit.
