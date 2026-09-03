@@ -585,11 +585,15 @@ fn format_range_like(raw: &str, new_version: &str) -> Option<String> {
     }
 
     if let Some((operator, start, end)) = find_inclusive_lower_bound_token(raw) {
-        // PEP 440 の compatible release はセグメント数が暗黙上限の幅を決めるため、
-        // 複合制約 (`~=1.2, <5.0`) でもセグメント数を保って書き換える。
-        // 完全版をそのまま埋めると `~=1.2` (上限 <2.0) が `~=4.9.0` (上限 <4.10.0) へ
-        // 黙って狭まり、以後マイナー系列を跨げなくなる。
-        if operator == "~=" {
+        // tilde 系の演算子はセグメント数が暗黙上限の幅を決めるため、複合制約
+        // (`~=1.2, <5.0` / `~1 <2.0.0`) でもセグメント数を保って書き換える。
+        // 完全版をそのまま埋めると PEP 440 の `~=1.2` (上限 <2.0) が `~=4.9.0`
+        // (上限 <4.10.0) へ、npm/Composer/Cargo の `~1` (上限 <2.0.0) が `~1.9.3`
+        // (上限 <1.10.0) へ黙って狭まり、以後マイナー系列を跨げなくなる。
+        // 単体の Tilde は format_tilde_like がセグメント数を保つのに、comparator set へ
+        // 入った途端に保護が外れる非対称を防ぐ。
+        // `^` は上限がセグメント数に依存しない (`^1` も `^1.9.3` も上限は <2.0.0) ため対象外。
+        if operator == "~=" || operator == "~" {
             return replace_version_token_preserving_shape(raw, start, end, new_version);
         }
         return replace_version_token(raw, start, end, new_version);

@@ -33,12 +33,15 @@ const PHP_VERSION_CORE: &str = r"[vV]?\d+(?:\.\d+){0,3}(?:-[\w.-]+)?(?:\+[\w.-]+
 static CARET_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&anchored_op_pattern(r"\^", PHP_VERSION_CORE)).unwrap());
 
-// チルダ: ~1.2.3 / ~1.2.3.4 / ~>1.2.3
-// composer/semver の tilde 分岐は `{^~>?<version>$}i` で `~` と `~>` の両方を受理する。
-// `~>` を弾くと依存が None になり Skip 行にも出ず一覧から完全に消えるため、
-// Node パーサ (`~>` 対応済み) と同じく両綴りを受理し、更新後も元の綴りを保つ。
+// チルダ: ~1.2.3 / ~1.2.3.4
+// composer/semver の tilde 分岐は正規表現 `{^~>?<version>$}i` でマッチした**後に**
+// `if (strpos($constraint, '~>') === 0) { throw ... 'Invalid operator "~>"' }` を実行するため、
+// Composer は `~>` を拒否する (composer/semver 3.4.3 の VersionParser.php で確認)。
+// node-semver は `LONETILDE = (?:~>?)` で `~>` を valid とするので Node パーサは受理するが、
+// PHP で受理すると「更新しました」と報告しつつ composer が読めない制約を書き戻すことになる。
+// 入力時点で `composer install` が失敗する壊れたファイルなので、安全側でスキップする。
 static TILDE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&anchored_op_pattern(r"~>?", PHP_VERSION_CORE)).unwrap());
+    LazyLock::new(|| Regex::new(&anchored_op_pattern(r"~", PHP_VERSION_CORE)).unwrap());
 
 // 以上: >=1.2.3 / >=1.2.3.4
 static GTE_RE: LazyLock<Regex> =
@@ -161,12 +164,11 @@ impl PhpVersionParser {
             );
         }
 
-        // チルダ (`~` / `~>` の両綴り。更新後も元の綴りを保つ)
+        // チルダ (Composer が受理するのは `~` のみ。`~>` は TILDE_RE が弾く)
         if let Some(caps) = TILDE_RE.captures(trimmed) {
             let version = normalize_version(caps.get(1)?.as_str());
-            let prefix = if trimmed.starts_with("~>") { "~>" } else { "~" };
             return Some(
-                VersionSpec::new(VersionSpecKind::Tilde, trimmed, version).with_prefix(prefix),
+                VersionSpec::new(VersionSpecKind::Tilde, trimmed, version).with_prefix("~"),
             );
         }
 
@@ -1038,5 +1040,40 @@ mod tests {
                 new_version
             );
         }
+    }
+
+    /// AND 制約に埋め込まれた tilde もセグメント数を保つ。
+    /// Composer の `~1.2` は `>=1.2.0 <2.0.0` (major 幅) なので、完全版 `~1.9.3`
+    /// (`<1.10.0`) を書き戻すと以後 `composer update` がマイナー系列を跨げなくなる
+    #[test]
+    fn test_format_updated_tilde_in_compound_keeps_segment_count() {
+        for (input, new_version, expected) in [
+            ("~1.2 <2.0", "1.9.3", "~1.9 <2.0"),
+            ("~1 <2.0", "1.9.3", "~1 <2.0"),
+            ("~1.2.3 <2.0", "1.8.9", "~1.8.9 <2.0"),
+        ] {
+            let spec = parse(input).unwrap_or_else(|| panic!("{input}"));
+            assert_eq!(spec.kind, VersionSpecKind::Range, "input={input}");
+            assert_eq!(
+                spec.format_updated(new_version),
+                expected,
+                "input={input} new={new_version}"
+            );
+        }
+    }
+
+    /// Composer は `~>` を明示的に拒否する (`Invalid operator "~>"`)。
+    /// 受理すると composer が読めない制約を「更新しました」と書き戻すことになるので
+    /// parse 時点でスキップする。Node は node-semver が valid とするので受理する側
+    #[test]
+    fn test_parse_rejects_tilde_greater_operator() {
+        assert!(parse("~>1.2.3").is_none());
+        assert!(parse("~> 1.2.3").is_none());
+        assert!(parse("~>1.2").is_none());
+
+        // 通常の `~` は従来どおり Tilde として受理する
+        let spec = parse("~1.2.3").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Tilde);
+        assert_eq!(spec.prefix.as_deref(), Some("~"));
     }
 }

@@ -73,9 +73,13 @@ impl DiffFormatter {
                 .try_format_updated(new_version)
                 .unwrap_or_else(|| dependency.version_spec.raw.clone());
 
-            writeln!(writer, "@@ {} @@", dependency.name)?;
-            writeln!(writer, "-  \"{}\": \"{}\"", dependency.name, old_version)?;
-            writeln!(writer, "+  \"{}\": \"{}\"", dependency.name, new_formatted)?;
+            // 表示にはマニフェスト上の依存キーを使う。`dependency.name` はレジストリ上の
+            // 実パッケージ名なので、npm alias (`"react": "npm:@preact/compat@^17"`) や
+            // Cargo の `package = "..."` リネーム依存では実ファイルに存在しないキーになる
+            let key = dependency.manifest_name();
+            writeln!(writer, "@@ {} @@", key)?;
+            writeln!(writer, "-  \"{}\": \"{}\"", key, old_version)?;
+            writeln!(writer, "+  \"{}\": \"{}\"", key, new_formatted)?;
         }
 
         Ok(true)
@@ -163,6 +167,38 @@ mod tests {
     fn test_diff_formatter_new() {
         let formatter = DiffFormatter::new(false);
         assert!(!formatter.dry_run);
+    }
+
+    /// alias / rename 依存では diff にマニフェスト上のキーを出す。
+    /// レジストリ上の実パッケージ名を出すと、実ファイルに存在しないキーが並ぶ
+    #[test]
+    fn test_format_diff_uses_manifest_key_for_alias_dependency() {
+        let mut summary = UpdateSummary::new(false);
+        let mut manifest = ManifestUpdateResult::new(PathBuf::from("package.json"), Language::Node);
+
+        // "react": "npm:@preact/compat@^17.0.0" 相当
+        let dep = sample_dependency("@preact/compat", "17.0.0").with_manifest_name("react");
+        manifest.add_result(UpdateResult::update(dep, "18.0.0"));
+        summary.add_manifest(manifest);
+
+        let result = OrchestratorResult {
+            summary,
+            write_results: Vec::new(),
+            errors: Vec::new(),
+        };
+
+        let formatter = DiffFormatter::new(false);
+        let mut output = Vec::new();
+        formatter.format(&result, &mut output).unwrap();
+        let text = String::from_utf8(output).unwrap();
+
+        assert!(text.contains("@@ react @@"), "{text}");
+        assert!(text.contains(r#"-  "react": "^17.0.0""#), "{text}");
+        assert!(text.contains(r#"+  "react": "^18.0.0""#), "{text}");
+        assert!(
+            !text.contains("@preact/compat"),
+            "マニフェストに存在しないキーを出さない: {text}"
+        );
     }
 
     #[test]

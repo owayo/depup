@@ -81,8 +81,9 @@ static BLOCK_KEYWORD_RE: LazyLock<Regex> = LazyLock::new(|| {
 //   source "https://gems.example.com" do
 // これらのブロック内の gem は rubygems.org の版で書き換えてはいけない
 // (git/path なら `bundle install` が壊れ、private source なら同名の公開 gem の版が入る)
-static NON_REGISTRY_BLOCK_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*(?:git|github|bitbucket|gist|path|source)\b").unwrap());
+static NON_REGISTRY_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\s*(?:git|github|gitlab|bitbucket|gist|path|source)\b").unwrap()
+});
 
 // 開発用グループかどうかを判定する
 fn is_dev_group(group_line: &str) -> bool {
@@ -114,9 +115,22 @@ fn has_option_key(lowered: &str, key: &str) -> bool {
         || lowered.contains(&format!(":{key}=>"))
 }
 
+/// Bundler が組み込みで登録する git source ショートハンド。
+/// `dsl.rb` の `add_git_sources` が `github` / `gist` / `bitbucket` / `gitlab` を登録する
+/// (`gitlab` は Bundler 2.5.7 で追加)。`git` / `path` / `source` は通常のオプションキー
+const NON_REGISTRY_OPTION_KEYS: [&str; 7] = [
+    "git",
+    "github",
+    "gitlab",
+    "bitbucket",
+    "gist",
+    "path",
+    "source",
+];
+
 fn has_non_registry_source(line: &str) -> bool {
     let lowered = line.to_lowercase();
-    ["git", "github", "bitbucket", "gist", "path", "source"]
+    NON_REGISTRY_OPTION_KEYS
         .iter()
         .any(|key| has_option_key(&lowered, key))
 }
@@ -846,6 +860,37 @@ gem 'pg', '~> 1.5'
 
         let deps = parse(content).unwrap();
         assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "pg");
+    }
+
+    /// Bundler が組み込みで登録する git source ショートハンド 4 種はすべて
+    /// レジストリ外依存として扱う。`gitlab:` を取りこぼすと GitLab の git 依存へ
+    /// rubygems.org 側の同名 gem の版が書き込まれ `bundle install` が壊れる
+    #[test]
+    fn test_parse_skips_all_builtin_git_source_shorthands() {
+        for shorthand in ["github", "gitlab", "bitbucket", "gist"] {
+            let content = format!("gem 'foo', {shorthand}: 'group/foo'\ngem 'pg', '~> 1.5'\n");
+            let deps = parse(&content).unwrap();
+            assert_eq!(
+                deps.len(),
+                1,
+                "{shorthand}: レジストリ外依存を surface してはいけない ({deps:?})"
+            );
+            assert_eq!(deps[0].name, "pg", "{shorthand}");
+        }
+    }
+
+    /// ブロック形式の `gitlab ... do` 内の gem も更新対象にしない
+    #[test]
+    fn test_parse_skips_gems_inside_gitlab_block() {
+        let content = r#"
+gitlab 'group/monorepo' do
+  gem 'inner-gem'
+end
+gem 'pg', '~> 1.5'
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1, "{deps:?}");
         assert_eq!(deps[0].name, "pg");
     }
 

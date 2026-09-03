@@ -285,6 +285,8 @@ depup preserves the original version range format:
 "~1.2.3" → "~1.3.0"  (tilde preserved)
 "~1.2"   → "~1.9"    (tilde segment count preserved — widening it would narrow the range)
 "~1"     → "~2"      (single-segment tilde keeps its major-level width)
+"~1.2 <2.0.0" → "~1.9 <2.0.0" (tilde inside a comparator set keeps its segment count too)
+"~1, <5.0" → "~4, <5.0" (Cargo multi-requirement, tilde width preserved)
 "~> 7.0" → "~> 8.1"  (RubyGems pessimistic operator, segment count preserved)
 ">=1.0.0" → ">=2.0.0" (range preserved)
 "requests (>=2.28,<3); python_version < '3.12'" → "requests (>=2.31,<3); python_version < '3.12'" (PEP 508 parentheses and marker preserved)
@@ -292,6 +294,7 @@ depup preserves the original version range format:
 "'paramiko>=3.5.0,<4.0.0,'" → "'paramiko>=3.9.1,<4.0.0,'" (PEP 508 trailing comma preserved)
 "'paramiko>=3.5.0,<4.0.0'" → "'paramiko>=3.9.1,<4.0.0'" (TOML literal string quote preserved)
 "1.x" → "2.x" (wildcard shape preserved)
+"1.2.x - 2.3.x" → "1.9.x - 2.3.x" (npm hyphen range with x-range endpoints)
 "1.x.x" → "2.x.x" (all wildcard positions preserved)
 "1.2.*" → "1.3.*" (wildcard shape preserved)
 "v1.*" → "v2.*" (leading `v` preserved)
@@ -366,6 +369,13 @@ depup respects upper-bound range constraints (both exclusive and inclusive):
 ```
 
 For npm/Composer hyphen ranges, a partial right-hand side like `1.0 - 2.0` is interpreted as a wildcard-expanded exclusive upper bound, so `2.0.x` updates remain eligible while `2.1.0` is excluded.
+
+node-semver's `HYPHENRANGE` accepts `XRANGEPLAIN` on both sides, so x-range endpoints such as `1.x - 2.x` are valid and updateable. Endpoints that depup rejects elsewhere (a digit after a wildcard like `1.x.3`, or a fully floating `*`) stay rejected.
+
+Composer rejects the `~>` operator (`Invalid operator "~>"`), so depup skips it for PHP rather than writing back a constraint Composer cannot read. Node accepts `~>` because node-semver defines it as valid.
+
+Cargo dependencies carrying `registry-index = "..."` are excluded from updates just like `registry = "..."`, since both point at a registry other than crates.io.
+
 
 When a dependency has a range with an upper bound (e.g., `>=3.5.0,<4.0.0`, `>=1.0,<=2.0`, `4.0.0...4.9.9`), depup will:
 - **Not propose** versions that exceed the upper bound

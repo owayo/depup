@@ -100,13 +100,17 @@ static CARET_TILDE_WILDCARD_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[\^~]\s*v?(?:\d+|[xX*])(?:\.(?:\d+|[xX*])){0,2}$").unwrap());
 static RANGE_TOKEN_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(NODE_VERSION_PATTERN).unwrap());
-// node-semver の hyphen range は両端が裸の version (partial version も可) でなければならない。
+// node-semver の hyphen range は両端が裸の version でなければならない
+// (`HYPHENRANGE = ^\s*(XRANGEPLAIN)\s+-\s+(XRANGEPLAIN)\s*$`)。
 // `^1.0 - 2.0` / `~1.0 - 2.0` / `>=1.0 - 2.0` のような演算子付き端点は node-semver 仕様上 invalid。
 // 単に `" - "` で contains 判定すると過受理して壊れた制約を Range として書き換える可能性があるため、
-// 両端が `vN(.N){0,2}(-pre)?(+meta)?` の数値トークンに限定して全体一致を要求する。
+// 両端を裸トークンに限定して全体一致を要求する。
+// XRANGEPLAIN の各セグメントは `XRANGEIDENTIFIER = nr|x|X|*` なので `1.x - 2.x` のような
+// x-range 端点も仕様上 valid。数値限定にすると該当依存が Skip 行にも出ず無言で消えるため、
+// パターンは x/X/* を含む NODE_VERSION_OR_X_PATTERN 側を使う。
 static HYPHEN_RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r"^\s*{NODE_VERSION_PATTERN}\s+-\s+{NODE_VERSION_PATTERN}\s*$"
+        r"^\s*({NODE_VERSION_OR_X_PATTERN})\s+-\s+({NODE_VERSION_OR_X_PATTERN})\s*$"
     ))
     .unwrap()
 });
@@ -124,14 +128,31 @@ fn extract_first_version(raw: &str) -> String {
         .unwrap_or_default()
 }
 
-fn range_versions_are_valid(raw: &str) -> bool {
-    RANGE_TOKEN_RE
-        .find_iter(raw)
-        .all(|m| normalize_valid_version(m.as_str()).is_some())
+/// hyphen range の端点 1 個が裸トークンとして valid かを判定する。
+/// x-range 端点 (`1.x`) は node-semver 仕様上 valid だが、depup は完全浮動
+/// (`*`) とワイルドカード後の数値セグメント (`1.x.3`) を他経路と同様に弾く。
+fn is_valid_hyphen_endpoint(endpoint: &str) -> bool {
+    let body = endpoint.trim();
+    let body = body.strip_prefix(['v', 'V']).unwrap_or(body);
+
+    if body.contains(['x', 'X', '*']) {
+        !is_fully_floating_wildcard(body) && !has_digit_after_wildcard(body)
+    } else {
+        normalize_valid_version(body).is_some()
+    }
 }
 
 fn has_hyphen_range(raw: &str) -> bool {
-    HYPHEN_RANGE_RE.is_match(raw) && range_versions_are_valid(raw)
+    // `A - B` の両端をそれぞれ検証する。`range_versions_are_valid` は数値トークンしか
+    // 見ないため、x-range 端点を許すようになった今は端点単位の判定が必要。
+    // 区切りは node-semver 仕様どおり `\s+-\s+` (空白は 1 個とは限らない) なので、
+    // 端点は文字列分割ではなく正規表現のキャプチャから取る。
+    HYPHEN_RANGE_RE
+        .captures(raw)
+        .and_then(|caps| Some((caps.get(1)?, caps.get(2)?)))
+        .is_some_and(|(lower, upper)| {
+            is_valid_hyphen_endpoint(lower.as_str()) && is_valid_hyphen_endpoint(upper.as_str())
+        })
 }
 
 fn normalize_comparator_tokens(raw: &str) -> Option<Vec<String>> {
@@ -765,6 +786,26 @@ mod tests {
         assert_eq!(spec.format_updated("3.0.0-rc.1"), "~3.0.0-rc.1");
     }
 
+    /// comparator set に埋め込まれた tilde もセグメント数を保つ。
+    /// 単体の `~1` は Tilde 経路で保護されるのに、`<2.0.0` が付いて Range になった
+    /// 途端に完全版へ展開されると許容幅が `<2.0.0` から `<1.10.0` へ黙って縮む
+    #[test]
+    fn test_format_updated_tilde_in_comparator_set_keeps_segment_count() {
+        for (input, new_version, expected) in [
+            ("~1 <2.0.0", "1.9.3", "~1 <2.0.0"),
+            ("~1.2 <2.0.0", "1.9.3", "~1.9 <2.0.0"),
+            ("~1.2.3 <2.0.0", "1.8.9", "~1.8.9 <2.0.0"),
+        ] {
+            let spec = parse(input).unwrap_or_else(|| panic!("{input}"));
+            assert_eq!(spec.kind, VersionSpecKind::Range, "input={input}");
+            assert_eq!(
+                spec.format_updated(new_version),
+                expected,
+                "input={input} new={new_version}"
+            );
+        }
+    }
+
     #[test]
     fn test_format_updated_wildcard_x() {
         let spec = parse("1.x").unwrap();
@@ -1161,6 +1202,31 @@ mod tests {
         assert!(parse("1.0 - ^2.0").is_none());
         assert!(parse("1.0 - ~2.0").is_none());
         assert!(parse("1.0 - >=2.0").is_none());
+    }
+
+    /// node-semver の HYPHENRANGE は両端が XRANGEPLAIN なので x-range 端点も valid。
+    /// 数値限定で弾いていた頃は該当依存が Skip 行にも出ず無言で消えていた
+    #[test]
+    fn test_parse_hyphen_range_accepts_x_range_endpoints() {
+        for raw in ["1.x - 2.x", "1.2.x - 2.3.x", "1.X - 2.X", "1.* - 2.*"] {
+            let spec = parse(raw).unwrap_or_else(|| panic!("`{raw}` は node-semver 上 valid"));
+            assert_eq!(spec.kind, VersionSpecKind::Range, "{raw}");
+        }
+
+        // 書き換えはワイルドカードの形を保ったまま下限だけ進める
+        let spec = parse("1.2.x - 2.3.x").unwrap();
+        assert_eq!(spec.format_updated("1.9.3"), "1.9.x - 2.3.x");
+    }
+
+    /// x-range 端点を許しても、depup が他経路で弾いている無効形は弾き続ける
+    #[test]
+    fn test_parse_hyphen_range_still_rejects_invalid_endpoints() {
+        // ワイルドカードの後ろに数値セグメント
+        assert!(parse("1.x.3 - 2.0.0").is_none());
+        assert!(parse("1.0.0 - 2.x.3").is_none());
+        // 完全浮動 (数値アンカーなし) は形を保てない
+        assert!(parse("* - 2.0.0").is_none());
+        assert!(parse("1.0.0 - *").is_none());
     }
 
     /// 制御テスト: 通常の hyphen range は引き続き Range として受理される

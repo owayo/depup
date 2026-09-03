@@ -672,11 +672,18 @@ fn normalize_composer_version(value: &str) -> String {
     };
     let lower = suffix.to_ascii_lowercase();
 
-    // patch alias は安定版の後発リリース (post) として扱う
+    // patch alias は安定版の後発リリース (post) として扱う。
+    // composer/semver の modifier regex は数値部の前に `.` / `-` を許す
+    // (`[._-]?(...|patch|pl|p)((?:[.-]?\d+)*+)?`) ため、`-p1` と `-p.1` は同じ
+    // `patch1` へ正規化される。区切りを剥がさないと `-p.1` だけ post ではなく
+    // prerelease と解釈され、安定版より小さいと判定してダウングレードを
+    // 「更新」として書き込んでしまう
     for prefix in ["patch", "pl", "p"] {
-        if let Some(number) = lower.strip_prefix(prefix)
-            && NumericIdentifier::parse(number).is_some()
-        {
+        let Some(rest) = lower.strip_prefix(prefix) else {
+            continue;
+        };
+        let number = rest.trim_start_matches(['.', '-']);
+        if NumericIdentifier::parse(number).is_some() {
             return format!("{base}.post{number}");
         }
     }
@@ -2371,6 +2378,40 @@ mod tests {
         for alias in ["1.0.0-p1", "1.0.0-pl1", "1.0.0-patch1"] {
             assert_eq!(compare_composer_versions(alias, "1.0.0"), Ordering::Greater);
         }
+
+        // composer/semver は数値部の前に `.` / `-` を許すため、区切り付きの綴りも
+        // 同じ patch alias。post 扱いにしないと安定版より小さいと判定され、
+        // `1.0.0-p.1` の利用者へ `1.0.0` への「更新」= 実質ダウングレードを書き込む
+        for alias in ["1.0.0-p.1", "1.0.0-pl.1", "1.0.0-patch.1"] {
+            assert_eq!(
+                compare_composer_versions(alias, "1.0.0"),
+                Ordering::Greater,
+                "{alias} は 1.0.0 より新しい patch alias"
+            );
+        }
+
+        // 既知の制限: ハイフン区切りの patch alias (`1.0.0-p-1`) は
+        // `rsplit_once('-')` が `base = "1.0.0-p"` / `suffix = "1"` へ割ってしまうため
+        // patch alias として認識できず prerelease 扱いになる。
+        // 正すには修飾子の検出自体を composer の modifier regex ベースへ作り替える
+        // 必要があり、実運用でこの綴りを見かけないため現状の挙動を明示的に固定する
+        assert_eq!(
+            compare_composer_versions("1.0.0-p-1", "1.0.0"),
+            Ordering::Less,
+            "ハイフン区切り patch alias は未対応 (既知の制限)"
+        );
+
+        // 区切りの有無で順序が割れない (同一バージョンの別綴り)
+        assert_eq!(
+            compare_composer_versions("1.0.0-p.1", "1.0.0-p1"),
+            Ordering::Equal
+        );
+
+        // `-p` 単独や `-pre` は patch alias ではないので従来どおり prerelease 扱い
+        assert_eq!(
+            compare_composer_versions("1.0.0-pre", "1.0.0"),
+            Ordering::Less
+        );
     }
 
     #[test]

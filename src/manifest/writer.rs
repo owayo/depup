@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write as _;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// マニフェストへの更新を書き戻すライター
 pub struct ManifestWriter {
@@ -284,14 +285,30 @@ fn write_atomically(path: &Path, content: &str) -> std::io::Result<()> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("manifest");
-    let tmp_path = dir.join(format!(".{}.depup-tmp-{}", file_name, std::process::id()));
+    // 一時ファイル名は PID だけだと予測可能で、同じ名前の symlink を先に置かれると
+    // `File::create` (O_CREAT|O_TRUNC、O_NOFOLLOW なし) がリンク先へ書き込んでしまう。
+    // ナノ秒を混ぜて推測を難しくし、`create_new` で「既存 (symlink 含む) があれば
+    // EEXIST で失敗」させることで、リンク先の実体を破壊する経路を塞ぐ。
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let tmp_path = dir.join(format!(
+        ".{}.depup-tmp-{}-{}",
+        file_name,
+        std::process::id(),
+        nonce
+    ));
 
     let result = (|| -> std::io::Result<()> {
         {
             // rename の前にデータを永続化する。`fs::write` はページキャッシュへ書くだけなので、
             // fsync しないと rename のメタデータだけが先に永続化され、電源断で
             // ゼロ長または部分内容のマニフェストが残りうる (元の内容も失われる)。
-            let mut file = fs::File::create(&tmp_path)?;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)?;
             file.write_all(content.as_bytes())?;
             file.sync_all()?;
         }

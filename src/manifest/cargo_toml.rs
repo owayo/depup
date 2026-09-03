@@ -86,6 +86,12 @@ static PATH_KEY_RE: LazyLock<Regex> =
 // 依存宣言内の `registry = "..."` キーとその値
 static REGISTRY_KEY_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?:^|[{,])\s*registry\s*=\s*(?:"([^"]*)"|'([^']*)')"#).unwrap());
+// 依存宣言内の `registry-index = "..."` キー。
+// `registry` が config 上のレジストリ名を指すのに対し `registry-index` はインデックス URL を
+// 直接指す別キーで、どちらも crates.io 以外を指す (Cargo は両方の同時指定を拒否する)。
+// `registry` 側のパターンは `registry\s*=` を要求するため `registry-index` にはマッチしない
+static REGISTRY_INDEX_KEY_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:^|[{,])\s*registry-index\s*=").unwrap());
 
 /// 行が crates.io 以外のソースを指す依存宣言かどうかを返す。
 ///
@@ -95,7 +101,7 @@ static REGISTRY_KEY_RE: LazyLock<Regex> =
 /// { path = "../my-lib", version = "0.4" }`) に writer の曖昧判定が「宣言 1 個」と見なして
 /// 発火せず、path 依存まで crates.io の最新版で黙って書き換えてしまう。
 fn declares_non_crates_io_source(line: &str) -> bool {
-    if PATH_KEY_RE.is_match(line) {
+    if PATH_KEY_RE.is_match(line) || REGISTRY_INDEX_KEY_RE.is_match(line) {
         return true;
     }
     REGISTRY_KEY_RE.captures(line).is_some_and(|caps| {
@@ -125,6 +131,12 @@ fn non_crates_io_dependency_sections(
         escaped_package
     ))
     .unwrap();
+    // `registry-index` は値に関わらず crates.io 以外を指すので値は見ない
+    let dotted_registry_index_re = Regex::new(&format!(
+        r"^\s*{}\s*\.\s*registry-index\s*=",
+        escaped_package
+    ))
+    .unwrap();
 
     for line in content.lines() {
         if let Some(name) = cargo_section_name(line) {
@@ -136,6 +148,7 @@ fn non_crates_io_dependency_sections(
             && declares_non_crates_io_source(line);
         let dotted_key_is_excluded = is_cargo_dependency_section(&section)
             && (dotted_path_re.is_match(line)
+                || dotted_registry_index_re.is_match(line)
                 || dotted_registry_re.captures(line).is_some_and(|caps| {
                     caps.get(1)
                         .or_else(|| caps.get(2))
@@ -483,8 +496,11 @@ fn parse_cargo_dependencies(
                 if t.get("registry")
                     .and_then(|v| v.as_str())
                     .is_some_and(|registry| registry != "crates-io")
+                    || t.contains_key("registry-index")
                 {
-                    // crates.io API の候補で別レジストリの依存を書き換えると誤更新になる
+                    // crates.io API の候補で別レジストリの依存を書き換えると誤更新になる。
+                    // `registry-index` はインデックス URL の直接指定なので、値に関わらず
+                    // crates.io 以外を指す (社内 private registry で使われる)
                     continue;
                 }
                 if let Some(version_str) = t.get("version").and_then(|v| v.as_str())
@@ -940,6 +956,49 @@ public-crate = { version = "2.0", registry = "crates-io" }
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].name, "public-crate");
         assert_eq!(deps[0].version_spec.version, "2.0");
+    }
+
+    /// `registry-index` はインデックス URL の直接指定で、`registry` と同じく
+    /// crates.io 以外を指す。crates.io の候補で書き換えると、社内 private registry の
+    /// 依存が同名の公開クレート (typosquat を含む) の版で上書きされる
+    #[test]
+    fn test_parse_registry_index_dependency_skipped() {
+        let content = r#"
+[dependencies]
+internal-crate = { version = "1.0", registry-index = "https://intranet.example/index" }
+public-crate = { version = "2.0" }
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(
+            deps.len(),
+            1,
+            "registry-index 依存は surface しない: {deps:?}"
+        );
+        assert_eq!(deps[0].name, "public-crate");
+    }
+
+    /// 複数行テーブル / dotted key 形式の `registry-index` も writer が書き換えない
+    #[test]
+    fn test_update_does_not_touch_registry_index_dependency() {
+        for content in [
+            // inline table
+            "[dependencies]\ninternal-crate = { version = \"1.0\", registry-index = \"https://intranet.example/index\" }\n",
+            // 複数行テーブル (version より後ろに registry-index)
+            "[dependencies.internal-crate]\nversion = \"1.0\"\nregistry-index = \"https://intranet.example/index\"\n",
+            // dotted key
+            "[dependencies]\ninternal-crate.version = \"1.0\"\ninternal-crate.registry-index = \"https://intranet.example/index\"\n",
+        ] {
+            let result = CargoTomlParser.update_version(content, "internal-crate", "9.9.9");
+            match result {
+                // 書き換え対象が見つからずエラーになるのが期待動作 (誤更新しない)
+                Err(_) => {}
+                Ok(updated) => assert_eq!(
+                    updated, content,
+                    "registry-index 依存を書き換えてはいけない: {content}"
+                ),
+            }
+        }
     }
 
     #[test]

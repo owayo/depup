@@ -684,6 +684,25 @@ mod tests {
         assert_eq!(tilde.version, "1.2");
     }
 
+    /// カンマ区切り複数要件に埋め込まれた tilde もセグメント数を保つ。
+    /// Cargo の `~1` は `>=1.0.0, <2.0.0` だが `~1.4.2` にすると `<1.5.0` へ縮む
+    #[test]
+    fn test_format_updated_tilde_in_multi_requirement_keeps_segment_count() {
+        for (input, new_version, expected) in [
+            ("~1, <5.0", "4.9.0", "~4, <5.0"),
+            ("~1.2, <1.5", "1.4.2", "~1.4, <1.5"),
+            ("~1.2.3, <1.5", "1.4.2", "~1.4.2, <1.5"),
+        ] {
+            let spec = parse(input).unwrap_or_else(|| panic!("{input}"));
+            assert_eq!(spec.kind, VersionSpecKind::Range, "input={input}");
+            assert_eq!(
+                spec.format_updated(new_version),
+                expected,
+                "input={input} new={new_version}"
+            );
+        }
+    }
+
     #[test]
     fn test_parse_mixed_lower_bounds_detected_as_range() {
         // 上限のない複数下限の混在も検出はされる (無言スキップしない)。

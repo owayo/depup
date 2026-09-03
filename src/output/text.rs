@@ -398,9 +398,12 @@ impl TextFormatter {
         if updates.is_empty() && !skips.is_empty() {
             let path_display = manifest.path.display().to_string();
             let lang_display = format!("({})", manifest.language);
+            // 更新ありの見出しと同じく `(dry-run)` 接頭辞を付ける。
+            // ここだけ落とすと、両方が混在するプロジェクトで一部の行にしか付かない
             writeln!(
                 writer,
-                "{} {} — {} updates, {} {}",
+                "{}{} {} — {} updates, {} {}",
+                prefix,
                 self.maybe_bold(&path_display),
                 self.maybe_dimmed(&lang_display),
                 self.maybe_dimmed("0"),
@@ -521,7 +524,10 @@ impl TextFormatter {
         }
 
         let mut result: Vec<_> = counts.into_iter().collect();
-        result.sort_by_key(|item| std::cmp::Reverse(item.1)); // カウント降順でソート
+        // カウント降順。同数のときは HashMap のイテレーション順が実行ごとに変わる
+        // (RandomState のシードがインスタンスごとに違う) ので、理由名を第 2 キーにして
+        // 出力順を確定させる。CI のスナップショット比較で偽の差分が出るのを防ぐ
+        result.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         result
     }
 
@@ -639,7 +645,8 @@ impl TextFormatter {
                 (reason, count, packages)
             })
             .collect();
-        result.sort_by_key(|item| std::cmp::Reverse(item.1)); // カウント降順でソート
+        // カウント降順。同数のときは理由名で確定させる (count_by_skip_reason と同方針)
+        result.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         result
     }
 }

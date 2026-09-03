@@ -427,8 +427,12 @@ impl ManifestParser for PackageSwiftParser {
         // が `https://GitHub.com/...` を受理する一方でここが大小区別のままだと、parse は
         // 依存として surface するのに書き換え先が見つからず report/apply が矛盾する。
         // owner/repo 側まで大小無視にすると別リポジトリへ誤爆するため、ホスト部だけを囲む。
+        // `extract_github_owner_repo` は GitHub の SSH over 443
+        // (`ssh://git@ssh.github.com:443/owner/repo.git`) も正規形として受理するため、
+        // ホスト部に `ssh.` 接頭辞とポート番号を許容しないと parse だけ通って
+        // 書き換え先が見つからず report/apply が矛盾する
         let url_pattern = format!(
-            r#"((?i:github\.com)[/:]{}(?:\.git)?)["'/?#\s)]"#,
+            r#"((?i:(?:ssh\.)?github\.com)(?::\d+)?[/:]{}(?:\.git)?)["'/?#\s)]"#,
             escaped_package
         );
         let masked = mask_comments(content);
@@ -710,6 +714,35 @@ let package = Package(
             ),
             Some("apple/swift-argument-parser".to_string())
         );
+    }
+
+    /// parse できる URL 形式はすべて update_version でも書き換えられること。
+    /// parse (正規化ベース) と update (生 URL の正規表現) が二重定義になっているため、
+    /// 片方だけ対応した形式があると「更新あり」と報告してから書き込みが失敗する
+    #[test]
+    fn test_update_version_supports_every_parsable_github_url_form() {
+        for url in [
+            "https://github.com/apple/swift-log.git",
+            "https://github.com/apple/swift-log",
+            "git@github.com:apple/swift-log.git",
+            "ssh://git@github.com/apple/swift-log.git",
+            "ssh://git@ssh.github.com:443/apple/swift-log.git",
+        ] {
+            let content = format!(
+                "// swift-tools-version:5.9\nimport PackageDescription\nlet package = Package(\n    name: \"X\",\n    dependencies: [\n        .package(url: \"{url}\", from: \"1.0.0\"),\n    ]\n)\n"
+            );
+
+            let deps = PackageSwiftParser.parse(&content).unwrap();
+            assert_eq!(deps.len(), 1, "parse できるべき: {url}");
+            assert_eq!(deps[0].name, "apple/swift-log", "{url}");
+
+            let updated = PackageSwiftParser
+                .update_version(&content, "apple/swift-log", "1.5.0")
+                .unwrap_or_else(|e| panic!("update できるべき: {url} ({e})"));
+            assert!(updated.contains("from: \"1.5.0\""), "{url}: {updated}");
+            // URL 自体は書き換えない
+            assert!(updated.contains(url), "{url}: {updated}");
+        }
     }
 
     #[test]
