@@ -60,7 +60,7 @@
 - **エイジフィルター**: N日/週前以降にリリースされたバージョンのみに更新
 - **pnpm連携**: pnpm設定の `minimumReleaseAge` を自動適用
 - **Bun Catalogs対応**: `package.json` の Bun `catalog` / `catalogs` 定義を更新
-- **モノレポ対応**: `.depup`、pnpmワークスペース、ネストした package install、Tauriプロジェクト
+- **モノレポ対応**: `.depup`、Cargo/pnpm/Go ワークスペース、Gradle マルチプロジェクト、ネストした package install、Tauriプロジェクト
 - **リリース日表示**: 各バージョンのリリース日時を表示
 - **複数出力形式**: テキスト（カラー）、JSON、diff
 
@@ -71,10 +71,10 @@
 | <img src="https://img.shields.io/badge/-339933?logo=nodedotjs&logoColor=white" height="16"> Node.js | package.json（Bun catalogs 含む） | npm | package-lock.json, pnpm-lock.yaml, yarn.lock, bun.lock, bun.lockb |
 | <img src="https://img.shields.io/badge/-3776AB?logo=python&logoColor=white" height="16"> Python | pyproject.toml | PyPI | uv.lock, requirements.lock, poetry.lock |
 | <img src="https://img.shields.io/badge/-000000?logo=rust&logoColor=white" height="16"> Rust | Cargo.toml | crates.io | Cargo.lock |
-| <img src="https://img.shields.io/badge/-00ADD8?logo=go&logoColor=white" height="16"> Go | go.mod | Go Proxy | go.sum |
+| <img src="https://img.shields.io/badge/-00ADD8?logo=go&logoColor=white" height="16"> Go | go.mod（go.work のメンバーも自動検出） | Go Proxy | go.sum |
 | <img src="https://img.shields.io/badge/-CC342D?logo=ruby&logoColor=white" height="16"> Ruby | Gemfile | RubyGems | Gemfile.lock |
 | <img src="https://img.shields.io/badge/-777BB4?logo=php&logoColor=white" height="16"> PHP | composer.json | Packagist | composer.lock |
-| <img src="https://img.shields.io/badge/-ED8B00?logo=openjdk&logoColor=white" height="16"> Java | build.gradle, build.gradle.kts, gradle/*.versions.toml | Maven Central | gradle.lockfile |
+| <img src="https://img.shields.io/badge/-ED8B00?logo=openjdk&logoColor=white" height="16"> Java | build.gradle, build.gradle.kts, gradle/*.versions.toml（settings.gradle のサブプロジェクトも自動検出） | Maven Central | gradle.lockfile |
 | <img src="https://img.shields.io/badge/-F05138?logo=swift&logoColor=white" height="16"> Swift | Package.swift | GitHub Tags | Package.resolved |
 | mise | mise.toml, .mise.toml, .config/mise/config.toml, .tool-versions | `mise ls-remote` | mise.lock |
 
@@ -262,7 +262,9 @@ depup --cd ./projects/myapp -n
 >
 > **注意**: Go の `exclude` ディレクティブは記述自体を書き換えず、更新候補の除外に反映します。上流モジュールの最新 `go.mod` が単一版または閉区間で `retract` した版も候補から除外します。タグ付きバージョンがないモジュールでは Go Proxy の `@latest` へフォールバックし、`.info` の `Time` が省略されている場合は Unix epoch を使うため、公開日不明の版が `--age` で永久に除外されることはありません。
 >
-> **注意**: `gem "pg", ">= 0.18", "< 2.0"` や `gem "rack", "!= 2.2.4"` のような Gemfile の複合制約・除外制約は解析対象ですが、自動では書き換えません。制約の一部だけを更新すると意味が壊れるため、unsafe な編集は適用せずに報告します。
+> **注意**: `gem "pg", ">= 0.18", "< 2.0"` のような Gemfile の複合制約は解析・更新の対象です。包含下限だけを進め、元の引数の個数・順序・クォート種別・空白・括弧付き呼び出し形式・行末条件修飾子を保ったまま書き戻します。比較の基準は記述順に依存せず包含下限なので、`gem "pg", "< 2.0", ">= 0.18"` でも `0.18` を基準に判定します。書き換え後の制約を元の引数の個数へ分割できない場合（引数自体がカンマを含む場合など）は、unsafe な編集を適用せずエラーとして報告します。`gem "rack", "!= 2.2.4"` のような除外制約は、一部だけを更新すると意味が壊れるため判定の段階でスキップします。
+>
+> **注意**: `git_source(:name) { ... }` で登録した Bundler のカスタム git source ショートハンド（例: `gem 'rails', stash: 'forks/rails'`）も、組み込みの `git:` / `github:` と同じくレジストリ外依存として更新対象から除外します。
 >
 > **注意**: バージョンなしで `git:` / `github:` / `bitbucket:` / `gist:` / `path:` / `source:` を指定した Gemfile 依存は、RubyGems のレジストリ制約へ変換せずにスキップします。同じ形式でもバージョンが明示されていれば、Bundler が gemspec を検証する制約として、source オプションを保持したまま解析・更新できます。オプションキーは Ruby の 2 通りの綴り（`git: '...'` と hash-rocket 形式 `:git => '...'`）の両方を認識します。`git ... do` / `github ... do` / `path ... do` / `source ... do` ブロック内の gem も同じ理由でスキップし、`platforms` / `install_if` のような通常のブロックは従来どおり処理します。引数が次行へ続く宣言（`gem "devise",`）は、その行だけでは版を決められないため「バージョンなしのレジストリ依存」として報告せずスキップします。行単位の `group:` / `groups:` オプションは開発依存の判定に使います。
 >
@@ -275,6 +277,16 @@ depup --cd ./projects/myapp -n
 > **注意**: Composer の platform package（`php`, `hhvm`, `ext-*`, `lib-*`, Composer API パッケージなど）は更新対象から除外します。
 >
 > **注意**: Composer/Packagist は `composer/semver` の `VersionParser` に従って 1〜4 セグメントの数値バージョンを valid 扱いします。depup も `1.2.3.4`、`^1.0.0.0`、`~3.4.5.6`、`1.0.0.*` などの 4 セグメントまでのバージョンをパース・更新でき、5 セグメント以上は invalid として除外します。
+>
+> **注意**: Composer の modifier は区切り文字を省略でき `.` / `_` も使えるため（`composer/semver` は `[._-]?`）、depup は `5.0.0alpha3` / `1.0.0.RC1` / `1.0.0_beta1` をプレリリース、`2.2.1p1` / `2.2.1pl1` / `2.2.1patch1` を base より **新しい** patch alias として扱います。どちらの形式も現在の Packagist に実在します（`nikic/php-parser` の `5.0.0beta1`、`laminas/laminas-diactoros` のセキュリティパッチ `2.2.1p2`）。
+>
+> **注意**: Gradle の `-SNAPSHOT` / `.SNAPSHOT` は更新対象から除外します。SNAPSHOT は解決のたびに最新のタイムスタンプ版を取り直す「移動する参照」なので、固定 release へ書き換えるとビルドが使うものが黙って変わってしまいます。`.Final` / `.RELEASE` / `-jre` / `-SP1` のような安定版 qualifier は従来どおり更新します。
+>
+> **注意**: Gradle の `resolutionStrategy { force ... }` / `constraints { }` / `dependencySubstitution { }` の中に書かれた座標は依存として報告しません。これらは他所で宣言済みのバージョンを再掲するものであり、別々の宣言として扱うと同じ座標が曖昧になって更新が拒否されていました。
+>
+> **注意**: Go の `+incompatible` は `go` コマンドと同じ規則でフィルタします。semver 順で最初の `+incompatible` に到達したとき、直前の compatible 版が本物の `go.mod` を持っていれば、それ以降の `+incompatible` をすべて捨てます。これが無いと `github.com/libp2p/go-libp2p` が `v0.49.0` から 2018 年の `v6.0.23+incompatible` へ「更新」され、しかもビルドは通ってしまいます。
+>
+> **注意**: PyPI 以外を既定インデックスにしている `pyproject.toml`（Poetry の `priority = "primary"` / `"default"` source、uv の `[[tool.uv.index]] default = true` や `[tool.uv] index-url`、PDM による `pypi` の上書き）は、警告を出したうえで全依存をスキップします。depup は PyPI しか参照しないため、更新すると private パッケージが同名の公開パッケージで置き換わってしまいます。
 
 ### 範囲形式の維持
 
@@ -739,6 +751,20 @@ shared    # 共有ライブラリ
 ### pnpmワークスペース
 
 depupは `pnpm-workspace.yaml` を検出し、全てのワークスペースパッケージを処理します。`packages` 配列は block-style (`- 'packages/*'`) と flow-style (`packages: ['packages/*', 'apps/*']`) の両方に対応し、否定パターン (`!packages/legacy`) も扱えます。
+
+### Cargoワークスペース
+
+`[workspace] members`（`crates/*` のような glob パターンを含む）を展開し、`[workspace] exclude` に挙げられたメンバーは除外します。
+
+### Goワークスペース
+
+`go.work` の `use` ディレクティブ（単一行形式と `use ( ... )` ブロック形式の両方）を展開し、各メンバーモジュールの `go.mod` を処理します。展開しないと、ルートに `go.mod` が無い構成では全メンバーの依存が古いままでも「更新なし」と報告してしまいます。
+
+### Gradleマルチプロジェクト
+
+`settings.gradle` / `settings.gradle.kts` の `include ':app', ':core'`（Groovy 形式と Kotlin DSL 形式の両方）を展開し、各サブプロジェクトの `build.gradle` / `build.gradle.kts` と `buildSrc/` を処理します。依存宣言の大半はサブプロジェクト側にあるため、ルートのビルドファイルだけを見ていると取りこぼします。
+
+展開先のパスには `.depup` と同じ安全性検査が適用されます。絶対パス、`..` による親ディレクトリ参照、プロジェクト外へ解決される symlink は拒否されます。
 
 ### Tauriプロジェクト
 

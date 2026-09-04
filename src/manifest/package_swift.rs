@@ -417,6 +417,20 @@ impl ManifestParser for PackageSwiftParser {
         package: &str,
         new_version: &str,
     ) -> Result<String, ManifestError> {
+        // 書き込もうとするバージョンが SPM の Version (semver 2.0.0) として妥当か検証する。
+        // SPM は厳格パースなので、`2024.01.15` のような先頭ゼロ付きの CalVer タグを
+        // そのまま書き込むと `swift build` が `Invalid semantic version string` で
+        // `Package.swift` ごと読み込みに失敗し、プロジェクト全体がビルド不能になる。
+        // レジストリ側 (GitHub Tags) の取りこぼしに備えた最後の防波堤として、
+        // ファイルを書き換える前に弾く。
+        if !is_valid_swift_version(new_version) {
+            return Err(ManifestError::InvalidVersionSpec {
+                path: PathBuf::from("Package.swift"),
+                spec: new_version.to_string(),
+                message: "not a valid Swift Package Manager version (semver 2.0.0 requires three numeric segments without leading zeros)".to_string(),
+            });
+        }
+
         let escaped_package = regex::escape(package);
         // URL は Swift 文字列リテラル内にあるため、リポジトリ名の直後には必ず閉じ引用符
         // (`"`) かパス区切り等の境界文字が続く。境界文字を要求することで、
@@ -803,6 +817,53 @@ let package = Package(
         let content = r#".package(url: "https://github.com/apple/swift-nio.git", from: "2.40.0")"#;
         let result = PackageSwiftParser.update_version(content, "nonexistent/repo", "1.0.0");
         assert!(result.is_err());
+    }
+
+    /// バグ回帰テスト: SPM が読めないバージョンは書き込む前に弾く。
+    ///
+    /// 以前は `new_version` を検証せず `"{}"` に埋めていたため、GitHub の CalVer タグ
+    /// (`2024.01.15`) が候補として採用されると、`swift build` が
+    /// `Invalid semantic version string` で `Package.swift` ごと読めなくなる版を
+    /// 書き込んでいた。
+    #[test]
+    fn test_update_version_rejects_invalid_swift_version() {
+        let content = r#".package(url: "https://github.com/apple/swift-nio.git", from: "2.40.0")"#;
+        for invalid in [
+            "2024.01.15", // 先頭ゼロを含む CalVer タグ
+            "1.02.0",
+            "1.2.03",
+            "1.2.3-01", // 先頭ゼロの数値プレリリース識別子
+            "1.2",      // 2 セグメント
+            "v1.2.3",   // v 接頭辞は SPM のバージョン文字列に付かない
+            "1.2.3.4",  // 4 セグメント
+            "not-a-version",
+            "",
+        ] {
+            let result = PackageSwiftParser.update_version(content, "apple/swift-nio", invalid);
+            assert!(
+                result.is_err(),
+                "expected error for invalid version: {:?}",
+                invalid
+            );
+        }
+        // 元ファイルは書き換えられない (エラーを返すだけ)
+        assert!(content.contains(r#"from: "2.40.0""#));
+    }
+
+    #[test]
+    fn test_update_version_accepts_valid_semver_forms() {
+        let content = r#".package(url: "https://github.com/apple/swift-nio.git", from: "2.40.0")"#;
+        for valid in [
+            "2.41.0",
+            "1.0.0-beta.1",
+            "1.0.0+build.123",
+            "1.0.0-rc.1+sha.abc",
+        ] {
+            let result = PackageSwiftParser
+                .update_version(content, "apple/swift-nio", valid)
+                .unwrap_or_else(|e| panic!("expected success for {}: {}", valid, e));
+            assert!(result.contains(&format!(r#"from: "{}""#, valid)));
+        }
     }
 
     #[test]

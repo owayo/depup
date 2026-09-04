@@ -21,7 +21,7 @@ mod pypi;
 mod rubygems;
 
 pub use client::HttpClient;
-pub use crates_io::CratesIoAdapter;
+pub use crates_io::{CratesIoAdapter, CratesIoRateLimit};
 pub(crate) use git_remote::redact_url;
 pub use git_remote::{GitRemote, GitRemoteError, GitRemoteRefs, parse_ls_remote_output};
 pub use github_tags::GitHubTagsAdapter;

@@ -29,10 +29,20 @@ const VERSION_TOKEN: &str = r"[vV]?(?:\d+!)?\d+(?:\.\d+)*(?:[-+][0-9A-Za-z.-]+)?
 /// Maven レンジ専用のバージョントークン。
 /// Gradle の順序付け規則に合わせ、`.`, `-`, `_`, `+` 区切りと英数字混在パートを許容する。
 const MAVEN_VERSION_TOKEN: &str = r"[vV]?\d[0-9A-Za-z]*(?:[.\-_+][0-9A-Za-z]+)*";
+/// ワイルドカードセグメントを含みうる端点用トークン (node-semver の XRANGEPLAIN 相当)。
+///
+/// `VERSION_TOKEN` は数値セグメントしか受理しないため、`1.2.x - 2.3.x` のような
+/// x-range 端点を持つハイフンレンジや `<=2.x` の上限を 1 つも拾えない。パーサ側は
+/// これらを Range として受理するので、上限抽出が追随しないと上限フィルタが丸ごと
+/// 効かなくなり、下限が上限を追い越した空レンジ (`4.17.x - 2.3.x`) を書き戻して
+/// `npm install` を壊していた。
+const WILDCARD_BOUND_TOKEN: &str = r"[vV]?(?:\d+|[xX*])(?:\.(?:\d+|[xX*]))*(?:[-+][0-9A-Za-z.-]+)?";
 
 /// Range 制約から包含上限 (`<=X`) を抽出する正規表現。
+/// ワイルドカードを含む上限 (`<=2.x`) も拾い、`strip_wildcard_tail` で
+/// node-semver と同じ排他的上限 (`<3.0.0`) へ変換する。
 static UPPER_BOUND_LTE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"<=\s*({VERSION_TOKEN})")).unwrap());
+    LazyLock::new(|| Regex::new(&format!(r"<=\s*({WILDCARD_BOUND_TOKEN})")).unwrap());
 /// Range 制約から排他的上限 (`<X`) を抽出する正規表現。
 static UPPER_BOUND_LT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&format!(r"<\s*({VERSION_TOKEN})")).unwrap());
@@ -45,8 +55,12 @@ static UPPER_BOUND_SWIFT_HALF_OPEN_RE: LazyLock<Regex> =
 /// ハイフンレンジ (`A - B`) から上限を抽出する正規表現。
 /// npm / Composer の仕様どおりハイフンの前後にスペースを必須とし、
 /// Maven の qualifier 付き下限 (`[1.0-2,2.0)` の `1.0-2`) への誤マッチを防ぐ。
-static UPPER_BOUND_HYPHEN_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"{VERSION_TOKEN}\s+-\s+({VERSION_TOKEN})")).unwrap());
+static UPPER_BOUND_HYPHEN_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r"{WILDCARD_BOUND_TOKEN}\s+-\s+({WILDCARD_BOUND_TOKEN})"
+    ))
+    .unwrap()
+});
 /// Maven 形式レンジ (`[1.0,2.0)`, `(,2.0]`) を解釈する正規表現。
 static MAVEN_RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
@@ -80,6 +94,24 @@ fn normalize_bound_version(version: &str) -> String {
     version_info::strip_ascii_v_prefix(version).to_string()
 }
 
+/// 端点のワイルドカードセグメント以降を切り落とし、残った部分指定を返す。
+///
+/// node-semver はワイルドカードを含む端点を「そのセグメント以降は任意」と読むため、
+/// `2.3.x` は `<2.4.0`、`2.x` は `<3.0.0` と等価になる。切り落とした結果は部分指定
+/// (`2.3` / `2`) なので、既存の「最終セグメント +1 の排他的上限」ロジックへそのまま
+/// 渡せば同じ上限が得られる。
+///
+/// 先頭セグメントがワイルドカード (`* - 2.0.0` / `<=x`) の場合は上限を決められない
+/// ため `None` を返し、呼び出し側で上限なしとして扱う。
+fn strip_wildcard_tail(version: &str) -> Option<String> {
+    let is_wildcard = |segment: &str| matches!(segment, "x" | "X" | "*");
+    match version.split('.').position(is_wildcard) {
+        Some(0) => None,
+        Some(index) => Some(version.split('.').take(index).collect::<Vec<_>>().join(".")),
+        None => Some(version.to_string()),
+    }
+}
+
 /// npm / Composer のハイフンレンジ右辺を上限制約へ正規化する。
 ///
 /// 右辺が部分指定 (`2`, `2.3`) の場合はワイルドカード展開後の排他的上限へ進める。
@@ -94,6 +126,14 @@ fn normalize_hyphen_upper_bound(version: &str) -> (String, bool) {
     if normalized.contains(['-', '+']) {
         return (normalized, true);
     }
+
+    // `2.3.x` / `2.x` はワイルドカード以降を落とし、残った部分指定を排他的上限へ
+    // 展開する (node-semver: `2.3.x` -> `<2.4.0`、`2.x` -> `<3.0.0`)。
+    // 先頭がワイルドカードなら上限を決められないので、値そのものを包含上限として
+    // 返す (後段の比較で候補が不当に絞られないよう、この形は parser 側が弾く)。
+    let Some(normalized) = strip_wildcard_tail(&normalized) else {
+        return (normalized, true);
+    };
 
     let segments: Vec<&str> = normalized.split('.').collect();
     if !(1..=2).contains(&segments.len()) {
@@ -236,7 +276,15 @@ fn extract_upper_bound(raw: &str) -> Option<(String, bool)> {
     let mut best: Option<(String, bool)> = None;
     for caps in UPPER_BOUND_LTE_RE.captures_iter(trimmed) {
         if let Some(m) = caps.get(1) {
-            best = stricter_upper_bound(best, (normalize_bound_version(m.as_str()), true));
+            // `<=2.x` は node-semver では `<3.0.0` (replaceXRange がリリースを +1 して
+            // 排他的上限へ変換する)。包含上限のまま `<=2` と読むと 2.0.1 以降の候補を
+            // すべて落とし、有効な更新を無言で取りこぼす。
+            let bound = if m.as_str().contains(['x', 'X', '*']) {
+                normalize_hyphen_upper_bound(m.as_str())
+            } else {
+                (normalize_bound_version(m.as_str()), true)
+            };
+            best = stricter_upper_bound(best, bound);
         }
     }
     for caps in UPPER_BOUND_LT_RE.captures_iter(trimmed) {
@@ -1419,6 +1467,77 @@ mod tests {
         assert_eq!(super::extract_upper_bound(">=1.0"), None);
         // `>` のみで上限なし
         assert_eq!(super::extract_upper_bound(">1.0"), None);
+    }
+
+    /// 回帰テスト: ハイフンレンジの端点が x-range でも上限を抽出する。
+    ///
+    /// パーサ側が `1.2.x - 2.3.x` を Range として受理するのに上限抽出が数値
+    /// セグメントしか読めず、上限フィルタが丸ごと効かなかった。judge が
+    /// レジストリ最新版を選び、writer が下限だけを置換するため
+    /// `4.17.x - 2.3.x` (= `>=4.17.0 <2.4.0-0`、空レンジ) を書き戻して
+    /// `npm install` を壊していた。
+    #[test]
+    fn test_extract_upper_bound_hyphen_range_with_wildcard_endpoints() {
+        // node-semver: `2.3.x` は `<2.4.0` 相当
+        assert_eq!(
+            super::extract_upper_bound("1.2.x - 2.3.x"),
+            Some(("2.4".to_string(), false))
+        );
+        // `2.x` は `<3.0.0` 相当
+        assert_eq!(
+            super::extract_upper_bound("1.x - 2.x"),
+            Some(("3".to_string(), false))
+        );
+        assert_eq!(
+            super::extract_upper_bound("1.X - 2.X"),
+            Some(("3".to_string(), false))
+        );
+        assert_eq!(
+            super::extract_upper_bound("1.* - 2.*"),
+            Some(("3".to_string(), false))
+        );
+        // 左端だけワイルドカード
+        assert_eq!(
+            super::extract_upper_bound("1.x - 2.0.0"),
+            Some(("2.0.0".to_string(), true))
+        );
+        // v 接頭辞付き
+        assert_eq!(
+            super::extract_upper_bound("v1.x - v2.x"),
+            Some(("3".to_string(), false))
+        );
+        // 右端だけワイルドカード (従来から動いていた形)
+        assert_eq!(
+            super::extract_upper_bound("1.0.0 - 2.3.x"),
+            Some(("2.4".to_string(), false))
+        );
+    }
+
+    /// 回帰テスト: `<=2.x` は node-semver では `<3.0.0`。
+    ///
+    /// 包含上限のまま `<=2` と読むと 2.0.1 以降の候補をすべて落とし、
+    /// 有効な更新を無言で取りこぼす。排他側 (`<2.x` → `<2`) は `<2.0.0` と
+    /// 等価なので従来どおりで正しい。
+    #[test]
+    fn test_extract_upper_bound_lte_with_wildcard() {
+        assert_eq!(
+            super::extract_upper_bound(">=1.0.0 <=2.x"),
+            Some(("3".to_string(), false))
+        );
+        assert_eq!(
+            super::extract_upper_bound(">=1.0.0 <=2.3.x"),
+            Some(("2.4".to_string(), false))
+        );
+        // ワイルドカードなしの `<=` は従来どおり包含上限
+        assert_eq!(
+            super::extract_upper_bound(">=1.0.0 <=2.3.4"),
+            Some(("2.3.4".to_string(), true))
+        );
+        // 排他側は従来どおり
+        assert_eq!(
+            super::extract_upper_bound(">=1.0.0 <2.x"),
+            Some(("2".to_string(), false))
+        );
     }
 
     #[test]

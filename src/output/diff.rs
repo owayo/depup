@@ -67,11 +67,16 @@ impl DiffFormatter {
 
         // 各更新を diff hunk として書く
         for (dependency, new_version) in displayable {
-            let old_version = &dependency.version_spec.raw;
-            let new_formatted = dependency
+            let new_constraint = dependency
                 .version_spec
                 .try_format_updated(new_version)
                 .unwrap_or_else(|| dependency.version_spec.raw.clone());
+            // 値には接頭辞も含める。npm alias では `version_spec.raw` が制約部分
+            // (`^17.0.0`) しか持たないため、そのまま出すと「alias 宣言が外れて素の
+            // `^18.0.0` になる」ように見え、実際の書き込み
+            // (`"npm:@preact/compat@^18.0.0"`) と食い違う
+            let old_version = dependency.manifest_value(&dependency.version_spec.raw);
+            let new_formatted = dependency.manifest_value(&new_constraint);
 
             // 表示にはマニフェスト上の依存キーを使う。`dependency.name` はレジストリ上の
             // 実パッケージ名なので、npm alias (`"react": "npm:@preact/compat@^17"`) や
@@ -169,15 +174,16 @@ mod tests {
         assert!(!formatter.dry_run);
     }
 
-    /// alias / rename 依存では diff にマニフェスト上のキーを出す。
+    /// rename 依存では diff にマニフェスト上のキーを出す。
     /// レジストリ上の実パッケージ名を出すと、実ファイルに存在しないキーが並ぶ
     #[test]
-    fn test_format_diff_uses_manifest_key_for_alias_dependency() {
+    fn test_format_diff_uses_manifest_key_for_renamed_dependency() {
         let mut summary = UpdateSummary::new(false);
-        let mut manifest = ManifestUpdateResult::new(PathBuf::from("package.json"), Language::Node);
+        let mut manifest = ManifestUpdateResult::new(PathBuf::from("Cargo.toml"), Language::Rust);
 
-        // "react": "npm:@preact/compat@^17.0.0" 相当
-        let dep = sample_dependency("@preact/compat", "17.0.0").with_manifest_name("react");
+        // `mylib = { package = "actual-crate", version = "^17.0.0" }` 相当。
+        // Cargo の rename では値の中に実クレート名が現れないので、キーだけを差し替える
+        let dep = sample_dependency("actual-crate", "17.0.0").with_manifest_name("mylib");
         manifest.add_result(UpdateResult::update(dep, "18.0.0"));
         summary.add_manifest(manifest);
 
@@ -192,12 +198,54 @@ mod tests {
         formatter.format(&result, &mut output).unwrap();
         let text = String::from_utf8(output).unwrap();
 
-        assert!(text.contains("@@ react @@"), "{text}");
-        assert!(text.contains(r#"-  "react": "^17.0.0""#), "{text}");
-        assert!(text.contains(r#"+  "react": "^18.0.0""#), "{text}");
+        assert!(text.contains("@@ mylib @@"), "{text}");
+        assert!(text.contains(r#"-  "mylib": "^17.0.0""#), "{text}");
+        assert!(text.contains(r#"+  "mylib": "^18.0.0""#), "{text}");
         assert!(
-            !text.contains("@preact/compat"),
+            !text.contains("actual-crate"),
             "マニフェストに存在しないキーを出さない: {text}"
+        );
+    }
+
+    /// 回帰テスト: npm alias では値の `npm:<real>@` 接頭辞も diff に出す。
+    ///
+    /// `version_spec.raw` は制約部分 (`^17.0.0`) しか持たないため、接頭辞を
+    /// 落とすと diff が「alias 宣言が外れて素の `^18.0.0` になる」ように見える。
+    /// 実際に書き込まれるのは `"npm:@preact/compat@^18.0.0"` なので、レビュー
+    /// 内容と適用結果が食い違っていた。
+    #[test]
+    fn test_format_diff_keeps_npm_alias_prefix_in_values() {
+        let mut summary = UpdateSummary::new(false);
+        let mut manifest = ManifestUpdateResult::new(PathBuf::from("package.json"), Language::Node);
+
+        // "react": "npm:@preact/compat@^17.0.0" 相当
+        let dep = sample_dependency("@preact/compat", "17.0.0")
+            .with_manifest_name("react")
+            .with_value_prefix("npm:@preact/compat@");
+        manifest.add_result(UpdateResult::update(dep, "18.0.0"));
+        summary.add_manifest(manifest);
+
+        let result = OrchestratorResult {
+            summary,
+            write_results: Vec::new(),
+            errors: Vec::new(),
+        };
+
+        let formatter = DiffFormatter::new(false);
+        let mut output = Vec::new();
+        formatter.format(&result, &mut output).unwrap();
+        let text = String::from_utf8(output).unwrap();
+
+        // キーはマニフェスト上の alias 名
+        assert!(text.contains("@@ react @@"), "{text}");
+        // 値は接頭辞込みで実ファイルと一致する
+        assert!(
+            text.contains(r#"-  "react": "npm:@preact/compat@^17.0.0""#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"+  "react": "npm:@preact/compat@^18.0.0""#),
+            "{text}"
         );
     }
 

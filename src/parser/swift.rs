@@ -137,6 +137,20 @@ mod tests {
         assert!(parse("1.2.3-01").is_none());
     }
 
+    /// バグ回帰テスト: CalVer タグ (`2024.01.15`) は SPM の Version として invalid。
+    ///
+    /// このパーサは `Package.swift` 側とレジストリ側 (GitHub Tags) が共有する
+    /// 「SPM が読めるバージョンか」の単一判定であり、ここで弾かれた形はレジストリの
+    /// 更新候補にも入らない。以前は取得側だけが先頭ゼロを許しており、`2024 > 1` のため
+    /// CalVer タグが必ず最新として選ばれ、`swift build` が
+    /// `Invalid semantic version string` で落ちる `Package.swift` を書き込んでいた。
+    #[test]
+    fn test_parse_rejects_calver_tag_with_leading_zero() {
+        assert!(parse("2024.01.15").is_none());
+        // 先頭ゼロが無ければ 3 セグメントの数値として semver 上は valid
+        assert!(parse("2024.1.15").is_some());
+    }
+
     #[test]
     fn test_parse_prerelease_alpha_accepted() {
         // alpha プレリリースも semver 2.0.0 仕様により受理される

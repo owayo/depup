@@ -10,15 +10,21 @@
 //! - Rye の `tool.rye.dev-dependencies`
 //! - uv の `tool.uv.dev-dependencies` (旧形式) と `tool.uv.sources` によるソース除外
 //! - PDM の `tool.pdm.dev-dependencies`
+//!
+//! 書き換え (`update_version`) は「セクションヘッダのキー + 行頭のドットキー」を連結した
+//! 論理パスで対象を決めるため、同じ値へ解決される dotted key
+//! (`optional-dependencies.dev = [...]`) と inline table
+//! (`optional-dependencies = { dev = [...] }`) も parse と同じ範囲を扱う。
+//!
+//! プロジェクト全体の既定インデックスが PyPI 以外 (Poetry の primary source /
+//! uv の default index・index-url / PDM の `pypi` source 上書き) の場合は、
+//! マニフェストごと更新対象から外す。
 
 use crate::domain::{Dependency, Language};
 use crate::error::ManifestError;
 use crate::manifest::{
     ManifestParser,
-    line_utils::{
-        HashCommentMode, captured_quote_and_version, parse_toml_section_header,
-        strip_hash_line_comment,
-    },
+    line_utils::{HashCommentMode, parse_toml_section_header, strip_hash_line_comment},
 };
 use crate::parser::{VersionParser, get_parser};
 use regex::Regex;
@@ -34,12 +40,6 @@ pub struct PyprojectTomlParser;
 // 例: `package-name>=1.0,<2.0`, `package-name==1.0`, `package-name^1.0`
 static PEP508_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^([a-zA-Z0-9][-a-zA-Z0-9._]*)\s*(.*)$").unwrap());
-/// Poetry の多行依存テーブル内の `version = "..."` 行を検出する正規表現。
-/// 行頭アンカー付きなので、行末コメント内の `version = "..."` は書き換えない。
-static POETRY_TABLE_VERSION_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"^(\s*version\s*=\s*)(?:"([^"]+)"|'([^']+)')"#).unwrap());
-static POETRY_INLINE_SOURCE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"source\s*=\s*(?:"([^"]+)"|'([^']+)')"#).unwrap());
 
 impl ManifestParser for PyprojectTomlParser {
     fn parse(&self, content: &str) -> Result<Vec<Dependency>, ManifestError> {
@@ -51,6 +51,26 @@ impl ManifestParser for PyprojectTomlParser {
         })?;
 
         let mut dependencies = Vec::new();
+
+        // プロジェクト全体の既定インデックスが PyPI 以外なら、依存名が同じでも
+        // 別物のパッケージを指しているため、マニフェストごと更新対象から外す
+        // (社内 private index の依存を PyPI 上の同名パッケージ (typosquat を含む) の
+        // 版で書き換える誤更新を防ぐ安全側のスキップ)。
+        //
+        // 依存が 0 件になるだけだと利用者には「更新なし」と区別がつかないため、
+        // 理由を 1 度だけ通知する。`mise` コマンド不在時にマニフェストを外して
+        // 警告するのと同じ方針。
+        if uses_non_pypi_default_index(&toml) {
+            use colored::Colorize as _;
+            eprintln!(
+                "{}",
+                "⚠ pyproject.toml: a non-PyPI default index is configured; \
+                 all dependencies are skipped (depup only queries PyPI)"
+                    .yellow()
+            );
+            return Ok(dependencies);
+        }
+
         let parser = get_parser(Language::Python);
         let parser = parser.as_ref();
         let excluded = non_pypi_source_names(&toml);
@@ -133,39 +153,26 @@ impl ManifestParser for PyprojectTomlParser {
     ) -> Result<String, ManifestError> {
         // TOML の整形を壊さないよう、依存セクション内だけを文字列置換で差し替える
         let parser = get_parser(Language::Python);
-        let package_has_non_pypi_source = toml::from_str::<Value>(content)
-            .map(|toml| non_pypi_source_names(&toml))
-            .unwrap_or_default()
-            .contains(&normalize_python_package_name(package));
-        if package_has_non_pypi_source {
-            return Err(ManifestError::InvalidVersionSpec {
-                path: PathBuf::from("pyproject.toml"),
-                spec: package.to_string(),
-                message: "package uses a non-PyPI source".to_string(),
-            });
+        let parser = parser.as_ref();
+        let manifest = toml::from_str::<Value>(content).ok();
+
+        if let Some(toml) = &manifest {
+            if non_pypi_source_names(toml).contains(&normalize_python_package_name(package)) {
+                return Err(ManifestError::InvalidVersionSpec {
+                    path: PathBuf::from("pyproject.toml"),
+                    spec: package.to_string(),
+                    message: "package uses a non-PyPI source".to_string(),
+                });
+            }
+            // parse 側と同じ範囲を拒否する (report/apply の整合)
+            if uses_non_pypi_default_index(toml) {
+                return Err(ManifestError::InvalidVersionSpec {
+                    path: PathBuf::from("pyproject.toml"),
+                    spec: package.to_string(),
+                    message: "manifest configures a non-PyPI default index".to_string(),
+                });
+            }
         }
-
-        // Poetry のキーは、ドットを含む名前 (`zope.interface` / `ruamel.yaml`) では
-        // TOML のベアキーに書けずクォートが必須になる。parse (toml クレート) は
-        // クォート付きキーもそのまま依存として読むため、書き換え側も同じ範囲を
-        // 対象にしないと report/apply が矛盾する。キャプチャ 1 にクォートごと
-        // 含めるので書き戻しは元の表記を保つ。
-        let key_pattern = {
-            let escaped = regex::escape(package);
-            format!(r#"(?:"{escaped}"|'{escaped}'|{escaped})"#)
-        };
-
-        // Poetry 形式: `name = "^1.0.0"` / `name = '^1.0.0'`
-        let simple_re = Regex::new(&format!(
-            r#"^(\s*{key_pattern}\s*=\s*)(?:"([^"]+)"|'([^']+)')"#
-        ))
-        .ok();
-
-        // Poetry の inline table 形式: `name = { version = "^1.0.0", ... }`
-        let table_re = Regex::new(&format!(
-            r#"^(\s*{key_pattern}\s*=\s*\{{\s*[^}}]*version\s*=\s*)(?:"([^"]+)"|'([^']+)')([^}}]*\}})"#
-        ))
-        .ok();
 
         // 配列中の PEP 508 形式: `"package>=1.0,<2.0"` / `"package [extras] (>=1.0); marker"`
         let pep508_re = Regex::new(&format!(
@@ -175,19 +182,21 @@ impl ManifestParser for PyprojectTomlParser {
         ))
         .ok();
 
-        // 行単位で現在の TOML セクションを追跡し、parse が依存として読むセクション内の
-        // 全出現だけを更新する (`[build-system]` の requires 等は書き換えない)
+        // 行ごとに「セクションヘッダのキー + 行頭のドットキー」を連結した論理パスを組み立て、
+        // parse (toml クレートの値解決) が依存として読む論理パスと同じ範囲だけを更新する。
+        // セクションヘッダ文字列の完全一致で判定していた頃は、同じ値へ解決される
+        // dotted key (`optional-dependencies.dev = [...]`) や inline table
+        // (`optional-dependencies = { dev = [...] }`) を parse だけが読み、writer が
+        // 書けずに report/apply が矛盾していた。
         let mut result = String::with_capacity(content.len());
         let mut updated = false;
-        let mut section = TomlSectionKind::Other;
-        // 現在の多行 Poetry 依存テーブルが更新対象パッケージのものか
-        let mut poetry_table_matches = false;
-        // `[project]` / `[tool.rye]` / `[tool.uv]` 内で依存配列
-        // (`dependencies` / `dev-dependencies`) の中にいるか
-        let mut in_scoped_dep_array = false;
+        // 現在のセクションヘッダのキー列 (ルート直下は空)
+        let mut section: Vec<String> = Vec::new();
         // マルチライン文字列 (`"""` / `'''`) の内側かどうか (Some の場合はその区切り)。
         // description 等の docstring 内側では TOML 構文を解釈せず素通しする。
         let mut multiline_delim: Option<&'static str> = None;
+        // 依存配列 / inline table が次行以降へ続いている深さ
+        let mut open_dependency_depth: i32 = 0;
 
         for line in content.split_inclusive('\n') {
             // マルチライン文字列の内側は素通しする。docstring に依存配列風のテキスト
@@ -199,6 +208,17 @@ impl ManifestParser for PyprojectTomlParser {
                 result.push_str(line);
                 continue;
             }
+
+            // セクションヘッダ。依存配列の内側には現れないので、配列内の `["a"]` のような
+            // 行をヘッダと誤認しないよう深さ 0 のときだけ判定する。
+            if open_dependency_depth == 0
+                && let Some(header) = toml_section_header(line)
+            {
+                section = split_toml_key_path(header).unwrap_or_default();
+                result.push_str(line);
+                continue;
+            }
+
             // この行でマルチライン文字列が開いて同一行で閉じないなら、以降を素通しする。
             if let Some(delim) = opens_unclosed_multiline_string(line) {
                 multiline_delim = Some(delim);
@@ -206,66 +226,58 @@ impl ManifestParser for PyprojectTomlParser {
                 continue;
             }
 
-            if let Some(header) = toml_section_header(line) {
-                section = classify_toml_section(header);
-                poetry_table_matches = section == TomlSectionKind::PoetryDependencyTable
-                    && poetry_dependency_table_package(header).is_some_and(|name| name == package);
-                in_scoped_dep_array = false;
-                result.push_str(line);
-                continue;
-            }
-
-            let updated_line = match section {
-                TomlSectionKind::PoetryDependencies => update_poetry_dependency_line(
-                    line,
-                    simple_re.as_ref(),
-                    table_re.as_ref(),
-                    parser.as_ref(),
-                    new_version,
-                ),
-                TomlSectionKind::PoetryDependencyTable if poetry_table_matches => {
-                    update_poetry_table_version_line(line, parser.as_ref(), new_version)
-                }
-                TomlSectionKind::PoetryDependencyTable => None,
-                TomlSectionKind::Pep508Dependencies => update_pep508_array_line(
+            let (updated_line, is_dependency_line) = if open_dependency_depth > 0 {
+                // 複数行に跨る依存配列の内側
+                let updated_line = update_pep508_array_line(
                     line,
                     pep508_re.as_ref(),
                     package,
-                    parser.as_ref(),
+                    parser,
                     new_version,
-                ),
-                TomlSectionKind::Pep508ScopedArrays => {
-                    // 依存配列 (`dependencies = [` / `dev-dependencies = [`) の内側だけ処理する。
-                    // `name` / `keywords` / `description` 等の他キーは書き換えない。
-                    if in_scoped_dep_array {
-                        if line_has_scoped_array_close(line) {
-                            in_scoped_dep_array = false;
-                        }
-                        update_pep508_array_line(
+                );
+                (updated_line, true)
+            } else if let Some((keys, value_start)) = parse_assignment_key_path(line) {
+                let path = logical_key_path(&section, keys);
+                if is_pep508_dependency_path(&path) {
+                    let updated_line = update_pep508_array_line(
+                        line,
+                        pep508_re.as_ref(),
+                        package,
+                        parser,
+                        new_version,
+                    );
+                    (updated_line, true)
+                } else {
+                    let updated_line = match poetry_target(&path, package) {
+                        Some(PoetryTarget::Table) => update_poetry_table_value(
                             line,
-                            pep508_re.as_ref(),
+                            value_start,
                             package,
-                            parser.as_ref(),
+                            parser,
                             new_version,
-                        )
-                    } else if is_scoped_dependency_array_start(line) {
-                        // 配列開始行。同一行で閉じなければ以降も配列内
-                        if !line_has_scoped_array_close(line) {
-                            in_scoped_dep_array = true;
+                        ),
+                        Some(PoetryTarget::Entry) => {
+                            update_poetry_entry_value(line, value_start, parser, new_version)
                         }
-                        update_pep508_array_line(
-                            line,
-                            pep508_re.as_ref(),
-                            package,
-                            parser.as_ref(),
-                            new_version,
-                        )
-                    } else {
-                        None
-                    }
+                        Some(PoetryTarget::EntryVersion) => quoted_value_span(line, value_start)
+                            .and_then(|span| {
+                                replace_quoted_version(line, span, parser, new_version)
+                            }),
+                        None => None,
+                    };
+                    (updated_line, false)
                 }
-                TomlSectionKind::Other => None,
+            } else {
+                (None, false)
             };
+
+            // 依存配列 / inline table が次行へ続くかを、文字列・コメント外の括弧で追跡する
+            if open_dependency_depth > 0 {
+                open_dependency_depth =
+                    (open_dependency_depth + line_bracket_depth_delta(line)).max(0);
+            } else if is_dependency_line {
+                open_dependency_depth = line_bracket_depth_delta(line).max(0);
+            }
 
             match updated_line {
                 Some(new_line) => {
@@ -288,149 +300,406 @@ impl ManifestParser for PyprojectTomlParser {
     }
 }
 
-/// `update_version` が置換対象とする TOML セクションの種別
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TomlSectionKind {
-    /// Poetry の依存セクション (`name = "^1.0"` / inline table 置換の対象)
-    PoetryDependencies,
-    /// セクション全体が PEP 508 依存配列 (の集合) で全行が置換対象
-    /// 対象セクション: `[project.optional-dependencies]` / `[dependency-groups]` /
-    /// `[tool.pdm.dev-dependencies]`
-    Pep508Dependencies,
-    /// セクション内の特定の依存配列 (`dependencies` / `dev-dependencies`) だけが置換対象で、
-    /// `name` / `keywords` / `description` 等の他キーは書き換えてはいけないセクション
-    /// 対象セクション: `[project]` / `[tool.rye]` / `[tool.uv]`
-    Pep508ScopedArrays,
-    /// Poetry の多行依存テーブル本体 (`[tool.poetry.dependencies.<name>]`)。
-    /// ヘッダ末尾のセグメントが対象パッケージ名で、配下の `version` キー行だけが置換対象
-    PoetryDependencyTable,
-    /// 依存セクション以外 (`[build-system]` 等。書き換え対象外)
-    Other,
-}
-
-/// Poetry の多行依存テーブル (`[tool.poetry.dependencies.<name>]` /
-/// `[tool.poetry.group.<g>.dependencies.<name>]`) のヘッダから対象パッケージ名を取り出す。
-///
-/// TOML のクォート付きキー (`[tool.poetry.dependencies."zope.interface"]`) にも対応する。
-/// クォートなしでドットを含む末尾 (`[tool.poetry.dependencies.foo.bar]`) は、toml クレートが
-/// ネストしたテーブルとして読むため単一パッケージ名ではない。parse が依存として
-/// surface しないので `None` を返して書き換え対象から外す。
-fn poetry_dependency_table_package(header: &str) -> Option<String> {
-    let tail = header
-        .strip_prefix("tool.poetry.dependencies.")
-        .or_else(|| header.strip_prefix("tool.poetry.dev-dependencies."))
-        .or_else(|| {
-            let rest = header.strip_prefix("tool.poetry.group.")?;
-            let idx = rest.find(".dependencies.")?;
-            rest.get(idx + ".dependencies.".len()..)
-        })?
-        .trim();
-
-    for quote in ['"', '\''] {
-        if let Some(inner) = tail
-            .strip_prefix(quote)
-            .and_then(|value| value.strip_suffix(quote))
-        {
-            return (!inner.is_empty() && !inner.contains(quote)).then(|| inner.to_string());
-        }
-    }
-    (!tail.is_empty() && !tail.contains('.')).then(|| tail.to_string())
-}
-
 /// TOML のセクションヘッダ行 (`[section]` / `[[section]]`) からドット区切りキーを取り出す。
 /// 字句解析は line_utils の共有実装に委譲する (この実装が共有元になった)。
 fn toml_section_header(line: &str) -> Option<&str> {
     parse_toml_section_header(line)
 }
 
-/// セクションヘッダのドット区切りキーから置換対象種別を判定する
-fn classify_toml_section(header: &str) -> TomlSectionKind {
-    // parse が読む Poetry の依存セクション
-    if header == "tool.poetry.dependencies"
-        || header == "tool.poetry.dev-dependencies"
-        || (header.starts_with("tool.poetry.group.") && header.ends_with(".dependencies"))
-    {
-        return TomlSectionKind::PoetryDependencies;
-    }
-    // セクション全体が PEP 508 依存配列 (の集合) で、全行が置換対象:
-    // - [project.optional-dependencies] (PEP 621、各キー = 配列)
-    // - [dependency-groups] (PEP 735、各キー = 配列)
-    // - [tool.pdm.dev-dependencies] (PDM、各キー = 配列)
-    // Poetry の多行依存テーブル (`[tool.poetry.dependencies.<name>]`)
-    if poetry_dependency_table_package(header).is_some() {
-        return TomlSectionKind::PoetryDependencyTable;
-    }
-    if header == "project.optional-dependencies"
-        || header == "dependency-groups"
-        || header == "tool.pdm.dev-dependencies"
-    {
-        return TomlSectionKind::Pep508Dependencies;
-    }
-    // セクション内の特定の依存配列だけが対象 (name/keywords/description 等は書き換えない):
-    // - [project] の dependencies 配列 (PEP 621)
-    // - [tool.rye] の dev-dependencies 配列 (Rye)
-    // - [tool.uv] の dev-dependencies 配列 (uv 旧形式)
-    if header == "project" || header == "tool.rye" || header == "tool.uv" {
-        return TomlSectionKind::Pep508ScopedArrays;
-    }
-    TomlSectionKind::Other
+/// セクションヘッダのキー列と行頭のドットキーを連結し、その行が書いている値の論理パスにする。
+/// `[project]` + `optional-dependencies.dev` → `project.optional-dependencies.dev`。
+fn logical_key_path(section: &[String], keys: Vec<String>) -> Vec<String> {
+    let mut path = section.to_vec();
+    path.extend(keys);
+    path
 }
 
-/// `[project]` / `[tool.rye]` / `[tool.uv]` 内で依存配列
-/// (`dependencies = [` / `dev-dependencies = [`) の開始行かどうかを判定する。
-/// `name = "..."` や `keywords = [...]`、uv の `constraint-dependencies` /
-/// `override-dependencies` は対象外 (キー名の完全一致で判定するため)。
-fn is_scoped_dependency_array_start(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    let after_key = if let Some(rest) = trimmed.strip_prefix("dependencies") {
-        rest
-    } else if let Some(rest) = trimmed.strip_prefix("dev-dependencies") {
-        rest
-    } else {
-        return false;
-    };
-    // キー名の直後は空白か `=` のみ (`dependencies-extra` のような別キーに前方一致しない)
-    let after_key = after_key.trim_start();
-    after_key.starts_with('=') && after_key[1..].trim_start().starts_with('[')
+/// PEP 508 依存指定の配列 (またはそれを直接内包するテーブル) を指す論理パスか判定する。
+///
+/// 配列そのもの (`project.dependencies`) に加えて、その親テーブル
+/// (`project.optional-dependencies` / `dependency-groups` / `tool.pdm.dev-dependencies`)
+/// も対象にする。inline table 形式 (`optional-dependencies = { dev = [...] }`) では
+/// 1 行に親テーブルごと書かれるため、親を対象にしないと parse は読むのに writer が
+/// 書けない (report/apply の矛盾) 状態になる。
+///
+/// `project` / `tool.uv` のようにメタデータと同居するテーブル自体は対象にしない
+/// (テーブルごと inline で書かれた場合に `name` / `description` を巻き込むため。
+/// parse は読むので取りこぼしになるが、メタデータ破壊よりは安全側に倒す)。
+fn is_pep508_dependency_path(path: &[String]) -> bool {
+    let segments: Vec<&str> = path.iter().map(String::as_str).collect();
+    matches!(
+        segments.as_slice(),
+        ["project", "dependencies"]
+            | ["project", "optional-dependencies"]
+            | ["project", "optional-dependencies", _]
+            | ["dependency-groups"]
+            | ["dependency-groups", _]
+            | ["tool", "pdm", "dev-dependencies"]
+            | ["tool", "pdm", "dev-dependencies", _]
+            | ["tool", "rye", "dev-dependencies"]
+            | ["tool", "uv", "dev-dependencies"]
+    )
 }
 
-/// 行をクォート外でスキャンし、配列の閉じ括弧 `]` を含むか判定する。
-/// extras (`foo[extra]`) のようなクォート内の `]` は配列終了とみなさない。
-fn line_has_scoped_array_close(line: &str) -> bool {
-    let mut in_single = false;
-    let mut in_double = false;
-    for ch in line.chars() {
+/// Poetry の依存テーブル (「名前 → 制約」のテーブル) を指す論理パスか判定する。
+fn is_poetry_dependency_table_path(path: &[String]) -> bool {
+    let segments: Vec<&str> = path.iter().map(String::as_str).collect();
+    matches!(
+        segments.as_slice(),
+        ["tool", "poetry", "dependencies"]
+            | ["tool", "poetry", "dev-dependencies"]
+            | ["tool", "poetry", "group", _, "dependencies"]
+    )
+}
+
+/// 行が Poetry 依存のどこを書いているか
+enum PoetryTarget {
+    /// 依存テーブルそのもの (`dependencies = { requests = "^2.28" }`)
+    Table,
+    /// 対象パッケージのエントリ (`requests = "^2.28"` / `requests = { version = ... }`)
+    Entry,
+    /// 対象パッケージの version キー (`version = "^2.28"`)
+    EntryVersion,
+}
+
+/// 論理パスから、その行が対象パッケージの Poetry 依存を書いているかを判定する。
+fn poetry_target(path: &[String], package: &str) -> Option<PoetryTarget> {
+    if is_poetry_dependency_table_path(path) {
+        return Some(PoetryTarget::Table);
+    }
+    if let Some((last, head)) = path.split_last()
+        && last == package
+        && is_poetry_dependency_table_path(head)
+    {
+        return Some(PoetryTarget::Entry);
+    }
+    if path.len() >= 2
+        && path[path.len() - 1] == "version"
+        && path[path.len() - 2] == package
+        && is_poetry_dependency_table_path(&path[..path.len() - 2])
+    {
+        return Some(PoetryTarget::EntryVersion);
+    }
+    None
+}
+
+/// TOML の 1 行を走査し、文字列リテラルの外側にある文字だけを `visit` へ渡す。
+///
+/// - 単一行の基本文字列 (`"..."`、バックスラッシュエスケープを解釈) とリテラル文字列
+///   (`'...'`) の内側は訪問しない。
+/// - 文字列外の `#` に達した時点で走査を打ち切る (行コメント)。
+/// - 行内で閉じないマルチライン文字列 (`"""` / `'''`) を開いた場合はその区切りを返す。
+///
+/// マルチライン区切りを単一行クォートより**先に**判定するのが要点。逆にすると
+/// `"""` の 1 文字目で単一行の基本文字列に入ったと誤認する。
+fn scan_toml_line_outside_strings(
+    line: &str,
+    mut visit: impl FnMut(usize, char),
+) -> Option<&'static str> {
+    let mut idx = 0;
+    'scan: while idx < line.len() {
+        let rest = &line[idx..];
+
+        for delim in ["\"\"\"", "'''"] {
+            if let Some(after_open) = rest.strip_prefix(delim) {
+                match after_open.find(delim) {
+                    // 同一行で閉じるので読み飛ばして走査を続ける
+                    Some(close) => {
+                        idx += delim.len() + close + delim.len();
+                        continue 'scan;
+                    }
+                    // 開いたまま行が終わる = 以降の行はマルチライン文字列の内側
+                    None => return Some(delim),
+                }
+            }
+        }
+
+        let Some(ch) = rest.chars().next() else {
+            break;
+        };
         match ch {
-            '\'' if !in_double => in_single = !in_single,
-            '"' if !in_single => in_double = !in_double,
-            '#' if !in_single && !in_double => return false,
-            ']' if !in_single && !in_double => return true,
-            _ => {}
+            '"' | '\'' => idx += skip_single_line_string(rest, ch == '"'),
+            // 行コメント以降は TOML 構文として解釈しない
+            '#' => return None,
+            _ => {
+                visit(idx, ch);
+                idx += ch.len_utf8();
+            }
         }
     }
-    false
+    None
+}
+
+/// 単一行の TOML 文字列を読み飛ばし、消費したバイト数を返す。
+/// `basic` が true なら基本文字列 (`"..."`) としてバックスラッシュエスケープを解釈する。
+/// 閉じクォートが無ければ行末まで消費する。
+fn skip_single_line_string(rest: &str, basic: bool) -> usize {
+    let quote = if basic { '"' } else { '\'' };
+    let start = quote.len_utf8();
+    let mut escaped = false;
+    for (offset, ch) in rest[start..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if basic && ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == quote {
+            return start + offset + ch.len_utf8();
+        }
+    }
+    rest.len()
 }
 
 /// 行がマルチライン文字列 (`"""` / `'''`) を開いて同一行内で閉じない場合、その区切りを返す。
-/// TOML の複数行基本文字列 (`"""`) とリテラル文字列 (`'''`) の両方に対応する。
-/// description 等の docstring を素通しして依存配列の誤検出を防ぐために使う。
+///
+/// 行コメント内 (`# ... """`) や別種クォートの内側 (`description = "Ain't got '''"`) の
+/// 区切りは無視する。以前は行全体を `find("\"\"\"")` するだけだったため、コメントや
+/// 文字列内の区切りで docstring 状態が立ち、以降のファイル全体が更新不能になっていた。
 fn opens_unclosed_multiline_string(line: &str) -> Option<&'static str> {
-    // 行内で最初に現れる区切り (""" / ''') を選ぶ
-    let mut earliest: Option<(usize, &'static str)> = None;
-    for delim in ["\"\"\"", "'''"] {
-        if let Some(pos) = line.find(delim)
-            && earliest.map(|(p, _)| pos < p).unwrap_or(true)
-        {
-            earliest = Some((pos, delim));
+    scan_toml_line_outside_strings(line, |_, _| {})
+}
+
+/// 文字列リテラル・行コメントの外側で数えた括弧の増減を返す。
+/// 依存配列 (`dependencies = [`) や inline table が次行以降へ続くかの判定に使う。
+/// extras (`"foo[extra]"`) のようなクォート内の括弧は数えない。
+fn line_bracket_depth_delta(line: &str) -> i32 {
+    let mut depth = 0;
+    scan_toml_line_outside_strings(line, |_, ch| match ch {
+        '[' | '{' => depth += 1,
+        ']' | '}' => depth -= 1,
+        _ => {}
+    });
+    depth
+}
+
+/// TOML のキーセグメント 1 個 (bare キー / クォート付きキー) を読み、(値, 消費バイト数)
+/// を返す。クォート内のエスケープは展開しない (依存名でエスケープを使う例は無い)。
+fn read_toml_key_segment(rest: &str) -> Option<(String, usize)> {
+    for quote in ['"', '\''] {
+        if rest.starts_with(quote) {
+            let len = skip_single_line_string(rest, quote == '"');
+            let literal = &rest[..len];
+            // 閉じクォートが無い断片はキーとして扱わない
+            let inner = literal
+                .strip_prefix(quote)
+                .and_then(|value| value.strip_suffix(quote))?;
+            return Some((inner.to_string(), len));
         }
     }
-    let (pos, delim) = earliest?;
-    // 開始区切りの直後に同じ区切りが再度現れれば、同一行で閉じている (開いたままではない)
-    if line[pos + delim.len()..].contains(delim) {
-        None
-    } else {
-        Some(delim)
+    let len = rest
+        .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'))
+        .unwrap_or(rest.len());
+    (len > 0).then(|| (rest[..len].to_string(), len))
+}
+
+/// 文字列の先頭から TOML のドット区切りキーを読み、(セグメント列, 消費バイト数) を返す。
+/// 消費バイト数には最後のセグメント直後の空白も含む。
+fn read_toml_key_path(text: &str) -> Option<(Vec<String>, usize)> {
+    let mut segments = Vec::new();
+    let mut idx = 0;
+    loop {
+        idx += leading_whitespace_len(&text[idx..]);
+        let (segment, len) = read_toml_key_segment(text.get(idx..)?)?;
+        segments.push(segment);
+        idx += len + leading_whitespace_len(&text[idx + len..]);
+        match text[idx..].starts_with('.') {
+            true => idx += 1,
+            false => return Some((segments, idx)),
+        }
     }
+}
+
+fn leading_whitespace_len(text: &str) -> usize {
+    text.len() - text.trim_start().len()
+}
+
+/// ドット区切りキー全体 (セクションヘッダ等) をセグメント列へ分解する。
+/// 末尾に余分な文字が残る場合は解釈できないものとして `None` を返す。
+fn split_toml_key_path(key: &str) -> Option<Vec<String>> {
+    let (segments, consumed) = read_toml_key_path(key)?;
+    key[consumed..].trim().is_empty().then_some(segments)
+}
+
+/// `text[idx..]` の先頭から `key = ` を読み、(キーのセグメント列, 値の開始位置) を返す。
+/// 行頭の代入と inline table のエントリで共有する。
+fn read_key_assignment(text: &str, idx: usize) -> Option<(Vec<String>, usize)> {
+    let (segments, consumed) = read_toml_key_path(text.get(idx..)?)?;
+    let after_key = idx + consumed;
+    if !text.get(after_key..)?.starts_with('=') {
+        return None;
+    }
+    let value_start = after_key + 1;
+    Some((
+        segments,
+        value_start + leading_whitespace_len(text.get(value_start..)?),
+    ))
+}
+
+/// 行頭が `key = ...` (ドット区切りキー可) なら、キーのセグメント列と値の開始位置を返す。
+/// 配列要素の行 (`"requests>=2.0",`)・コメント行・継続行は `None`。
+fn parse_assignment_key_path(line: &str) -> Option<(Vec<String>, usize)> {
+    let indent = leading_whitespace_len(line);
+    if line[indent..].starts_with('#') {
+        return None;
+    }
+    read_key_assignment(line, indent)
+}
+
+/// inline table (`{ ... }`) の直下エントリを (キーのセグメント列, 値の開始位置) で列挙する。
+///
+/// ネストした inline table / 配列 / 文字列リテラルの内側は読み飛ばす。文字列を読み飛ばすのが
+/// 要点で、素朴に `version\s*=` を探すと `postinstall = 'version = "x"'` のような
+/// 別フィールドの中身を書き換えてしまう。
+fn inline_table_entries(line: &str, brace_start: usize) -> Vec<(Vec<String>, usize)> {
+    let mut entries = Vec::new();
+    let mut idx = brace_start + 1;
+    let mut depth: i32 = 0;
+    let mut at_entry_start = true;
+
+    while idx < line.len() {
+        let rest = &line[idx..];
+        let ws = leading_whitespace_len(rest);
+        if ws > 0 {
+            idx += ws;
+            continue;
+        }
+        let Some(ch) = rest.chars().next() else {
+            break;
+        };
+
+        if at_entry_start
+            && depth == 0
+            && ch != '}'
+            && let Some((keys, value_start)) = read_key_assignment(line, idx)
+        {
+            entries.push((keys, value_start));
+            idx = value_start;
+            at_entry_start = false;
+            continue;
+        }
+
+        match ch {
+            '"' | '\'' => idx += skip_single_line_string(rest, ch == '"'),
+            '{' | '[' => {
+                depth += 1;
+                idx += 1;
+            }
+            '}' | ']' => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+                idx += 1;
+            }
+            ',' if depth == 0 => {
+                at_entry_start = true;
+                idx += 1;
+            }
+            '#' => break,
+            _ => idx += ch.len_utf8(),
+        }
+    }
+
+    entries
+}
+
+/// 行の指定位置にあるクォート値の「中身」のバイト範囲を返す。
+/// 値がクォート文字列でない (inline table / 配列 / 真偽値等) 場合は `None`。
+fn quoted_value_span(line: &str, value_start: usize) -> Option<(usize, usize)> {
+    let rest = line.get(value_start..)?;
+    let quote = rest.chars().next().filter(|ch| matches!(ch, '"' | '\''))?;
+    let len = skip_single_line_string(rest, quote == '"');
+    // 閉じクォートが行内に無い値は書き換えない
+    if len <= quote.len_utf8() || !rest[..len].ends_with(quote) {
+        return None;
+    }
+    Some((
+        value_start + quote.len_utf8(),
+        value_start + len - quote.len_utf8(),
+    ))
+}
+
+/// クォート値の中身を、更新後のバージョン制約へ差し替えた行を返す。
+/// 引用符の種別 (`"` / `'`) は中身だけを置換するので自動的に保たれる。
+fn replace_quoted_version(
+    line: &str,
+    span: (usize, usize),
+    parser: &dyn VersionParser,
+    new_version: &str,
+) -> Option<String> {
+    let (start, end) = span;
+    // Poetry コンテキストでは演算子なしの bare バージョンも完全一致ピンとして扱う
+    let spec = parser.parse_exact_pin(&line[start..end])?;
+    let updated = spec.try_format_updated(new_version)?;
+    Some(format!("{}{}{}", &line[..start], updated, &line[end..]))
+}
+
+/// Poetry の依存エントリの値 (`"^1.0"` / `{ version = "^1.0", ... }`) を更新する。
+fn update_poetry_entry_value(
+    line: &str,
+    value_start: usize,
+    parser: &dyn VersionParser,
+    new_version: &str,
+) -> Option<String> {
+    // `name = "^1.0.0"` (演算子付き / bare の文字列指定)
+    if let Some(span) = quoted_value_span(line, value_start) {
+        return replace_quoted_version(line, span, parser, new_version);
+    }
+
+    // `name = { version = "^1.0.0", ... }`
+    if !line[value_start..].starts_with('{') {
+        // 配列 (Poetry のマルチプル制約) 等は安全に更新できないので触らない
+        return None;
+    }
+    let entries = inline_table_entries(line, value_start);
+    // PyPI 以外の source を持つ inline table は PyPI の候補で書き換えない
+    if entries.iter().any(|(keys, start)| {
+        keys.len() == 1
+            && keys[0] == "source"
+            && quoted_value_span(line, *start)
+                .is_some_and(|(s, e)| source_name_is_non_pypi(&line[s..e]))
+    }) {
+        return None;
+    }
+    let version_start = entries
+        .iter()
+        .find(|(keys, _)| keys.len() == 1 && keys[0] == "version")
+        .map(|(_, start)| *start)?;
+    let span = quoted_value_span(line, version_start)?;
+    replace_quoted_version(line, span, parser, new_version)
+}
+
+/// Poetry の依存テーブルが inline table で書かれている場合
+/// (`dependencies = { requests = "^2.28", ... }`) に、対象パッケージのエントリを更新する。
+fn update_poetry_table_value(
+    line: &str,
+    value_start: usize,
+    package: &str,
+    parser: &dyn VersionParser,
+    new_version: &str,
+) -> Option<String> {
+    if !line[value_start..].starts_with('{') {
+        return None;
+    }
+    for (keys, start) in inline_table_entries(line, value_start) {
+        let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+        match keys.as_slice() {
+            // `{ requests = "^2.28" }` / `{ requests = { version = "^2.28" } }`
+            [name] if *name == package => {
+                return update_poetry_entry_value(line, start, parser, new_version);
+            }
+            // dotted key の `{ requests.version = "^2.28" }`
+            [name, "version"] if *name == package => {
+                let span = quoted_value_span(line, start)?;
+                return replace_quoted_version(line, span, parser, new_version);
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// TOML 行から `#` 以降の行コメントを取り除く。文字列リテラル内 (`"..."` / `'...'`)
@@ -438,86 +707,6 @@ fn opens_unclosed_multiline_string(line: &str) -> Option<&'static str> {
 fn strip_toml_line_comment(line: &str) -> &str {
     // TOML ではバックスラッシュをリテラル扱いする (Plain モード)
     strip_hash_line_comment(line, HashCommentMode::Plain)
-}
-
-/// Poetry 依存セクション内の 1 行を更新する。更新が起きた場合のみ `Some` を返す
-fn update_poetry_dependency_line(
-    line: &str,
-    simple_re: Option<&Regex>,
-    table_re: Option<&Regex>,
-    parser: &dyn VersionParser,
-    new_version: &str,
-) -> Option<String> {
-    // Poetry 形式: `name = "^1.0.0"` / `name = '^1.0.0'`
-    if let Some(re) = simple_re
-        && let Some(caps) = re.captures(line)
-    {
-        let (quote, old_version) = captured_quote_and_version(&caps);
-        // Poetry コンテキストでは演算子なしの bare バージョンも完全一致ピンとして扱う
-        if let Some(spec) = parser.parse_exact_pin(old_version)
-            && let Some(new_ver) = spec.try_format_updated(new_version)
-        {
-            let matched_end = caps.get(0).map(|m| m.end()).unwrap_or(0);
-            let mut new_line = String::with_capacity(line.len() + new_ver.len());
-            new_line.push_str(&caps[1]);
-            new_line.push_str(quote);
-            new_line.push_str(&new_ver);
-            new_line.push_str(quote);
-            new_line.push_str(&line[matched_end..]);
-            return Some(new_line);
-        }
-        return None;
-    }
-
-    // Poetry の inline table 形式: `name = { version = "^1.0.0", ... }`
-    if let Some(re) = table_re
-        && let Some(caps) = re.captures(line)
-    {
-        let (quote, old_version) = captured_quote_and_version(&caps);
-        let table_fragment = caps.get(0).map(|m| m.as_str()).unwrap_or("");
-        if !inline_poetry_table_has_non_pypi_source(table_fragment)
-            && let Some(spec) = parser.parse_exact_pin(old_version)
-            && let Some(new_ver) = spec.try_format_updated(new_version)
-        {
-            let matched_end = caps.get(0).map(|m| m.end()).unwrap_or(0);
-            let mut new_line = String::with_capacity(line.len() + new_ver.len());
-            new_line.push_str(&caps[1]);
-            new_line.push_str(quote);
-            new_line.push_str(&new_ver);
-            new_line.push_str(quote);
-            new_line.push_str(&caps[4]);
-            new_line.push_str(&line[matched_end..]);
-            return Some(new_line);
-        }
-    }
-
-    None
-}
-
-/// Poetry の多行依存テーブル (`[tool.poetry.dependencies.<name>]`) 内の
-/// `version = "..."` 行を更新する。更新が起きた場合のみ `Some` を返す。
-///
-/// 非 PyPI ソース (`source = "..."`) を持つテーブルは `update_version` 冒頭の
-/// 除外集合で先に弾かれるため、ここでは version 行だけを見ればよい。
-fn update_poetry_table_version_line(
-    line: &str,
-    parser: &dyn VersionParser,
-    new_version: &str,
-) -> Option<String> {
-    let caps = POETRY_TABLE_VERSION_RE.captures(line)?;
-    let (quote, old_version) = captured_quote_and_version(&caps);
-    // Poetry コンテキストでは演算子なしの bare バージョンも完全一致ピンとして扱う
-    let spec = parser.parse_exact_pin(old_version)?;
-    let new_ver = spec.try_format_updated(new_version)?;
-    let matched_end = caps.get(0)?.end();
-
-    let mut new_line = String::with_capacity(line.len() + new_ver.len());
-    new_line.push_str(&caps[1]);
-    new_line.push_str(quote);
-    new_line.push_str(&new_ver);
-    new_line.push_str(quote);
-    new_line.push_str(&line[matched_end..]);
-    Some(new_line)
 }
 
 /// PEP 508 配列を含む依存セクション内の 1 行を更新する。更新が起きた場合のみ `Some` を返す
@@ -705,12 +894,124 @@ fn pep508_uses_non_pypi_source(dep_str: &str, source_names: &HashSet<String>) ->
         .unwrap_or(false)
 }
 
-fn inline_poetry_table_has_non_pypi_source(table_fragment: &str) -> bool {
-    POETRY_INLINE_SOURCE_RE
-        .captures(table_fragment)
-        .and_then(|caps| caps.get(1).or_else(|| caps.get(2)))
-        .map(|source| source_name_is_non_pypi(source.as_str()))
-        .unwrap_or(false)
+/// インデックス URL が PyPI 本体を指しているか判定する。
+///
+/// ホスト部だけを見て `pypi.org` / `*.pypi.org` を PyPI とみなす。
+/// `pypi.org.evil.example` のような類似ホストは、`.pypi.org` で終わらないので弾かれる。
+fn index_url_is_pypi(url: &str) -> bool {
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    // userinfo (`user:pass@host`) とポート番号を落とす
+    let host = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
+    let host = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host == "pypi.org" || host.ends_with(".pypi.org")
+}
+
+/// Poetry の `[[tool.poetry.source]]` が暗黙の PyPI を無効化しているか判定する。
+///
+/// Poetry は primary / default 優先度のソースを 1 つでも宣言すると暗黙の PyPI を
+/// 無効化する。`priority` 省略時は primary 扱い、legacy の `default = true` も
+/// PyPI を置き換える。`name = "pypi"` が併記されていれば PyPI は生きているので対象外。
+/// `secondary = true` (legacy) / `supplemental` / `explicit` は PyPI を残すので対象外。
+fn poetry_disables_default_pypi(toml: &Value) -> bool {
+    let Some(sources) = toml
+        .get("tool")
+        .and_then(|t| t.get("poetry"))
+        .and_then(|p| p.get("source"))
+        .and_then(|s| s.as_array())
+    else {
+        return false;
+    };
+
+    let pypi_declared = sources.iter().any(|source| {
+        source
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| name.eq_ignore_ascii_case("pypi"))
+    });
+    if pypi_declared {
+        return false;
+    }
+
+    sources.iter().any(|source| {
+        match source.get("priority").and_then(Value::as_str) {
+            Some(priority) => {
+                priority.eq_ignore_ascii_case("default") || priority.eq_ignore_ascii_case("primary")
+            }
+            // priority 省略は primary 扱い。ただし legacy の `secondary = true` は
+            // 補助ソースなので PyPI を無効化しない。
+            None => source.get("secondary").and_then(Value::as_bool) != Some(true),
+        }
+    })
+}
+
+/// uv の既定インデックスが PyPI 以外を指しているか判定する。
+/// `[[tool.uv.index]]` の `default = true` と `[tool.uv] index-url` の両方を見る。
+fn uv_disables_default_pypi(toml: &Value) -> bool {
+    let Some(uv) = toml.get("tool").and_then(|t| t.get("uv")) else {
+        return false;
+    };
+
+    let default_index_is_non_pypi =
+        uv.get("index")
+            .and_then(|i| i.as_array())
+            .is_some_and(|indexes| {
+                indexes.iter().any(|index| {
+                    index.get("default").and_then(Value::as_bool) == Some(true)
+                        && index
+                            .get("url")
+                            .and_then(Value::as_str)
+                            .is_some_and(|url| !index_url_is_pypi(url))
+                })
+            });
+    if default_index_is_non_pypi {
+        return true;
+    }
+
+    uv.get("index-url")
+        .and_then(Value::as_str)
+        .is_some_and(|url| !index_url_is_pypi(url))
+}
+
+/// PDM の `[[tool.pdm.source]]` が既定の PyPI を別 URL で上書きしているか判定する。
+/// PDM では `name = "pypi"` のエントリが既定インデックスを置き換える。
+fn pdm_overrides_default_pypi(toml: &Value) -> bool {
+    toml.get("tool")
+        .and_then(|t| t.get("pdm"))
+        .and_then(|p| p.get("source"))
+        .and_then(|s| s.as_array())
+        .is_some_and(|sources| {
+            sources.iter().any(|source| {
+                source
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name.eq_ignore_ascii_case("pypi"))
+                    && source
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .is_some_and(|url| !index_url_is_pypi(url))
+            })
+        })
+}
+
+/// マニフェスト全体の既定インデックスが PyPI 以外かを判定する。
+///
+/// 依存単位の `source` / `[tool.uv.sources]` 指定 (`non_pypi_source_names`) と違い、
+/// これらの設定は**すべての依存**の解決先を差し替える。`internal-auth = "^1.2.0"` の
+/// ように依存側には何の印も無いまま private index から取得されるため、PyPI 上の
+/// 同名パッケージ (typosquat を含む) の版で書き換えると別物へ差し替わる。
+/// Cargo の `registry = "..."` 付き依存を除外しているのと同型の防御。
+fn uses_non_pypi_default_index(toml: &Value) -> bool {
+    poetry_disables_default_pypi(toml)
+        || uv_disables_default_pypi(toml)
+        || pdm_overrides_default_pypi(toml)
 }
 
 /// PEP 508 依存配列を読み取るコンテキスト。
@@ -2513,27 +2814,609 @@ version = "^7.0"
     }
 
     /// クォートなしでドットを含むヘッダはネストしたテーブルなので、単一パッケージ名として扱わない。
+    /// `[tool.poetry.dependencies.foo.bar]` は toml クレートも `foo` の下の `bar` テーブルと
+    /// 読むため parse が依存として surface せず、writer も書き換えてはいけない。
     #[test]
-    fn test_poetry_dependency_table_package_rejects_bare_dotted_tail() {
+    fn test_poetry_dependency_table_rejects_bare_dotted_tail() {
+        let content = r#"
+[tool.poetry.dependencies.foo.bar]
+version = "^1.0.0"
+"#;
+        // parse も update もこの形を単一パッケージとして扱わない (parse/write の整合)
+        assert!(parse(content).unwrap().is_empty());
+        for package in ["foo", "bar", "foo.bar"] {
+            assert!(
+                PyprojectTomlParser
+                    .update_version(content, package, "2.0.0")
+                    .is_err(),
+                "package={package}"
+            );
+        }
+
+        // クォート付きの単一セグメントは従来どおり対象
+        let quoted = r#"
+[tool.poetry.dependencies."zope.interface"]
+version = "^5.4.0"
+"#;
+        let result = PyprojectTomlParser
+            .update_version(quoted, "zope.interface", "6.1.0")
+            .unwrap();
+        assert!(result.contains(r#"version = "^6.1.0""#), "{result}");
+    }
+
+    // --- 修正: dotted key / inline table 形式の依存宣言 (report/apply の整合) ---
+
+    /// 回帰テスト: `[project]` 内の dotted key で書かれた optional-dependencies も
+    /// parse / update の両方で扱えること。
+    /// 以前は parse (toml クレートの値解決) だけが読み、writer はセクションヘッダと
+    /// キー名の完全一致しか見ていなかったため
+    /// 「更新あり」と報告した後に必ず書き込みが失敗していた。
+    #[test]
+    fn test_dotted_key_optional_dependencies_parse_and_update() {
+        let content = r#"
+[project]
+name = "x"
+optional-dependencies.dev = ["pytest>=7.0.0"]
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "pytest");
+
+        let result = PyprojectTomlParser
+            .update_version(content, "pytest", "8.4.0")
+            .unwrap();
+        assert!(result.contains(r#""pytest>=8.4.0""#), "{result}");
+    }
+
+    /// 回帰テスト: inline table で書かれた optional-dependencies も更新できること。
+    #[test]
+    fn test_inline_table_optional_dependencies_parse_and_update() {
+        let content = r#"
+[project]
+name = "x"
+optional-dependencies = { dev = ["pytest>=7.0.0"] }
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "pytest");
+
+        let result = PyprojectTomlParser
+            .update_version(content, "pytest", "8.4.0")
+            .unwrap();
+        assert!(result.contains(r#""pytest>=8.4.0""#), "{result}");
+    }
+
+    /// 回帰テスト: 複数行に跨る dotted key の依存配列も配列の内側として追跡すること。
+    #[test]
+    fn test_dotted_key_multiline_dependency_array() {
+        let content = r#"
+[project]
+name = "x"
+optional-dependencies.dev = [
+    "pytest>=7.0.0",
+    "ruff>=0.5.0",
+]
+keywords = ["pytest>=9.9.9"]
+"#;
+
+        let result = PyprojectTomlParser
+            .update_version(content, "pytest", "8.4.0")
+            .unwrap();
+        assert!(result.contains(r#""pytest>=8.4.0""#), "{result}");
+        assert!(result.contains(r#""ruff>=0.5.0""#), "{result}");
+        // 配列を抜けた後のメタデータ配列は書き換えない
+        assert!(
+            result.contains(r#"keywords = ["pytest>=9.9.9"]"#),
+            "{result}"
+        );
+    }
+
+    /// 回帰テスト: ルート直下に書かれた `project.dependencies` /
+    /// `dependency-groups` (inline table) も更新できること。
+    #[test]
+    fn test_root_level_dotted_and_inline_dependency_tables() {
+        let content = r#"
+project.dependencies = ["requests>=2.28.0"]
+dependency-groups = { dev = ["pytest>=7.0.0"] }
+"#;
+
+        let deps = parse(content).unwrap();
+        let names: Vec<&str> = deps.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"requests"), "{names:?}");
+        assert!(names.contains(&"pytest"), "{names:?}");
+
+        let result = PyprojectTomlParser
+            .update_version(content, "requests", "2.31.0")
+            .unwrap();
+        assert!(result.contains(r#""requests>=2.31.0""#), "{result}");
+
+        let result = PyprojectTomlParser
+            .update_version(content, "pytest", "8.4.0")
+            .unwrap();
+        assert!(result.contains(r#""pytest>=8.4.0""#), "{result}");
+    }
+
+    /// 回帰テスト: PDM の dev-dependencies を inline table で書いた場合も更新できること。
+    #[test]
+    fn test_pdm_inline_dev_dependencies_update() {
+        let content = r#"
+[tool.pdm]
+dev-dependencies = { test = ["pytest>=8.0"] }
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "pytest");
+
+        let result = PyprojectTomlParser
+            .update_version(content, "pytest", "8.4.0")
+            .unwrap();
+        assert!(result.contains(r#""pytest>=8.4.0""#), "{result}");
+    }
+
+    /// 回帰テスト: Poetry の依存テーブルを inline table / dotted key で書いた場合も
+    /// 更新でき、同名プレフィックスの別パッケージを壊さないこと。
+    #[test]
+    fn test_poetry_inline_and_dotted_dependency_table_update() {
+        let inline = r#"
+[tool.poetry]
+dependencies = { requests = "^2.28", types-requests = "^2.28", numpy = { version = "1.26.0" } }
+"#;
+
+        let deps = parse(inline).unwrap();
+        let names: Vec<&str> = deps.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"requests"), "{names:?}");
+
+        // Caret はセグメント数を保たない (許容幅が常に次メジャーで変わらないため)
+        let result = PyprojectTomlParser
+            .update_version(inline, "requests", "2.31.0")
+            .unwrap();
+        assert!(result.contains(r#"requests = "^2.31.0""#), "{result}");
+        assert!(
+            result.contains(r#"types-requests = "^2.28""#),
+            "同名プレフィックスの別パッケージを壊してはいけない: {result}"
+        );
+
+        // inline table 内のネストした inline table (`numpy = { version = ... }`)
+        let result = PyprojectTomlParser
+            .update_version(inline, "numpy", "2.0.0")
+            .unwrap();
+        assert!(result.contains(r#"{ version = "2.0.0" }"#), "{result}");
+
+        // dotted key 形式 (`dependencies.requests = "^2.28"`)
+        let dotted = r#"
+[tool.poetry]
+dependencies.requests = "^2.28"
+dependencies.numpy = { version = "1.26.0" }
+"#;
+        let deps = parse(dotted).unwrap();
+        let names: Vec<&str> = deps.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"requests"), "{names:?}");
+
+        let result = PyprojectTomlParser
+            .update_version(dotted, "requests", "2.31.0")
+            .unwrap();
+        assert!(
+            result.contains(r#"dependencies.requests = "^2.31.0""#),
+            "{result}"
+        );
+
+        let result = PyprojectTomlParser
+            .update_version(dotted, "numpy", "2.0.0")
+            .unwrap();
+        assert!(
+            result.contains(r#"dependencies.numpy = { version = "2.0.0" }"#),
+            "{result}"
+        );
+    }
+
+    /// inline table 形式でも、PyPI 以外の source を持つ依存は書き換えない。
+    #[test]
+    fn test_poetry_inline_table_non_pypi_source_not_updated() {
+        let content = r#"
+[tool.poetry]
+dependencies = { private-pkg = { version = "^1.0", source = "internal" } }
+"#;
+
+        // parse も update も対象外 (report/apply の整合)
+        assert!(parse(content).unwrap().is_empty());
+        assert!(
+            PyprojectTomlParser
+                .update_version(content, "private-pkg", "1.2.0")
+                .is_err()
+        );
+    }
+
+    /// inline table の別フィールドに `version = "..."` を含む文字列があっても、
+    /// そこを書き換えないこと (文字列リテラルの内側を読み飛ばす)。
+    #[test]
+    fn test_poetry_inline_table_ignores_version_inside_string_literal() {
+        let content = r#"
+[tool.poetry.dependencies]
+mypkg = { markers = 'version = "9.9.9"', version = "^1.0.0" }
+"#;
+
+        let result = PyprojectTomlParser
+            .update_version(content, "mypkg", "2.0.0")
+            .unwrap();
+        assert!(
+            result.contains(r#"markers = 'version = "9.9.9"'"#),
+            "別フィールドの文字列を壊してはいけない: {result}"
+        );
+        assert!(result.contains(r#"version = "^2.0.0""#), "{result}");
+    }
+
+    // --- 修正: コメント内・クォート内の `"""` / `'''` の誤検出 ---
+
+    /// 回帰テスト: 行コメント内の `"""` をマルチライン文字列開始と誤認しないこと。
+    /// 以前は誤認して以降の全行が素通しになり、依存を「更新あり」と報告した後に
+    /// 書き込みが必ず失敗していた。
+    #[test]
+    fn test_update_version_ignores_multiline_delimiter_in_comment() {
+        let content = r#"[project]
+name = "x"
+# NOTE: description には """ を使わないこと
+dependencies = [
+    "requests>=2.28.0",
+]
+"#;
+        let result = PyprojectTomlParser
+            .update_version(content, "requests", "2.31.0")
+            .unwrap();
+        assert!(result.contains(r#""requests>=2.31.0""#), "{result}");
+    }
+
+    /// 回帰テスト: 基本文字列の内側の `'''`、リテラル文字列の内側の `"""` も
+    /// マルチライン文字列開始と誤認しないこと。
+    #[test]
+    fn test_update_version_ignores_multiline_delimiter_inside_strings() {
+        let content = r#"[project]
+description = "Ain't got '''"
+readme = 'see """ marker'
+dependencies = [
+    "requests>=2.28.0",
+]
+"#;
+        let result = PyprojectTomlParser
+            .update_version(content, "requests", "2.31.0")
+            .unwrap();
+        assert!(result.contains(r#""requests>=2.31.0""#), "{result}");
+        assert!(
+            result.contains(r#"description = "Ain't got '''""#),
+            "{result}"
+        );
+        assert!(result.contains(r#"readme = 'see """ marker'"#), "{result}");
+    }
+
+    /// 制御: 本物のマルチライン文字列 (`'''`) の内側は従来どおり素通しする。
+    #[test]
+    fn test_update_version_still_skips_real_literal_multiline_string() {
+        let content = r#"[project]
+description = '''
+dependencies = [
+  "requests>=2.0",
+]
+'''
+dependencies = [
+    "requests>=2.0",
+]
+"#;
+        let result = PyprojectTomlParser
+            .update_version(content, "requests", "2.31.0")
+            .unwrap();
         assert_eq!(
-            poetry_dependency_table_package("tool.poetry.dependencies.requests"),
-            Some("requests".to_string())
+            result.matches("requests>=2.0").count(),
+            1,
+            "docstring 内の擬似依存が破壊された: {result}"
         );
         assert_eq!(
-            poetry_dependency_table_package(r#"tool.poetry.dependencies."zope.interface""#),
-            Some("zope.interface".to_string())
+            result.matches("requests>=2.31.0").count(),
+            1,
+            "本物の依存が更新されていない: {result}"
         );
-        assert_eq!(
-            poetry_dependency_table_package("tool.poetry.group.dev.dependencies.pytest"),
-            Some("pytest".to_string())
+    }
+
+    // --- 修正: プロジェクト全体の既定インデックスが PyPI 以外 ---
+
+    /// 回帰テスト: Poetry の primary / default source が宣言されていると暗黙の PyPI が
+    /// 無効化される。依存側には印が無いまま private index から解決されるため、
+    /// PyPI 上の同名パッケージ (typosquat を含む) の版で書き換えてはいけない。
+    #[test]
+    fn test_poetry_primary_source_disables_updates() {
+        for priority in [
+            r#"priority = "primary""#,
+            r#"priority = "default""#,
+            "default = true",
+            "", // priority 省略は primary 扱い
+        ] {
+            let content = format!(
+                r#"
+[[tool.poetry.source]]
+name = "internal"
+url = "https://pypi.internal.example.com/simple/"
+{priority}
+
+[tool.poetry.dependencies]
+internal-auth = "^1.2.0"
+"#
+            );
+
+            assert!(
+                parse(&content).unwrap().is_empty(),
+                "priority={priority:?} で依存が surface している"
+            );
+            assert!(
+                PyprojectTomlParser
+                    .update_version(&content, "internal-auth", "9.9.9")
+                    .is_err(),
+                "priority={priority:?} で書き換えられている"
+            );
+        }
+    }
+
+    /// PyPI が併記されていたり補助的な優先度なら、PyPI は生きているので従来どおり更新する。
+    #[test]
+    fn test_poetry_source_keeps_updates_when_pypi_is_alive() {
+        let cases = [
+            // PyPI を明示的に併記
+            r#"
+[[tool.poetry.source]]
+name = "internal"
+url = "https://pypi.internal.example.com/simple/"
+priority = "primary"
+
+[[tool.poetry.source]]
+name = "pypi"
+priority = "supplemental"
+"#,
+            // 補助的な優先度のみ
+            r#"
+[[tool.poetry.source]]
+name = "internal"
+url = "https://pypi.internal.example.com/simple/"
+priority = "supplemental"
+"#,
+            r#"
+[[tool.poetry.source]]
+name = "internal"
+url = "https://pypi.internal.example.com/simple/"
+priority = "explicit"
+"#,
+            // legacy の secondary
+            r#"
+[[tool.poetry.source]]
+name = "internal"
+url = "https://pypi.internal.example.com/simple/"
+secondary = true
+"#,
+            // source 設定なし
+            "",
+        ];
+
+        for source in cases {
+            let content = format!(
+                r#"{source}
+[tool.poetry.dependencies]
+internal-auth = "^1.2.0"
+"#
+            );
+            let deps = parse(&content).unwrap();
+            assert_eq!(deps.len(), 1, "source={source}");
+            assert!(
+                PyprojectTomlParser
+                    .update_version(&content, "internal-auth", "1.9.0")
+                    .is_ok(),
+                "source={source}"
+            );
+        }
+    }
+
+    /// 回帰テスト: uv の既定インデックス差し替え (`[[tool.uv.index]] default = true` /
+    /// `[tool.uv] index-url`) も PyPI 以外なら更新対象から外す。
+    #[test]
+    fn test_uv_default_index_disables_updates() {
+        let default_index = r#"
+[project]
+dependencies = ["internal-auth>=1.2.0"]
+
+[[tool.uv.index]]
+name = "internal"
+url = "https://pypi.internal.example.com/simple/"
+default = true
+"#;
+        assert!(parse(default_index).unwrap().is_empty());
+        assert!(
+            PyprojectTomlParser
+                .update_version(default_index, "internal-auth", "9.9.9")
+                .is_err()
         );
-        assert_eq!(
-            poetry_dependency_table_package("tool.poetry.dependencies.foo.bar"),
-            None
+
+        let index_url = r#"
+[project]
+dependencies = ["internal-auth>=1.2.0"]
+
+[tool.uv]
+index-url = "https://pypi.internal.example.com/simple/"
+"#;
+        assert!(parse(index_url).unwrap().is_empty());
+
+        // PyPI そのものを指す設定なら従来どおり更新する
+        let pypi_index = r#"
+[project]
+dependencies = ["requests>=2.28.0"]
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
+"#;
+        assert_eq!(parse(pypi_index).unwrap().len(), 1);
+
+        // 既定でない追加インデックスは PyPI を無効化しない
+        let extra_index = r#"
+[project]
+dependencies = ["requests>=2.28.0"]
+
+[[tool.uv.index]]
+name = "extra"
+url = "https://pypi.internal.example.com/simple/"
+"#;
+        assert_eq!(parse(extra_index).unwrap().len(), 1);
+    }
+
+    /// 回帰テスト: PDM の `[[tool.pdm.source]]` による `pypi` 上書きも更新対象から外す。
+    #[test]
+    fn test_pdm_pypi_source_override_disables_updates() {
+        let content = r#"
+[project]
+dependencies = ["internal-auth>=1.2.0"]
+
+[[tool.pdm.source]]
+name = "pypi"
+url = "https://pypi.internal.example.com/simple/"
+"#;
+        assert!(parse(content).unwrap().is_empty());
+        assert!(
+            PyprojectTomlParser
+                .update_version(content, "internal-auth", "9.9.9")
+                .is_err()
         );
-        assert_eq!(
-            poetry_dependency_table_package("tool.poetry.dependencies"),
-            None
+
+        // 別名の追加ソースは既定 PyPI を置き換えないので更新できる
+        let extra = r#"
+[project]
+dependencies = ["requests>=2.28.0"]
+
+[[tool.pdm.source]]
+name = "internal"
+url = "https://pypi.internal.example.com/simple/"
+"#;
+        assert_eq!(parse(extra).unwrap().len(), 1);
+    }
+
+    /// PyPI 判定はホスト部で行い、類似ホストを PyPI と誤認しない。
+    #[test]
+    fn test_index_url_is_pypi_host_matching() {
+        assert!(index_url_is_pypi("https://pypi.org/simple"));
+        assert!(index_url_is_pypi("https://PyPI.org/simple/"));
+        assert!(index_url_is_pypi("https://test.pypi.org/simple"));
+        assert!(index_url_is_pypi("https://user:pass@pypi.org:443/simple"));
+        assert!(!index_url_is_pypi("https://pypi.org.evil.example/simple"));
+        assert!(!index_url_is_pypi("https://mypypi.org/simple"));
+        assert!(!index_url_is_pypi(
+            "https://pypi.internal.example.com/simple/"
+        ));
+    }
+
+    // --- 修正: PEP 440 local version 付き完全一致は書き換えない ---
+
+    /// 回帰テスト: `torch==2.1.0+cu121` のような local version 付き完全一致は、
+    /// ラベルを落とすと PyPI に存在しない別ビルドを指す制約になるため書き換えない。
+    /// parse は依存として surface するので、judge が
+    /// 「constraint cannot be updated safely」の skip として可視化できる。
+    #[test]
+    fn test_local_version_pin_is_reported_but_not_written() {
+        let content = r#"
+[project]
+dependencies = ["torch==2.1.0+cu121"]
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "torch");
+        assert_eq!(deps[0].version_spec.version, "2.1.0+cu121");
+        assert!(
+            deps[0].version_spec.try_format_updated("2.34.2").is_none(),
+            "local label 付きの制約は書き換え不能であるべき"
+        );
+
+        // writer も書き換えない (report/apply の整合)
+        assert!(
+            PyprojectTomlParser
+                .update_version(content, "torch", "2.34.2")
+                .is_err()
+        );
+
+        // local label が無ければ従来どおり更新できる
+        let plain = r#"
+[project]
+dependencies = ["torch==2.1.0"]
+"#;
+        let result = PyprojectTomlParser
+            .update_version(plain, "torch", "2.34.2")
+            .unwrap();
+        assert!(result.contains(r#""torch==2.34.2""#), "{result}");
+    }
+
+    /// 論理パスによる走査でも CRLF の行末を保持すること。
+    #[test]
+    fn test_update_version_preserves_crlf() {
+        let content = "[project]\r\ndependencies = [\r\n    \"requests>=2.28.0\",\r\n]\r\n\r\n[tool.poetry.dependencies]\r\nrequests = \"^2.28.0\"\r\n";
+        let result = PyprojectTomlParser
+            .update_version(content, "requests", "2.31.0")
+            .unwrap();
+        assert!(result.contains("\"requests>=2.31.0\",\r\n"), "{result:?}");
+        assert!(result.contains("requests = \"^2.31.0\"\r\n"), "{result:?}");
+        assert!(!result.contains("\n\n"), "LF へ潰れている: {result:?}");
+    }
+
+    /// PEP 735 の include-group (`{ include-group = "..." }`) が混ざった依存配列でも、
+    /// 配列の内外を取り違えずに更新できること (inline table の括弧も深さで数える)。
+    #[test]
+    fn test_update_dependency_group_with_include_group() {
+        let content = r#"
+[dependency-groups]
+test = ["pytest>=7.0.0"]
+dev = [
+    { include-group = "test" },
+    "ruff>=0.5.0",
+]
+
+[project]
+keywords = ["ruff>=9.9.9"]
+"#;
+        let result = PyprojectTomlParser
+            .update_version(content, "ruff", "0.9.2")
+            .unwrap();
+        assert!(result.contains(r#""ruff>=0.9.2""#), "{result}");
+        // 配列を抜けた後のメタデータ配列は書き換えない
+        assert!(result.contains(r#"keywords = ["ruff>=9.9.9"]"#), "{result}");
+    }
+
+    /// Poetry 依存セクション内のコメント行・空行を挟んでも更新が続くこと。
+    #[test]
+    fn test_update_poetry_section_with_comment_lines() {
+        let content = r#"
+[tool.poetry.dependencies]
+# HTTP クライアント
+python = "^3.11"
+
+requests = "^2.28.0"  # 本番で使用
+"#;
+        let result = PyprojectTomlParser
+            .update_version(content, "requests", "2.31.0")
+            .unwrap();
+        assert!(
+            result.contains(r#"requests = "^2.31.0"  # 本番で使用"#),
+            "{result}"
+        );
+    }
+
+    /// Poetry の bare 完全一致ピンでも local label は保持され、書き換えられない。
+    #[test]
+    fn test_poetry_local_version_pin_not_written() {
+        let content = r#"
+[tool.poetry.dependencies]
+torch = "2.1.0+cu121"
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].version_spec.version, "2.1.0+cu121");
+        assert!(
+            PyprojectTomlParser
+                .update_version(content, "torch", "2.34.2")
+                .is_err()
         );
     }
 }

@@ -48,6 +48,35 @@ static PEP440_RELEASE_PREFIX_WILDCARD_RE: LazyLock<Regex> =
 static BARE_VERSION_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\d[0-9A-Za-z._!+-]*$").unwrap());
 
+/// 書き換え可否を検証するためのダミー更新先バージョン。
+/// 実在する候補ではなく、`try_format_updated` の構文チェック経路を通すためだけに使う。
+const REWRITE_PROBE_VERSION: &str = "9.9.9";
+
+/// PEP 440 の local version label (`+cu121`) を持つ完全一致指定 (`==` / `===`) を、
+/// 「解析はするが安全に書き換えられない制約」として表現する VersionSpec にする。
+///
+/// PEP 440 は local version label を候補マッチ時に完全に無視すると定めているため、
+/// 公開バージョンを進めた時点でラベルは意味を失う。一方でラベルを黙って落として
+/// 書き戻すと、`torch==2.1.0+cu121` (CUDA ビルド) が PyPI に存在しない別ビルドの
+/// `torch==2.5.0` へすり替わって環境が壊れる。
+///
+/// `VersionSpecKind::Exact` のままだと `try_format_updated` が必ず `Some` を返し、
+/// ラベルを落とした制約を書き戻してしまう。`Range` にすると `format_range_like` が
+/// バージョントークンを再構成できず `None` を返すため、judge が
+/// `SkipReason::ParseError("constraint cannot be updated safely")` として
+/// skip 行に可視化する (依存ごと落とす無言スキップは避ける)。
+///
+/// 比較用 version には local label を保持したままにするので、`1.0+local > 1.0` の
+/// PEP 440 順による候補選択・OSV 照合は従来どおり機能する。
+fn local_version_exact_spec(raw: &str, normalized: &str) -> Option<VersionSpec> {
+    let spec = VersionSpec::new(VersionSpecKind::Range, raw, normalized);
+    // 想定外の入力で「書き換えられる」と判定された場合は、誤った制約を書き戻すより
+    // 依存ごと取りこぼす方が安全なので None を返す。
+    spec.try_format_updated(REWRITE_PROBE_VERSION)
+        .is_none()
+        .then_some(spec)
+}
+
 fn pep440_prefix_wildcard_is_allowed(op: &str, raw_version: &str) -> bool {
     if !raw_version.ends_with(".*") {
         return true;
@@ -186,6 +215,11 @@ fn parse_poetry_bare_pin(version_str: &str) -> Option<VersionSpec> {
     if normalized.is_empty() {
         return None;
     }
+    // bare ピンも `==` と同義なので、local label 付きは安全に書き換えられない制約として扱う
+    // (ラベルを落とすと PyPI に存在しない別ビルドを指す制約になる)。
+    if trimmed.contains('+') {
+        return local_version_exact_spec(trimmed, &normalized);
+    }
     Some(VersionSpec::new(
         VersionSpecKind::Exact,
         trimmed,
@@ -231,6 +265,12 @@ impl VersionParser for PythonVersionParser {
                 }
                 normalize_for_compare(raw_version)
             };
+
+            // local version label 付きの完全一致は、ラベルを落とさずに公開バージョンだけ
+            // 進める書き戻し方が存在しないため、更新できない制約として扱う。
+            if matches!(op, "==" | "===") && has_local {
+                return local_version_exact_spec(trimmed, &normalized);
+            }
 
             return Some(match op {
                 "===" | "==" if op == "===" || !raw_version.ends_with(".*") => {
@@ -355,11 +395,12 @@ mod tests {
             assert!(!s.version.is_empty(), "v={v}");
         }
 
-        // local version は `==` と同様に保持する
-        assert_eq!(
-            parser.parse_exact_pin("1.0+cu121").unwrap().version,
-            "1.0+cu121"
-        );
+        // local version は `==` と同様に比較用 version へ保持するが、
+        // ラベルを落とさずには書き戻せないので更新不能な制約として扱う
+        let local = parser.parse_exact_pin("1.0+cu121").unwrap();
+        assert_eq!(local.version, "1.0+cu121");
+        assert_eq!(local.kind, VersionSpecKind::Range);
+        assert!(local.try_format_updated("2.0.0").is_none());
 
         // 非バージョン文字列や空は None のまま
         assert!(parser.parse_exact_pin("hello").is_none());
@@ -664,18 +705,97 @@ mod tests {
 
     #[test]
     fn test_parse_local_version() {
-        // PEP 440 ローカルバージョン指定: '+' 以降はローカルセグメントとして扱われる
+        // PEP 440 ローカルバージョン指定: '+' 以降はローカルセグメントとして扱われる。
+        // 比較用 version には従来どおりラベルを保持するが、書き戻しでラベルを
+        // 落とさないよう「安全に書き換えられない制約」として扱う。
         let spec = parse("==1.0+local1").unwrap();
-        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.kind, VersionSpecKind::Range);
         assert_eq!(spec.version, "1.0+local1");
-        assert_eq!(spec.prefix, Some("==".to_string()));
+        assert_eq!(spec.raw, "==1.0+local1");
+        assert!(spec.try_format_updated("2.0.0").is_none());
     }
 
     #[test]
     fn test_parse_local_version_normalizes_separator_and_case() {
         let spec = parse("==1.0+Cu_121").unwrap();
-        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert_eq!(spec.kind, VersionSpecKind::Range);
         assert_eq!(spec.version, "1.0+cu.121");
+    }
+
+    /// 回帰テスト: PEP 440 の local version label は「候補マッチ時に完全に無視される」
+    /// ため、公開バージョンを進めた時点でラベルの意味が失われる。ラベルを黙って落として
+    /// 書き戻すと `torch==2.1.0+cu121` が PyPI に存在しない別ビルドを指す
+    /// `torch==2.5.0` に化けて環境が壊れるので、更新不能な制約として扱う。
+    ///
+    /// 以前は `VersionSpecKind::Exact` のまま `wrap_with_affixes` が
+    /// `==<新バージョン>` を返しており、`--include-pinned` を付けると
+    /// `+cu121` が消えた制約が書き込まれていた。
+    #[test]
+    fn test_local_version_exact_is_not_rewritable() {
+        for raw in [
+            "==2.1.0+cu121",
+            "==1.0+local1",
+            "===1.0+local1",
+            "==1!2.0+cu121",
+        ] {
+            let spec = parse(raw).expect(raw);
+            assert_eq!(spec.kind, VersionSpecKind::Range, "raw={raw}");
+            assert_eq!(spec.raw, raw);
+            assert!(
+                spec.try_format_updated("2.34.2").is_none(),
+                "local label 付き制約を書き換えてはいけない: raw={raw}"
+            );
+            // format_updated は元表記を保つ (writer 側でも版が変わらない)
+            assert_eq!(spec.format_updated("2.34.2"), raw, "raw={raw}");
+        }
+
+        // Poetry の bare 完全一致ピンも `==` と同義なので同じ扱いにする
+        let bare = PythonVersionParser.parse_exact_pin("2.1.0+cu121").unwrap();
+        assert_eq!(bare.kind, VersionSpecKind::Range);
+        assert_eq!(bare.version, "2.1.0+cu121");
+        assert!(bare.try_format_updated("2.34.2").is_none());
+    }
+
+    /// local label 付き制約が judge で「無言の取りこぼし」ではなく
+    /// skip 行として可視化されることを確認する。
+    #[test]
+    fn test_local_version_pin_is_surfaced_as_skip_by_judge() {
+        use crate::domain::{Dependency, SkipReason, UpdateResult};
+        use crate::update::{UpdateFilter, UpdateJudge, VersionInfo};
+
+        let spec = parse("==2.1.0+cu121").unwrap();
+        let dep = Dependency::new("torch", spec, false, Language::Python);
+        let judge = UpdateJudge::new(UpdateFilter::new());
+        let versions = vec![VersionInfo::new(
+            "2.34.2",
+            chrono::Utc::now() - chrono::Duration::days(60),
+        )];
+
+        match judge.judge(&dep, &versions) {
+            UpdateResult::Skip { reason, .. } => {
+                assert!(
+                    matches!(reason, SkipReason::ParseError(ref m) if m.contains("safely")),
+                    "unexpected skip reason: {reason:?}"
+                );
+            }
+            other => panic!("local label 付き制約が更新対象になっている: {other:?}"),
+        }
+    }
+
+    /// 制御: local label を持たない完全一致は従来どおり Exact / pinned のまま更新できる。
+    #[test]
+    fn test_exact_without_local_version_still_updates() {
+        let spec = parse("==2.1.0").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Exact);
+        assert!(spec.is_pinned());
+        assert_eq!(
+            spec.try_format_updated("2.34.2").as_deref(),
+            Some("==2.34.2")
+        );
+
+        let bare = PythonVersionParser.parse_exact_pin("2.1.0").unwrap();
+        assert_eq!(bare.kind, VersionSpecKind::Exact);
+        assert_eq!(bare.try_format_updated("2.34.2").as_deref(), Some("2.34.2"));
     }
 
     #[test]

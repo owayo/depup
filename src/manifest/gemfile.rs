@@ -85,6 +85,13 @@ static NON_REGISTRY_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^\s*(?:git|github|gitlab|bitbucket|gist|path|source)\b").unwrap()
 });
 
+// `git_source(:stash) { |repo| "https://stash.example.com/#{repo}.git" }` の宣言。
+// Bundler はここで登録した名前を git ソースのショートハンドオプションとして受け付ける
+// (`gem 'rails', stash: 'forks/rails'`)。ブロックが `{ ... }` でも `do ... end` でも
+// 行頭の形は同じなので `git_source(:NAME)` までを見れば足りる。
+static GIT_SOURCE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*git_source\(\s*:(\w+)\s*\)").unwrap());
+
 // 開発用グループかどうかを判定する
 fn is_dev_group(group_line: &str) -> bool {
     let lowered = group_line.to_lowercase();
@@ -128,11 +135,37 @@ const NON_REGISTRY_OPTION_KEYS: [&str; 7] = [
     "source",
 ];
 
-fn has_non_registry_source(line: &str) -> bool {
+/// `git_source(:NAME)` で登録されたユーザー定義の git ソースショートハンドを集める。
+///
+/// Bundler は組み込みの `github` / `gitlab` などと同じ扱いでこの名前をオプションキーとして
+/// 受け付けるため、集めないと `gem 'rails', stash: 'forks/rails'` が
+/// 「バージョンなしの rubygems 依存」に見え、rubygems.org の同名 gem (typosquat を含む) の
+/// 版を注入してしまう。parse と update_version の両方で同じ集合を使い、
+/// 「parse は除外したのに writer が書き換える」非対称を作らない。
+fn collect_git_source_keys(content: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        // コメントアウトされた宣言を拾わないよう、行コメント除去後に判定する
+        if let Some(caps) = GIT_SOURCE_RE.captures(strip_line_comment(trimmed)) {
+            keys.push(caps[1].to_lowercase());
+        }
+    }
+    keys
+}
+
+fn has_non_registry_source(line: &str, custom_git_sources: &[String]) -> bool {
     let lowered = line.to_lowercase();
     NON_REGISTRY_OPTION_KEYS
         .iter()
+        .copied()
         .any(|key| has_option_key(&lowered, key))
+        || custom_git_sources
+            .iter()
+            .any(|key| has_option_key(&lowered, key))
 }
 
 /// クォート外の `#` 以降 (行コメント) を取り除いた部分文字列を返す。
@@ -188,11 +221,81 @@ fn has_unquoted_end_keyword(code: &str) -> bool {
     false
 }
 
+/// ブロックの開始・終了行ならスタックを更新して `true` を返す。
+///
+/// parse と `update_version` が同じ規則を共有するための唯一の情報源。片方にしか
+/// 追跡がないと「parse は `path ... do` ブロック内の gem を除外したのに、writer は
+/// 同名の行を全部書き換えてローカル依存へ rubygems の版を注入する」非対称が起きる。
+fn track_block_structure(code: &str, block_stack: &mut Vec<GemfileBlock>) -> bool {
+    // `group ... do` を積む
+    if let Some(caps) = GROUP_START_RE.captures(code) {
+        let group_spec = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        block_stack.push(GemfileBlock::Group(is_dev_group(group_spec)));
+        return true;
+    }
+
+    // group 以外の `do` ブロック（platforms, git, path, source 等）を追跡する
+    if DO_BLOCK_RE.is_match(code) {
+        block_stack.push(if NON_REGISTRY_BLOCK_RE.is_match(code) {
+            GemfileBlock::NonRegistry
+        } else {
+            GemfileBlock::Other
+        });
+        return true;
+    }
+
+    // `if` / `case` / `begin` 等も `end` を消費するため、スタックの深さを合わせる。
+    // (行末修飾子の `... if cond` は行頭が `if` ではないので該当しない)
+    if BLOCK_KEYWORD_RE.is_match(code) {
+        if !has_unquoted_end_keyword(code) {
+            block_stack.push(GemfileBlock::Other);
+        }
+        return true;
+    }
+
+    // 対応する `end` で適切なスタック/カウンタを戻す
+    if GROUP_END_RE.is_match(code) {
+        block_stack.pop();
+        return true;
+    }
+
+    false
+}
+
+/// レジストリ外ソース (`git` / `path` / `source` 等) のブロック内かどうか
+fn in_non_registry_block(block_stack: &[GemfileBlock]) -> bool {
+    block_stack
+        .iter()
+        .any(|block| matches!(block, GemfileBlock::NonRegistry))
+}
+
+/// 更新後の制約文字列を、元の `gem` 引数の個数へ配り直す。
+///
+/// parse は `gem "pg", ">= 0.18", "< 2.0"` の複数引数を `", "` で 1 本に繋いでから
+/// 解釈するため、`try_format_updated` の結果も 1 本の文字列 (`">= 1.5.0, < 2.0"`)
+/// になる。書き戻しでは元の引数へ分け直す必要がある。要素数が一致しない場合は
+/// どの引数へ何を書くか決められないため `None` を返し、呼び出し側でエラーにする。
+fn split_updated_constraint(formatted: &str, expected: usize) -> Option<Vec<String>> {
+    if expected <= 1 {
+        // 単一引数はカンマを含んでいてもそのまま 1 つの文字列として書き戻す
+        // (`gem "pg", ">= 0.18, < 2.0"` の形)
+        return Some(vec![formatted.to_string()]);
+    }
+
+    let parts: Vec<String> = formatted
+        .split(',')
+        .map(|part| part.trim().into())
+        .collect();
+    (parts.len() == expected).then_some(parts)
+}
+
 impl ManifestParser for GemfileParser {
     fn parse(&self, content: &str) -> Result<Vec<Dependency>, ManifestError> {
         let mut dependencies = Vec::new();
         let parser = get_parser(Language::Ruby);
         let mut block_stack = Vec::new();
+        // `git_source(:NAME)` は宣言より後ろの gem でも先でも効くため、走査前に集める
+        let custom_git_sources = collect_git_source_keys(content);
 
         for line in content.lines() {
             let trimmed = line.trim();
@@ -206,35 +309,8 @@ impl ManifestParser for GemfileParser {
             // (行末コメントの `do` や `git:` をブロック開始・git 依存と誤認しないため)
             let code = strip_line_comment(trimmed);
 
-            // `group ... do` を積む
-            if let Some(caps) = GROUP_START_RE.captures(code) {
-                let group_spec = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                block_stack.push(GemfileBlock::Group(is_dev_group(group_spec)));
-                continue;
-            }
-
-            // group 以外の `do` ブロック（platforms, git, path, source 等）を追跡する
-            if DO_BLOCK_RE.is_match(code) {
-                block_stack.push(if NON_REGISTRY_BLOCK_RE.is_match(code) {
-                    GemfileBlock::NonRegistry
-                } else {
-                    GemfileBlock::Other
-                });
-                continue;
-            }
-
-            // `if` / `case` / `begin` 等も `end` を消費するため、スタックの深さを合わせる。
-            // (行末修飾子の `... if cond` は行頭が `if` ではないので該当しない)
-            if BLOCK_KEYWORD_RE.is_match(code) {
-                if !has_unquoted_end_keyword(code) {
-                    block_stack.push(GemfileBlock::Other);
-                }
-                continue;
-            }
-
-            // 対応する `end` で適切なスタック/カウンタを戻す
-            if GROUP_END_RE.is_match(code) {
-                block_stack.pop();
+            // ブロックの開始・終了は update_version と同じ走査規則で追跡する
+            if track_block_structure(code, &mut block_stack) {
                 continue;
             }
 
@@ -255,10 +331,7 @@ impl ManifestParser for GemfileParser {
                 }
 
                 // git / path / source ブロックの内側は RubyGems のレジストリ依存ではない
-                if block_stack
-                    .iter()
-                    .any(|block| matches!(block, GemfileBlock::NonRegistry))
-                {
+                if in_non_registry_block(&block_stack) {
                     continue;
                 }
 
@@ -267,7 +340,7 @@ impl ManifestParser for GemfileParser {
                     // バージョン指定のない git / path / private source は
                     // RubyGems のレジストリ依存ではないため除外する。
                     // version が明示されている場合は Bundler の gemspec 検証用制約として扱える。
-                    if has_non_registry_source(code) {
+                    if has_non_registry_source(code, &custom_git_sources) {
                         continue;
                     }
                     // 引数が次行へ続く宣言 (`gem "devise",` で行が終わる形) は、
@@ -343,15 +416,45 @@ impl ManifestParser for GemfileParser {
             })?;
 
         let mut lines = Vec::new();
+        let mut block_stack = Vec::new();
+        // parse と同じ集合を使い、独自 git ソース (`git_source(:stash)`) を持つ gem を
+        // レジストリ依存として書き換えないようにする
+        let custom_git_sources = collect_git_source_keys(content);
+
         for raw_line in content.split_inclusive('\n') {
             // 行末の改行コード (`\n` / `\r\n`) を退避し、本文のみを処理対象にする
             let (line, line_ending) = split_line_ending(raw_line);
+
+            let trimmed = line.trim();
+            let is_blank_or_comment = trimmed.is_empty() || trimmed.starts_with('#');
+            // ブロック判定とオプション判定はコメント除去後の文字列で行う
+            // (行末コメントの `do` や `git:` をブロック開始・git 依存と誤認しないため)
+            let code = if is_blank_or_comment {
+                ""
+            } else {
+                strip_line_comment(trimmed)
+            };
+
+            // parse と同じ規則でブロックを追跡する。追跡がないと、parse が除外した
+            // `path "../mygem" do` ブロック内の gem まで名前一致だけで書き換えてしまい、
+            // ローカル依存へ rubygems.org の版を注入する。
+            if !is_blank_or_comment && track_block_structure(code, &mut block_stack) {
+                lines.push(raw_line.to_string());
+                continue;
+            }
 
             // 同名 gem が複数箇所 (group 内外など) に宣言されている場合は全出現を更新する。
             // Cargo / Gradle / pyproject と同じく「1 依存 = 全出現を書き換え」の不変条件を守る。
             if let Some(caps) = GEM_RE.captures(line)
                 && caps.get(1).map(|m| m.as_str()) == Some(package)
             {
+                // レジストリ外ブロックの内側は parse が依存として surface しないので、
+                // writer 側も触らない (触ると git / path 依存へ rubygems の版が入る)
+                if in_non_registry_block(&block_stack) {
+                    lines.push(raw_line.to_string());
+                    continue;
+                }
+
                 let mut version_parts = Vec::new();
                 for i in 2..=4 {
                     if let Some(m) = caps.get(i) {
@@ -362,7 +465,7 @@ impl ManifestParser for GemfileParser {
                 match version_parts.len() {
                     0 => {
                         // parse と同じく、バージョンなしの非レジストリ依存だけを除外する。
-                        if has_non_registry_source(strip_line_comment(line)) {
+                        if has_non_registry_source(code, &custom_git_sources) {
                             lines.push(raw_line.to_string());
                             continue;
                         }
@@ -418,44 +521,57 @@ impl ManifestParser for GemfileParser {
                             continue;
                         }
                     }
-                    1 => {
-                        let old_version = version_parts[0].as_str();
-                        if let Some(spec) = parser.parse(old_version) {
-                            if spec.kind == VersionSpecKind::Range {
-                                return Err(ManifestError::InvalidVersionSpec {
-                                    path: PathBuf::from("Gemfile"),
-                                    spec: package.to_string(),
-                                    message: "複合制約や除外制約は安全に書き換えられません"
-                                        .to_string(),
-                                });
-                            }
+                    // 単一制約も複合制約 (`gem "pg", ">= 0.18", "< 2.0"`) も同じ経路で扱う。
+                    // parse は複数引数を `", "` で 1 本に繋いで judge へ渡すので、writer も
+                    // 同じ文字列を組み立てて更新し、結果を元の引数へ配り直す。片方だけ
+                    // 「複合は書き換え不可」にすると judge が Update を報告した更新を
+                    // writer が必ず失敗させる (report/apply の矛盾) 。
+                    _ => {
+                        let joined = version_parts
+                            .iter()
+                            .map(|part| part.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
 
-                            let Some(new_ver) = spec.try_format_updated(new_version) else {
+                        if let Some(spec) = parser.parse(&joined) {
+                            // judge も同じ `try_format_updated` で更新可否を決めているため、
+                            // ここが None になるのは judge が Skip した制約だけ
+                            // (`!= 2.2.4` などの除外制約)
+                            let Some(formatted) = spec.try_format_updated(new_version) else {
                                 return Err(ManifestError::InvalidVersionSpec {
                                     path: PathBuf::from("Gemfile"),
                                     spec: package.to_string(),
                                     message: "この制約は安全に書き換えられません".to_string(),
                                 });
                             };
-                            let version_range = version_parts[0].range();
-                            let mut updated_line = String::with_capacity(
-                                raw_line.len() - old_version.len() + new_ver.len(),
-                            );
-                            updated_line.push_str(&line[..version_range.start]);
-                            updated_line.push_str(&new_ver);
-                            updated_line.push_str(&line[version_range.end..]);
+
+                            let Some(new_parts) =
+                                split_updated_constraint(&formatted, version_parts.len())
+                            else {
+                                return Err(ManifestError::InvalidVersionSpec {
+                                    path: PathBuf::from("Gemfile"),
+                                    spec: package.to_string(),
+                                    message: "複合バージョン制約は安全に書き換えられません"
+                                        .to_string(),
+                                });
+                            };
+
+                            // クォート種別・引数間の空白・括弧・行末修飾子・コメントを保つため、
+                            // 各引数のクォート内側だけを差し替える
+                            let mut updated_line =
+                                String::with_capacity(raw_line.len() + formatted.len());
+                            let mut cursor = 0;
+                            for (part, new_part) in version_parts.iter().zip(new_parts.iter()) {
+                                updated_line.push_str(&line[cursor..part.start()]);
+                                updated_line.push_str(new_part);
+                                cursor = part.end();
+                            }
+                            updated_line.push_str(&line[cursor..]);
                             updated_line.push_str(line_ending);
                             updated = true;
                             lines.push(updated_line);
                             continue;
                         }
-                    }
-                    _ => {
-                        return Err(ManifestError::InvalidVersionSpec {
-                            path: PathBuf::from("Gemfile"),
-                            spec: package.to_string(),
-                            message: "複合バージョン制約は安全に書き換えられません".to_string(),
-                        });
                     }
                 }
             }
@@ -1021,11 +1137,118 @@ gem 'nokogiri'
         assert!(result.is_err());
     }
 
+    /// 回帰テスト: 複数引数の複合制約 (`gem "rails", ">= 6.0", "< 8.0"`) を
+    /// judge が Update と判定したら writer も書き込めること。
+    ///
+    /// 以前は writer が「引数が 2 個以上なら無条件でエラー」としていたため、
+    /// Rails 標準の Gemfile で「1 updated」と表示しながら exit code 2 で
+    /// 1 バイトも書き換えられない report/apply 矛盾が起きていた。
     #[test]
-    fn test_update_version_compound_constraint_returns_err() {
-        let content = r#"gem 'pg', '>= 0.18', '< 2.0'"#;
+    fn test_update_version_compound_constraint_round_trip() {
+        let content = "gem \"rails\", \">= 6.0\", \"< 8.0\"\n";
+
+        // parse は複数引数を 1 本の Range 制約として解釈する
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Range);
+        assert_eq!(deps[0].version_spec.raw, ">= 6.0, < 8.0");
+
+        // judge が更新可否に使う書式化も成功する (= Update が報告される)
+        assert_eq!(
+            deps[0]
+                .version_spec
+                .try_format_updated("7.2.3.2")
+                .as_deref(),
+            Some(">= 7.2.3.2, < 8.0")
+        );
+
+        // writer は元の引数の個数・順序・クォート種別を保って書き戻す
+        let result = GemfileParser
+            .update_version(content, "rails", "7.2.3.2")
+            .unwrap();
+        assert_eq!(result, "gem \"rails\", \">= 7.2.3.2\", \"< 8.0\"\n");
+    }
+
+    /// シングルクォート・3 引数・上限が先に書かれた並びでも同様に書き戻せること
+    #[test]
+    fn test_update_version_compound_constraint_variants() {
+        for (content, expected) in [
+            // シングルクォート 2 引数
+            (
+                "gem 'pg', '>= 0.18', '< 2.0'\n",
+                "gem 'pg', '>= 1.5.0', '< 2.0'\n",
+            ),
+            // 3 引数 (書き換えるのは包含下限だけ)
+            (
+                "gem 'pg', '>= 0.18', '<= 1.9', '< 2.0'\n",
+                "gem 'pg', '>= 1.5.0', '<= 1.9', '< 2.0'\n",
+            ),
+            // 上限が先に書かれていても下限側だけを進める
+            (
+                "gem 'pg', '< 2.0', '>= 0.18'\n",
+                "gem 'pg', '< 2.0', '>= 1.5.0'\n",
+            ),
+            // 括弧付き呼び出し
+            (
+                "gem(\"pg\", \">= 0.18\", \"< 2.0\")\n",
+                "gem(\"pg\", \">= 1.5.0\", \"< 2.0\")\n",
+            ),
+            // 行末条件修飾子
+            (
+                "gem 'pg', '>= 0.18', '< 2.0' if ENV['DB']\n",
+                "gem 'pg', '>= 1.5.0', '< 2.0' if ENV['DB']\n",
+            ),
+            // 行末コメント
+            (
+                "gem 'pg', '>= 0.18', '< 2.0' # database\n",
+                "gem 'pg', '>= 1.5.0', '< 2.0' # database\n",
+            ),
+            // CRLF は保持する
+            (
+                "gem 'pg', '>= 0.18', '< 2.0'\r\n",
+                "gem 'pg', '>= 1.5.0', '< 2.0'\r\n",
+            ),
+            // 引数間の空白 (詰めた書き方) も保持する
+            (
+                "gem 'pg','>= 0.18','< 2.0'\n",
+                "gem 'pg','>= 1.5.0','< 2.0'\n",
+            ),
+        ] {
+            let result = GemfileParser
+                .update_version(content, "pg", "1.5.0")
+                .unwrap_or_else(|e| panic!("{content:?}: {e}"));
+            assert_eq!(result, expected, "input={content:?}");
+        }
+    }
+
+    /// カンマ分割の要素数が元の引数の個数と一致しない場合は、どの引数へ何を書くか
+    /// 決められないため安全側でエラーにする (誤書き込みを防ぐ)。
+    #[test]
+    fn test_update_version_compound_constraint_part_count_mismatch_returns_err() {
+        // 1 つ目の引数が自前でカンマを含むため、更新後の文字列は 3 要素になる
+        let content = "gem 'pg', '>= 0.18, < 1.0', '<= 2.0'\n";
         let result = GemfileParser.update_version(content, "pg", "1.5.0");
-        assert!(result.is_err());
+        assert!(result.is_err(), "{result:?}");
+    }
+
+    /// 除外制約 (`!=`) を含む複合制約は judge が Skip するため writer には来ないが、
+    /// 来た場合も従来どおりエラーにする。
+    #[test]
+    fn test_update_version_compound_constraint_with_not_equal_returns_err() {
+        let content = "gem 'pg', '>= 0.18', '!= 1.2.0', '< 2.0'\n";
+        let result = GemfileParser.update_version(content, "pg", "1.5.0");
+        assert!(result.is_err(), "{result:?}");
+    }
+
+    /// 単一引数に書かれた複合制約 (`'>= 0.18, < 2.0'`) も同じ経路で書き戻せること。
+    /// judge は複数引数と同じ Range として扱うため、writer だけ拒否すると矛盾する。
+    #[test]
+    fn test_update_version_single_argument_compound_constraint() {
+        let content = "gem 'pg', '>= 0.18, < 2.0'\n";
+        let result = GemfileParser
+            .update_version(content, "pg", "1.5.0")
+            .unwrap();
+        assert_eq!(result, "gem 'pg', '>= 1.5.0, < 2.0'\n");
     }
 
     // --- 追加エッジケーステスト ---
@@ -1558,6 +1781,167 @@ end
             .update_version(content, "rmagick", "5.3.0")
             .unwrap();
         assert_eq!(result, "gem 'rmagick', '5.3.0'\r\ngem 'nokogiri'\r\n");
+    }
+
+    // --- `git_source` で登録した独自ショートハンドの回帰テスト ---
+
+    /// 回帰テスト: `git_source(:stash)` で登録したキーを持つ gem は git 依存なので
+    /// 更新対象にしない。以前は組み込み 7 キーしか見ておらず、
+    /// `gem 'rails', stash: 'forks/rails'` を「バージョンなしの rubygems 依存」と
+    /// 判定して rubygems.org の版を注入し、`bundle install` を壊していた
+    /// (同名の公開 gem = typosquat の版を入れる供給網リスクでもある)。
+    #[test]
+    fn test_parse_skips_gem_with_custom_git_source_shorthand() {
+        let content = r#"
+git_source(:stash) { |repo_name| "https://stash.example.com/#{repo_name}.git" }
+
+gem 'rails', stash: 'forks/rails'
+gem 'pg', '~> 1.5'
+"#;
+        let deps = parse(content).unwrap();
+        let names: Vec<&str> = deps.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["pg"], "{deps:?}");
+    }
+
+    /// `do |repo| ... end` 形式の `git_source` 宣言でも同じく認識すること
+    #[test]
+    fn test_parse_skips_gem_with_custom_git_source_do_block_form() {
+        let content = r#"
+git_source(:stash) do |repo_name|
+  "https://stash.example.com/#{repo_name}.git"
+end
+
+gem 'rails', :stash => 'forks/rails'
+gem 'pg', '~> 1.5'
+"#;
+        let deps = parse(content).unwrap();
+        let names: Vec<&str> = deps.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["pg"], "{deps:?}");
+    }
+
+    /// parse と writer で同じ集合を使うこと。writer 側だけ知らないと
+    /// 「parse は除外したのに writer が書き換える」非対称に戻る。
+    #[test]
+    fn test_update_version_skips_gem_with_custom_git_source_shorthand() {
+        let content = r#"git_source(:stash) { |repo_name| "https://stash.example.com/#{repo_name}.git" }
+gem 'rails', stash: 'forks/rails'
+"#;
+        let result = GemfileParser.update_version(content, "rails", "8.0.2");
+        assert!(
+            result.is_err(),
+            "git 依存へ rubygems の版を注入してはいけない: {result:?}"
+        );
+    }
+
+    /// `git_source` 宣言がなければ未知のキーは通常のオプションとして扱う
+    /// (全キーをレジストリ外扱いして更新を取りこぼさないこと)。
+    #[test]
+    fn test_parse_unknown_option_key_without_git_source_is_registry_dep() {
+        let content = "gem 'rails', stash: 'forks/rails'\n";
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1, "{deps:?}");
+        assert_eq!(deps[0].name, "rails");
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Any);
+
+        // writer 側も従来どおりバージョンを挿入できる
+        let result = GemfileParser
+            .update_version(content, "rails", "8.0.2")
+            .unwrap();
+        assert_eq!(result, "gem 'rails', '8.0.2', stash: 'forks/rails'\n");
+    }
+
+    /// コメントアウトされた `git_source` 宣言は登録扱いしない
+    #[test]
+    fn test_parse_commented_out_git_source_is_ignored() {
+        let content = "# git_source(:stash) { |repo| repo }\ngem 'rails', stash: 'forks/rails'\n";
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1, "{deps:?}");
+        assert_eq!(deps[0].name, "rails");
+    }
+
+    // --- update_version のブロック追跡に対する回帰テスト ---
+
+    /// 回帰テスト: parse は `path ... do` ブロック内の gem を除外するのに、
+    /// update_version にはブロック追跡がなく名前一致した全行を書き換えていた。
+    /// 結果としてローカル path 依存へ rubygems の版が注入されていた。
+    #[test]
+    fn test_update_version_skips_gems_inside_non_registry_block() {
+        let content = r#"if ENV["LOCAL_MYGEM"]
+  path "../mygem" do
+    gem "mygem"
+  end
+else
+  gem "mygem", "~> 2.0"
+end
+"#;
+        // parse はブロック内の宣言を surface しない
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1, "{deps:?}");
+        assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Tilde);
+
+        let result = GemfileParser
+            .update_version(content, "mygem", "2.5.0")
+            .unwrap();
+        assert_eq!(
+            result,
+            r#"if ENV["LOCAL_MYGEM"]
+  path "../mygem" do
+    gem "mygem"
+  end
+else
+  gem "mygem", "~> 2.5"
+end
+"#
+        );
+    }
+
+    /// バージョンなし gem の挿入経路 (`version_parts` が空の分岐) でも
+    /// 非レジストリブロック内は書き換えないこと
+    #[test]
+    fn test_update_version_skips_versionless_gem_inside_git_block() {
+        let content = r#"git "https://github.com/rails/rails.git", branch: "main" do
+  gem "activesupport"
+end
+
+gem "activesupport", "~> 7.0"
+"#;
+        let result = GemfileParser
+            .update_version(content, "activesupport", "7.1.0")
+            .unwrap();
+        assert_eq!(
+            result,
+            r#"git "https://github.com/rails/rails.git", branch: "main" do
+  gem "activesupport"
+end
+
+gem "activesupport", "~> 7.1"
+"#
+        );
+    }
+
+    /// `platforms` / `install_if` のような通常ブロック内の gem は従来どおり更新する
+    #[test]
+    fn test_update_version_updates_gems_inside_regular_block() {
+        let content = "platforms :ruby do\n  gem 'pg', '~> 1.5'\nend\n";
+        let result = GemfileParser
+            .update_version(content, "pg", "1.6.0")
+            .unwrap();
+        assert_eq!(result, "platforms :ruby do\n  gem 'pg', '~> 1.6'\nend\n");
+    }
+
+    /// 非レジストリブロックを抜けた後の gem は更新対象に戻ること
+    /// (ブロック追跡が `end` で正しく pop されること)
+    #[test]
+    fn test_update_version_after_non_registry_block_is_updated() {
+        let content =
+            "source 'https://gems.example.com' do\n  gem 'pg', '~> 1.0'\nend\ngem 'pg', '~> 1.5'\n";
+        let result = GemfileParser
+            .update_version(content, "pg", "1.6.0")
+            .unwrap();
+        assert_eq!(
+            result,
+            "source 'https://gems.example.com' do\n  gem 'pg', '~> 1.0'\nend\ngem 'pg', '~> 1.6'\n"
+        );
     }
 
     #[test]

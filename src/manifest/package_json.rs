@@ -192,12 +192,18 @@ fn parse_dependency_object(
                 .as_deref()
                 .and_then(real_package_name_from_alias_prefix)
                 .unwrap_or(name.as_str());
-            let dep = if is_dev {
+            let mut dep = if is_dev {
                 Dependency::development(package_name, spec, Language::Node)
             } else {
                 Dependency::production(package_name, spec, Language::Node)
             }
             .with_manifest_name(name.clone());
+            // `npm:<real>@` は制約の一部ではなくマニフェスト上の値の接頭辞。
+            // 保持しないと `--diff` が alias を剥がした表示になり、実書き込み
+            // (`format_node_update` が接頭辞を復元する) と食い違う
+            if let Some(prefix) = alias_prefix {
+                dep = dep.with_value_prefix(prefix);
+            }
             output.push(dep);
         }
     }

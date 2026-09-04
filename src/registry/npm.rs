@@ -47,6 +47,49 @@ impl NpmAdapter {
         format!("{}/{}", NPM_REGISTRY_URL, package)
     }
 
+    /// パッケージ名が npm の命名規則に収まっていることを検証する。
+    ///
+    /// 名前は `build_url` で URL パスへ直接埋め込まれる。`reqwest` が使う `url`
+    /// crate は WHATWG URL 仕様どおりドットセグメントを正規化するため、
+    /// `"a/../lodash": "^1.0.0"` のようなキーがあると lodash の版を取得して
+    /// `a/../lodash` へ書き戻してしまう。`?` / `#` はクエリ・フラグメントとして
+    /// 解釈される。npm alias (`npm:<real>@<range>`) の実名はマニフェストの**値**から
+    /// 切り出されるため、名前の出所はキーだけではない点にも注意。
+    fn validate_package_name(&self, package: &str) -> Result<(), RegistryError> {
+        let invalid = |reason: &str| RegistryError::InvalidPackageName {
+            name: package.to_string(),
+            registry: self.registry_name().to_string(),
+            reason: reason.to_string(),
+        };
+
+        // scope 付き (`@scope/name`) は `/` を 1 個だけ含む
+        let (scope, name) = match package.strip_prefix('@') {
+            Some(rest) => {
+                let (scope, name) = rest
+                    .split_once('/')
+                    .ok_or_else(|| invalid("scoped package must be @scope/name"))?;
+                (Some(scope), name)
+            }
+            None => (None, package),
+        };
+
+        let is_valid_segment = |segment: &str| {
+            !segment.is_empty()
+                && segment != "."
+                && segment != ".."
+                && segment
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '~'))
+        };
+
+        if !is_valid_segment(name) || scope.is_some_and(|scope| !is_valid_segment(scope)) {
+            return Err(invalid(
+                "expected (@scope/)name with [A-Za-z0-9._~-] characters",
+            ));
+        }
+        Ok(())
+    }
+
     /// dist-tags.latest との比較に基づき、このバージョンを候補から除外すべきか判定する
     ///
     /// npm は `is_prerelease_version` が検出できない非定型プレリリース
@@ -77,6 +120,8 @@ impl RegistryAdapter for NpmAdapter {
     }
 
     async fn fetch_versions(&self, package: &str) -> Result<Vec<VersionInfo>, RegistryError> {
+        self.validate_package_name(package)?;
+
         let url = self.build_url(package);
         let response: NpmPackageResponse = self
             .client
@@ -121,6 +166,53 @@ mod tests {
         let client = HttpClient::new().unwrap();
         let adapter = NpmAdapter::new(client);
         assert_eq!(adapter.language(), Language::Node);
+    }
+
+    /// 回帰テスト: パッケージ名の URL インジェクションを弾く。
+    ///
+    /// `a/../lodash` は `url` crate のドットセグメント正規化で `lodash` に解決され、
+    /// 無関係なパッケージの版を取得して元のキーへ書き戻してしまう。
+    #[test]
+    fn test_validate_package_name_rejects_url_injection() {
+        let adapter = NpmAdapter::new(HttpClient::new().unwrap());
+        for name in [
+            "a/../lodash",
+            "..",
+            ".",
+            "lodash?x=1",
+            "lodash#frag",
+            "",
+            "a/b",
+            "@scope",
+            "@scope/",
+            "@/name",
+            "@scope/a/b",
+            "lodash%2f..",
+        ] {
+            assert!(
+                adapter.validate_package_name(name).is_err(),
+                "不正なパッケージ名を受理してはならない: {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_package_name_accepts_npm_names() {
+        let adapter = NpmAdapter::new(HttpClient::new().unwrap());
+        for name in [
+            "lodash",
+            "typescript",
+            "@types/node",
+            "@preact/compat",
+            "socket.io",
+            "left-pad",
+            "some_pkg",
+        ] {
+            assert!(
+                adapter.validate_package_name(name).is_ok(),
+                "正当なパッケージ名を弾いてはならない: {name:?}"
+            );
+        }
     }
 
     #[test]

@@ -184,17 +184,26 @@ fn run_package_installs(
         return Ok(());
     }
 
+    let pm_runner = SystemPackageManager::new();
+
     if args.verbose {
         eprintln!();
         eprintln!("Running package manager install...");
         if min_age.is_some() {
-            // age が有効な場合、transitive 依存へネイティブ対応しない言語を通知する
-            // (どの言語が対応済みかは Language 側が単一の情報源)
-            let mut unsupported: Vec<&str> = install_map
+            // age が有効な場合、transitive 依存へネイティブ対応しない PM を通知する。
+            //
+            // 判定は言語単位ではなく **実際に選ばれる PM 単位**で行う。Node の
+            // transitive age は pnpm、Python は uv だけの機能なので、言語で判定すると
+            // npm / yarn / bun / pip / poetry / rye / pipenv のプロジェクトで通知が
+            // 出ず、「transitive にも cooldown が効いた」と誤解させてしまう。
+            // どの PM が対応済みかは Language 側が単一の情報源。
+            let mut unsupported: Vec<String> = install_map
                 .iter()
-                .flat_map(|(_dir, langs)| langs)
-                .filter(|lang| !lang.has_native_transitive_age_support())
-                .map(|lang| lang.display_name())
+                .flat_map(|(dir, langs)| langs.iter().map(move |lang| (dir, *lang)))
+                .filter_map(|(dir, lang)| {
+                    let (_, pm) = pm_runner.resolve_package_manager(lang, dir)?;
+                    (!lang.pm_has_native_transitive_age_support(pm)).then(|| pm.to_string())
+                })
                 .collect();
             unsupported.sort();
             unsupported.dedup();
@@ -207,7 +216,6 @@ fn run_package_installs(
         }
     }
 
-    let pm_runner = SystemPackageManager::new();
     let mut any_install_failed = false;
 
     // install コマンドは出力をキャプチャするため完了まで何も表示されない。
@@ -466,7 +474,13 @@ fn build_install_map(
         }
     }
 
-    dir_langs.into_iter().collect()
+    // `HashMap` の `RandomState` はインスタンスごとにシードが変わるため、そのまま
+    // collect するとモノレポで install を走らせるディレクトリの順序が実行のたびに
+    // 入れ替わる。verbose 出力や失敗時の stderr の行順が変わると CI のログ比較で
+    // 偽の差分になるので、パス順に固定する。
+    let mut install_map: Vec<(PathBuf, Vec<Language>)> = dir_langs.into_iter().collect();
+    install_map.sort_by(|a, b| a.0.cmp(&b.0));
+    install_map
 }
 
 #[cfg(test)]

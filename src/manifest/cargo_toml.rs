@@ -93,6 +93,39 @@ static REGISTRY_KEY_RE: LazyLock<Regex> =
 static REGISTRY_INDEX_KEY_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?:^|[{,])\s*registry-index\s*=").unwrap());
 
+/// ソース指定キー (`path` / `registry` / `registry-index`) をどこに現れたときに
+/// 依存オプションとして解釈するか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceKeyScope {
+    /// 複数行テーブル (`[dependencies.<pkg>]`) の本文行。行頭のキーは依存オプション名。
+    TableBody,
+    /// 依存セクション (`[dependencies]`) の宣言行。行頭のキーはパッケージ名なので、
+    /// inline table の内側 (`{` / `,` の後ろ) に現れたキーだけをオプションとして解釈する。
+    /// 区別しないと `path = "0.1.1"` (crates.io に実在するクレート `path` の通常宣言。
+    /// `registry` も同様) を path 依存と誤認し、writer が行ごとスキップして
+    /// 「更新あり」と報告した後に書き込みが失敗する (report/apply の矛盾)。
+    DeclarationLine,
+}
+
+/// `scope` で有効な位置に現れたマッチだけを返す。
+///
+/// 正規表現の先頭は `(?:^|[{,])` なので、行頭にマッチしたか inline table の内側に
+/// マッチしたかはマッチ文字列の先頭文字で判別できる。行頭側の一致だけを捨てるために
+/// 最初のマッチで打ち切らず全マッチを走査する
+/// (`path = { path = "../x" }` のように両方が同居し得る)。
+fn scoped_source_key_captures<'a>(
+    re: &Regex,
+    line: &'a str,
+    scope: SourceKeyScope,
+) -> Option<regex::Captures<'a>> {
+    re.captures_iter(line).find(|caps| match scope {
+        SourceKeyScope::TableBody => true,
+        SourceKeyScope::DeclarationLine => caps
+            .get(0)
+            .is_some_and(|matched| matched.as_str().starts_with(['{', ','])),
+    })
+}
+
 /// 行が crates.io 以外のソースを指す依存宣言かどうかを返す。
 ///
 /// parse 側 (`parse_cargo_dependencies`) は path 依存と `registry` 指定 (crates-io 以外) を
@@ -100,11 +133,13 @@ static REGISTRY_INDEX_KEY_RE: LazyLock<Regex> =
 /// 宣言されている場合 (`[dependencies] my-lib = "0.4"` + `[dev-dependencies] my-lib =
 /// { path = "../my-lib", version = "0.4" }`) に writer の曖昧判定が「宣言 1 個」と見なして
 /// 発火せず、path 依存まで crates.io の最新版で黙って書き換えてしまう。
-fn declares_non_crates_io_source(line: &str) -> bool {
-    if PATH_KEY_RE.is_match(line) || REGISTRY_INDEX_KEY_RE.is_match(line) {
+fn declares_non_crates_io_source(line: &str, scope: SourceKeyScope) -> bool {
+    if scoped_source_key_captures(&PATH_KEY_RE, line, scope).is_some()
+        || scoped_source_key_captures(&REGISTRY_INDEX_KEY_RE, line, scope).is_some()
+    {
         return true;
     }
-    REGISTRY_KEY_RE.captures(line).is_some_and(|caps| {
+    scoped_source_key_captures(&REGISTRY_KEY_RE, line, scope).is_some_and(|caps| {
         let registry = caps
             .get(1)
             .or_else(|| caps.get(2))
@@ -145,7 +180,7 @@ fn non_crates_io_dependency_sections(
             continue;
         }
         let package_table_is_excluded = is_cargo_package_dependency_table(&section, package)
-            && declares_non_crates_io_source(line);
+            && declares_non_crates_io_source(line, SourceKeyScope::TableBody);
         let dotted_key_is_excluded = is_cargo_dependency_section(&section)
             && (dotted_path_re.is_match(line)
                 || dotted_registry_index_re.is_match(line)
@@ -299,8 +334,10 @@ impl ManifestParser for CargoTomlParser {
                     continue;
                 }
                 // inline table が path / 別レジストリを指す場合は parse も依存として
-                // 拾わないため、writer も触らない
-                if declares_non_crates_io_source(line) {
+                // 拾わないため、writer も触らない。行頭のキーはパッケージ名なので
+                // inline table の内側だけを見る (`path` / `registry` という名前の
+                // クレートの通常宣言を path 依存と誤認しない)
+                if declares_non_crates_io_source(line, SourceKeyScope::DeclarationLine) {
                     rebuilt.push_str(segment);
                     continue;
                 }
@@ -401,8 +438,23 @@ impl ManifestParser for CargoTomlParser {
                 spec: package.to_string(),
                 message: format!("invalid regex pattern: {}", e),
             })?;
+        // TOML の dotted key 形式: `mylib.git = "..."` + `mylib.tag = "v1.0.0"`
+        // toml クレートは dotted key を inline table と同じ構造へ畳むため、parse は
+        // git tag 依存として surface する。ここを書き換えないと `git ls-remote` で
+        // 見つけた新しいタグを「更新あり」と報告した後に書き込みが失敗し、
+        // report/apply が矛盾する (update_version 側の dotted key 対応と対になる)。
+        let dotted_pattern = format!(
+            r#"^(\s*{}\s*\.\s*tag\s*=\s*)(?:"([^"]+)"|'([^']+)')"#,
+            regex::escape(package)
+        );
+        let dotted_re =
+            Regex::new(&dotted_pattern).map_err(|e| ManifestError::InvalidVersionSpec {
+                path: PathBuf::from("Cargo.toml"),
+                spec: package.to_string(),
+                message: format!("invalid regex pattern: {}", e),
+            })?;
 
-        // inline table と複数行テーブルの両方をセクション追跡しながら更新する。
+        // inline table・dotted key・複数行テーブルをセクション追跡しながら更新する。
         // 依存セクション外の同名キーを誤って書き換えず、TOML の単一引用符も保持する。
         let mut section = String::new();
         let mut rebuilt = String::new();
@@ -422,6 +474,19 @@ impl ManifestParser for CargoTomlParser {
                 let quote = if caps.get(3).is_some() { "'" } else { "\"" };
                 let replacement = format!("{}{}{}{}", &caps[1], quote, new_tag, quote);
                 rebuilt.push_str(&inline_re.replace(line, replacement.as_str()));
+                rebuilt.push_str(newline);
+                updated = true;
+                continue;
+            }
+
+            // dotted key は inline table と同じく依存セクション直下に書かれるため、
+            // 対象セクションの判定も inline table と同じものを使う
+            if is_cargo_git_tag_inline_section(&section)
+                && let Some(caps) = dotted_re.captures(line)
+            {
+                let quote = if caps.get(3).is_some() { "'" } else { "\"" };
+                let replacement = format!("{}{}{}{}", &caps[1], quote, new_tag, quote);
+                rebuilt.push_str(&dotted_re.replace(line, replacement.as_str()));
                 rebuilt.push_str(newline);
                 updated = true;
                 continue;
@@ -999,6 +1064,127 @@ public-crate = { version = "2.0" }
                 ),
             }
         }
+    }
+
+    /// 回帰: `path` / `registry` は crates.io に実在するクレート名でもある。
+    /// 依存セクションの行頭キーはパッケージ名なので、そこに現れた `path = "0.1.1"` を
+    /// 「path 依存の宣言」と誤認してはいけない。以前は writer が行ごとスキップし、
+    /// judge が「更新あり」と報告した後に
+    /// 「package not found or version could not be updated」で失敗していた。
+    #[test]
+    fn test_update_crate_named_like_source_keys() {
+        for (package, content, expected) in [
+            (
+                "path",
+                "[dependencies]\npath = \"0.1.1\"\n",
+                "[dependencies]\npath = \"9.9.9\"\n",
+            ),
+            (
+                "registry",
+                "[dependencies]\nregistry = \"0.2\"\n",
+                "[dependencies]\nregistry = \"9.9.9\"\n",
+            ),
+            (
+                "registry-index",
+                "[dependencies]\nregistry-index = \"0.2\"\n",
+                "[dependencies]\nregistry-index = \"9.9.9\"\n",
+            ),
+            // 名前が前方一致するだけのクレートは従来どおり更新できる
+            (
+                "pathdiff",
+                "[dependencies]\npathdiff = \"0.2\"\n",
+                "[dependencies]\npathdiff = \"9.9.9\"\n",
+            ),
+        ] {
+            let deps = parse(content).unwrap();
+            assert_eq!(deps.len(), 1, "{package} は依存として surface する");
+            assert_eq!(deps[0].name, package);
+
+            let result = CargoTomlParser
+                .update_version(content, package, "9.9.9")
+                .unwrap_or_else(|e| panic!("{package} を更新できるべき: {e}"));
+            assert_eq!(result, expected);
+        }
+    }
+
+    /// 行頭キーの誤認を直しても、inline table 内のソース指定による除外は維持する
+    #[test]
+    fn test_update_still_excludes_inline_source_keys() {
+        for content in [
+            "[dependencies]\nfoo = { path = \"../x\", version = \"1.0\" }\n",
+            "[dependencies]\nfoo = { registry = \"internal\", version = \"1.0\" }\n",
+            "[dependencies]\nfoo = { registry-index = \"https://intranet.example/index\", version = \"1.0\" }\n",
+            // クレート名が `path` でも、実体が path 依存なら書き換えない
+            "[dependencies]\npath = { path = \"../path\", version = \"0.1.1\" }\n",
+        ] {
+            let package = if content.contains("\npath = {") {
+                "path"
+            } else {
+                "foo"
+            };
+            match CargoTomlParser.update_version(content, package, "9.9.9") {
+                // 書き換え対象が見つからずエラーになるのが期待動作 (誤更新しない)
+                Err(_) => {}
+                Ok(updated) => assert_eq!(
+                    updated, content,
+                    "crates.io 以外を指す依存を書き換えてはいけない: {content}"
+                ),
+            }
+        }
+    }
+
+    /// 回帰: dotted key の git tag 依存。toml クレートは dotted key を inline table と
+    /// 同じ構造へ畳むため parse は git tag 依存として surface する。writer に dotted key の
+    /// パターンが無いと「更新あり」と報告した後に
+    /// 「git tag not found or could not be updated」で必ず失敗していた。
+    #[test]
+    fn test_update_git_tag_dotted_key() {
+        let content = r#"[dependencies]
+mylib.git = "https://github.com/org/mylib"
+mylib.tag = "v1.0.0"
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "mylib");
+        assert_eq!(
+            deps[0].git_source.as_ref().map(|git| &git.reference),
+            Some(&GitReference::Tag("v1.0.0".to_string()))
+        );
+
+        let result = CargoTomlParser
+            .update_git_tag(content, "mylib", "v1.1.0")
+            .unwrap();
+        assert!(result.contains(r#"mylib.tag = "v1.1.0""#), "{}", result);
+        assert!(result.contains(r#"mylib.git = "https://github.com/org/mylib""#));
+    }
+
+    #[test]
+    fn test_update_git_tag_dotted_key_preserves_single_quotes() {
+        let content =
+            "[dependencies]\nmylib.git = 'https://github.com/org/mylib'\nmylib.tag = 'v1.0.0'\n";
+
+        let result = CargoTomlParser
+            .update_git_tag(content, "mylib", "v1.1.0")
+            .unwrap();
+        assert!(result.contains("mylib.tag = 'v1.1.0'"), "{}", result);
+    }
+
+    #[test]
+    fn test_update_git_tag_dotted_key_scoped_to_dependency_sections() {
+        let content = r#"[package.metadata.custom]
+mylib.tag = "keep"
+
+[dependencies]
+mylib.git = "https://github.com/org/mylib"
+mylib.tag = "v1.0.0"
+"#;
+
+        let result = CargoTomlParser
+            .update_git_tag(content, "mylib", "v1.1.0")
+            .unwrap();
+        assert!(result.contains(r#"mylib.tag = "keep""#), "{}", result);
+        assert!(result.contains(r#"mylib.tag = "v1.1.0""#), "{}", result);
     }
 
     #[test]

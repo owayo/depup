@@ -4,17 +4,32 @@
 //! API エンドポイント:
 //! - バージョン一覧: https://proxy.golang.org/{module}/@v/list
 //! - バージョン情報: https://proxy.golang.org/{module}/@v/{version}.info
+//! - go.mod: https://proxy.golang.org/{module}/@v/{version}.mod
+//!
+//! `@v/list` は Go 本体が候補として採用しない版も含むため、そのまま使わずに
+//! `+incompatible` の選別 (`filter_incompatible_versions`) と retract の除外を
+//! 適用してから候補にする。
 
 use crate::domain::Language;
 use crate::error::RegistryError;
+use crate::manifest::GoModParser;
 use crate::registry::{HttpClient, RegistryAdapter};
 use crate::update::{VersionInfo, compare_semver_versions, is_prerelease_version};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use futures::stream::{self, StreamExt};
 use serde::Deserialize;
 
 /// Go Module Proxy のベース URL
 const GO_PROXY_URL: &str = "https://proxy.golang.org";
+
+/// `@v/{version}.info` を同時に取得する本数。
+///
+/// Go proxy はバージョン一覧しか一括で返さず、リリース時刻は版ごとに 1 リクエスト
+/// 必要になる。版数が多いモジュール (`github.com/aws/aws-sdk-go` で 1865 件) を
+/// 直列に引くと 1 依存だけで数分かかるため並列化する。マニフェスト側の並列度
+/// (依存数に応じて最大 4) と掛け合わさるので、控えめな値にしている。
+const INFO_FETCH_CONCURRENCY: usize = 8;
 
 /// Go Module Proxy アダプタ
 pub struct GoProxyAdapter {
@@ -131,6 +146,127 @@ fn latest_version_for_retractions<'a>(
     latest_release.or(latest_prerelease)
 }
 
+/// バージョンが Go の `+incompatible` 版かどうかを判定する。
+///
+/// Go 本体 (`modload.filterVersions`) と同じく末尾一致で判定する。
+fn is_incompatible_version(version: &str) -> bool {
+    version.ends_with("+incompatible")
+}
+
+/// semver 昇順で並べたときに、最初の `+incompatible` の直前へ来る compatible 版を返す。
+///
+/// これが Go の `filterVersions` が go.mod の有無を問い合わせる `lastCompatible`。
+/// `+incompatible` が 1 件も無い場合、および `+incompatible` より前に compatible 版が
+/// 無い場合は `None` を返す (どちらも問い合わせ不要で、後者は `+incompatible` しか
+/// 選択肢が無いのでそのまま残す)。
+fn last_compatible_before_incompatible<'a>(versions: &[&'a str]) -> Option<&'a str> {
+    let mut sorted: Vec<&'a str> = versions.to_vec();
+    sorted.sort_by(|a, b| compare_semver_versions(a, b));
+
+    let mut last_compatible: Option<&'a str> = None;
+    for version in sorted {
+        if is_incompatible_version(version) {
+            return last_compatible;
+        }
+        last_compatible = Some(version);
+    }
+
+    None
+}
+
+/// Go 本体の `modload.filterVersions` 相当の `+incompatible` 選別。
+///
+/// `@v/list` は 2019 年の修正 (golang.org/issue/34165) 以前にキャッシュされた
+/// `+incompatible` タグを保持し続けるため、一覧をそのまま候補にすると
+/// `github.com/libp2p/go-libp2p` が `v0.49.0` から 2018 年の `v6.0.23+incompatible` へ、
+/// `github.com/russross/blackfriday` が `v1.6.0` から `v2.0.0+incompatible` へ
+/// 「更新」される。`+incompatible` は prerelease ではなく build metadata なので
+/// prerelease フィルタで落ちず、リリース日も古いので age フィルタも通り抜ける。
+/// クライアント側のこの選別が唯一の防波堤になる。
+///
+/// 規則: semver 昇順で走査し、最初の `+incompatible` に到達した時点で直前の
+/// compatible 版が本物の go.mod を持つなら、そこから先 (昇順なので以降はすべて
+/// `+incompatible`) を候補から落とす。go.mod を持たないなら作者がモジュール以前の
+/// major タグ運用をしているとみなし、`+incompatible` を残す。
+///
+/// `last_compatible_has_go_mod` は [`last_compatible_before_incompatible`] が返した
+/// 版の go.mod 実在フラグ。判定対象が無い (`None`) 場合は `false` を渡す。
+///
+/// 制限: Go は現在版が `+incompatible` のとき (`preferIncompatible`) 全候補を許可するが、
+/// `RegistryAdapter::fetch_versions` は現在版を受け取らないためこの分岐は再現できない。
+/// その結果 `+incompatible` を使っているプロジェクトは更新候補が現在版より低くなり
+/// 「更新なし」になる。ダウングレードを書き込むよりは安全側と判断している。
+fn filter_incompatible_versions<'a>(
+    versions: &[&'a str],
+    last_compatible_has_go_mod: bool,
+) -> Vec<&'a str> {
+    if !last_compatible_has_go_mod {
+        return versions.to_vec();
+    }
+
+    let mut order: Vec<usize> = (0..versions.len()).collect();
+    order.sort_by(|&a, &b| compare_semver_versions(versions[a], versions[b]));
+
+    let mut keep = vec![true; versions.len()];
+    let mut seen_compatible = false;
+    for (position, &index) in order.iter().enumerate() {
+        if !is_incompatible_version(versions[index]) {
+            seen_compatible = true;
+            continue;
+        }
+        // 最初の `+incompatible` に到達。Go はここで走査を打ち切る。
+        if seen_compatible {
+            for &dropped in &order[position..] {
+                keep[dropped] = false;
+            }
+        }
+        break;
+    }
+
+    versions
+        .iter()
+        .zip(keep)
+        .filter_map(|(version, keep)| keep.then_some(*version))
+        .collect()
+}
+
+/// プロキシが合成した go.mod (= 本物の go.mod を持たない版) かどうかを判定する。
+///
+/// Go の `versionHasGoMod` は取得内容を `modfetch.LegacyGoMod`
+/// (`module <path>` の 1 行だけ) とバイト比較する。ここでは行末・空行の差異だけを
+/// 吸収し、それ以外は「本物の go.mod」として扱う。合成と誤判定すると
+/// `+incompatible` を残してしまい、防ごうとしているダウングレードがそのまま起きるため、
+/// 判定は安全側 (= 本物寄り) に倒す。
+fn is_synthesized_go_mod(content: &str, module_path: &str) -> bool {
+    let mut lines = content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+
+    let Some(first) = lines.next() else {
+        return false;
+    };
+    if lines.next().is_some() {
+        return false;
+    }
+
+    let Some(rest) = first.strip_prefix("module") else {
+        return false;
+    };
+    if !rest.starts_with(char::is_whitespace) {
+        return false;
+    }
+
+    // `modfile.AutoQuote` は必要なときだけ引用符を付けるため、両形式を受け付ける。
+    let declared = rest.trim();
+    let declared = declared
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(declared);
+
+    declared == module_path
+}
+
 /// `go.mod` から単一版・閉区間の retract 指示を抽出する。
 fn parse_retractions(content: &str) -> Vec<Retraction> {
     let mut retractions = Vec::new();
@@ -142,7 +278,10 @@ fn parse_retractions(content: &str) -> Vec<Retraction> {
             continue;
         }
 
-        if logical.starts_with("retract (") || logical == "retract (" {
+        // ブロック開始判定は go.mod パーサと共有する。以前は `starts_with("retract (")`
+        // の文字列前方一致だったため、`retract(` (空白なし) のブロックを認識できず
+        // 撤回済み版が候補に残っていた。
+        if GoModParser::is_block_start(logical, "retract") {
             in_retract_block = true;
             continue;
         }
@@ -153,8 +292,10 @@ fn parse_retractions(content: &str) -> Vec<Retraction> {
 
         let spec = if in_retract_block {
             logical
-        } else if let Some(spec) = logical.strip_prefix("retract ") {
-            spec.trim()
+        } else if let Some(rest) = logical.strip_prefix("retract")
+            && rest.starts_with(char::is_whitespace)
+        {
+            rest.trim()
         } else {
             continue;
         };
@@ -269,40 +410,88 @@ impl RegistryAdapter for GoProxyAdapter {
             };
         }
 
-        let latest_version = latest_version_for_retractions(version_strings.iter().copied())
+        // `+incompatible` を候補に残すかどうかを Go 本体と同じ規則で決める。
+        // 判定に使う go.mod は、後段の retract 情報源と同じ版になることが多い
+        // (どちらも「最も新しい compatible 版」) ので取得結果を控えて使い回す。
+        let mut cached_go_mod: Option<(&str, String)> = None;
+        let mut last_compatible_has_go_mod = false;
+        if let Some(last_compatible) = last_compatible_before_incompatible(&version_strings) {
+            let mod_url = self.build_mod_url(module, last_compatible);
+            match self
+                .client
+                .get_text(&mod_url, module, self.registry_name())
+                .await
+            {
+                Ok(go_mod) => {
+                    last_compatible_has_go_mod = !is_synthesized_go_mod(&go_mod, module);
+                    cached_go_mod = Some((last_compatible, go_mod));
+                }
+                Err(_) => {
+                    // 判定材料が取れないときは `+incompatible` を落とす側へ倒す。
+                    // 取りこぼしは「更新なし」として利用者に見えるだけだが、逆側に
+                    // 倒すと 8 年前の `+incompatible` 版へのダウングレードが
+                    // 「更新」として黙って書き込まれる。
+                    last_compatible_has_go_mod = true;
+                }
+            }
+        }
+
+        let candidates = filter_incompatible_versions(&version_strings, last_compatible_has_go_mod);
+
+        // retract 情報源は `+incompatible` を落とした後の一覧から選ぶ。フィルタ前から
+        // 選ぶと `github.com/libp2p/go-libp2p` では `v6.0.23+incompatible` の
+        // 合成 go.mod を読んでしまい、`v0.49.0` の go.mod にある本物の retract を
+        // 取りこぼす。
+        let latest_version = latest_version_for_retractions(candidates.iter().copied())
             .ok_or_else(|| RegistryError::InvalidResponse {
                 package: module.to_string(),
                 registry: self.registry_name().to_string(),
                 message: "retract 情報を取得する最新バージョンを決定できません".to_string(),
             })?;
-        let mod_url = self.build_mod_url(module, latest_version);
-        let latest_go_mod = self
-            .client
-            .get_text(&mod_url, module, self.registry_name())
-            .await?;
+        let latest_go_mod = match cached_go_mod {
+            Some((version, go_mod)) if version == latest_version => go_mod,
+            _ => {
+                let mod_url = self.build_mod_url(module, latest_version);
+                self.client
+                    .get_text(&mod_url, module, self.registry_name())
+                    .await?
+            }
+        };
         let retractions = parse_retractions(&latest_go_mod);
 
-        // 各バージョンについて、リリース時刻を取得するために情報をフェッチ
-        let mut versions = Vec::new();
+        // 各バージョンについて、リリース時刻を取得するために情報をフェッチする。
+        //
+        // `@v/list` は数千件になりうる (`github.com/aws/aws-sdk-go` で 1865 件)。
+        // 1 件ずつ await すると 1 依存の解決だけで数分の無音待ちになり、利用者からは
+        // ハングと区別がつかない。しかも取得失敗時は 1 件ごとにリトライの
+        // 総デッドラインまで待たされる。結果は最後にソートし直すので取得順に
+        // 意味は無く、`buffer_unordered` で並列化する。
+        // URL は事前に組み立てて所有値で持つ。ストリームへ `&str` を流すと
+        // クロージャが特定のライフタイムに束縛され、`buffer_unordered` が要求する
+        // 高階ライフタイム境界 (どのライフタイムでも成立する `FnMut`) を満たせない。
+        let info_urls: Vec<String> = candidates
+            .into_iter()
+            .filter(|version| !is_retracted(version, &retractions))
+            .map(|version| self.build_info_url(module, version))
+            .collect();
 
-        for version_str in version_strings {
-            if is_retracted(version_str, &retractions) {
-                continue;
-            }
+        // 同じ理由で `self` も async ブロックへ持ち込まず、必要な参照だけ取り出す。
+        let client = &self.client;
+        let registry_name = self.registry_name();
 
-            let info_url = self.build_info_url(module, version_str);
-            match self
-                .client
-                .get_json::<VersionInfoResponse>(&info_url, module, self.registry_name())
-                .await
-            {
-                Ok(info) => versions.push(into_version_info(info)),
-                Err(_) => {
-                    // 特定バージョンの情報が取得できない場合はスキップ
-                    continue;
-                }
-            }
-        }
+        let mut versions: Vec<VersionInfo> = stream::iter(info_urls)
+            .map(|info_url| async move {
+                // 特定バージョンの情報が取得できない場合はスキップ
+                client
+                    .get_json::<VersionInfoResponse>(&info_url, module, registry_name)
+                    .await
+                    .ok()
+                    .map(into_version_info)
+            })
+            .buffer_unordered(INFO_FETCH_CONCURRENCY)
+            .filter_map(std::future::ready)
+            .collect()
+            .await;
 
         // バージョンでソート
         versions.sort();
@@ -487,6 +676,190 @@ retract (
                 },
             ]
         );
+    }
+
+    /// バグ回帰テスト: `github.com/libp2p/go-libp2p` の実データ。
+    /// `@v/list` の最大安定版は 2018 年の `v6.0.23+incompatible` だが、
+    /// `v0.49.0` が本物の go.mod を持つため Go は `+incompatible` を全部捨てる。
+    /// 以前は選別が無く、`v0.49.0` から 8 年前の版へ「更新」していた。
+    #[test]
+    fn test_filter_incompatible_drops_when_last_compatible_has_go_mod() {
+        let versions = [
+            "v0.48.0",
+            "v2.0.0+incompatible",
+            "v0.49.0",
+            "v6.0.23+incompatible",
+        ];
+
+        assert_eq!(
+            last_compatible_before_incompatible(&versions),
+            Some("v0.49.0")
+        );
+        assert_eq!(
+            filter_incompatible_versions(&versions, true),
+            vec!["v0.48.0", "v0.49.0"]
+        );
+    }
+
+    /// 直前の compatible 版が合成 go.mod しか持たない (= モジュール以前の major タグ運用)
+    /// なら、Go と同じく `+incompatible` を候補に残す。
+    #[test]
+    fn test_filter_incompatible_keeps_when_last_compatible_lacks_go_mod() {
+        let versions = [
+            "v0.48.0",
+            "v2.0.0+incompatible",
+            "v0.49.0",
+            "v6.0.23+incompatible",
+        ];
+
+        assert_eq!(
+            filter_incompatible_versions(&versions, false),
+            versions.to_vec()
+        );
+    }
+
+    /// `+incompatible` しか無い一覧では判定対象の compatible 版が存在しないため、
+    /// 候補が全滅しないよう `+incompatible` をそのまま残す。
+    #[test]
+    fn test_filter_incompatible_keeps_incompatible_only_list() {
+        let versions = ["v3.0.0+incompatible", "v2.0.0+incompatible"];
+
+        assert_eq!(last_compatible_before_incompatible(&versions), None);
+        // 判定対象が無いので `false` を渡す運用だが、`true` でも落とさないこと
+        assert_eq!(
+            filter_incompatible_versions(&versions, false),
+            versions.to_vec()
+        );
+        assert_eq!(
+            filter_incompatible_versions(&versions, true),
+            versions.to_vec()
+        );
+    }
+
+    /// `+incompatible` を含まない一覧は素通しする。
+    #[test]
+    fn test_filter_incompatible_keeps_compatible_only_list() {
+        let versions = ["v1.6.0", "v1.5.3", "v2.0.0-rc.1"];
+
+        assert_eq!(last_compatible_before_incompatible(&versions), None);
+        assert_eq!(
+            filter_incompatible_versions(&versions, true),
+            versions.to_vec()
+        );
+    }
+
+    /// Go は compatible なプレリリースを `+incompatible` リリースより優先する
+    /// (「we even prefer a compatible pre-release over an incompatible release」)。
+    #[test]
+    fn test_filter_incompatible_prefers_compatible_prerelease() {
+        let versions = ["v1.6.0", "v1.7.0-rc.1", "v2.0.0+incompatible"];
+
+        assert_eq!(
+            last_compatible_before_incompatible(&versions),
+            Some("v1.7.0-rc.1")
+        );
+        assert_eq!(
+            filter_incompatible_versions(&versions, true),
+            vec!["v1.6.0", "v1.7.0-rc.1"]
+        );
+    }
+
+    /// バグ回帰テスト (副次): retract 情報源をフィルタ前の一覧から選ぶと、
+    /// `v6.0.23+incompatible` の合成 go.mod を読んで本物の retract を取りこぼす。
+    #[test]
+    fn test_latest_version_for_retractions_uses_filtered_candidates() {
+        let versions = ["v0.49.0", "v6.0.23+incompatible"];
+
+        // `+incompatible` は build metadata なので prerelease 扱いされず最大版になる
+        assert_eq!(
+            latest_version_for_retractions(versions),
+            Some("v6.0.23+incompatible")
+        );
+
+        let candidates = filter_incompatible_versions(&versions, true);
+        assert_eq!(
+            latest_version_for_retractions(candidates.iter().copied()),
+            Some("v0.49.0")
+        );
+    }
+
+    #[test]
+    fn test_is_synthesized_go_mod_detects_legacy_go_mod() {
+        // プロキシが合成する go.mod は `module <path>` の 1 行だけ
+        assert!(is_synthesized_go_mod(
+            "module github.com/libp2p/go-libp2p\n",
+            "github.com/libp2p/go-libp2p"
+        ));
+        // CRLF・前後の空行は差異として扱わない
+        assert!(is_synthesized_go_mod(
+            "\r\nmodule github.com/x/y\r\n\r\n",
+            "github.com/x/y"
+        ));
+        // 引用符付きの module 行も合成形
+        assert!(is_synthesized_go_mod(
+            "module \"github.com/x/y\"\n",
+            "github.com/x/y"
+        ));
+    }
+
+    #[test]
+    fn test_is_synthesized_go_mod_treats_ambiguous_content_as_real() {
+        // `go` 行などがあれば本物の go.mod
+        assert!(!is_synthesized_go_mod(
+            "module github.com/x/y\n\ngo 1.21\n",
+            "github.com/x/y"
+        ));
+        // 別モジュールの go.mod は合成形ではない
+        assert!(!is_synthesized_go_mod(
+            "module github.com/other/mod\n",
+            "github.com/x/y"
+        ));
+        // 判定できない入力は安全側 (本物扱い = `+incompatible` を落とす) へ倒す
+        assert!(!is_synthesized_go_mod("", "github.com/x/y"));
+        assert!(!is_synthesized_go_mod(
+            "modulegithub.com/x/y\n",
+            "github.com/x/y"
+        ));
+    }
+
+    /// バグ回帰テスト: `retract(` (空白なし) のブロックを認識できず、
+    /// 撤回済み版が候補に残っていた。
+    #[test]
+    fn test_parse_retractions_supports_block_without_space() {
+        let content = r#"
+module example.com/lib
+
+retract(
+    v1.0.0
+    [v1.1.0, v1.2.0]
+)
+"#;
+
+        assert_eq!(
+            parse_retractions(content),
+            vec![
+                Retraction::Exact("v1.0.0".to_string()),
+                Retraction::Range {
+                    lower: "v1.1.0".to_string(),
+                    upper: "v1.2.0".to_string(),
+                },
+            ]
+        );
+    }
+
+    /// `retract` とバージョンがタブ区切りの単一行指定も解釈する。
+    #[test]
+    fn test_parse_retractions_supports_tab_separated_single_line() {
+        assert_eq!(
+            parse_retractions("module example.com/lib\n\nretract\tv1.0.0\n"),
+            vec![Retraction::Exact("v1.0.0".to_string())]
+        );
+    }
+
+    /// `retract` を接頭辞に持つだけの別ディレクティブは拾わない。
+    #[test]
+    fn test_parse_retractions_ignores_similar_directive() {
+        assert!(parse_retractions("retracted v1.0.0\nretractions (\n)\n").is_empty());
     }
 
     #[test]

@@ -21,8 +21,9 @@ use crate::manifest::{
 use crate::osv::{OsvCheck, OsvChecker};
 use crate::progress::Progress;
 use crate::registry::{
-    CratesIoAdapter, GitHubTagsAdapter, GitRemote, GoProxyAdapter, HttpClient, MavenCentralAdapter,
-    MiseAdapter, NpmAdapter, PackagistAdapter, PyPIAdapter, RegistryAdapter, RubyGemsAdapter,
+    CratesIoAdapter, CratesIoRateLimit, GitHubTagsAdapter, GitRemote, GoProxyAdapter, HttpClient,
+    MavenCentralAdapter, MiseAdapter, NpmAdapter, PackagistAdapter, PyPIAdapter, RegistryAdapter,
+    RubyGemsAdapter,
 };
 use crate::tauri_sync::{TAURI_CRATE, TAURI_NPM_PACKAGES, TauriVersionSync};
 use crate::update::{
@@ -73,6 +74,14 @@ pub const LOCK_AGE_AUDIT_BUDGET: Duration = Duration::from_secs(180);
 /// cargo 自身がレジストリアクセスで固まっても監査フェーズごと止まらないようにする。
 /// 通常はインデックス取得込みでも数秒で終わる。
 const CARGO_UPDATE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// 差し戻しに着手するために必要な残り予算。
+///
+/// `cargo update` に渡すタイムアウトは残り予算でクランプされるため、予算の末尾で
+/// 着手すると 1 秒程度で必ずタイムアウトする。試行した組合せは直前に
+/// `previously_tried` へ記録され二度と再試行されないため、本来差し戻せた依存が
+/// 「失敗」として恒久的に確定してしまう。着手できないなら未検証として残す方が良い。
+const MIN_CARGO_UPDATE_SLICE: Duration = Duration::from_secs(10);
 
 /// バージョン情報のキャッシュ (言語, パッケージ名) をキーとする
 pub type VersionCache = Arc<Mutex<HashMap<(Language, String), Vec<VersionInfo>>>>;
@@ -202,6 +211,9 @@ pub struct Orchestrator {
     general_semaphore: Arc<Semaphore>,
     /// crates.io 専用レート制限セマフォ
     crates_io_semaphore: Arc<Semaphore>,
+    /// crates.io の 1 リクエスト/秒 間隔を実行全体で共有する状態。
+    /// アダプタごとに持たせるとマニフェスト境界やフェーズ境界で間隔がリセットされる
+    crates_io_rate_limit: Arc<CratesIoRateLimit>,
     /// ディレクトリ間で共有されるバージョンキャッシュ
     version_cache: VersionCache,
     /// 同一パッケージの取得を一つにまとめるキー単位のロック
@@ -283,6 +295,7 @@ impl Orchestrator {
             client,
             general_semaphore: Arc::new(Semaphore::new(DEFAULT_CONCURRENCY)),
             crates_io_semaphore: Arc::new(Semaphore::new(CRATES_IO_CONCURRENCY)),
+            crates_io_rate_limit: Arc::new(CratesIoRateLimit::new()),
             version_cache: Arc::new(Mutex::new(HashMap::new())),
             version_fetch_locks: Arc::new(Mutex::new(HashMap::new())),
             git_remote: GitRemote::new(),
@@ -319,7 +332,12 @@ impl Orchestrator {
         let Some(cutoff) = crate::domain::cutoff_now(min_age) else {
             return LockAgeAuditResult::default();
         };
-        let adapter = CratesIoAdapter::new(self.client.clone());
+        // check フェーズと同じレート制限状態を使う。別インスタンスにすると
+        // 直前のリクエストから 1 秒経たずに監査の 1 発目が飛ぶ
+        let adapter = CratesIoAdapter::with_rate_limit(
+            self.client.clone(),
+            self.crates_io_rate_limit.clone(),
+        );
 
         let mut aggregated: Vec<LockAgeAdjustment> = Vec::new();
         let mut previously_tried: std::collections::HashSet<(String, String)> =
@@ -360,7 +378,7 @@ impl Orchestrator {
             let mut budget_exhausted = false;
             let mut completed = 0usize;
 
-            for (index, (name, versions)) in targets.iter().enumerate() {
+            'audit: for (index, (name, versions)) in targets.iter().enumerate() {
                 let elapsed = started.elapsed();
                 if elapsed >= LOCK_AGE_AUDIT_BUDGET {
                     // 予算切れ: 監査済みの調整は活かしつつ、残件数を呼び出し側へ返す
@@ -391,6 +409,10 @@ impl Orchestrator {
                                 });
                             }
                         }
+                        // fetch 失敗でもこの対象は「処理済み」。ここで進捗を進めないと
+                        // 末尾の数件が失敗したときにバーが手前で止まったまま次の
+                        // ディレクトリへ移る (全件失敗なら 0 のまま)
+                        completed = index + 1;
                         continue;
                     }
                 };
@@ -422,6 +444,19 @@ impl Orchestrator {
                         });
                         continue;
                     };
+
+                    // 残り予算が `cargo update` 1 回分に満たないなら着手しない。
+                    // 直後に `previously_tried` へ記録される組合せは二度と再試行
+                    // されないため、1 秒程度に切り詰められたタイムアウトで走らせると
+                    // 本来差し戻せた依存が「失敗」として恒久的に確定してしまう。
+                    // 未検証として残す方が次回の実行で救える
+                    if LOCK_AGE_AUDIT_BUDGET.saturating_sub(started.elapsed())
+                        < MIN_CARGO_UPDATE_SLICE
+                    {
+                        unchecked = targets.len() - index;
+                        budget_exhausted = true;
+                        break 'audit;
+                    }
 
                     // 差し戻しの成否によらず試行済みとして記録する。resolver 制約で
                     // 失敗した組合せは、別の差し戻しで制約が緩めば理論上は成功しうるが、
@@ -881,8 +916,9 @@ impl Orchestrator {
         if let Some(age) = resolved.duration {
             filter = filter.with_min_age(age);
         }
-        // mise の除外設定は depup 側で解釈しないため、食い違いを通知する
+        // mise の除外設定・ツール単位の age は depup 側で解釈しないため、食い違いを通知する
         self.warn_mise_age_excludes();
+        self.warn_mise_tool_age_overrides();
 
         // 変更レベル上限
         if let Some(level) = self.args.max_change {
@@ -1002,6 +1038,33 @@ impl Orchestrator {
         eprintln!("{}", msg.yellow());
     }
 
+    /// mise のツール単位 `minimum_release_age` も depup 側では解釈しないため通知する。
+    ///
+    /// `[settings]` の値はプロジェクトポリシーとして CLI を上書きするが、
+    /// `node = { version = "22", minimum_release_age = "30d" }` のようなツール単位の
+    /// 指定は depup が読まない。黙って無視すると、そのツールだけ depup と
+    /// `mise install` の結果が食い違う (excludes 側には既に警告があるのに
+    /// こちらだけ無言、という非対称も解消する)。
+    fn warn_mise_tool_age_overrides(&self) {
+        use colored::Colorize as _;
+        if !has_mise_config(&self.args.path) {
+            return;
+        }
+        let overrides = MiseSettings::tool_minimum_release_ages_from_dir(&self.args.path);
+        if overrides.is_empty() {
+            return;
+        }
+        let listed = overrides
+            .iter()
+            .map(|entry| format!("{} = {}", entry.tool, entry.raw))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let msg = format!(
+            "⚠ mise's per-tool minimum_release_age ({listed}) is not applied by depup: the resolved project/CLI age is used for all tools"
+        );
+        eprintln!("{}", msg.yellow());
+    }
+
     /// CLI引数に基づいて言語を処理すべきかチェックする
     fn should_process_language(&self, language: Language) -> bool {
         if !self.args.has_language_filter() {
@@ -1025,7 +1088,10 @@ impl Orchestrator {
         match language {
             Language::Node => Box::new(NpmAdapter::new(self.client.clone())),
             Language::Python => Box::new(PyPIAdapter::new(self.client.clone())),
-            Language::Rust => Box::new(CratesIoAdapter::new(self.client.clone())),
+            Language::Rust => Box::new(CratesIoAdapter::with_rate_limit(
+                self.client.clone(),
+                self.crates_io_rate_limit.clone(),
+            )),
             Language::Go => Box::new(GoProxyAdapter::new(self.client.clone())),
             Language::Ruby => Box::new(RubyGemsAdapter::new(self.client.clone())),
             Language::Php => Box::new(PackagistAdapter::new(self.client.clone())),
@@ -1138,14 +1204,20 @@ impl Orchestrator {
         let npm_current = npm_packages.first().map(|(_, _, _, v)| v.as_str());
 
         // 保留中の更新後の実効バージョンが既にメジャー.マイナーで一致して
-        // いれば同期不要
-        let npm_effective = npm_packages
-            .first()
-            .map(|(_, _, r, current)| effective_version(r, current));
+        // いれば同期不要。
+        //
+        // 判定は npm パッケージ全件で行う。`@tauri-apps/api` と `@tauri-apps/cli` は
+        // パッチ集合差や age フィルタで judge 結果が非対称になりうるため、先頭 1 件
+        // (依存はキー順に並ぶので通常 `api`) の一致だけで打ち切ると、残りのパッケージの
+        // ずれが同期されないまま放置される。
         let crate_effective = crate_info
             .as_ref()
             .map(|(_, _, r, current)| effective_version(r, current));
-        if same_effective_major_minor(npm_effective, crate_effective) {
+        let all_npm_aligned = !npm_packages.is_empty()
+            && npm_packages.iter().all(|(_, _, r, current)| {
+                same_effective_major_minor(Some(effective_version(r, current)), crate_effective)
+            });
+        if all_npm_aligned {
             return;
         }
 
@@ -1618,9 +1690,14 @@ fn git_urls_match(a: &str, b: &str) -> bool {
 /// ユーザの明示的なフィルタ (--exclude / --only / 言語フィルタ / pinned /
 /// --max-change) や判定不能 (fetch・parse 失敗) によるスキップを同期が
 /// 上書きすると、指定を破ってマニフェストへ書き込んでしまう。
+///
+/// OSV フォールバックで脆弱な候補を退けた結果も保護する。同期先の選定は
+/// レジストリの生のバージョン一覧から最新を選ぶため、保護しないと judge が
+/// 除外したはずの脆弱版を選び直して書き戻し、OSV チェックを無効化したのと
+/// 同じ結果になる。
 fn tauri_sync_protected(result: &UpdateResult) -> bool {
     match result {
-        UpdateResult::Update { .. } => false,
+        UpdateResult::Update { osv_skipped, .. } => !osv_skipped.is_empty(),
         UpdateResult::Skip { reason, .. } => !matches!(
             reason,
             SkipReason::AlreadyLatest | SkipReason::NoSuitableVersion

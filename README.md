@@ -60,7 +60,7 @@
 - **Age Filter**: Only update to versions released N days/weeks ago
 - **pnpm Integration**: Respects `minimumReleaseAge` from pnpm settings
 - **Bun Catalogs**: Updates Bun `catalog` / `catalogs` definitions in `package.json`
-- **Monorepo Support**: `.depup`, pnpm workspaces, nested package installs, and Tauri projects
+- **Monorepo Support**: `.depup`, Cargo/pnpm/Go workspaces, Gradle multi-project builds, nested package installs, and Tauri projects
 - **Release Date Display**: Shows when each new version was released
 - **Multiple Output Formats**: Text (colored), JSON, diff
 
@@ -71,10 +71,10 @@
 | <img src="https://img.shields.io/badge/-339933?logo=nodedotjs&logoColor=white" height="16"> Node.js | package.json (including Bun catalogs) | npm | package-lock.json, pnpm-lock.yaml, yarn.lock, bun.lock, bun.lockb |
 | <img src="https://img.shields.io/badge/-3776AB?logo=python&logoColor=white" height="16"> Python | pyproject.toml | PyPI | uv.lock, requirements.lock, poetry.lock |
 | <img src="https://img.shields.io/badge/-000000?logo=rust&logoColor=white" height="16"> Rust | Cargo.toml | crates.io | Cargo.lock |
-| <img src="https://img.shields.io/badge/-00ADD8?logo=go&logoColor=white" height="16"> Go | go.mod | Go Proxy | go.sum |
+| <img src="https://img.shields.io/badge/-00ADD8?logo=go&logoColor=white" height="16"> Go | go.mod (go.work members auto-detected) | Go Proxy | go.sum |
 | <img src="https://img.shields.io/badge/-CC342D?logo=ruby&logoColor=white" height="16"> Ruby | Gemfile | RubyGems | Gemfile.lock |
 | <img src="https://img.shields.io/badge/-777BB4?logo=php&logoColor=white" height="16"> PHP | composer.json | Packagist | composer.lock |
-| <img src="https://img.shields.io/badge/-ED8B00?logo=openjdk&logoColor=white" height="16"> Java | build.gradle, build.gradle.kts, gradle/*.versions.toml | Maven Central | gradle.lockfile |
+| <img src="https://img.shields.io/badge/-ED8B00?logo=openjdk&logoColor=white" height="16"> Java | build.gradle, build.gradle.kts, gradle/*.versions.toml (settings.gradle subprojects auto-detected) | Maven Central | gradle.lockfile |
 | <img src="https://img.shields.io/badge/-F05138?logo=swift&logoColor=white" height="16"> Swift | Package.swift | GitHub Tags | Package.resolved |
 | mise | mise.toml, .mise.toml, .config/mise/config.toml, .tool-versions | `mise ls-remote` | mise.lock |
 
@@ -262,7 +262,9 @@ Use `--include-pinned` to update pinned versions.
 >
 > **Note**: Go `exclude` directives are applied to update candidates without rewriting the directive itself. Versions retracted by the upstream module's latest `go.mod` are also excluded, including closed retract ranges. For modules without tagged versions, depup falls back to the Go Proxy `@latest` endpoint; an omitted `.info` `Time` uses the Unix epoch so an unknown release date is not permanently filtered by `--age`.
 >
-> **Note**: Gemfile compound and exclusion constraints such as `gem "pg", ">= 0.18", "< 2.0"` and `gem "rack", "!= 2.2.4"` are parsed, but depup does not rewrite them automatically. Replacing only part of those constraints can change their meaning, so depup reports them instead of applying an unsafe edit.
+> **Note**: Gemfile compound constraints such as `gem "pg", ">= 0.18", "< 2.0"` are parsed and updated. depup advances only the inclusive lower bound and writes it back across the original arguments, preserving their count, order, quote style, spacing, parenthesized call form, and trailing conditional modifiers. The comparison baseline is the inclusive lower bound regardless of the order the constraints are written in, so `gem "pg", "< 2.0", ">= 0.18"` is compared against `0.18`. If the rewritten constraint cannot be split back into the original number of arguments (for example when one argument itself contains a comma), depup reports an error instead of applying an unsafe edit. Exclusion constraints such as `gem "rack", "!= 2.2.4"` are skipped at the judging stage because replacing part of them can change their meaning.
+>
+> **Note**: Custom Bundler git source shorthands registered with `git_source(:name) { ... }` (for example `gem 'rails', stash: 'forks/rails'`) are treated as non-registry dependencies and skipped, just like the built-in `git:` / `github:` shorthands.
 >
 > **Note**: Gemfile entries that point to non-registry sources without a version (`git:`, `github:`, `bitbucket:`, `gist:`, `path:`, `source:`) are skipped instead of being converted into RubyGems registry constraints. If such an entry explicitly includes a version, depup treats it as Bundler's gemspec constraint and can parse and update it while preserving the source option. Both Ruby option spellings are recognised — `git: '...'` and the hash-rocket form `:git => '...'`. Gems declared inside `git ... do` / `github ... do` / `path ... do` / `source ... do` blocks are skipped for the same reason, while ordinary blocks such as `platforms` and `install_if` are still processed. Declarations whose arguments continue on the next line (`gem "devise",`) are skipped rather than reported as versionless registry gems, because that line alone cannot determine the version. Inline `group:` / `groups:` options are used to classify development dependencies.
 >
@@ -275,6 +277,16 @@ Use `--include-pinned` to update pinned versions.
 > **Note**: Composer platform packages such as `php`, `hhvm`, `ext-*`, `lib-*`, and Composer API packages are skipped.
 >
 > **Note**: Composer/Packagist accepts 1-4 segment numeric versions per `composer/semver`'s `VersionParser`, so depup parses and updates four-segment versions like `1.2.3.4`, `^1.0.0.0`, `~3.4.5.6`, and `1.0.0.*` while rejecting 5+ segment forms as invalid.
+>
+> **Note**: Composer modifiers may omit the separator or use `.` / `_` (`composer/semver` allows `[._-]?`), so depup treats `5.0.0alpha3`, `1.0.0.RC1`, and `1.0.0_beta1` as pre-releases and `2.2.1p1` / `2.2.1pl1` / `2.2.1patch1` as patch aliases that sort **above** the base version. Both forms occur on Packagist today (`nikic/php-parser` publishes `5.0.0beta1`; `laminas/laminas-diactoros` ships security patches as `2.2.1p2`).
+>
+> **Note**: Gradle `-SNAPSHOT` / `.SNAPSHOT` versions are excluded from updates. A snapshot is a moving reference that resolves to the newest timestamped build on every resolution, so rewriting it to a fixed release would silently change what the build uses. Stable qualifiers such as `.Final`, `.RELEASE`, `-jre`, and `-SP1` are still updated.
+>
+> **Note**: Gradle coordinates declared inside `resolutionStrategy { force ... }`, `constraints { }`, and `dependencySubstitution { }` are not reported as dependencies. They restate a version that is already declared elsewhere, and treating them as separate declarations made the shared coordinate ambiguous and blocked the update.
+>
+> **Note**: Go versions tagged `+incompatible` are filtered using the same rule the `go` command applies: once a `+incompatible` version is reached in semver order, it and everything above it are discarded if the preceding compatible version has a real `go.mod`. Without this, a module like `github.com/libp2p/go-libp2p` would be "updated" from `v0.49.0` to a 2018-era `v6.0.23+incompatible` that still builds successfully.
+>
+> **Note**: A `pyproject.toml` that configures a non-PyPI default index — a Poetry `priority = "primary"` / `"default"` source, a uv `[[tool.uv.index]] default = true` or `[tool.uv] index-url`, or a PDM source overriding `pypi` — has all of its dependencies skipped, with a warning. depup only queries PyPI, so updating those dependencies would replace private packages with same-named public ones.
 
 ### Range Preservation
 
@@ -739,6 +751,20 @@ When `--install` is used, depup runs the package manager in the nearest matching
 ### pnpm Workspaces
 
 depup detects `pnpm-workspace.yaml` and processes all workspace packages. Both block-style (`- 'packages/*'`) and flow-style (`packages: ['packages/*', 'apps/*']`) `packages` arrays are supported, including negation patterns (`!packages/legacy`).
+
+### Cargo Workspaces
+
+depup expands `[workspace] members` (including glob patterns like `crates/*`) and skips entries listed in `[workspace] exclude`.
+
+### Go Workspaces
+
+depup expands the `use` directives in `go.work` (both the single-line and `use ( ... )` block forms) and processes each member module's `go.mod`. Without this, a repository whose root has no `go.mod` would report "no updates" even though every member has outdated dependencies.
+
+### Gradle Multi-Project Builds
+
+depup expands `include ':app', ':core'` from `settings.gradle` / `settings.gradle.kts` (both the Groovy and Kotlin DSL forms) and processes each subproject's `build.gradle` / `build.gradle.kts`, plus `buildSrc/`. Most dependency declarations live in subprojects, so scanning only the root build file would miss them.
+
+Expanded paths are subject to the same containment checks as `.depup`: absolute paths, `..` traversal, and symlinks resolving outside the project are rejected.
 
 ### Tauri Projects
 

@@ -27,7 +27,19 @@ pub struct PhpVersionParser;
 // バージョンコアのパターンは 1 箇所に集約する。Node パーサの NODE_VERSION_PATTERN と同様、
 // 全演算子の正規表現がこの定数を共有することで、過去に起きた「WILDCARD_RE だけ [vV] を
 // 受理し他は v? のまま」のような定義間の不整合を構造的に防ぐ。
-const PHP_VERSION_CORE: &str = r"[vV]?\d+(?:\.\d+){0,3}(?:-[\w.-]+)?(?:\+[\w.-]+)?";
+//
+// 末尾の修飾子は 2 通り受け付ける:
+//  1. `(?:-[\w.-]+)?` — ハイフン区切りの汎用 suffix (`-rc.1` / `-beta1`)。従来からの形。
+//  2. composer/semver の modifier regex 相当
+//     (`[._-]?(stable|beta|b|RC|alpha|a|patch|pl|p)((?:[.-]?\d+)*)?([.-]?dev)?`)。
+//     本家は**区切り文字を省略でき `.` / `_` も使える**ため、`2.2.1p2` (laminas/laminas-diactoros の
+//     セキュリティパッチ) / `^1.0.0beta1` / `1.0.0.RC1` / `1.0.0_beta1` はいずれも正当な制約。
+//     ハイフンを必須にしていたせいでこれらは parse が None を返し、依存ごと (スキップ理由にも
+//     出ずに) 監査対象から消えていた。
+// 1 を先に置くのは、ハイフン付き入力の一致範囲を従来と 1 バイトも変えないため
+// (VERSION_TOKEN_RE は非アンカーで使うので、優先順位が変わると抽出結果が変わりうる)。
+// 大文字小文字は composer が i フラグで無視するので `(?i:...)` で局所的に無視する。
+const PHP_VERSION_CORE: &str = r"[vV]?\d+(?:\.\d+){0,3}(?:-[\w.-]+)?(?:[._-]?(?i:stable|beta|b|rc|alpha|a|patch|pl|p)(?:[.-]?\d+)*)?(?:[.-]?(?i:dev))?(?:\+[\w.-]+)?";
 
 // キャレット: ^1.2.3 / ^1.2.3.4
 static CARET_RE: LazyLock<Regex> =
@@ -1075,5 +1087,74 @@ mod tests {
         let spec = parse("~1.2.3").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Tilde);
         assert_eq!(spec.prefix.as_deref(), Some("~"));
+    }
+
+    /// 回帰テスト: composer/semver の modifier は区切り文字 `[._-]` を省略できるため、
+    /// `2.2.1p2` (laminas/laminas-diactoros の 2.x 系セキュリティパッチ) や
+    /// `1.0.0beta1` (nikic/php-parser の prerelease タグ綴り) も正当な制約。
+    /// 以前は修飾子の前に `-` を必須にしていたので parse が None を返し、これらの版を
+    /// ピンした composer.json が依存ごと (スキップ理由にも出ずに) 監査対象外になっていた。
+    #[test]
+    fn test_parse_separatorless_modifier_constraints() {
+        // 固定ピン (patch alias)。更新後も形式が保たれる
+        let exact = parse("2.2.1p2").unwrap();
+        assert_eq!(exact.kind, VersionSpecKind::Exact);
+        assert_eq!(exact.version, "2.2.1p2");
+        assert!(exact.is_pinned());
+        assert_eq!(exact.format_updated("2.2.2"), "2.2.2");
+
+        // caret は演算子を保持する
+        let caret = parse("^2.2.1p2").unwrap();
+        assert_eq!(caret.kind, VersionSpecKind::Caret);
+        assert_eq!(caret.version, "2.2.1p2");
+        assert_eq!(caret.prefix.as_deref(), Some("^"));
+        assert_eq!(caret.format_updated("2.5.0"), "^2.5.0");
+
+        // tilde は演算子とセグメント数を保持する
+        let tilde = parse("~2.2.1p1").unwrap();
+        assert_eq!(tilde.kind, VersionSpecKind::Tilde);
+        assert_eq!(tilde.version, "2.2.1p1");
+        assert_eq!(tilde.format_updated("2.2.9"), "~2.2.9");
+
+        // 区切りなしの prerelease 修飾子
+        let beta = parse("^1.0.0beta1").unwrap();
+        assert_eq!(beta.kind, VersionSpecKind::Caret);
+        assert_eq!(beta.version, "1.0.0beta1");
+        assert_eq!(beta.format_updated("1.2.0"), "^1.2.0");
+
+        let gte = parse(">=5.0.0beta1").unwrap();
+        assert_eq!(gte.kind, VersionSpecKind::GreaterOrEqual);
+        assert_eq!(gte.version, "5.0.0beta1");
+        assert_eq!(gte.format_updated("5.1.0"), ">=5.1.0");
+
+        // `.` / `_` 区切り・大文字綴り・v 接頭辞も composer は受理する
+        for (raw, expected_version) in [
+            ("1.0.0.RC1", "1.0.0.RC1"),
+            ("1.0.0_beta1", "1.0.0_beta1"),
+            ("5.0.0alpha3", "5.0.0alpha3"),
+            ("v5.0.0beta1", "5.0.0beta1"),
+            ("2.2.1pl1", "2.2.1pl1"),
+            ("2.2.1patch1", "2.2.1patch1"),
+        ] {
+            let spec = parse(raw).unwrap_or_else(|| panic!("{raw} は解析できるべき"));
+            assert_eq!(spec.kind, VersionSpecKind::Exact, "raw={raw}");
+            assert_eq!(spec.version, expected_version, "raw={raw}");
+        }
+    }
+
+    /// 制御テスト: 修飾子パターンを足しても、従来 None だった入力
+    /// (ブランチ名 / バージョン風ブランチ名 / 5 セグメント / 完全浮動指定) は引き続き弾く。
+    #[test]
+    fn test_parse_separatorless_modifier_does_not_over_accept() {
+        for raw in [
+            "dev-main",
+            "1.x-dev",
+            "2.x-dev",
+            "1.2.3.4.5",
+            "not-a-version",
+            "*",
+        ] {
+            assert!(parse(raw).is_none(), "{raw} は更新対象にしない");
+        }
     }
 }

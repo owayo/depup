@@ -133,26 +133,35 @@ impl Language {
         }
     }
 
-    /// `--age` を transitive (推移) 依存にも効かせる手段があるかを返す。
+    /// `--age` を transitive (推移) 依存にも効かせられるパッケージマネージャを返す。
     ///
-    /// `false` の言語では direct 依存にしか age 制約がかからないため、
-    /// `--verbose` でその旨を通知する。内訳:
-    /// - Node: pnpm v10.16+ の `npm_config_minimum_release_age` env var
-    /// - Python: uv の `--exclude-newer`
-    /// - Rust: `cargo update` 後の Cargo.lock 監査 (post-install audit)
+    /// 対応は**言語単位ではなく PM 単位**である点が重要。ここに載っていない PM が
+    /// 選ばれた場合は direct 依存にしか age 制約がかからないため、`--verbose` で
+    /// その旨を通知する。内訳:
+    /// - pnpm (Node): v10.16+ の `npm_config_minimum_release_age` env var。
+    ///   npm / yarn / bun には同等の手段が無い
+    /// - uv (Python): `--exclude-newer`。pip / poetry / rye / pipenv には無い
+    /// - cargo (Rust): `cargo update` 後の Cargo.lock 監査 (post-install audit)
     /// - mise: `mise install` へ渡す `MISE_MINIMUM_RELEASE_AGE` env var
     ///   (そもそも mise のツールは互いに推移依存を持たず、マニフェストに書かれた
     ///   ツールがそのまま解決対象なので「direct のみ」という取りこぼしが起きない)
     ///
-    /// 判定を `Language` 側に置くことで、言語を追加したときに
-    /// 通知漏れが起きないようにする (match の網羅性検査が効く)。
-    pub fn has_native_transitive_age_support(&self) -> bool {
+    /// 一覧を `Language` 側に置くことで、言語を追加したときに通知漏れが起きない
+    /// ようにする (match の網羅性検査が効く)。
+    pub fn native_transitive_age_package_managers(&self) -> &'static [&'static str] {
         match self {
-            Language::Node | Language::Python | Language::Rust | Language::Mise => true,
-            Language::Go | Language::Ruby | Language::Php | Language::Java | Language::Swift => {
-                false
-            }
+            Language::Node => &["pnpm"],
+            Language::Python => &["uv"],
+            Language::Rust => &["cargo"],
+            Language::Mise => &["mise"],
+            Language::Go | Language::Ruby | Language::Php | Language::Java | Language::Swift => &[],
         }
+    }
+
+    /// 指定のパッケージマネージャが transitive 依存へ age をネイティブ適用できるか。
+    pub fn pm_has_native_transitive_age_support(&self, package_manager: &str) -> bool {
+        self.native_transitive_age_package_managers()
+            .contains(&package_manager)
     }
 }
 
@@ -251,7 +260,7 @@ mod tests {
         // ツールは OSV の単一 ecosystem に対応付けられない
         assert_eq!(Language::Mise.osv_ecosystem(), None);
         // `mise install` へ MISE_MINIMUM_RELEASE_AGE を渡せる
-        assert!(Language::Mise.has_native_transitive_age_support());
+        assert!(Language::Mise.pm_has_native_transitive_age_support("mise"));
     }
 
     #[test]
@@ -345,19 +354,40 @@ mod tests {
     }
 
     #[test]
-    fn test_has_native_transitive_age_support() {
+    fn test_native_transitive_age_package_managers() {
         // ネイティブ手段あり: pnpm の env var / uv の --exclude-newer /
-        // Rust の post-install lock 監査
-        assert!(Language::Node.has_native_transitive_age_support());
-        assert!(Language::Python.has_native_transitive_age_support());
-        assert!(Language::Rust.has_native_transitive_age_support());
+        // Rust の post-install lock 監査 / mise の env var
+        assert!(Language::Node.pm_has_native_transitive_age_support("pnpm"));
+        assert!(Language::Python.pm_has_native_transitive_age_support("uv"));
+        assert!(Language::Rust.pm_has_native_transitive_age_support("cargo"));
+        assert!(Language::Mise.pm_has_native_transitive_age_support("mise"));
 
-        // direct 依存にしか age がかからない (--verbose で通知される) 言語
-        assert!(!Language::Go.has_native_transitive_age_support());
-        assert!(!Language::Ruby.has_native_transitive_age_support());
-        assert!(!Language::Php.has_native_transitive_age_support());
-        assert!(!Language::Java.has_native_transitive_age_support());
-        assert!(!Language::Swift.has_native_transitive_age_support());
+        // 同じ言語でも PM が違えば direct 依存にしか age がかからない。
+        // 言語単位で判定していたときは npm / yarn / bun / pip / poetry などでも
+        // 「transitive にも効く」と誤って扱われ、通知が出ていなかった
+        for pm in ["npm", "yarn", "bun"] {
+            assert!(
+                !Language::Node.pm_has_native_transitive_age_support(pm),
+                "{pm} は transitive age 非対応"
+            );
+        }
+        for pm in ["pip", "poetry", "rye", "pipenv"] {
+            assert!(
+                !Language::Python.pm_has_native_transitive_age_support(pm),
+                "{pm} は transitive age 非対応"
+            );
+        }
+
+        // ネイティブ手段が無い言語は PM を問わず非対応
+        for language in [
+            Language::Go,
+            Language::Ruby,
+            Language::Php,
+            Language::Java,
+            Language::Swift,
+        ] {
+            assert!(language.native_transitive_age_package_managers().is_empty());
+        }
 
         // 通知文には display_name を使うため、全言語で空でないこと
         for language in Language::all() {

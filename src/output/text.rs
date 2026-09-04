@@ -350,11 +350,14 @@ impl TextFormatter {
                     )?;
                     continue;
                 }
-                // バージョンなしの依存には "-" を表示
-                let old_version = if dependency.version_spec.version.is_empty() {
+                // バージョンなしの依存には "-" を表示。
+                // 更新先はレジストリが返す生の値なので、現在版も同じ書式
+                // (Go なら `v` 付き) に揃える
+                let current_version = dependency.version_spec.display_version();
+                let old_version = if current_version.is_empty() {
                     "-"
                 } else {
-                    &dependency.version_spec.version
+                    &current_version
                 };
                 self.format_update_line(
                     &dependency.name,
@@ -632,7 +635,8 @@ impl TextFormatter {
                 let key = self.format_skip_reason(reason);
                 groups.entry(key).or_default().push(SkipPackageInfo {
                     name: dependency.name.clone(),
-                    version: dependency.version_spec.version.clone(),
+                    // 更新行の表示と書式を揃える (Go なら `v` 付き)
+                    version: dependency.version_spec.display_version(),
                     released_at: *released_at,
                 });
             }

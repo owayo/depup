@@ -51,6 +51,36 @@ impl PackagistAdapter {
         format!("{}/{}.json", PACKAGIST_API_URL, package)
     }
 
+    /// パッケージ名が Composer の命名規則 (`vendor/package`) に収まっていることを検証する。
+    ///
+    /// 名前は `build_url` で URL パスへ直接埋め込まれる。`url` crate は WHATWG URL
+    /// 仕様どおりドットセグメントを正規化するため、`a/../monolog/monolog` のような
+    /// キーがあると別パッケージの版を取得して元のキーへ書き戻してしまう。
+    /// `?` / `#` はクエリ・フラグメントとして解釈される。
+    fn validate_package_name(&self, package: &str) -> Result<(), RegistryError> {
+        let is_valid_segment = |segment: &str| {
+            !segment.is_empty()
+                && segment != "."
+                && segment != ".."
+                && segment
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        };
+
+        let valid = package
+            .split_once('/')
+            .is_some_and(|(vendor, name)| is_valid_segment(vendor) && is_valid_segment(name));
+        if valid {
+            Ok(())
+        } else {
+            Err(RegistryError::InvalidPackageName {
+                name: package.to_string(),
+                registry: self.registry_name().to_string(),
+                reason: "expected vendor/package with [A-Za-z0-9._-] characters".to_string(),
+            })
+        }
+    }
+
     /// 'v' プレフィックスがあれば除去してバージョン文字列を正規化
     fn normalize_version(version: &str) -> String {
         version.strip_prefix('v').unwrap_or(version).to_string()
@@ -85,6 +115,8 @@ impl RegistryAdapter for PackagistAdapter {
     }
 
     async fn fetch_versions(&self, package: &str) -> Result<Vec<VersionInfo>, RegistryError> {
+        self.validate_package_name(package)?;
+
         let url = self.build_url(package);
         let response: PackagistResponse = self
             .client
@@ -145,6 +177,50 @@ mod tests {
         let client = HttpClient::new().unwrap();
         let adapter = PackagistAdapter::new(client);
         assert_eq!(adapter.registry_name(), "packagist");
+    }
+
+    /// 回帰テスト: パッケージ名の URL インジェクションを弾く。
+    ///
+    /// `a/../monolog/monolog` は `url` crate のドットセグメント正規化で
+    /// 別パッケージへ解決され、無関係な版を元のキーへ書き戻してしまう。
+    #[test]
+    fn test_validate_package_name_rejects_url_injection() {
+        let adapter = PackagistAdapter::new(HttpClient::new().unwrap());
+        for name in [
+            "a/../monolog/monolog",
+            "monolog",
+            "monolog/monolog/extra",
+            "../monolog",
+            "vendor/..",
+            "vendor/.",
+            "vendor/pkg?x=1",
+            "vendor/pkg#frag",
+            "/pkg",
+            "vendor/",
+            "",
+        ] {
+            assert!(
+                adapter.validate_package_name(name).is_err(),
+                "不正なパッケージ名を受理してはならない: {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_package_name_accepts_composer_names() {
+        let adapter = PackagistAdapter::new(HttpClient::new().unwrap());
+        for name in [
+            "monolog/monolog",
+            "symfony/http-foundation",
+            "php-amqplib/php-amqplib",
+            "laminas/laminas-diactoros",
+            "phpunit/php-code-coverage",
+        ] {
+            assert!(
+                adapter.validate_package_name(name).is_ok(),
+                "正当なパッケージ名を弾いてはならない: {name:?}"
+            );
+        }
     }
 
     #[test]

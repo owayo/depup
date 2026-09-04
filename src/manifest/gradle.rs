@@ -92,6 +92,14 @@ static EXT_VAR_SINGLE: LazyLock<Regex> =
 static EXT_VAR_DOUBLE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"^\s*(\w+)\s*=\s*"([^"]+)""#).unwrap());
 
+// 1 行完結の ext ブロック本文用: `ext { jacksonVersion = '2.13.0' }` の `{` 以降を
+// 走査するため行頭アンカーを持たない。`ext { a = '1'; b = '2' }` のように同じ行へ
+// 複数書かれた形式も拾えるよう、captures_iter で全一致を回す。
+static EXT_INLINE_VAR_SINGLE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(\w+)\s*=\s*'([^']+)'"#).unwrap());
+static EXT_INLINE_VAR_DOUBLE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(\w+)\s*=\s*"([^"]+)""#).unwrap());
+
 // ext ブロック開始
 static EXT_BLOCK_START: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*ext\s*\{").unwrap());
 
@@ -167,6 +175,59 @@ const DEV_CONFIGURATIONS: [&str; 6] = [
     "androidTestImplementation",
     "debugImplementation",
 ];
+
+// 依存宣言として surface してはいけないブロックの開始。
+// - `resolutionStrategy { force '...' }`: 競合解決の指示であって依存の宣言ではない
+// - `constraints { implementation('...') }`: 推移依存へのバージョン制約
+// - `dependencySubstitution { substitute(module('...')) ... }`: 依存の置換ルール
+//
+// DEP_STRING / DEP_MAP は `classpath` / `kapt` / 独自 configuration を通すために
+// configuration 名を任意の語として受理する。そのためこれらのブロック内の座標まで
+// 依存として拾ってしまい、同じ座標が `dependencies` にも書かれている一般的な構成では
+// manifest_name が重複する。writer は同名の宣言が複数あると曖昧な更新を拒否するため、
+// 「Refusing to update ambiguous dependency」で更新不能 (exit code 2) になっていた。
+static NON_DEPENDENCY_BLOCK_START: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(?:resolutionStrategy|constraints|dependencySubstitution)\s*\{").unwrap()
+});
+
+// configuration 名の位置に現れても依存宣言ではないキーワード。
+// `configurations.all { resolutionStrategy.force 'g:a:v' }` のようにブロックを開かない
+// ドット記法でも書けるため、ブロック追跡だけでは取りこぼす。カスタム configuration 名を
+// 通す既存の設計を壊さないよう、依存宣言には使われ得ない語だけを最小限で列挙する。
+const NON_DEPENDENCY_KEYWORDS: [&str; 1] = ["force"];
+
+fn is_non_dependency_keyword(config: &str) -> bool {
+    NON_DEPENDENCY_KEYWORDS.contains(&config)
+}
+
+/// `resolutionStrategy` / `constraints` / `dependencySubstitution` ブロックの内側にある行を
+/// 真にしたマスクを返す。ブロックは入れ子になり得るので、開始時点の brace 深さまで戻った
+/// 行で抜ける (`dependency_block_end` と同じ数え方)。
+/// 開始行そのものにも座標が載る (`constraints { implementation('g:a:1') }`) ため、
+/// 開始行も内側として扱う。
+/// 呼び出し側はコメント除去済みの行を渡すこと (コメント内の `{` を数えないため)。
+fn non_dependency_block_mask(lines: &[&str]) -> Vec<bool> {
+    let mut mask = Vec::with_capacity(lines.len());
+    let mut depth = 0usize;
+    // ブロックが開いた時点の深さ。Some の間は対象ブロックの内側にいる。
+    let mut skip_from_depth: Option<usize> = None;
+
+    for line in lines {
+        if skip_from_depth.is_none() && NON_DEPENDENCY_BLOCK_START.is_match(line) {
+            skip_from_depth = Some(depth);
+        }
+        mask.push(skip_from_depth.is_some());
+
+        depth = depth.saturating_add(line.matches('{').count());
+        depth = depth.saturating_sub(line.matches('}').count());
+
+        if skip_from_depth.is_some_and(|start_depth| depth <= start_depth) {
+            skip_from_depth = None;
+        }
+    }
+
+    mask
+}
 
 fn rich_version_method(name: &str) -> Option<RichVersionMethod> {
     match name {
@@ -368,9 +429,20 @@ impl GradleParser {
             }
 
             // ext ブロックの開始/終了を追跡
-            if EXT_BLOCK_START.is_match(trimmed) {
+            if let Some(block_start) = EXT_BLOCK_START.find(trimmed) {
                 in_ext_block = true;
                 brace_depth = 1;
+                // `ext { jacksonVersion = '2.13.0' }` のように 1 行で完結する形式では
+                // ブロック本文が開始行そのものに載る。ここで本文を読まずに次の行へ進むと
+                // 変数が 1 つも登録されず、それを参照する依存が「解決できない変数」として
+                // 依存ごと無言で消える (複数行形式なら拾えるので同じ意味の記述で
+                // 挙動が割れていた)。
+                let body = &trimmed[block_start.end()..];
+                for re in [&*EXT_INLINE_VAR_SINGLE, &*EXT_INLINE_VAR_DOUBLE] {
+                    for caps in re.captures_iter(body) {
+                        insert_captured_variable(&mut variables, &caps, line_number, true);
+                    }
+                }
                 // 1 行完結の ext ブロックを判定
                 if trimmed.contains('}') {
                     brace_depth = 0;
@@ -430,6 +502,10 @@ impl GradleParser {
         let caps = DEP_MAP.captures(line)?;
 
         let config = caps.get(1).map(|m| m.as_str())?;
+        // `force group: 'x', name: 'y', version: 'z'` は依存宣言ではないので拾わない
+        if is_non_dependency_keyword(config) {
+            return None;
+        }
         let group = caps.get(2).map(|m| m.as_str())?;
         let artifact = caps.get(3).map(|m| m.as_str())?;
         let version_raw = caps.get(4).map(|m| m.as_str())?;
@@ -466,6 +542,10 @@ impl GradleParser {
         // まず変数展開あり文字列記法を試す
         if let Some(caps) = DEP_STRING_VAR.captures(line) {
             let config = caps.get(1).map(|m| m.as_str())?;
+            // `force "g:a:$ver"` のような競合解決の指示は依存宣言ではないので拾わない
+            if is_non_dependency_keyword(config) {
+                return None;
+            }
             let group = caps.get(2).map(|m| m.as_str())?;
             let artifact = caps.get(3).map(|m| m.as_str())?;
             let var_ref = caps.get(4).map(|m| m.as_str())?;
@@ -496,6 +576,10 @@ impl GradleParser {
         let caps = DEP_STRING.captures(line)?;
 
         let config = caps.get(1).map(|m| m.as_str())?;
+        // `force 'g:a:v'` / `force('g:a:v')` は依存宣言ではないので拾わない
+        if is_non_dependency_keyword(config) {
+            return None;
+        }
         let group = caps.get(2).map(|m| m.as_str())?;
         let artifact = caps.get(3).map(|m| m.as_str())?;
         let version = caps.get(4).map(|m| m.as_str())?;
@@ -746,12 +830,21 @@ impl ManifestParser for GradleParser {
         // ブロックコメント内の宣言を生きた依存として拾わないよう、除去済みの行で判定する
         let stripped_lines = strip_gradle_comment_lines(content);
         let lines: Vec<&str> = stripped_lines.iter().map(|line| line.as_str()).collect();
+        // resolutionStrategy / constraints / dependencySubstitution の内側は依存の宣言ではない
+        let non_dependency_lines = non_dependency_block_mask(&lines);
 
         for (line_index, line) in lines.iter().enumerate() {
             let trimmed = line.trim();
 
             // 空行とコメント行をスキップ
             if trimmed.is_empty() {
+                continue;
+            }
+
+            // 依存以外のブロック内の座標は surface しない。ここで拾うと同じ座標が
+            // dependencies 側にもある構成で宣言が重複し、writer が曖昧と判断して
+            // 更新を拒否する (以後その依存は永久に更新できない)。
+            if non_dependency_lines[line_index] {
                 continue;
             }
 
@@ -810,11 +903,18 @@ impl ManifestParser for GradleParser {
         let variables = self.extract_variables(content);
         // コメントアウトされた宣言に変数バインドを誘導されないよう、除去済みの行で判定する
         let stripped_lines = strip_gradle_comment_lines(content);
+        let active_lines: Vec<&str> = stripped_lines.iter().map(|line| line.as_str()).collect();
+        // parse と同じ範囲だけを見る (依存以外のブロック内の宣言に変数バインドを誘導されない)
+        let non_dependency_lines = non_dependency_block_mask(&active_lines);
 
         // このパッケージに使われている変数名を特定
         let mut variable_for_package: Option<String> = None;
 
-        for line in &stripped_lines {
+        for (line, is_non_dependency) in active_lines.iter().zip(&non_dependency_lines) {
+            if *is_non_dependency {
+                continue;
+            }
+
             // map 記法を確認
             if let Some((_dep, var_name)) =
                 self.parse_map_notation(line, &variables, parser.as_ref())
@@ -878,7 +978,7 @@ impl GradleParser {
 
             if idx + 1 == var_def.line_number
                 && let Some(replaced) =
-                    replace_variable_version_value(line, &active_line, &formatted_version)
+                    replace_variable_version_value(line, &active_line, var_name, &formatted_version)
             {
                 result.push_str(&replaced);
                 result.push_str(line_ending);
@@ -1066,6 +1166,7 @@ fn package_name(group: &str, artifact: &str) -> String {
 fn replace_variable_version_value(
     line: &str,
     active_line: &str,
+    var_name: &str,
     formatted_version: &str,
 ) -> Option<String> {
     let regexes: [&Regex; 7] = [
@@ -1081,7 +1182,15 @@ fn replace_variable_version_value(
     ];
 
     for re in regexes {
-        let Some(value) = re.captures(active_line).and_then(|caps| caps.get(2)) else {
+        let Some(caps) = re.captures(active_line) else {
+            continue;
+        };
+        // 同じ行に複数の代入が並ぶ形式 (1 行完結の ext ブロック) で別の変数を
+        // 書き換えないよう、捕獲した変数名が対象と一致することを確認する。
+        if caps.get(1).is_none_or(|name| name.as_str() != var_name) {
+            continue;
+        }
+        let Some(value) = caps.get(2) else {
             continue;
         };
         // コメント除去はバイト位置を保つため、値の範囲を元の行へそのまま適用できる
@@ -1090,6 +1199,29 @@ fn replace_variable_version_value(
         replaced.push_str(formatted_version);
         replaced.push_str(&line[value.end()..]);
         return Some(replaced);
+    }
+
+    // 1 行完結の ext ブロック (`ext { jacksonVersion = '2.13.0' }`) は本文が
+    // 行頭に来ないため上の行頭アンカー付きパターンでは拾えない。parse 側が
+    // 変数として登録する以上、ここで書き戻せないと report/apply が矛盾する。
+    let block_start = EXT_BLOCK_START.find(active_line)?;
+    let body_offset = block_start.end();
+    let body = &active_line[body_offset..];
+    for re in [&*EXT_INLINE_VAR_SINGLE, &*EXT_INLINE_VAR_DOUBLE] {
+        for caps in re.captures_iter(body) {
+            if caps.get(1).is_none_or(|name| name.as_str() != var_name) {
+                continue;
+            }
+            let Some(value) = caps.get(2) else {
+                continue;
+            };
+            let (start, end) = (body_offset + value.start(), body_offset + value.end());
+            let mut replaced = String::with_capacity(line.len() + formatted_version.len());
+            replaced.push_str(&line[..start]);
+            replaced.push_str(formatted_version);
+            replaced.push_str(&line[end..]);
+            return Some(replaced);
+        }
     }
 
     None
@@ -2150,15 +2282,194 @@ dependencies {
     }
 
     #[test]
-    fn test_parse_snapshot_version() {
+    fn test_parse_snapshot_version_is_skipped() {
+        // 回帰: `-SNAPSHOT` は解決のたびに最新の開発ビルドを取り直す動く参照なので、
+        // Maven Central の最新 release へ書き換えてはいけない (java パーサ側で弾く)。
         let content = r#"
 dependencies {
     implementation 'com.example:my-lib:1.0.0-SNAPSHOT'
 }
 "#;
         let deps = parse(content).unwrap();
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_parse_snapshot_via_variable_is_skipped() {
+        // 変数経由の SNAPSHOT も同様にスキップする (parse/update の範囲を揃える)
+        let content = r#"
+ext {
+    myLibVersion = '1.0.0-SNAPSHOT'
+}
+dependencies {
+    implementation "com.example:my-lib:$myLibVersion"
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert!(deps.is_empty());
+    }
+
+    // --- resolutionStrategy / constraints / dependencySubstitution ---
+
+    #[test]
+    fn test_parse_ignores_resolution_strategy_force() {
+        // 回帰: `force` の座標を依存として拾うと、同じ座標の `implementation` 宣言と合わせて
+        // manifest_name が 2 件になり、writer が
+        // 「Refusing to update ambiguous dependency」で更新を拒否して exit code 2 になる。
+        let content = r#"
+dependencies {
+    implementation 'com.google.guava:guava:31.0-jre'
+}
+configurations.all { resolutionStrategy { force 'com.google.guava:guava:31.0-jre' } }
+"#;
+        let deps = parse(content).unwrap();
         assert_eq!(deps.len(), 1);
-        assert_eq!(deps[0].version_spec.version, "1.0.0-SNAPSHOT");
+        assert_eq!(deps[0].name, "com.google.guava:guava");
+
+        // 依存が 1 件なので writer 側の曖昧判定に掛からず、更新も成功する
+        let result = GradleParser
+            .update_version(content, "com.google.guava:guava", "33.4.0-jre")
+            .unwrap();
+        assert!(result.contains("implementation 'com.google.guava:guava:33.4.0-jre'"));
+        // force は同じ座標のピンなので追随させる (古いまま残すと解決結果が変わらず
+        // 「更新した」という報告が実態と食い違う)
+        assert!(result.contains("force 'com.google.guava:guava:33.4.0-jre'"));
+    }
+
+    #[test]
+    fn test_parse_ignores_multiline_resolution_strategy_force() {
+        // 複数行で書かれた resolutionStrategy と Kotlin DSL の `force(...)` 形式
+        let content = r#"
+dependencies {
+    implementation("com.google.guava:guava:31.0-jre")
+}
+configurations.all {
+    resolutionStrategy {
+        force("com.google.guava:guava:31.0-jre")
+        force("org.slf4j:slf4j-api:1.7.36")
+    }
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "com.google.guava:guava");
+    }
+
+    #[test]
+    fn test_parse_ignores_resolution_strategy_force_dot_notation() {
+        // ブロックを開かないドット記法 (`resolutionStrategy.force`) は
+        // ブロック追跡では拾えないため、configuration 名の除外で防ぐ
+        let content = r#"
+dependencies {
+    implementation 'com.google.guava:guava:31.0-jre'
+}
+configurations.all {
+    resolutionStrategy.force 'com.google.guava:guava:31.0-jre'
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "com.google.guava:guava");
+    }
+
+    #[test]
+    fn test_parse_ignores_dependency_constraints_block() {
+        let content = r#"
+dependencies {
+    implementation 'com.google.guava:guava:31.0-jre'
+    constraints {
+        implementation('com.google.guava:guava:31.0-jre') {
+            because 'CVE-2020-8908'
+        }
+    }
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "com.google.guava:guava");
+
+        let result = GradleParser
+            .update_version(content, "com.google.guava:guava", "33.4.0-jre")
+            .unwrap();
+        assert!(result.contains("implementation 'com.google.guava:guava:33.4.0-jre'"));
+    }
+
+    #[test]
+    fn test_parse_skips_constraints_only_declaration() {
+        // constraints ブロックにしか現れない座標は「推移依存への制約」であって
+        // 直接の依存宣言ではないため、更新対象にしない (安全側)
+        let content = r#"
+dependencies {
+    constraints {
+        implementation 'com.google.guava:guava:31.0-jre'
+    }
+    implementation 'org.slf4j:slf4j-api:1.7.36'
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "org.slf4j:slf4j-api");
+    }
+
+    #[test]
+    fn test_parse_skips_dependency_substitution_block() {
+        let content = r#"
+configurations.all {
+    resolutionStrategy.dependencySubstitution {
+        substitute(
+            module('com.google.guava:guava:31.0-jre')
+        ).using(module('com.google.guava:guava:33.4.0-jre'))
+    }
+}
+dependencies {
+    implementation 'org.slf4j:slf4j-api:1.7.36'
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "org.slf4j:slf4j-api");
+    }
+
+    #[test]
+    fn test_parse_keeps_custom_configuration_names() {
+        // ブロック追跡・キーワード除外を入れても、任意の configuration 名を通す
+        // 既存の設計は維持する (classpath / kapt / ksp / 独自 configuration)
+        let content = r#"
+buildscript {
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.1.0'
+    }
+}
+dependencies {
+    kapt 'com.google.dagger:dagger-compiler:2.48'
+    myCustomConfig 'org.slf4j:slf4j-api:1.7.36'
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 3);
+        let names: Vec<&str> = deps.iter().map(|dep| dep.name.as_str()).collect();
+        assert!(names.contains(&"com.android.tools.build:gradle"));
+        assert!(names.contains(&"com.google.dagger:dagger-compiler"));
+        assert!(names.contains(&"org.slf4j:slf4j-api"));
+    }
+
+    #[test]
+    fn test_parse_dependency_after_constraints_block_is_not_skipped() {
+        // ブロックを抜けた後の宣言はマスクされない (深さ追跡の回帰テスト)
+        let content = r#"
+dependencies {
+    constraints {
+        implementation 'com.google.guava:guava:31.0-jre'
+    }
+    implementation 'org.slf4j:slf4j-api:1.7.36'
+    testImplementation 'junit:junit:4.13.2'
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 2);
+        assert_eq!(deps[0].name, "org.slf4j:slf4j-api");
+        assert_eq!(deps[1].name, "junit:junit");
+        assert!(deps[1].is_dev);
     }
 
     #[test]
@@ -2344,6 +2655,94 @@ dependencies {
             .update_version(content, "org.springframework:spring-core", "6.1.0")
             .unwrap();
         assert!(result.contains("ext.springVersion = '6.1.0'"), "{}", result);
+    }
+
+    /// 回帰テスト: 1 行完結の `ext { x = '1.0' }` も変数として解決・書き戻しできる。
+    /// 以前は開始行の本文を読まずに次行へ進んでいたため変数が登録されず、それを
+    /// 参照する依存が「解決できない変数」として依存ごと無言で消えていた
+    /// (同じ意味の複数行形式では解決できるので挙動が割れていた)。
+    #[test]
+    fn test_single_line_ext_block_parse_and_update() {
+        let content = r#"
+ext { jacksonVersion = '2.13.0' }
+
+dependencies {
+    implementation "com.fasterxml.jackson.core:jackson-databind:${jacksonVersion}"
+}
+"#;
+        let deps = parse(content).unwrap();
+        let dep = deps
+            .iter()
+            .find(|d| d.name == "com.fasterxml.jackson.core:jackson-databind")
+            .expect("1 行 ext ブロック参照の依存が検出されるべき");
+        assert_eq!(dep.version_spec.version, "2.13.0");
+
+        let result = GradleParser
+            .update_version(
+                content,
+                "com.fasterxml.jackson.core:jackson-databind",
+                "2.19.0",
+            )
+            .unwrap();
+        assert!(
+            result.contains("ext { jacksonVersion = '2.19.0' }"),
+            "{result}"
+        );
+    }
+
+    /// 1 行の ext ブロックに複数の変数が並んでいても、対象の変数だけを書き換える。
+    /// 名前を照合せずに最初の一致を置換すると隣の変数を壊す。
+    #[test]
+    fn test_single_line_ext_block_with_multiple_variables() {
+        let content = r#"
+ext { jacksonVersion = '2.13.0'; okhttpVersion = '4.9.0' }
+
+dependencies {
+    implementation "com.fasterxml.jackson.core:jackson-databind:${jacksonVersion}"
+    implementation "com.squareup.okhttp3:okhttp:${okhttpVersion}"
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(
+            deps.iter()
+                .find(|d| d.name == "com.squareup.okhttp3:okhttp")
+                .map(|d| d.version_spec.version.as_str()),
+            Some("4.9.0")
+        );
+
+        let result = GradleParser
+            .update_version(content, "com.squareup.okhttp3:okhttp", "4.12.0")
+            .unwrap();
+        assert!(result.contains("okhttpVersion = '4.12.0'"), "{result}");
+        // 同じ行の別変数は書き換えない
+        assert!(result.contains("jacksonVersion = '2.13.0'"), "{result}");
+    }
+
+    /// ダブルクォートの 1 行 ext ブロック (Kotlin DSL 風の書き方) も同様に扱う。
+    #[test]
+    fn test_single_line_ext_block_double_quotes() {
+        let content = r#"
+ext { slf4jVersion = "1.7.30" }
+
+dependencies {
+    implementation "org.slf4j:slf4j-api:${slf4jVersion}"
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(
+            deps.iter()
+                .find(|d| d.name == "org.slf4j:slf4j-api")
+                .map(|d| d.version_spec.version.as_str()),
+            Some("1.7.30")
+        );
+
+        let result = GradleParser
+            .update_version(content, "org.slf4j:slf4j-api", "2.0.17")
+            .unwrap();
+        assert!(
+            result.contains(r#"ext { slf4jVersion = "2.0.17" }"#),
+            "{result}"
+        );
     }
 
     /// 回帰テスト: `${Versions.x}` のような修飾付き変数参照も最終セグメントで解決する。

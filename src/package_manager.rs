@@ -308,7 +308,10 @@ impl SystemPackageManager {
     ///
     /// 実行ディレクトリは通常 `working_dir` と同じだが、Tauri プロジェクトの Rust だけは
     /// `src-tauri` を使う。対応するマニフェストが無ければ `None` (= スキップ)。
-    fn resolve_package_manager(
+    ///
+    /// install 実行前に「どの PM が選ばれるか」を知る必要がある呼び出し側
+    /// (`--age` の transitive 対応可否の通知) からも使うため公開している。
+    pub fn resolve_package_manager(
         &self,
         language: Language,
         working_dir: &Path,

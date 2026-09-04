@@ -3,7 +3,8 @@
 //! 対応対象:
 //! - require 文 (単一行およびブロック)
 //! - `// pinned` コメントによるバージョン固定
-//! - replace ディレクティブ (パースと更新の両方でスキップ)
+//! - replace ディレクティブ (記述自体はパース・更新ともスキップし、
+//!   さらに置換対象の `require` を更新候補から除外する)
 //! - exclude ディレクティブ (更新候補から除外し、記述自体は書き換えない)
 
 use crate::domain::{Dependency, Language};
@@ -11,28 +12,45 @@ use crate::error::ManifestError;
 use crate::manifest::{ManifestParser, line_utils::split_line_ending};
 use crate::parser::{VersionParser, get_parser};
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
 /// `go.mod` 用パーサ
 pub struct GoModParser;
 
+// バージョン部の共通パターン: `v1.2.3` とその後続 (prerelease / build metadata)。
+//
+// 後続の `[^\s/]*` から `/` を除くのは、go の字句解析が識別子の途中でも `//` で
+// 必ずコメントを切り出すため (x/mod modfile/read.go)。`[^\s]*` にすると
+// `v1.0.0//indirect` のように `//` の前に空白が無い行でコメントまで飲み込み、
+// 行全体が正規表現に一致せず依存が無言で取りこぼされていた
+// (`v1.0.0 //indirect` は動くという非対称があった)。
+const GO_VERSION_PATTERN: &str = r"v[\d]+\.[\d]+\.[\d]+[^\s/]*";
+
 // 単一 require 文の正規表現: require module/path v1.2.3
 // go.mod では ModulePath / Version ともに quoted string も許容される
 static SINGLE_REQUIRE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"^\s*require\s+("[^"]+"|`[^`]+`|\S+)\s+("[^"]+"|`[^`]+`|v[\d]+\.[\d]+\.[\d]+[^\s]*)\s*(//.*)?\s*$"#,
-    )
+    Regex::new(&format!(
+        r#"^\s*require\s+("[^"]+"|`[^`]+`|\S+)\s+("[^"]+"|`[^`]+`|{})\s*(//.*)?\s*$"#,
+        GO_VERSION_PATTERN
+    ))
     .unwrap()
 });
 
 // require ブロック内エントリの正規表現: module/path v1.2.3
 static BLOCK_ENTRY_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"^\s*("[^"]+"|`[^`]+`|\S+)\s+("[^"]+"|`[^`]+`|v[\d]+\.[\d]+\.[\d]+[^\s]*)\s*(//.*)?\s*$"#,
-    )
+    Regex::new(&format!(
+        r#"^\s*("[^"]+"|`[^`]+`|\S+)\s+("[^"]+"|`[^`]+`|{})\s*(//.*)?\s*$"#,
+        GO_VERSION_PATTERN
+    ))
     .unwrap()
+});
+
+// replace の左辺 (置換対象) を読むための正規表現: `<module> [<version>]`
+// `=>` より左側だけを渡す前提で、モジュールパスと省略可能なバージョンを取り出す。
+static REPLACE_LHS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^\s*("[^"]+"|`[^`]+`|\S+)(?:\s+("[^"]+"|`[^`]+`|\S+))?\s*$"#).unwrap()
 });
 
 // pinned コメントの正規表現。
@@ -53,10 +71,121 @@ fn is_go_block_start(logical: &str, keyword: &str) -> bool {
         .is_some_and(|rest| rest == "(")
 }
 
+/// `<keyword> <残り>` 形式の単一行ディレクティブから、キーワード以降を取り出す。
+///
+/// go の字句解析はキーワードと引数を空白種別で区別しないため、`strip_prefix("keyword ")`
+/// のように半角スペース固定にするとタブ区切りの記述を取りこぼす。
+fn strip_go_directive<'a>(logical: &'a str, keyword: &str) -> Option<&'a str> {
+    let rest = logical.strip_prefix(keyword)?;
+    rest.starts_with(char::is_whitespace).then(|| rest.trim())
+}
+
+/// `replace` の左辺 (置換対象) を集めたもの。
+///
+/// Go の `modload.replacement()` は `replace[path@version]` → `replace[path]` の順に
+/// 引き、版付き左辺は**その版だけ**を置換する。したがって
+/// - 版なし replace: そのモジュールの全バージョンがローカルパス / 別モジュールへ差し替わる
+/// - 版付き replace: 左辺の版と一致する `require` だけが差し替わる
+///
+/// のいずれかになる。前者で `require` を更新しても実ビルドは一切変わらず報告ノイズになり、
+/// 後者では左辺と一致しなくなって**置換が黙って外れ**、ローカルのパッチ済みコードから
+/// 上流コードへエラーなしで切り替わる。どちらもローカル解決される依存なので、
+/// Cargo の path 依存 / 非 crates.io registry 依存と同じ方針で更新対象から外す。
+#[derive(Debug, Default)]
+struct ReplaceTargets {
+    /// 版なし replace の対象モジュール (全バージョンが置換対象)
+    wildcard: HashSet<String>,
+    /// 版付き replace の対象モジュール → 置換される版
+    versioned: HashMap<String, HashSet<String>>,
+}
+
+impl ReplaceTargets {
+    /// `<module> [<version>] => <...>` 形式の 1 エントリを取り込む。
+    fn add_entry(&mut self, entry: &str) {
+        // `=>` の左側だけが置換対象。go の字句解析では `=>` はトークンなので
+        // `a=>b` のように空白が無くても成立する。
+        let Some((lhs, _)) = entry.split_once("=>") else {
+            return;
+        };
+        let Some(caps) = REPLACE_LHS_RE.captures(lhs) else {
+            return;
+        };
+        let Some(module) = caps.get(1) else {
+            return;
+        };
+        let module = unquote_go_token(module.as_str()).to_string();
+
+        match caps.get(2) {
+            Some(version) => {
+                let version = unquote_go_token(version.as_str()).to_string();
+                self.versioned.entry(module).or_default().insert(version);
+            }
+            None => {
+                self.wildcard.insert(module);
+            }
+        }
+    }
+
+    /// 指定モジュール・バージョンの `require` が replace で差し替えられるか。
+    fn replaces(&self, module: &str, version: &str) -> bool {
+        self.wildcard.contains(module)
+            || self
+                .versioned
+                .get(module)
+                .is_some_and(|versions| versions.contains(version))
+    }
+}
+
+/// `go.mod` 全体から `replace` の左辺を収集する (単一行・ブロック形式の両方)。
+fn collect_replace_targets(content: &str) -> ReplaceTargets {
+    let mut targets = ReplaceTargets::default();
+    let mut in_replace_block = false;
+
+    for line in content.lines() {
+        let logical = line.split("//").next().unwrap_or("").trim();
+        if logical.is_empty() {
+            continue;
+        }
+
+        if is_go_block_start(logical, "replace") {
+            in_replace_block = true;
+            continue;
+        }
+        if in_replace_block && logical == ")" {
+            in_replace_block = false;
+            continue;
+        }
+
+        let entry = if in_replace_block {
+            logical
+        } else if let Some(entry) = strip_go_directive(logical, "replace") {
+            entry
+        } else {
+            continue;
+        };
+
+        targets.add_entry(entry);
+    }
+
+    targets
+}
+
+impl GoModParser {
+    /// go.mod のブロック開始行判定 (`require (` / `retract(`) をクレート内へ公開する。
+    ///
+    /// `mod go_mod` は `manifest` 内部限定の可視性なので、自由関数のままでは
+    /// 他モジュール (Go Proxy の retract 解析) から参照できない。公開済みの
+    /// `GoModParser` にぶら下げることで、空白の有無を吸収する判定を 1 箇所に保つ。
+    pub(crate) fn is_block_start(logical: &str, keyword: &str) -> bool {
+        is_go_block_start(logical, keyword)
+    }
+}
+
 impl ManifestParser for GoModParser {
     fn parse(&self, content: &str) -> Result<Vec<Dependency>, ManifestError> {
         let mut dependencies = Vec::new();
         let parser = get_parser(Language::Go);
+        let replace_targets = collect_replace_targets(content);
 
         let mut in_require_block = false;
         let mut in_replace_block = false;
@@ -100,7 +229,9 @@ impl ManifestParser for GoModParser {
 
             // 単一 require 文をパースする
             if let Some(caps) = SINGLE_REQUIRE_RE.captures(trimmed) {
-                if let Some(dep) = parse_go_dependency(&caps, parser.as_ref(), is_pinned) {
+                if let Some(dep) =
+                    parse_go_dependency(&caps, parser.as_ref(), is_pinned, &replace_targets)
+                {
                     dependencies.push(dep);
                 }
                 continue;
@@ -109,7 +240,8 @@ impl ManifestParser for GoModParser {
             // require ブロック内エントリをパースする
             if in_require_block
                 && let Some(caps) = BLOCK_ENTRY_RE.captures(trimmed)
-                && let Some(dep) = parse_go_dependency(&caps, parser.as_ref(), is_pinned)
+                && let Some(dep) =
+                    parse_go_dependency(&caps, parser.as_ref(), is_pinned, &replace_targets)
             {
                 dependencies.push(dep);
             }
@@ -318,9 +450,18 @@ fn parse_go_dependency(
     caps: &regex::Captures,
     parser: &dyn VersionParser,
     is_pinned: bool,
+    replace_targets: &ReplaceTargets,
 ) -> Option<Dependency> {
     let module = unquote_go_token(caps.get(1)?.as_str());
     let version = unquote_go_token(caps.get(2)?.as_str());
+
+    // replace で差し替えられる require は更新対象から外す。
+    // 版付き replace はバージョンを進めた瞬間に左辺と一致しなくなり、置換が
+    // 黙って外れてローカルのパッチ済みコードから上流コードへ切り替わる。
+    // 版なし replace は更新しても実ビルドが変わらないので報告ノイズにしかならない。
+    if replace_targets.replaces(module, version) {
+        return None;
+    }
 
     // 間接依存をスキップする (通常 // indirect コメントが付いている)
     let comment = caps.get(3).map(|m| m.as_str()).unwrap_or("");
@@ -562,31 +703,41 @@ require github.com/x/lib v1.0.0 // unpinned for now
         assert_ne!(deps[0].version_spec.kind, VersionSpecKind::GoPinned);
     }
 
+    /// バグ回帰テスト: 版なし replace の対象モジュールは全バージョンがローカルへ
+    /// 差し替わるため、`require` を更新しても実ビルドは一切変わらない (報告ノイズ)。
     #[test]
-    fn test_parse_with_replace() {
+    fn test_parse_skips_module_with_wildcard_replace() {
         let content = r#"
 module example.com/myproject
 
 go 1.21
 
-require github.com/gin-gonic/gin v1.9.1
+require (
+	github.com/gin-gonic/gin v1.9.1
+	github.com/other/lib v1.0.0
+)
 
 replace github.com/gin-gonic/gin => ../local-gin
 "#;
 
         let deps = parse(content).unwrap();
         assert_eq!(deps.len(), 1);
-        assert_eq!(deps[0].name, "github.com/gin-gonic/gin");
+        assert_eq!(deps[0].name, "github.com/other/lib");
     }
 
+    /// バグ回帰テスト: ブロック形式の replace も対象モジュールを更新候補から外す。
     #[test]
-    fn test_parse_replace_block() {
+    fn test_parse_skips_modules_with_replace_block() {
         let content = r#"
 module example.com/myproject
 
 go 1.21
 
-require github.com/gin-gonic/gin v1.9.1
+require (
+	github.com/gin-gonic/gin v1.9.1
+	github.com/other/lib v1.0.0
+	github.com/kept/lib v2.3.4
+)
 
 replace (
 	github.com/gin-gonic/gin => ../local-gin
@@ -596,6 +747,176 @@ replace (
 
         let deps = parse(content).unwrap();
         assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "github.com/kept/lib");
+    }
+
+    /// バグ回帰テスト: 版付き replace の版と一致する `require` を更新すると、
+    /// 左辺と一致しなくなって置換が黙って外れ、ローカルのパッチ済みコードから
+    /// 上流コードへエラーなしで切り替わる。
+    #[test]
+    fn test_parse_skips_require_matching_versioned_replace() {
+        let content = r#"
+module example.com/myproject
+
+go 1.21
+
+require example.com/lib v1.0.0
+
+replace example.com/lib v1.0.0 => ./vendor/lib-patched
+"#;
+
+        let deps = parse(content).unwrap();
+        assert!(
+            deps.is_empty(),
+            "版付き replace と一致する require は更新対象外にすべき: {:?}",
+            deps
+        );
+    }
+
+    /// 版付き replace の版が現在の `require` と一致しなければ置換は効いていないため、
+    /// 通常どおり更新対象にする (Go の `replace[path@version]` は完全一致)。
+    #[test]
+    fn test_parse_keeps_require_when_versioned_replace_does_not_match() {
+        let content = r#"
+module example.com/myproject
+
+go 1.21
+
+require example.com/lib v1.0.0
+
+replace example.com/lib v0.9.0 => ./vendor/lib-patched
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "example.com/lib");
+        assert_eq!(deps[0].version_spec.version, "1.0.0");
+    }
+
+    /// 引用符付き・空白なし (`a=>b`) の replace 記述も左辺として解釈する。
+    #[test]
+    fn test_parse_skips_quoted_and_compact_replace() {
+        let content = r#"
+module example.com/myproject
+
+go 1.21
+
+require (
+	"example.com/quoted" "v1.0.0"
+	example.com/compact v2.0.0
+)
+
+replace "example.com/quoted" "v1.0.0" => ./vendor/quoted
+replace example.com/compact=>./vendor/compact
+"#;
+
+        let deps = parse(content).unwrap();
+        assert!(
+            deps.is_empty(),
+            "引用符付き / 空白なしの replace も置換対象として扱うべき: {:?}",
+            deps
+        );
+    }
+
+    /// replace の右辺に現れるモジュールは置換対象ではないので更新候補から外さない。
+    #[test]
+    fn test_parse_keeps_module_appearing_only_on_replace_rhs() {
+        let content = r#"
+module example.com/myproject
+
+go 1.21
+
+require github.com/fork/gin v1.9.1
+
+replace github.com/gin-gonic/gin => github.com/fork/gin v1.9.1
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "github.com/fork/gin");
+    }
+
+    /// バグ回帰テスト: `//` の前に空白が無い行末コメント。
+    /// go の字句解析は識別子の途中でも `//` で必ず切る (x/mod modfile/read.go) ため
+    /// `v1.0.0//indirect` は正当な構文だが、バージョン部のパターンが貪欲で
+    /// コメントまで飲み込み、依存が無言で取りこぼされていた
+    /// (`v1.0.0 //indirect` は動くという非対称があった)。
+    #[test]
+    fn test_parse_comment_without_space_before_slashes() {
+        let content = r#"
+module example.com/myproject
+
+go 1.21
+
+require (
+	example.com/indirect v1.0.0//indirect
+	example.com/pinned v2.0.0//pinned
+	example.com/plain v3.0.0//some note
+)
+
+require example.com/single v4.0.0//indirect
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 4, "取りこぼしがあります: {:?}", deps);
+
+        let find = |name: &str| deps.iter().find(|d| d.name == name).unwrap();
+
+        // 空白なしでも `// indirect` 判定が働く
+        let indirect = find("example.com/indirect");
+        assert_eq!(indirect.version_spec.version, "1.0.0");
+        assert!(indirect.is_dev);
+
+        // 空白なしでも `// pinned` 判定が働く
+        let pinned = find("example.com/pinned");
+        assert_eq!(pinned.version_spec.version, "2.0.0");
+        assert_eq!(pinned.version_spec.kind, VersionSpecKind::GoPinned);
+
+        // コメント内容はバージョンに混入しない
+        let plain = find("example.com/plain");
+        assert_eq!(plain.version_spec.version, "3.0.0");
+        assert_eq!(plain.version_spec.raw, "v3.0.0");
+        assert!(!plain.is_dev);
+
+        let single = find("example.com/single");
+        assert_eq!(single.version_spec.version, "4.0.0");
+        assert!(single.is_dev);
+    }
+
+    /// 空白なしコメント付きの行も更新でき、コメントを保持する。
+    #[test]
+    fn test_update_comment_without_space_before_slashes() {
+        let content =
+            "module example.com/myproject\n\nrequire example.com/single v1.0.0//indirect\n";
+
+        let result = GoModParser
+            .update_version(content, "example.com/single", "v1.5.0")
+            .unwrap();
+
+        assert_eq!(
+            result,
+            "module example.com/myproject\n\nrequire example.com/single v1.5.0 //indirect\n"
+        );
+    }
+
+    /// 空白なしコメントでも `+incompatible` のような build metadata は
+    /// バージョン側に残す (`/` だけをコメント境界にする)。
+    #[test]
+    fn test_parse_incompatible_with_comment_without_space() {
+        let content = r#"
+module example.com/myproject
+
+require example.com/legacy v2.0.0+incompatible//indirect
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].version_spec.version, "2.0.0");
+        assert_eq!(
+            deps[0].version_spec.suffix,
+            Some("+incompatible".to_string())
+        );
+        assert!(deps[0].is_dev);
     }
 
     #[test]

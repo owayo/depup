@@ -6,7 +6,7 @@
 //! - Tauri プロジェクト (src-tauri/Cargo.toml) のサポート
 
 use crate::domain::Language;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// 検出されたマニフェストファイルの情報
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +56,17 @@ pub struct ManifestFile {
     pub info: ManifestInfo,
 }
 
+/// 既出でなければマニフェストを追加する。
+///
+/// マニフェストは複数の検出ソース (言語別の既定名 / Cargo workspace members /
+/// pnpm workspace packages / go.work / settings.gradle / version catalog / mise)
+/// から集まり、同じパスが別ソース経由で二重に入ると judge も書き込みも二重に走る。
+/// 追加経路を増やすたびに重複排除を書き忘れないよう、1 箇所へ寄せる。
+fn push_unique_manifest(manifests: &mut Vec<ManifestInfo>, path: PathBuf, language: Language) {
+    if !manifests.iter().any(|m| m.path == path) {
+        manifests.push(ManifestInfo::new(path, language));
+    }
+}
 /// 指定ディレクトリ内の全マニフェストファイルを検出する
 ///
 /// この関数の処理:
@@ -103,8 +114,8 @@ pub fn detect_manifests(dir: &Path) -> Vec<ManifestInfo> {
     {
         for member_dir in detect_cargo_workspace_members(dir, &content) {
             let member_cargo = member_dir.join("Cargo.toml");
-            if member_cargo.exists() && !manifests.iter().any(|m| m.path == member_cargo) {
-                manifests.push(ManifestInfo::new(&member_cargo, Language::Rust));
+            if member_cargo.exists() {
+                push_unique_manifest(&mut manifests, member_cargo, Language::Rust);
             }
         }
     }
@@ -130,28 +141,34 @@ pub fn detect_manifests(dir: &Path) -> Vec<ManifestInfo> {
         for package_path in workspace_packages {
             let package_json_path = package_path.join("package.json");
             // ルートの package.json と既出のマニフェストは重複追加しない
-            if package_json_path.exists()
-                && package_json_path != dir.join("package.json")
-                && !manifests.iter().any(|m| m.path == package_json_path)
-            {
-                manifests.push(ManifestInfo::new(&package_json_path, Language::Node));
+            if package_json_path.exists() && package_json_path != dir.join("package.json") {
+                push_unique_manifest(&mut manifests, package_json_path, Language::Node);
             }
         }
     }
 
+    // Go workspace (go.work) のメンバーモジュールを確認する。
+    // ルートに go.mod が無い構成では、展開しないと Go 依存が 1 件も更新されない。
+    for module_manifest in detect_go_work_modules(dir) {
+        push_unique_manifest(&mut manifests, module_manifest, Language::Go);
+    }
+
+    // Gradle マルチプロジェクト (settings.gradle の include) を確認する。
+    // 依存宣言の大半はサブプロジェクト側の build.gradle にあるため、
+    // ルートだけ見ていると「更新なし」と報告してしまう。
+    for build_file in detect_gradle_subprojects(dir) {
+        push_unique_manifest(&mut manifests, build_file, Language::Java);
+    }
+
     // Gradle version catalog は Java/Gradle 依存の別マニフェストとして扱う。
     for catalog_path in detect_gradle_version_catalogs(dir) {
-        if !manifests.iter().any(|m| m.path == catalog_path) {
-            manifests.push(ManifestInfo::new(catalog_path, Language::Java));
-        }
+        push_unique_manifest(&mut manifests, catalog_path, Language::Java);
     }
 
     // mise の設定ファイルを検出する。`mise.toml` は Language::all() のループで
     // 拾えるが、mise は同じディレクトリの複数ファイルを読むので残りも足す。
     for mise_path in detect_mise_manifests(dir) {
-        if !manifests.iter().any(|m| m.path == mise_path) {
-            manifests.push(ManifestInfo::new(mise_path, Language::Mise));
-        }
+        push_unique_manifest(&mut manifests, mise_path, Language::Mise);
     }
 
     manifests
@@ -431,6 +448,306 @@ fn detect_cargo_workspace_members(dir: &Path, content: &str) -> Vec<PathBuf> {
         }
     }
     result
+}
+
+/// ワークスペース定義ファイルに書かれた相対パスを安全に解決する。
+///
+/// `.depup` の相対パス制約と同じ判定で、絶対パス・`..`・外部へ解決される symlink を
+/// 拒否する。`go.work` / `settings.gradle` はリポジトリ内のファイルとはいえ、
+/// 展開結果はそのままマニフェストの書き換え対象になるのでプロジェクト外へは出さない。
+///
+/// 返すのは `base` からの素直な join (`./` は畳む)。canonicalize した実体パスを
+/// 返すと symlink 構造や表示パスが変わってしまうため、検証にだけ使う。
+fn resolve_project_subdir(base: &Path, relative: &str) -> Option<PathBuf> {
+    let relative = relative.trim();
+    if relative.is_empty() {
+        return None;
+    }
+
+    let candidate = Path::new(relative);
+    if candidate.is_absolute() {
+        return None;
+    }
+
+    let mut resolved = base.to_path_buf();
+    for component in candidate.components() {
+        match component {
+            // `./a` の `.` は読み飛ばす (パスに残すと比較で食い違う)
+            Component::CurDir => {}
+            Component::Normal(part) => resolved.push(part),
+            // `..` / ルート / Windows のプレフィックスは受け付けない
+            _ => return None,
+        }
+    }
+
+    if !resolved.is_dir() {
+        return None;
+    }
+
+    // symlink がプロジェクト外を指していないか実体で確認する
+    let canonical_base = base.canonicalize().ok()?;
+    let canonical_dir = resolved.canonicalize().ok()?;
+    canonical_dir
+        .starts_with(&canonical_base)
+        .then_some(resolved)
+}
+
+/// go.work の `use` を展開してメンバーモジュールの go.mod を返す。
+fn detect_go_work_modules(dir: &Path) -> Vec<PathBuf> {
+    let Ok(content) = std::fs::read_to_string(dir.join("go.work")) else {
+        return Vec::new();
+    };
+
+    let mut modules = Vec::new();
+    for module_path in parse_go_work_uses(&content) {
+        let Some(module_dir) = resolve_project_subdir(dir, &module_path) else {
+            continue;
+        };
+        let go_mod = module_dir.join("go.mod");
+        if go_mod.is_file() && !modules.contains(&go_mod) {
+            modules.push(go_mod);
+        }
+    }
+    modules
+}
+
+/// go.work の `use` ディレクティブからモジュールディレクトリの相対パスを集める。
+///
+/// 単一行 (`use ./svc-a`) と括弧ブロック (`use ( ... )`) の両方に対応し、
+/// go.mod / go.work 共通のクォート付き記法 (`use "./svc a"`) も解釈する。
+fn parse_go_work_uses(content: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut in_block = false;
+
+    for line in content.lines() {
+        // go.work のコメントは `//` のみ (`#` はコメントではない)
+        let line = match line.find("//") {
+            Some(pos) => &line[..pos],
+            None => line,
+        };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        if in_block {
+            if line.starts_with(')') {
+                in_block = false;
+                continue;
+            }
+            if let Some(path) = go_work_path_token(line) {
+                paths.push(path);
+            }
+            continue;
+        }
+
+        let Some(rest) = line.strip_prefix("use") else {
+            continue;
+        };
+        // `used` のような別トークンと区別する (`use(` / `use ...` のみ)
+        if !rest.is_empty() && !rest.starts_with(|c: char| c.is_whitespace() || c == '(') {
+            continue;
+        }
+
+        let rest = rest.trim_start();
+        if let Some(after_paren) = rest.strip_prefix('(') {
+            // ブロック形式。`use (` と同じ行に `)` があれば空ブロック
+            in_block = !after_paren.trim_start().starts_with(')');
+        } else if let Some(path) = go_work_path_token(rest) {
+            paths.push(path);
+        }
+    }
+
+    paths
+}
+
+/// go.work の 1 エントリからパストークンを取り出す (クォートと閉じ括弧を除く)
+fn go_work_path_token(text: &str) -> Option<String> {
+    let token = text.split_whitespace().next()?.trim_end_matches(')');
+    let unquoted = token
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or(token);
+    (!unquoted.is_empty()).then(|| unquoted.to_string())
+}
+
+/// settings.gradle(.kts) の `include` を展開してサブプロジェクトのビルドファイルを返す。
+fn detect_gradle_subprojects(dir: &Path) -> Vec<PathBuf> {
+    let mut build_files = Vec::new();
+    let mut has_settings = false;
+
+    for settings_name in ["settings.gradle", "settings.gradle.kts"] {
+        let Ok(content) = std::fs::read_to_string(dir.join(settings_name)) else {
+            continue;
+        };
+        has_settings = true;
+
+        for project_path in collect_gradle_includes(&content) {
+            let Some(project_dir) = resolve_project_subdir(dir, &project_path) else {
+                continue;
+            };
+            if let Some(build_file) = gradle_build_file(&project_dir)
+                && !build_files.contains(&build_file)
+            {
+                build_files.push(build_file);
+            }
+        }
+    }
+
+    // buildSrc は settings.gradle に書かなくても Gradle が組み込む複合ビルドで、
+    // プラグインの依存宣言を持つことが多い
+    let has_root_build = gradle_build_file(dir).is_some();
+    if (has_settings || has_root_build)
+        && let Some(build_file) = gradle_build_file(&dir.join("buildSrc"))
+        && !build_files.contains(&build_file)
+    {
+        build_files.push(build_file);
+    }
+
+    build_files
+}
+
+/// ディレクトリ直下のビルドファイルを返す (Groovy を Kotlin DSL より優先)
+fn gradle_build_file(dir: &Path) -> Option<PathBuf> {
+    ["build.gradle", "build.gradle.kts"]
+        .iter()
+        .map(|name| dir.join(name))
+        .find(|path| path.is_file())
+}
+
+/// settings.gradle の `include` 文からプロジェクトの相対ディレクトリを集める。
+///
+/// Groovy (`include ':app', ':core'`) と Kotlin DSL (`include(":app", ":core")`) の
+/// どちらも同じ走査で扱う。Gradle のプロジェクトパス `:a:b` はディレクトリ `a/b`
+/// に対応する。`includeBuild` / `includeFlat` は別セマンティクス (前者は複合ビルド、
+/// 後者はルートの兄弟ディレクトリ) なので単語境界で除外する。
+fn collect_gradle_includes(content: &str) -> Vec<String> {
+    const INCLUDE: &str = "include";
+
+    let stripped = strip_gradle_comments(content);
+    let bytes = stripped.as_bytes();
+    let mut paths = Vec::new();
+    let mut cursor = 0;
+
+    while let Some(offset) = stripped[cursor..].find(INCLUDE) {
+        let start = cursor + offset;
+        let end = start + INCLUDE.len();
+        cursor = end;
+
+        // `myInclude` のような別識別子の一部は対象外。`settings.include(...)` は
+        // 有効な呼び出しなので `.` は境界として許す
+        let preceded_by_word =
+            start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_');
+        let followed_by_word = bytes
+            .get(end)
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_');
+        if preceded_by_word || followed_by_word {
+            continue;
+        }
+
+        // 引数部の文字列リテラルを集める。`(` `,` 空白は引数の区切りとして読み飛ばし、
+        // `)` か想定外の文字が来たら 1 つの include 文の終わりとみなす
+        let mut pos = end;
+        while pos < bytes.len() {
+            match bytes[pos] {
+                b'\'' | b'"' => {
+                    let quote = bytes[pos] as char;
+                    let literal_start = pos + 1;
+                    let Some(literal_len) = stripped[literal_start..].find(quote) else {
+                        pos = bytes.len();
+                        break;
+                    };
+                    let literal = &stripped[literal_start..literal_start + literal_len];
+                    if let Some(relative) = gradle_project_path_to_dir(literal) {
+                        paths.push(relative);
+                    }
+                    pos = literal_start + literal_len + 1;
+                }
+                b'(' | b',' => pos += 1,
+                b')' => {
+                    pos += 1;
+                    break;
+                }
+                b if b.is_ascii_whitespace() => pos += 1,
+                _ => break,
+            }
+        }
+        cursor = pos;
+    }
+
+    paths
+}
+
+/// Gradle のプロジェクトパス (`:app:core`) を相対ディレクトリ (`app/core`) へ変換する
+fn gradle_project_path_to_dir(project_path: &str) -> Option<String> {
+    let trimmed = project_path.trim();
+    // `include` の引数はプロジェクトパスなので `:` 始まりのみを対象にする
+    // (`includeBuild '../other'` のようなディレクトリ指定と混同しない)
+    let body = trimmed.strip_prefix(':')?;
+    let segments: Vec<&str> = body.split(':').map(str::trim).collect();
+    if segments.iter().any(|segment| segment.is_empty()) {
+        return None;
+    }
+    Some(segments.join("/"))
+}
+
+/// Gradle スクリプトから `//` 行コメントと `/* ... */` ブロックコメントを取り除く。
+///
+/// 文字列リテラル内の `//` (`url 'https://...'`) はコメント扱いしない。
+/// 行数がずれないよう、除いた部分の改行は残す。
+fn strip_gradle_comments(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut chars = content.chars().peekable();
+    let mut quote: Option<char> = None;
+    let mut in_block_comment = false;
+
+    while let Some(ch) = chars.next() {
+        if in_block_comment {
+            if ch == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                in_block_comment = false;
+            } else if ch == '\n' {
+                out.push('\n');
+            }
+            continue;
+        }
+
+        if let Some(open) = quote {
+            out.push(ch);
+            if ch == '\\' {
+                // エスケープされた文字は閉じクォート判定に使わない
+                if let Some(escaped) = chars.next() {
+                    out.push(escaped);
+                }
+            } else if ch == open {
+                quote = None;
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' | '"' => {
+                quote = Some(ch);
+                out.push(ch);
+            }
+            '/' if chars.peek() == Some(&'/') => {
+                // 行末まで飛ばす
+                for skipped in chars.by_ref() {
+                    if skipped == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                in_block_comment = true;
+            }
+            _ => out.push(ch),
+        }
+    }
+
+    out
 }
 
 /// ディレクトリが Tauri プロジェクトかどうかを判定する
@@ -1098,5 +1415,270 @@ members = ["crates/nonexistent"]
                 .iter()
                 .any(|m| m.path.ends_with("gradle/tools.versions.toml"))
         );
+    }
+
+    /// go.mod を持つモジュールディレクトリを作る
+    fn create_go_module(base: &Path, name: &str) -> PathBuf {
+        let dir = base.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("go.mod"), "module example.com/m\n\ngo 1.22\n").unwrap();
+        dir.join("go.mod")
+    }
+
+    /// build.gradle を持つサブプロジェクトを作る
+    fn create_gradle_project(base: &Path, name: &str, file_name: &str) -> PathBuf {
+        let dir = base.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(file_name), "dependencies {}\n").unwrap();
+        dir.join(file_name)
+    }
+
+    /// 回帰: ルートに go.mod が無い go.work 構成では、展開しないと Go 依存が
+    /// 1 件も更新されない (無言の no-op)
+    #[test]
+    fn test_detect_go_work_modules() {
+        let dir = create_temp_dir();
+        let svc_a = create_go_module(dir.path(), "svc-a");
+        let svc_b = create_go_module(dir.path(), "svc-b");
+        let svc_c = create_go_module(dir.path(), "nested/svc-c");
+        fs::write(
+            dir.path().join("go.work"),
+            concat!(
+                "go 1.22\n",
+                "\n",
+                "use ./svc-a\n",
+                "\n",
+                "use (\n",
+                "\t./svc-b\n",
+                "\t\"./nested/svc-c\" // クォート付きも go.work の正しい記法\n",
+                ")\n",
+            ),
+        )
+        .unwrap();
+
+        let paths: Vec<_> = detect_manifests(dir.path())
+            .into_iter()
+            .filter(|m| m.language == Language::Go)
+            .map(|m| m.path)
+            .collect();
+        assert_eq!(paths.len(), 3);
+        assert!(paths.contains(&svc_a));
+        assert!(paths.contains(&svc_b));
+        assert!(paths.contains(&svc_c));
+    }
+
+    /// `use .` とルートの go.mod は同じファイルなので重複させない
+    #[test]
+    fn test_detect_go_work_does_not_duplicate_root_module() {
+        let dir = create_temp_dir();
+        fs::write(dir.path().join("go.mod"), "module example.com/root\n").unwrap();
+        create_go_module(dir.path(), "svc-a");
+        fs::write(dir.path().join("go.work"), "use (\n\t.\n\t./svc-a\n)\n").unwrap();
+
+        let paths: Vec<_> = detect_manifests(dir.path())
+            .into_iter()
+            .filter(|m| m.language == Language::Go)
+            .map(|m| m.path)
+            .collect();
+        assert_eq!(paths.len(), 2);
+        assert_eq!(
+            paths
+                .iter()
+                .filter(|p| **p == dir.path().join("go.mod"))
+                .count(),
+            1
+        );
+    }
+
+    /// プロジェクト外へ出る `use` は展開しない
+    #[test]
+    fn test_detect_go_work_rejects_paths_outside_project() {
+        let root = create_temp_dir();
+        let project = root.path().join("project");
+        fs::create_dir(&project).unwrap();
+        create_go_module(root.path(), "outside");
+        fs::write(project.join("go.work"), "use ../outside\nuse /etc\n").unwrap();
+
+        let manifests = detect_manifests(&project);
+        assert!(manifests.iter().all(|m| m.language != Language::Go));
+    }
+
+    /// symlink 経由でプロジェクト外へ解決される `use` も拒否する
+    #[cfg(unix)]
+    #[test]
+    fn test_detect_go_work_rejects_symlink_outside_project() {
+        use std::os::unix::fs::symlink;
+
+        let root = create_temp_dir();
+        let project = root.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let outside = root.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("go.mod"), "module example.com/outside\n").unwrap();
+        symlink(&outside, project.join("linked")).unwrap();
+        fs::write(project.join("go.work"), "use ./linked\n").unwrap();
+
+        let manifests = detect_manifests(&project);
+        assert!(manifests.iter().all(|m| m.language != Language::Go));
+    }
+
+    /// 回帰: 依存宣言の大半はサブプロジェクト側にあるため、settings.gradle の
+    /// include を展開しないと「更新なし」と報告してしまう
+    #[test]
+    fn test_detect_gradle_subprojects_groovy() {
+        let dir = create_temp_dir();
+        let app = create_gradle_project(dir.path(), "app", "build.gradle");
+        let api = create_gradle_project(dir.path(), "core/api", "build.gradle.kts");
+        fs::write(
+            dir.path().join("settings.gradle"),
+            concat!(
+                "rootProject.name = 'demo'\n",
+                "include ':app', ':core:api'\n",
+                "includeBuild '../other-build'\n",
+            ),
+        )
+        .unwrap();
+
+        let paths: Vec<_> = detect_manifests(dir.path())
+            .into_iter()
+            .filter(|m| m.language == Language::Java)
+            .map(|m| m.path)
+            .collect();
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&app));
+        assert!(paths.contains(&api));
+    }
+
+    /// Kotlin DSL の `include(":app", ":core")` と複数行の引数も同じ扱い
+    #[test]
+    fn test_detect_gradle_subprojects_kotlin_dsl() {
+        let dir = create_temp_dir();
+        let app = create_gradle_project(dir.path(), "app", "build.gradle.kts");
+        let core = create_gradle_project(dir.path(), "core", "build.gradle.kts");
+        fs::write(
+            dir.path().join("settings.gradle.kts"),
+            concat!(
+                "rootProject.name = \"demo\"\n",
+                "include(\n",
+                "    \":app\",\n",
+                "    \":core\",\n",
+                ")\n",
+            ),
+        )
+        .unwrap();
+
+        let paths: Vec<_> = detect_manifests(dir.path())
+            .into_iter()
+            .filter(|m| m.language == Language::Java)
+            .map(|m| m.path)
+            .collect();
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&app));
+        assert!(paths.contains(&core));
+    }
+
+    /// コメントアウトされた include と、プロジェクト外へ出るパスは展開しない
+    #[test]
+    fn test_detect_gradle_subprojects_ignores_comments_and_outside_paths() {
+        let dir = create_temp_dir();
+        create_gradle_project(dir.path(), "app", "build.gradle");
+        create_gradle_project(dir.path(), "ghost", "build.gradle");
+        fs::write(
+            dir.path().join("settings.gradle"),
+            concat!(
+                "// include ':ghost'\n",
+                "/*\n",
+                "include ':ghost'\n",
+                "*/\n",
+                "include ':app'\n",
+                "include ':..'\n",
+                "myInclude ':ghost'\n",
+            ),
+        )
+        .unwrap();
+
+        let paths: Vec<_> = detect_manifests(dir.path())
+            .into_iter()
+            .filter(|m| m.language == Language::Java)
+            .map(|m| m.path)
+            .collect();
+        assert_eq!(paths, vec![dir.path().join("app").join("build.gradle")]);
+    }
+
+    /// buildSrc は settings.gradle に書かなくても Gradle が組み込むビルド
+    #[test]
+    fn test_detect_gradle_buildsrc() {
+        let dir = create_temp_dir();
+        let build_src = create_gradle_project(dir.path(), "buildSrc", "build.gradle.kts");
+        fs::write(
+            dir.path().join("settings.gradle"),
+            "rootProject.name = 'x'\n",
+        )
+        .unwrap();
+
+        let paths: Vec<_> = detect_manifests(dir.path())
+            .into_iter()
+            .filter(|m| m.language == Language::Java)
+            .map(|m| m.path)
+            .collect();
+        assert_eq!(paths, vec![build_src]);
+    }
+
+    /// 同じサブプロジェクトが複数回 include されても重複しない
+    /// (settings.gradle と settings.gradle.kts が両方ある場合も同様)
+    #[test]
+    fn test_detect_gradle_subprojects_are_deduplicated() {
+        let dir = create_temp_dir();
+        let app = create_gradle_project(dir.path(), "app", "build.gradle");
+        fs::write(
+            dir.path().join("settings.gradle"),
+            "include ':app'\ninclude ':app'\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("settings.gradle.kts"),
+            "include(\":app\")\n",
+        )
+        .unwrap();
+
+        let paths: Vec<_> = detect_manifests(dir.path())
+            .into_iter()
+            .filter(|m| m.language == Language::Java)
+            .map(|m| m.path)
+            .collect();
+        assert_eq!(paths, vec![app]);
+    }
+
+    /// ルートの build.gradle は従来どおり 1 件だけ登録される
+    /// (include されたサブプロジェクト検出と二重にならない)
+    #[test]
+    fn test_detect_gradle_root_build_file_is_not_duplicated() {
+        let dir = create_temp_dir();
+        fs::write(dir.path().join("build.gradle"), "dependencies {}\n").unwrap();
+        create_gradle_project(dir.path(), "app", "build.gradle");
+        fs::write(dir.path().join("settings.gradle"), "include ':app'\n").unwrap();
+
+        let paths: Vec<_> = detect_manifests(dir.path())
+            .into_iter()
+            .filter(|m| m.language == Language::Java)
+            .map(|m| m.path)
+            .collect();
+        assert_eq!(paths.len(), 2);
+        assert_eq!(
+            paths
+                .iter()
+                .filter(|p| **p == dir.path().join("build.gradle"))
+                .count(),
+            1
+        );
+    }
+
+    /// 文字列リテラル内の `//` はコメントではない (URL を含む settings.gradle)
+    #[test]
+    fn test_strip_gradle_comments_keeps_string_literals() {
+        let stripped =
+            strip_gradle_comments("maven { url 'https://example.com/repo' } // 末尾コメント\n");
+        assert!(stripped.contains("https://example.com/repo"));
+        assert!(!stripped.contains("末尾コメント"));
     }
 }

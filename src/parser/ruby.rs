@@ -6,7 +6,7 @@
 //! - 比較演算子: `>=`, `<`, `>`, `<=`
 //! - 複合制約: `>= 1.0, < 2.0`, `>= 1.0 < 2.0`
 
-use crate::domain::{Language, VersionSpec, VersionSpecKind};
+use crate::domain::{Language, VersionSpec, VersionSpecKind, range_lower_bound_version};
 use crate::parser::{VersionParser, anchored_op_pattern};
 use regex::Regex;
 use std::sync::LazyLock;
@@ -150,19 +150,19 @@ impl VersionParser for RubyVersionParser {
         }
 
         // 複合制約 (>= 1.0, < 2.0)
-        if COMPOUND_RE.is_match(trimmed) {
+        //
+        // 比較基準は記述順に依存せず包含下限を採用する。`gem 'pg', '< 2.0', '>= 0.18'`
+        // のように上限を先に書いた場合、先頭トークン (`2.0`) を基準にすると judge が
+        // AlreadyLatest と誤判定して有効な更新を取りこぼす。書き換え側
+        // (`format_range_like`) も同じ探索で包含下限を選ぶため、判定と書き換え対象が
+        // 必ず一致する。包含下限が無い場合 (厳密下限 `> 1.0` のみ等) は従来どおり
+        // 先頭トークンへフォールバックする。
+        if COMPOUND_RE.is_match(trimmed) || COMPOUND_SPACE_RE.is_match(trimmed) {
             return Some(VersionSpec::new(
                 VersionSpecKind::Range,
                 trimmed,
-                extract_first_version(trimmed),
-            ));
-        }
-
-        if COMPOUND_SPACE_RE.is_match(trimmed) {
-            return Some(VersionSpec::new(
-                VersionSpecKind::Range,
-                trimmed,
-                extract_first_version(trimmed),
+                range_lower_bound_version(trimmed)
+                    .unwrap_or_else(|| extract_first_version(trimmed)),
             ));
         }
 
@@ -297,6 +297,26 @@ mod tests {
         let spec = parse(">= 1.0 < 2.0").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Range);
         assert_eq!(spec.version, "1.0");
+    }
+
+    /// 回帰テスト: 上限を先に書いた複合制約でも包含下限を比較基準にする。
+    ///
+    /// 先頭トークンを基準にしていたときは `< 2.0, >= 0.18` の基準が `2.0` になり、
+    /// judge が AlreadyLatest と誤判定して有効な更新を取りこぼしていた。
+    /// 書き換え側は元から包含下限だけを進めるので、判定と書き換え対象が
+    /// 食い違っていた。
+    #[test]
+    fn test_parse_compound_uses_inclusive_lower_bound_regardless_of_order() {
+        let spec = parse("< 2.0, >= 0.18").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "0.18");
+
+        let spec = parse("< 2.0 >= 0.18").unwrap();
+        assert_eq!(spec.version, "0.18");
+
+        // 包含下限が無い場合は従来どおり先頭トークンへフォールバックする
+        let spec = parse("< 2.0, > 0.18").unwrap();
+        assert_eq!(spec.version, "2.0");
     }
 
     #[test]
@@ -504,6 +524,45 @@ mod tests {
     fn test_format_updated_dotted_prerelease() {
         let spec = parse("~> 7.0.0.alpha.2").unwrap();
         assert_eq!(spec.format_updated("7.0.0.alpha.3"), "~> 7.0.0.alpha.3");
+    }
+
+    /// 回帰テスト: Gemfile の複数バージョン引数 (`gem "rails", ">= 6.0", "< 8.0"`) は
+    /// `", "` で 1 本に繋がれてこのパーサへ渡る。judge も writer も
+    /// `try_format_updated` の結果で更新を決めるため、「包含下限だけが進み上限は
+    /// そのまま残る」という契約をパーサ側でも固定しておく (writer はこの結果を
+    /// 元の引数へ配り直すだけなので、ここが崩れると書き戻しも壊れる)。
+    #[test]
+    fn test_format_updated_compound_replaces_lower_bound_only() {
+        for (input, new_version, expected) in [
+            (">= 6.0, < 8.0", "7.2.3.2", ">= 7.2.3.2, < 8.0"),
+            (">= 0.18, < 2.0", "1.5.0", ">= 1.5.0, < 2.0"),
+            // 上限が先に書かれていても書き換えるのは包含下限側だけ
+            ("< 2.0, >= 0.18", "1.5.0", "< 2.0, >= 1.5.0"),
+            // 3 要件でも同じ
+            (">= 0.18, <= 1.9, < 2.0", "1.5.0", ">= 1.5.0, <= 1.9, < 2.0"),
+        ] {
+            let spec = parse(input).expect(input);
+            assert_eq!(spec.kind, VersionSpecKind::Range, "input={input}");
+            assert_eq!(
+                spec.try_format_updated(new_version).as_deref(),
+                Some(expected),
+                "input={input} new={new_version}"
+            );
+        }
+    }
+
+    /// 除外制約 (`!=`) を含む複合制約は安全に書き換えられないため `None`。
+    /// judge はここで Skip し、writer もエラーにする (両者の判断が一致する)。
+    #[test]
+    fn test_format_updated_compound_with_not_equal_is_none() {
+        for input in [">= 0.18, != 1.2.0, < 2.0", "!= 1.5.0"] {
+            let spec = parse(input).expect(input);
+            assert_eq!(spec.kind, VersionSpecKind::Range, "input={input}");
+            assert!(
+                spec.try_format_updated("1.5.0").is_none(),
+                "input={input} は書き換え不可であるべき"
+            );
+        }
     }
 
     /// 回帰テスト: Tilde (`~>`) のセグメント数保持を「実パーサ経由」で検証する。

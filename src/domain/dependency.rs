@@ -24,6 +24,14 @@ pub struct Dependency {
     /// git 依存 (Cargo.toml の `{ git = "..." }` など) の場合に設定される
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git_source: Option<GitSource>,
+    /// マニフェスト上の値に前置される接頭辞 (npm alias の `npm:<real>@` など)。
+    ///
+    /// `version_spec.raw` は制約部分 (`^17.0.0`) だけを保持するため、これが無いと
+    /// `--diff` が `"react": "^17.0.0"` → `"^18.0.0"` と表示してしまう。実際に
+    /// 書き込まれるのは `"npm:@preact/compat@^18.0.0"` なので、diff だけを見ると
+    /// 「alias 宣言が外れる」と読めてレビュー結果と適用結果が食い違う。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_prefix: Option<String>,
 }
 
 impl Dependency {
@@ -42,6 +50,7 @@ impl Dependency {
             language,
             variable_name: None,
             git_source: None,
+            value_prefix: None,
         }
     }
 
@@ -49,6 +58,26 @@ impl Dependency {
     pub fn with_variable(mut self, var_name: impl Into<String>) -> Self {
         self.variable_name = Some(var_name.into());
         self
+    }
+
+    /// マニフェスト上の値に前置される接頭辞を設定する (ビルダーパターン)
+    pub fn with_value_prefix(mut self, value_prefix: impl Into<String>) -> Self {
+        let value_prefix = value_prefix.into();
+        if !value_prefix.is_empty() {
+            self.value_prefix = Some(value_prefix);
+        }
+        self
+    }
+
+    /// マニフェストへ書かれる値の表示用文字列を組み立てる。
+    ///
+    /// npm alias のように制約の前に接頭辞が付く形式では、接頭辞込みでないと
+    /// 実ファイルの内容と食い違う。`--diff` の before/after で使う。
+    pub fn manifest_value(&self, constraint: &str) -> String {
+        match &self.value_prefix {
+            Some(prefix) => format!("{prefix}{constraint}"),
+            None => constraint.to_string(),
+        }
     }
 
     /// マニフェスト上の依存キー名を設定する (ビルダーパターン)

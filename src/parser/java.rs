@@ -1,10 +1,11 @@
 //! Java/Gradle のバージョン指定パーサ
 //!
 //! 対応する構文:
-//! - 固定バージョン: `1.2.3`, `1.2.3-SNAPSHOT`, `1.2.3-alpha1`
+//! - 固定バージョン: `1.2.3`, `1.2.3-alpha1`
 //! - strict 記法: `1.2.3!!`, `1.2.+!!`, `[1.0,2.0[!!`
 //! - プレフィックス指定: `1.2.+` (`1.2` 系を許可)
 //! - 動的指定: `latest.release`, `latest.integration` (更新対象外)
+//! - SNAPSHOT 参照: `1.2.3-SNAPSHOT`, `1.2.3.SNAPSHOT` (動く参照なので更新対象外)
 //! - Maven 形式レンジ: `[1.0,2.0]`, `[1.0,)`, `(,2.0]`, `[1.0,2.0)`, `]1.0,2.0[`
 //!
 //! 備考: 変数参照 (例: `$version`, `${version}`) は
@@ -65,6 +66,23 @@ static MAVEN_RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
 static MAVEN_HARD_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&format!(r"^\[({GRADLE_VERSION_TOKEN})\]$")).unwrap());
 
+/// バージョンが SNAPSHOT 参照かどうかを返す。
+///
+/// Maven/Gradle の `-SNAPSHOT` は rc/beta のような固定されたプレリリースではなく、
+/// 解決のたびに最新のタイムスタンプ版を取り直す「動く参照」(Gradle の changing module)。
+/// これをレジストリの最新 release へ書き換えると、開発ビルドへの参照が黙って固定 release に
+/// 変わってしまうため、`latest.release` 等と同じく更新対象から外す。
+///
+/// 判定は末尾セグメントのみで行う。区切りは Maven 標準の `-` に加え、Spring Boot 系で
+/// 使われる `.SNAPSHOT` も同じ意味なので両方を見る。`5.0.0.RELEASE` / `4.0.0.Final` /
+/// `3.0.0-jre` のような安定版 qualifier は末尾が SNAPSHOT ではないため巻き込まない。
+fn is_snapshot_version(version: &str) -> bool {
+    version
+        .rsplit(['-', '.'])
+        .next()
+        .is_some_and(|last_segment| last_segment.eq_ignore_ascii_case("SNAPSHOT"))
+}
+
 impl VersionParser for JavaVersionParser {
     fn parse(&self, version_str: &str) -> Option<VersionSpec> {
         let trimmed = version_str.trim();
@@ -78,6 +96,10 @@ impl VersionParser for JavaVersionParser {
         // カンマを含まないこちらを優先するとマッチが安定する)。
         if let Some(caps) = MAVEN_HARD_RE.captures(trimmed) {
             let version = caps.get(1)?.as_str();
+            // SNAPSHOT への固定指定は動く参照なので更新しない
+            if is_snapshot_version(version) {
+                return None;
+            }
             return Some(
                 VersionSpec::new(VersionSpecKind::Exact, trimmed, version)
                     .with_prefix("[")
@@ -115,6 +137,10 @@ impl VersionParser for JavaVersionParser {
         // strict 記法を判定: 1.2.3!!
         if let Some(caps) = STRICT_VERSION_RE.captures(trimmed) {
             let version = caps.get(1)?.as_str();
+            // `!!` は競合解決の強さを指定するだけで、SNAPSHOT が動く参照であることは変わらない
+            if is_snapshot_version(version) {
+                return None;
+            }
             return Some(
                 VersionSpec::new(VersionSpecKind::Exact, trimmed, version).with_suffix("!!"),
             );
@@ -138,6 +164,13 @@ impl VersionParser for JavaVersionParser {
         // 通常バージョンを判定 (プレリリース識別子含む)
         if let Some(caps) = VERSION_RE.captures(trimmed) {
             let version = caps.get(1)?.as_str();
+            // `1.2.3-SNAPSHOT` / `1.2.3.SNAPSHOT` は最新の開発ビルドを指す動く参照なので、
+            // レジストリの最新 release で固定してしまわないよう更新対象から外す。
+            // judge 側は「現在版がプレリリースなら安定版も候補に残す」仕様のため、
+            // parse で弾かないと SNAPSHOT が release へ書き換えられてしまう。
+            if is_snapshot_version(version) {
+                return None;
+            }
             return Some(VersionSpec::new(VersionSpecKind::Exact, trimmed, version));
         }
 
@@ -188,11 +221,44 @@ mod tests {
     }
 
     // プレリリース系バージョンのテスト
+    /// 回帰テスト: SNAPSHOT は「毎回の解決で最新タイムスタンプ版を取り直す動く参照」であり、
+    /// rc/beta のような固定プレリリースではない。以前は Exact として surface した結果、
+    /// judge の「現在版がプレリリースなら安定版も候補に残す」規則で Maven Central の最新
+    /// release へ書き換えられ、開発ビルドへの参照が黙って固定 release に変わっていた。
     #[test]
-    fn test_parse_snapshot() {
-        let spec = parse("1.2.3-SNAPSHOT").unwrap();
-        assert_eq!(spec.kind, VersionSpecKind::Exact);
-        assert_eq!(spec.version, "1.2.3-SNAPSHOT");
+    fn test_parse_snapshot_is_skipped() {
+        assert!(parse("1.2.3-SNAPSHOT").is_none());
+    }
+
+    /// Spring Boot 系で使われるドット区切りの SNAPSHOT も同じ扱い
+    #[test]
+    fn test_parse_dot_separated_snapshot_is_skipped() {
+        assert!(parse("1.2.3.SNAPSHOT").is_none());
+    }
+
+    /// 小文字綴りも Maven/Gradle の慣用外だが、安全側 (更新しない) に倒す
+    #[test]
+    fn test_parse_lowercase_snapshot_is_skipped() {
+        assert!(parse("1.2.3-snapshot").is_none());
+    }
+
+    /// SNAPSHOT を弾く判定が JVM の安定版 qualifier を巻き込まないことを確認する
+    /// (ここを巻き込むと Java の依存が全滅する)
+    #[test]
+    fn test_parse_stable_qualifiers_are_still_updatable() {
+        for version in [
+            "1.2.3-RELEASE",
+            "1.2.3.RELEASE",
+            "1.2.3.Final",
+            "1.2.3-jre",
+            "1.2.3.GA",
+            "1.2.3-SP1",
+            "1.2.3-android",
+        ] {
+            let spec = parse(version).unwrap_or_else(|| panic!("{version} should parse"));
+            assert_eq!(spec.kind, VersionSpecKind::Exact);
+            assert_eq!(spec.version, version);
+        }
     }
 
     #[test]
@@ -276,10 +342,12 @@ mod tests {
         assert_eq!(spec.format_updated("2.0.0"), "2.0.0");
     }
 
+    /// 旧 `test_format_updated_snapshot` の置き換え。
+    /// `1.2.3-SNAPSHOT` → `2.0.0` の書き換えは「動く参照を固定 release にする」変更なので、
+    /// 更新の形式を検証するのではなく parse 時点で弾く方針へ変えた。
     #[test]
-    fn test_format_updated_snapshot() {
-        let spec = parse("1.2.3-SNAPSHOT").unwrap();
-        assert_eq!(spec.format_updated("2.0.0"), "2.0.0");
+    fn test_format_updated_snapshot_is_not_reachable() {
+        assert!(parse("1.2.3-SNAPSHOT").is_none());
     }
 
     // 対応言語のテスト
@@ -522,12 +590,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_strict_with_snapshot() {
-        // SNAPSHOT サフィックス付き strict 記法
-        let spec = parse("1.2.3-SNAPSHOT!!").unwrap();
-        assert_eq!(spec.kind, VersionSpecKind::Exact);
-        assert_eq!(spec.version, "1.2.3-SNAPSHOT");
-        assert_eq!(spec.suffix, Some("!!".to_string()));
+    fn test_parse_strict_with_snapshot_is_skipped() {
+        // `!!` は競合解決の強さを指定するだけで、SNAPSHOT が動く参照であることは変わらない。
+        // 更新すると `1.2.3-SNAPSHOT!!` が固定 release の strict 指定に化けるため弾く。
+        assert!(parse("1.2.3-SNAPSHOT!!").is_none());
     }
 
     #[test]
@@ -604,15 +670,20 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_maven_hard_requirement_with_snapshot() {
-        // Hard requirement に SNAPSHOT 等のプレリリースが付いた場合
-        let spec = parse("[1.2.3-SNAPSHOT]").unwrap();
-        assert_eq!(spec.kind, VersionSpecKind::Exact);
-        assert_eq!(spec.version, "1.2.3-SNAPSHOT");
-        assert_eq!(spec.prefix, Some("[".to_string()));
-        assert_eq!(spec.suffix, Some("]".to_string()));
-        assert!(spec.is_pinned());
-        assert_eq!(spec.format_updated("1.3.0"), "[1.3.0]");
+    fn test_parse_maven_hard_requirement_with_snapshot_is_skipped() {
+        // Hard requirement (`[1.2.3-SNAPSHOT]`) も SNAPSHOT を指す固定指定なので、
+        // release へ書き換えると動く参照が失われる。更新対象から外す。
+        assert!(parse("[1.2.3-SNAPSHOT]").is_none());
+    }
+
+    /// レンジの境界に現れる SNAPSHOT は「動く参照そのもの」ではなく上限/下限の指定なので、
+    /// 従来どおり解析・更新できる (下限側だけが進み、境界の綴りは保持される)。
+    #[test]
+    fn test_parse_maven_range_with_snapshot_bound_is_still_parsed() {
+        let spec = parse("[1.0,2.0-SNAPSHOT)").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.version, "1.0");
+        assert_eq!(spec.format_updated("1.9"), "[1.9,2.0-SNAPSHOT)");
     }
 
     /// 回帰テスト: `[,]` / `(,)` のように下限・上限が両方空の Maven レンジは意味を持たない。

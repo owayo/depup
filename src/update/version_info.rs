@@ -5,7 +5,9 @@
 
 use chrono::{DateTime, Utc};
 use pep440_rs::Version as Pep440Version;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::sync::LazyLock;
 
 /// レジストリから取得したパッケージバージョンの情報
 ///
@@ -650,12 +652,30 @@ pub(crate) fn is_semver_prerelease_version(version: &str) -> bool {
         || is_prerelease_version(version)
 }
 
+/// composer/semver の `VersionParser` が末尾修飾子の読み取りに使う正規表現と同じ形。
+///
+/// 本家は `'[._-]?(?:(stable|beta|b|RC|alpha|a|patch|pl|p)((?:[.-]?\d+)*+)?)?([.-]?dev)?'`
+/// で末尾を読む。**区切り文字 `[._-]` は省略可能**で `.` / `_` も使えるため、
+/// `5.0.0alpha3` / `1.0.0.beta1` / `1.0.0_beta1` / `2.2.1p1` はいずれも正当な
+/// Composer バージョンである。`-` の有無だけで判定を分けると綴り違いで挙動が割れる:
+/// `nikic/php-parser` が実配布している `v5.0.0beta1` (ハイフンなし) は prerelease と
+/// 判定されず、`>=4.0 <5.0.0` の利用者へ `>=5.0.0beta1 <5.0.0` という充足不能かつ
+/// `minimum-stability: stable` (既定) では解決できない制約を書き込んでいた
+/// (同じ作者の `nikic/fast-route 2.0.0-beta1` はハイフン付きなので正しく除外される)。
+///
+/// 数値コアは Composer/Packagist が valid とする 1〜4 セグメント (`1.0.0.0`) に合わせる。
+/// ビルドメタデータ (`+...`) は比較でもプレリリース判定でも無視されるため読み捨てる。
+static COMPOSER_MODIFIER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)^(?P<core>[vV]?\d+(?:\.\d+){0,3})(?:[._-]?(?P<mod>stable|beta|b|rc|alpha|a|patch|pl|p)(?P<num>(?:[.-]?\d+)*))?(?P<dev>[.-]?dev)?(?:\+\S+)?$",
+    )
+    .unwrap()
+});
+
 /// Composer の stability 修飾子を、共通の比較・判定ロジックが解釈できる形へ正規化する。
 ///
-/// composer/semver の `VersionParser` は末尾の修飾子を
-/// `[._-]?(stable|beta|b|RC|alpha|a|patch|pl|p)((?:[.-]?\d+)*)?([.-]?dev)?` で読み、
-/// `expandStability()` が短縮綴りを `a` → alpha / `b` → beta / `p`,`pl` → patch
-/// へ展開する。depup 側の共通判定は
+/// composer/semver の `expandStability()` は短縮綴りを `a` → alpha / `b` → beta /
+/// `p`,`pl` → patch へ展開する。depup 側の共通判定は
 /// - 短縮綴り `-a1` / `-b1` を prerelease と認識できない
 /// - `-beta10` を 1 個の識別子として ASCII 辞書順で比べるため `beta10 < beta9` になる
 ///
@@ -663,61 +683,79 @@ pub(crate) fn is_semver_prerelease_version(version: &str) -> bool {
 ///
 /// - `alpha` / `beta` / `rc` → `-<識別子>.<数値>` (数値を分離して数値比較させる)
 /// - `patch` / `pl` / `p` → `.post<数値>` (Composer では安定版の一種)
+/// - `stable` → 修飾子を落とす (本家 `VersionParser::normalize` も stable のときは
+///   修飾子なしのコアをそのまま返すため `1.0.0-stable == 1.0.0`)
+///
+/// 修飾子の検出は `-` の有無ではなく `COMPOSER_MODIFIER_RE` (= 本家の modifier regex)
+/// で行う。区切りなしの patch alias (`2.2.1p1`) を prerelease 扱いすると
+/// `2.2.0p2 < 2.2.0` という Composer と逆の順序になり
+/// (`php -r 'version_compare("2.2.1.0-patch2","2.2.1.0")'` は 1 = patch の方が大きい)、
+/// `laminas/laminas-diactoros` が 2.x 系へ出しているセキュリティパッチ
+/// (`2.2.1p2` / `2.2.0p2` / `2.1.5p2`) を黙って取りこぼす。
 ///
 /// 短縮綴り (`a` / `b` / `p` / `pl`) は数値が続く場合のみ展開する。`1.0.0-arm64` や
 /// `1.0.0-alpine` のような通常の suffix を prerelease と誤判定しないため。
 fn normalize_composer_version(value: &str) -> String {
-    let Some((base, suffix)) = value.rsplit_once('-') else {
+    let trimmed = value.trim();
+    let Some(caps) = COMPOSER_MODIFIER_RE.captures(trimmed) else {
         return value.to_string();
     };
-    let lower = suffix.to_ascii_lowercase();
+    let core = caps.name("core").map_or(trimmed, |m| m.as_str());
+    // 数値部は本家 (`ltrim($matches[$index + 1], '.-')`) と同じく先頭の区切りを剥がす。
+    // 剥がさないと `-p.1` だけ post ではなく prerelease と解釈され、安定版より
+    // 小さいと判定してダウングレードを「更新」として書き込んでしまう
+    let number = caps
+        .name("num")
+        .map_or("", |m| m.as_str().trim_start_matches(['.', '-']));
+    let has_dev = caps.name("dev").is_some();
 
-    // patch alias は安定版の後発リリース (post) として扱う。
-    // composer/semver の modifier regex は数値部の前に `.` / `-` を許す
-    // (`[._-]?(...|patch|pl|p)((?:[.-]?\d+)*+)?`) ため、`-p1` と `-p.1` は同じ
-    // `patch1` へ正規化される。区切りを剥がさないと `-p.1` だけ post ではなく
-    // prerelease と解釈され、安定版より小さいと判定してダウングレードを
-    // 「更新」として書き込んでしまう
-    for prefix in ["patch", "pl", "p"] {
-        let Some(rest) = lower.strip_prefix(prefix) else {
-            continue;
+    let Some(modifier) = caps.name("mod").map(|m| m.as_str().to_ascii_lowercase()) else {
+        // 修飾子なし。区切りなしの `1.0.0dev` だけを共通判定が読める形へ寄せる
+        // (`1.0.0-dev` / `1.0.0.dev` は共通判定が単語境界で既に拾えるので触らない)
+        return if has_dev {
+            format!("{core}-dev")
+        } else {
+            value.to_string()
         };
-        let number = rest.trim_start_matches(['.', '-']);
-        if NumericIdentifier::parse(number).is_some() {
-            return format!("{base}.post{number}");
-        }
-    }
+    };
 
-    // プレリリース修飾子。長い綴りを先に試す (`alpha` の前に `a` を試すと誤爆する)
-    for (prefix, expanded, requires_number) in [
-        ("alpha", "alpha", false),
-        ("beta", "beta", false),
-        ("rc", "rc", false),
-        ("a", "alpha", true),
-        ("b", "beta", true),
-    ] {
-        let Some(rest) = lower.strip_prefix(prefix) else {
-            continue;
-        };
-        let number = rest.trim_start_matches(['.', '-']);
-        if number.is_empty() {
-            if requires_number {
-                continue;
+    let expanded = match modifier.as_str() {
+        // stable は「修飾子なし」と同義 (本家は stable のとき修飾子を付けずに返す)
+        "stable" => return core.to_string(),
+        "alpha" | "a" => "alpha",
+        "beta" | "b" => "beta",
+        "rc" => "rc",
+        "patch" | "pl" | "p" => {
+            // 数値なしの `-p` / `-pl` / `-patch` は従来どおり展開しない (安全側)
+            if number.is_empty() {
+                return value.to_string();
             }
-            return format!("{base}-{expanded}");
+            let post = format!("{core}.post{number}");
+            // `-patch1-dev` は dev stability。post だけにすると安定版扱いになるため
+            // prerelease 識別子として dev を残す
+            return if has_dev { format!("{post}-dev") } else { post };
         }
-        if number.bytes().all(|b| b.is_ascii_digit()) {
-            return format!("{base}-{expanded}.{number}");
-        }
+        _ => return value.to_string(),
+    };
+
+    // 短縮綴りは数値が続くときだけ prerelease として展開する
+    if number.is_empty() && matches!(modifier.as_str(), "a" | "b") {
+        return value.to_string();
     }
 
-    value.to_string()
+    let body = if number.is_empty() {
+        format!("{core}-{expanded}")
+    } else {
+        format!("{core}-{expanded}.{number}")
+    };
+    if has_dev { format!("{body}.dev") } else { body }
 }
 
 /// Composer (composer/semver) の規則でプレリリースかどうかを判定する。
 ///
-/// 共通判定に加えて短縮綴り (`1.0.0-a1` = alpha / `1.0.0-b1` = beta) を認識する。
-/// `-p1` / `-pl1` / `-patch1` は Composer では安定版なので prerelease にしない。
+/// 共通判定に加えて短縮綴り (`1.0.0-a1` = alpha / `1.0.0-b1` = beta) と、区切りなしの
+/// 修飾子 (`5.0.0beta1` / `1.0.0.RC1` / `1.0.0_beta1`) を認識する。
+/// `-p1` / `-pl1` / `-patch1` / `2.2.1p1` は Composer では安定版なので prerelease にしない。
 pub(crate) fn is_composer_prerelease_version(version: &str) -> bool {
     is_prerelease_version(&normalize_composer_version(version))
 }
@@ -2390,28 +2428,177 @@ mod tests {
             );
         }
 
-        // 既知の制限: ハイフン区切りの patch alias (`1.0.0-p-1`) は
-        // `rsplit_once('-')` が `base = "1.0.0-p"` / `suffix = "1"` へ割ってしまうため
-        // patch alias として認識できず prerelease 扱いになる。
-        // 正すには修飾子の検出自体を composer の modifier regex ベースへ作り替える
-        // 必要があり、実運用でこの綴りを見かけないため現状の挙動を明示的に固定する
+        // composer/semver の modifier regex は数値部の前に `-` も許すため、
+        // `1.0.0-p-1` も patch alias。修飾子検出を modifier regex ベースへ作り替えて
+        // `rsplit_once('-')` 由来の分割ミス (`base = "1.0.0-p"` / `suffix = "1"`) を解消した
         assert_eq!(
             compare_composer_versions("1.0.0-p-1", "1.0.0"),
-            Ordering::Less,
-            "ハイフン区切り patch alias は未対応 (既知の制限)"
+            Ordering::Greater,
+            "ハイフン区切り patch alias も 1.0.0 より新しい"
         );
 
         // 区切りの有無で順序が割れない (同一バージョンの別綴り)
-        assert_eq!(
-            compare_composer_versions("1.0.0-p.1", "1.0.0-p1"),
-            Ordering::Equal
-        );
+        for spelling in ["1.0.0-p.1", "1.0.0-p-1", "1.0.0p1"] {
+            assert_eq!(
+                compare_composer_versions(spelling, "1.0.0-p1"),
+                Ordering::Equal,
+                "{spelling} は 1.0.0-p1 と同じバージョン"
+            );
+        }
 
         // `-p` 単独や `-pre` は patch alias ではないので従来どおり prerelease 扱い
         assert_eq!(
             compare_composer_versions("1.0.0-pre", "1.0.0"),
             Ordering::Less
         );
+        assert_eq!(
+            compare_composer_versions("1.0.0-p", "1.0.0"),
+            Ordering::Less
+        );
+    }
+
+    /// 回帰テスト: 区切りなしの prerelease 修飾子 (`5.0.0beta1`) を prerelease と
+    /// 判定する。composer/semver の modifier regex は区切り `[._-]` を省略できるため、
+    /// `nikic/php-parser` は `v5.0.0alpha1` 〜 `v5.0.0beta1` をハイフンなしで配布している。
+    /// 以前は `-` の有無だけで判定していたので、`>=4.0 <5.0.0` の利用者へ
+    /// `>=5.0.0beta1 <5.0.0` という充足不能な制約 (既定の `minimum-stability: stable`
+    /// では解決不能) を書き込んでいた。
+    #[test]
+    fn test_composer_separatorless_prerelease_is_detected() {
+        use std::cmp::Ordering;
+
+        // nikic/php-parser が実際に配布しているタグ
+        for version in [
+            "5.0.0alpha1",
+            "5.0.0alpha2",
+            "5.0.0alpha3",
+            "5.0.0beta1",
+            "v5.0.0beta1",
+        ] {
+            assert!(
+                is_composer_prerelease_version(version),
+                "{version} は prerelease として除外されるべき"
+            );
+            assert_eq!(
+                compare_composer_versions(version, "5.0.0"),
+                Ordering::Less,
+                "{version} は安定版 5.0.0 より小さい"
+            );
+        }
+
+        // `.` / `_` 区切りも composer/semver では正当な綴り
+        for version in ["1.0.0.RC1", "1.0.0_beta1", "1.0.0.beta1", "1.0.0alpha"] {
+            assert!(
+                is_composer_prerelease_version(version),
+                "{version} は prerelease として除外されるべき"
+            );
+        }
+
+        // 綴り違いで順序が割れない (ハイフンあり = なし)
+        assert_eq!(
+            compare_composer_versions("5.0.0beta1", "5.0.0-beta1"),
+            Ordering::Equal
+        );
+        // alpha3 < beta1 (数値部を分離しているので beta10 > beta9 も成立する)
+        assert_eq!(
+            compare_composer_versions("5.0.0alpha3", "5.0.0beta1"),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_composer_versions("5.0.0beta10", "5.0.0beta9"),
+            Ordering::Greater
+        );
+    }
+
+    /// 回帰テスト: 区切りなしの patch alias (`2.2.1p1`) は prerelease ではなく
+    /// 後発の安定版。`laminas/laminas-diactoros` は 2.x 系向けセキュリティパッチを
+    /// `2.2.1p2` / `2.2.0p2` / `2.1.5p2` の綴りで配布している。
+    /// 以前は `1p1` を「数字 + 英字」として prerelease と読み `2.2.0p2 < 2.2.0` になり、
+    /// PHP の `version_compare("2.2.1.0-patch2", "2.2.1.0") == 1` と逆順だった
+    /// (セキュリティパッチの取りこぼし / 上限超え候補の選択につながる)。
+    #[test]
+    fn test_composer_separatorless_patch_alias_ordering() {
+        use std::cmp::Ordering;
+
+        for (alias, base) in [
+            ("2.2.1p1", "2.2.1"),
+            ("2.2.1p2", "2.2.1"),
+            ("2.2.0p2", "2.2.0"),
+            ("2.1.5p2", "2.1.5"),
+        ] {
+            assert_eq!(
+                compare_composer_versions(alias, base),
+                Ordering::Greater,
+                "{alias} は {base} の後発 patch リリース"
+            );
+            assert!(
+                !is_composer_prerelease_version(alias),
+                "{alias} は安定版なので prerelease 扱いしない"
+            );
+        }
+
+        // 区切りの有無で綴りが割れない
+        assert_eq!(
+            compare_composer_versions("2.2.1p1", "2.2.1-p1"),
+            Ordering::Equal
+        );
+        // patch 番号は数値比較 (辞書順だと p10 < p9 になる)
+        assert_eq!(
+            compare_composer_versions("2.2.1p10", "2.2.1p9"),
+            Ordering::Greater
+        );
+        // 上限側との関係: patch alias は base より大きいので `<2.2.1` を満たさない
+        assert_eq!(
+            compare_composer_versions("2.2.1p2", "2.2.2"),
+            Ordering::Less
+        );
+    }
+
+    /// 巻き込み防止テスト: 修飾子に見えるだけの通常 suffix を prerelease / patch と
+    /// 誤判定しない。短縮綴り (`a` / `b` / `p` / `pl`) は数値が続くときだけ展開する。
+    #[test]
+    fn test_composer_modifier_does_not_swallow_plain_suffixes() {
+        use std::cmp::Ordering;
+
+        for version in [
+            "1.0.0-arm64",
+            "1.0.0-alpine",
+            "1.0.0-bookworm",
+            "1.0.0-patched",
+        ] {
+            assert!(
+                !is_composer_prerelease_version(version),
+                "{version} は修飾子ではないので prerelease 扱いしない"
+            );
+        }
+
+        // 既存のハイフン付き挙動が変わらないこと
+        assert!(is_composer_prerelease_version("1.0.0-alpha.1"));
+        assert!(is_composer_prerelease_version("1.0.0-beta1"));
+        assert!(is_composer_prerelease_version("1.0.0-rc.1"));
+        assert!(is_composer_prerelease_version("1.0.0-a1"));
+        assert!(is_composer_prerelease_version("1.0.0-b1"));
+        assert!(is_composer_prerelease_version("1.0.0-dev"));
+        assert!(!is_composer_prerelease_version("1.0.0"));
+        assert!(!is_composer_prerelease_version("1.0.0-p1"));
+        assert_eq!(
+            compare_composer_versions("1.0.0-beta.1", "1.0.0"),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_composer_versions("1.0.0-rc.1", "1.0.0-beta.9"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_composer_versions("1.0.0", "1.0.0.0"),
+            Ordering::Equal
+        );
+        // stable 修飾子は「修飾子なし」と同義 (本家 VersionParser::normalize と同じ)
+        assert_eq!(
+            compare_composer_versions("1.0.0-stable", "1.0.0"),
+            Ordering::Equal
+        );
+        assert!(!is_composer_prerelease_version("1.0.0-stable"));
     }
 
     #[test]

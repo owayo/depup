@@ -100,6 +100,88 @@ impl MiseSettings {
     }
 }
 
+/// `[tools]` のツール単位に書かれた `minimum_release_age`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolMinimumReleaseAge {
+    /// ツール名 (`[tools]` のキー)
+    pub tool: String,
+    /// 設定値の生表記 (`"30d"`)。警告表示に使う
+    pub raw: String,
+    /// 相対表記として解釈できた場合の値 (絶対日付などは `None`)
+    pub age: Option<Duration>,
+}
+
+/// ツール単位の `minimum_release_age` 読み取り。
+///
+/// `MiseSettings` の関連関数として置く。この関数は `[settings]` ではなく `[tools]`
+/// を見るので `MiseSettings::parse` には混ぜないが、`manifest` モジュールが
+/// re-export しているのは型 (`MiseSettings`) なので、関連関数にしておけば
+/// 呼び出し側 (orchestrator) から `MiseSettings::tool_minimum_release_ages` で
+/// 到達できる。
+impl MiseSettings {
+    /// `[tools]` のツール単位 `minimum_release_age` を読み取る。
+    ///
+    /// ```toml
+    /// [tools]
+    /// node = { version = "22", minimum_release_age = "30d" }
+    /// ```
+    ///
+    /// depup は age を「プロジェクト全体で 1 つの値」として judge / install に渡すため、
+    /// ツール単位の値は適用できない。黙って無視すると mise 側の解決結果と depup の
+    /// 報告が食い違うので、`minimum_release_age_excludes` と同じく呼び出し側が警告を
+    /// 出せるように検出結果を返す。
+    ///
+    /// dotted key (`node.minimum_release_age = "30d"`) も toml クレートが inline table と
+    /// 同じ構造へ畳むためそのまま拾える。返り値はツール名の昇順で安定させる。
+    pub fn tool_minimum_release_ages(content: &str) -> Vec<ToolMinimumReleaseAge> {
+        let Ok(parsed) = toml::from_str::<toml::Value>(content) else {
+            return Vec::new();
+        };
+        let Some(tools) = parsed.get("tools").and_then(|v| v.as_table()) else {
+            return Vec::new();
+        };
+
+        let mut found: Vec<ToolMinimumReleaseAge> = tools
+            .iter()
+            .filter_map(|(tool, value)| {
+                let raw = value
+                    .as_table()?
+                    .get("minimum_release_age")
+                    .and_then(|v| v.as_str())?;
+                Some(ToolMinimumReleaseAge {
+                    tool: tool.trim().to_string(),
+                    raw: raw.to_string(),
+                    age: parse_mise_duration(raw),
+                })
+            })
+            .collect();
+
+        // TOML のテーブルは順序を保持しないため、表示順を安定させる
+        found.sort_by(|a, b| a.tool.cmp(&b.tool));
+        found
+    }
+
+    /// ディレクトリ直下の mise 設定ファイルからツール単位 `minimum_release_age` を集める。
+    ///
+    /// 複数ファイルに散っていてもすべて返す (同じツールが複数ファイルにあれば
+    /// mise の優先順で先に読まれたファイルの値を採用する)。
+    pub fn tool_minimum_release_ages_from_dir(dir: &Path) -> Vec<ToolMinimumReleaseAge> {
+        let mut found: Vec<ToolMinimumReleaseAge> = Vec::new();
+        for filename in MISE_CONFIG_FILENAMES {
+            let Ok(content) = std::fs::read_to_string(dir.join(filename)) else {
+                continue;
+            };
+            for entry in Self::tool_minimum_release_ages(&content) {
+                if !found.iter().any(|existing| existing.tool == entry.tool) {
+                    found.push(entry);
+                }
+            }
+        }
+        found.sort_by(|a, b| a.tool.cmp(&b.tool));
+        found
+    }
+}
+
 /// 指定ディレクトリに mise の設定ファイルがあるか
 pub fn has_mise_config(dir: &Path) -> bool {
     MISE_CONFIG_FILENAMES
@@ -291,6 +373,79 @@ mod tests {
         assert!(!has_mise_config(dir.path()));
         fs::write(dir.path().join("mise.toml"), "[tools]\n").unwrap();
         assert!(has_mise_config(dir.path()));
+    }
+
+    /// ツール単位の `minimum_release_age` は depup が適用できないので、
+    /// 呼び出し側が警告を出せるように検出できること
+    #[test]
+    fn test_tool_minimum_release_ages() {
+        let content = concat!(
+            "[tools]\n",
+            "node = { version = \"22\", minimum_release_age = \"30d\" }\n",
+            "python.minimum_release_age = \"12h\"\n",
+            "go = \"1.24.3\"\n",
+            "java = { version = \"temurin-21\" }\n",
+        );
+
+        let found = MiseSettings::tool_minimum_release_ages(content);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].tool, "node");
+        assert_eq!(found[0].raw, "30d");
+        assert_eq!(found[0].age, Some(Duration::from_secs(30 * 86400)));
+        // dotted key も inline table と同じ構造へ畳まれるので拾える
+        assert_eq!(found[1].tool, "python");
+        assert_eq!(found[1].age, Some(Duration::from_secs(12 * 3600)));
+    }
+
+    /// 相対表記として解釈できない値でも「設定されている」ことは報告する
+    #[test]
+    fn test_tool_minimum_release_ages_keeps_unparsable_value() {
+        let content =
+            "[tools]\nnode = { version = \"22\", minimum_release_age = \"2024-06-01\" }\n";
+        let found = MiseSettings::tool_minimum_release_ages(content);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].raw, "2024-06-01");
+        assert!(found[0].age.is_none());
+    }
+
+    #[test]
+    fn test_tool_minimum_release_ages_without_tools_section() {
+        assert!(
+            MiseSettings::tool_minimum_release_ages("[settings]\nminimum_release_age = \"7d\"\n")
+                .is_empty()
+        );
+        assert!(MiseSettings::tool_minimum_release_ages("[settings\nbroken").is_empty());
+    }
+
+    #[test]
+    fn test_tool_minimum_release_ages_from_dir() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("mise.toml"),
+            "[tools]\nnode = { version = \"22\", minimum_release_age = \"30d\" }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join(".mise.toml"),
+            "[tools]\nruby = { version = \"3.4\", minimum_release_age = \"7d\" }\n",
+        )
+        .unwrap();
+
+        let found = MiseSettings::tool_minimum_release_ages_from_dir(dir.path());
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].tool, "node");
+        assert_eq!(found[1].tool, "ruby");
+
+        // ローカル上書きは読まない (from_dir と同じ方針)
+        fs::write(
+            dir.path().join("mise.local.toml"),
+            "[tools]\ngo = { version = \"1.24\", minimum_release_age = \"90d\" }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            MiseSettings::tool_minimum_release_ages_from_dir(dir.path()).len(),
+            2
+        );
     }
 
     #[test]

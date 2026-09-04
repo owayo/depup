@@ -408,7 +408,13 @@ fn replace_version_token_preserving_shape(
     let replacement = if has_wildcard_segment(token) {
         format_wildcard_like(token, new_version)?
     } else {
-        format_partial_version_like(token, new_version)?
+        // セグメント数を保てない形 (プレリリース識別子やビルドメタデータを含む
+        // `~1.2.3-rc.1` 等) では識別子を落とさないよう完全版へフォールバックする。
+        // 単体 Tilde (`format_tilde_like` 経由) は同じ状況で完全版を使うため、
+        // ここで諦めると「上限が付いて Range になった途端に更新できなくなる」
+        // という非対称が生まれる。
+        format_partial_version_like(token, new_version)
+            .unwrap_or_else(|| preserve_version_prefix(token, new_version))
     };
 
     Some(format!("{}{}{}", &raw[..start], replacement, &raw[end..]))
@@ -511,8 +517,15 @@ fn format_range_like(raw: &str, new_version: &str) -> Option<String> {
         return replace_version_token(raw, start, end, new_version);
     }
 
-    if trimmed.contains("||") || contains_not_equal_operator(trimmed) || trimmed.starts_with("===")
-    {
+    // OR 結合された制約は「どちらかの分岐を満たせばよい」という和集合なので、
+    // 片方の分岐の下限だけを進めると意味が変わる (`>=1.0 <2.0 | >=3.0` の下限を
+    // 上げると 1.x を許す分岐が消える)。安全に書き換えられないため丸ごと諦める。
+    //
+    // 判定は `|` 1 文字で行う。composer/semver の `parseConstraints` は
+    // `preg_split('{\s*\|\|?\s*}')` で `|` と `||` を同格の OR として扱うため、
+    // `||` だけを見ていると `>=1.0 <2.0 | >=3.0` のような後方互換表記が素通りする。
+    // `|` を制約構文の別の用途で使うエコシステムは無い。
+    if trimmed.contains('|') || contains_not_equal_operator(trimmed) || trimmed.starts_with("===") {
         return None;
     }
 
@@ -644,6 +657,24 @@ impl VersionSpec {
         self.kind.is_pinned()
     }
 
+    /// 報告 (テキスト / JSON 出力) で「現在のバージョン」として見せる文字列。
+    ///
+    /// `version` は比較用に正規化した値なので、Go のようにバージョン文字列自体が
+    /// `v` を含むエコシステムでは接頭辞が落ちる。一方で更新先はレジストリが返す
+    /// 生の値 (`v1.6.0`) なので、そのまま並べると `1.3.0 → v1.6.0` という不揃いな
+    /// 表示になり、JSON を機械処理する側でも `from` と `to` の書式が食い違う。
+    ///
+    /// 対象は `v` / `V` の接頭辞だけ。`^` / `~` / `>=` は制約を表す演算子であって
+    /// バージョンの一部ではないため含めない (含めると他言語の表示が変わる)。
+    pub fn display_version(&self) -> String {
+        match self.prefix.as_deref() {
+            Some(prefix @ ("v" | "V")) if !self.version.is_empty() => {
+                format!("{prefix}{}", self.version)
+            }
+            _ => self.version.clone(),
+        }
+    }
+
     /// 安全に更新後の文字列表現を組み立てられる場合だけ返す
     pub fn try_format_updated(&self, new_version: &str) -> Option<String> {
         match self.kind {
@@ -758,6 +789,33 @@ mod tests {
     fn test_version_spec_with_prefix() {
         let spec = VersionSpec::new(VersionSpecKind::Caret, "^1.2.3", "1.2.3").with_prefix("^");
         assert_eq!(spec.prefix, Some("^".to_string()));
+    }
+
+    /// 回帰テスト: 表示用バージョンは `v` 接頭辞だけを復元する。
+    ///
+    /// Go の更新先はレジストリが返す `v1.6.0` なのに、現在版は比較用に `v` を
+    /// 剥がした `1.3.0` を出していたため `1.3.0 → v1.6.0` と不揃いになり、
+    /// JSON の `from` / `to` も書式が食い違っていた。
+    #[test]
+    fn test_display_version_restores_v_prefix_only() {
+        // Go: `v` はバージョン文字列の一部なので復元する
+        let spec = VersionSpec::new(VersionSpecKind::Exact, "v1.3.0", "1.3.0").with_prefix("v");
+        assert_eq!(spec.display_version(), "v1.3.0");
+
+        let spec = VersionSpec::new(VersionSpecKind::Exact, "V1.3.0", "1.3.0").with_prefix("V");
+        assert_eq!(spec.display_version(), "V1.3.0");
+
+        // 演算子は制約であってバージョンの一部ではないので含めない
+        for (raw, prefix) in [("^1.2.3", "^"), ("~1.2.3", "~"), (">=1.2.3", ">=")] {
+            let spec = VersionSpec::new(VersionSpecKind::Caret, raw, "1.2.3").with_prefix(prefix);
+            assert_eq!(spec.display_version(), "1.2.3", "raw={raw}");
+        }
+
+        // prefix なし・バージョンなしはそのまま
+        let spec = VersionSpec::new(VersionSpecKind::Exact, "1.2.3", "1.2.3");
+        assert_eq!(spec.display_version(), "1.2.3");
+        let spec = VersionSpec::new(VersionSpecKind::Any, "", "");
+        assert_eq!(spec.display_version(), "");
     }
 
     #[test]
@@ -1028,6 +1086,57 @@ mod tests {
     fn test_try_format_updated_range_rejects_single_pipe_or_constraint() {
         let spec = VersionSpec::new(VersionSpecKind::Range, "^1 | ^2", "1");
         assert!(spec.try_format_updated("2.0.0").is_none());
+    }
+
+    /// 回帰テスト: 比較演算子やカンマを含む単一パイプ OR も拒否する。
+    ///
+    /// 以前は `||` しか見ておらず、`^1 | ^2` が弾かれていたのは
+    /// `format_partial_version_like` の数値セグメント検査に引っかかる副作用に
+    /// すぎなかった。`<` / `>` / `,` が入ると穴が開き、片方の分岐の下限だけを
+    /// 進めて OR の意味を変える (`>=1.0 <2.0 | >=3.0` の 1.x 分岐が消える) か、
+    /// 別分岐の上限で候補を不当に絞っていた。
+    #[test]
+    fn test_try_format_updated_range_rejects_single_pipe_with_comparators() {
+        for raw in [
+            ">=1.0 <2.0 | >=3.0",
+            ">=1.0 <2.0 | >=3.0 <4.0",
+            ">=1.0,<2.0|>=3.0",
+            "5.5.*|>=6.0",
+        ] {
+            let spec = VersionSpec::new(VersionSpecKind::Range, raw, "1.0");
+            assert!(
+                spec.try_format_updated("3.5.0").is_none(),
+                "単一パイプ OR は書き換え不可であるべき: {raw}"
+            );
+        }
+    }
+
+    /// 回帰テスト: comparator set に埋め込まれた tilde の下限がプレリリースや
+    /// ビルドメタデータを含む場合、セグメント数を保てなくても完全版へ
+    /// フォールバックする。
+    ///
+    /// 単体 Tilde (`~1.2.3-rc.1`) は完全版フォールバックが効くのに、上限が付いて
+    /// Range 扱いになった途端に書き換え不能になる非対称があった。
+    #[test]
+    fn test_format_range_like_embedded_tilde_with_prerelease_falls_back() {
+        let spec = VersionSpec::new(VersionSpecKind::Range, "~1.2.3-rc.1, <2.0", "1.2.3-rc.1");
+        assert_eq!(
+            spec.try_format_updated("1.9.0-rc.2"),
+            Some("~1.9.0-rc.2, <2.0".to_string())
+        );
+
+        let spec = VersionSpec::new(VersionSpecKind::Range, "~1.2.3+build, <2.0", "1.2.3+build");
+        assert_eq!(
+            spec.try_format_updated("1.9.0"),
+            Some("~1.9.0, <2.0".to_string())
+        );
+
+        // 数値だけの下限は従来どおりセグメント数を保つ
+        let spec = VersionSpec::new(VersionSpecKind::Range, "~1.2, <2.0", "1.2");
+        assert_eq!(
+            spec.try_format_updated("1.9.3"),
+            Some("~1.9, <2.0".to_string())
+        );
     }
 
     #[test]

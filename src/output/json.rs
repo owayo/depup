@@ -192,7 +192,9 @@ impl JsonFormatter {
                         Some(JsonUpdate {
                             name: dependency.name.clone(),
                             kind: "registry",
-                            from: dependency.version_spec.version.clone(),
+                            // `to` はレジストリが返す生の値なので、`from` も同じ書式
+                            // (Go なら `v` 付き) に揃える
+                            from: dependency.version_spec.display_version(),
                             to: new_version.clone(),
                             dev: dependency.is_dev,
                             source: None,

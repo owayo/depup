@@ -251,6 +251,157 @@ dependencies {
         );
     }
 
+    /// go.work のメンバーモジュールが検出されることをテストする
+    ///
+    /// ルートに go.mod が無い構成では、展開しないと Go 依存が 1 件も更新されず
+    /// 「更新なし」と報告してしまう (無言の no-op)。
+    #[test]
+    fn test_detect_go_work_member_modules() {
+        let temp_dir = create_test_dir();
+        let root = temp_dir.path();
+
+        fs::write(
+            root.join("go.work"),
+            "go 1.23.0\n\nuse (\n\t./svc-a\n\t./svc-b\n)\n",
+        )
+        .unwrap();
+        for member in ["svc-a", "svc-b"] {
+            fs::create_dir_all(root.join(member)).unwrap();
+            fs::write(
+                root.join(member).join("go.mod"),
+                format!("module example.com/{member}\n\ngo 1.23.0\n"),
+            )
+            .unwrap();
+        }
+
+        let manifests = depup::manifest::detect_manifests(root);
+        let go_manifests: Vec<_> = manifests
+            .iter()
+            .filter(|m| m.language == depup::domain::Language::Go)
+            .collect();
+
+        assert_eq!(
+            go_manifests.len(),
+            2,
+            "go.work の use に挙げた 2 モジュールが検出されるべき: {manifests:?}"
+        );
+        for member in ["svc-a", "svc-b"] {
+            assert!(
+                go_manifests
+                    .iter()
+                    .any(|m| m.path == root.join(member).join("go.mod")),
+                "{member}/go.mod が検出されるべき"
+            );
+        }
+    }
+
+    /// go.work が参照するモジュールとルートの go.mod が重複しないことをテストする
+    #[test]
+    fn test_detect_go_work_does_not_duplicate_root_module() {
+        let temp_dir = create_test_dir();
+        let root = temp_dir.path();
+
+        fs::write(root.join("go.work"), "go 1.23.0\n\nuse .\n").unwrap();
+        fs::write(
+            root.join("go.mod"),
+            "module example.com/root\n\ngo 1.23.0\n",
+        )
+        .unwrap();
+
+        let manifests = depup::manifest::detect_manifests(root);
+        let go_count = manifests
+            .iter()
+            .filter(|m| m.language == depup::domain::Language::Go)
+            .count();
+
+        assert_eq!(go_count, 1, "ルートの go.mod は 1 件だけであるべき");
+    }
+
+    /// settings.gradle の include からサブプロジェクトが検出されることをテストする
+    ///
+    /// 依存宣言の大半はサブプロジェクト側にあるため、ルートだけ見ていると
+    /// 「更新なし」と報告してしまう。
+    #[test]
+    fn test_detect_gradle_subprojects_from_settings() {
+        let temp_dir = create_test_dir();
+        let root = temp_dir.path();
+
+        fs::write(
+            root.join("settings.gradle"),
+            "rootProject.name = 'demo'\ninclude ':app', ':core'\n",
+        )
+        .unwrap();
+        for module in ["app", "core"] {
+            fs::create_dir_all(root.join(module)).unwrap();
+            fs::write(
+                root.join(module).join("build.gradle"),
+                "dependencies {\n    implementation 'com.google.guava:guava:33.0.0-jre'\n}\n",
+            )
+            .unwrap();
+        }
+
+        let manifests = depup::manifest::detect_manifests(root);
+        let java_manifests: Vec<_> = manifests
+            .iter()
+            .filter(|m| m.language == depup::domain::Language::Java)
+            .collect();
+
+        assert_eq!(
+            java_manifests.len(),
+            2,
+            "include に挙げた 2 サブプロジェクトが検出されるべき: {manifests:?}"
+        );
+        for module in ["app", "core"] {
+            assert!(
+                java_manifests
+                    .iter()
+                    .any(|m| m.path == root.join(module).join("build.gradle")),
+                "{module}/build.gradle が検出されるべき"
+            );
+        }
+    }
+
+    /// Kotlin DSL の settings.gradle.kts でもサブプロジェクトを検出することをテストする
+    #[test]
+    fn test_detect_gradle_subprojects_kotlin_dsl() {
+        let temp_dir = create_test_dir();
+        let root = temp_dir.path();
+
+        fs::write(
+            root.join("settings.gradle.kts"),
+            "rootProject.name = \"demo\"\ninclude(\n    \":app\",\n    \":core:api\",\n)\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("app")).unwrap();
+        fs::write(
+            root.join("app").join("build.gradle.kts"),
+            "dependencies {\n    implementation(\"com.google.guava:guava:33.0.0-jre\")\n}\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("core").join("api")).unwrap();
+        fs::write(
+            root.join("core").join("api").join("build.gradle"),
+            "dependencies {\n    implementation 'junit:junit:4.13.2'\n}\n",
+        )
+        .unwrap();
+
+        let manifests = depup::manifest::detect_manifests(root);
+        let java_paths: Vec<_> = manifests
+            .iter()
+            .filter(|m| m.language == depup::domain::Language::Java)
+            .map(|m| m.path.clone())
+            .collect();
+
+        assert!(
+            java_paths.contains(&root.join("app").join("build.gradle.kts")),
+            "app/build.gradle.kts が検出されるべき: {java_paths:?}"
+        );
+        assert!(
+            java_paths.contains(&root.join("core").join("api").join("build.gradle")),
+            "core/api/build.gradle が検出されるべき: {java_paths:?}"
+        );
+    }
+
     /// build.gradle.kts（Kotlin DSL）の検出をテストする
     #[test]
     fn test_detect_gradle_kts_manifest() {
@@ -1478,6 +1629,116 @@ mod pipeline_tests {
         // ファイル内容が変更されたことを確認する
         let updated = fs::read_to_string(&path).unwrap();
         assert!(updated.contains("^4.18.0"));
+    }
+
+    /// 回帰テスト: x-range 端点のハイフンレンジで上限が守られることを
+    /// judge → writer の実経路で確認する。
+    ///
+    /// 上限抽出がワイルドカード端点を読めなかったときは、judge がレンジ外の
+    /// 最新版を選び writer が下限だけを置換して `4.18.x - 2.3.x`
+    /// (= `>=4.18.0 <2.4.0-0`、空レンジ) を書き込み、`npm install` が
+    /// 必ず失敗するマニフェストを生成していた。
+    #[test]
+    fn test_pipeline_hyphen_range_with_wildcard_endpoints_respects_upper_bound() {
+        let dir = create_test_dir();
+        let path = dir.path().join("package.json");
+        fs::write(
+            &path,
+            r#"{
+  "dependencies": {
+    "lodash": "1.2.x - 2.3.x"
+  }
+}"#,
+        )
+        .unwrap();
+
+        let manifests = detect_manifests(dir.path());
+        let parser = get_parser(manifests[0].language);
+        let content = fs::read_to_string(&path).unwrap();
+        let deps = parser.parse(&content).unwrap();
+        assert_eq!(deps.len(), 1);
+
+        // 上限 `2.3.x` (= <2.4.0) を跨ぐ候補を含める
+        let versions = vec![
+            VersionInfo::new("1.2.0", Utc::now() - chrono::Duration::days(400)),
+            VersionInfo::new("2.3.0", Utc::now() - chrono::Duration::days(300)),
+            VersionInfo::new("2.4.0", Utc::now() - chrono::Duration::days(200)),
+            VersionInfo::new("4.18.1", Utc::now() - chrono::Duration::days(100)),
+        ];
+
+        let judge = UpdateJudge::new(UpdateFilter::new());
+        let result = judge.judge(&deps[0], &versions);
+
+        let mut manifest_result = ManifestUpdateResult::new(&path, manifests[0].language);
+        manifest_result.add_result(result);
+
+        let writer = ManifestWriter::new(false);
+        writer
+            .apply_updates(&manifest_result, parser.as_ref())
+            .unwrap();
+
+        let updated = fs::read_to_string(&path).unwrap();
+        assert!(
+            updated.contains("2.3.x - 2.3.x"),
+            "上限内の最新版へ更新されるべき: {updated}"
+        );
+        assert!(
+            !updated.contains("4.18"),
+            "上限を超える候補を選んではならない: {updated}"
+        );
+    }
+
+    /// 回帰テスト: Gemfile の複合制約が judge → writer の実経路で更新できる。
+    ///
+    /// 以前は judge が Update を返すのに writer が「複合バージョン制約は安全に
+    /// 書き換えられません」で失敗し、サマリだけ「更新した」と表示していた。
+    #[test]
+    fn test_pipeline_updates_gemfile_compound_constraint() {
+        let dir = create_test_dir();
+        let path = dir.path().join("Gemfile");
+        fs::write(
+            &path,
+            "source \"https://rubygems.org\"\ngem \"pg\", \">= 0.18\", \"< 2.0\"\n",
+        )
+        .unwrap();
+
+        let manifests = detect_manifests(dir.path());
+        let parser = get_parser(manifests[0].language);
+        let content = fs::read_to_string(&path).unwrap();
+        let deps = parser.parse(&content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(
+            deps[0].version_spec.version, "0.18",
+            "比較基準は包含下限であるべき"
+        );
+
+        let versions = vec![
+            VersionInfo::new("0.18.0", Utc::now() - chrono::Duration::days(400)),
+            VersionInfo::new("1.5.9", Utc::now() - chrono::Duration::days(100)),
+            // 上限 `< 2.0` を超える候補は選ばれてはならない
+            VersionInfo::new("2.1.0", Utc::now() - chrono::Duration::days(50)),
+        ];
+
+        let judge = UpdateJudge::new(UpdateFilter::new());
+        let result = judge.judge(&deps[0], &versions);
+
+        let mut manifest_result = ManifestUpdateResult::new(&path, manifests[0].language);
+        manifest_result.add_result(result);
+
+        let writer = ManifestWriter::new(false);
+        let write_result = writer
+            .apply_updates(&manifest_result, parser.as_ref())
+            .unwrap();
+
+        assert_eq!(
+            write_result.updates_applied, 1,
+            "複合制約も書き込めるべき: {write_result:?}"
+        );
+        let updated = fs::read_to_string(&path).unwrap();
+        assert!(
+            updated.contains(r#"gem "pg", ">= 1.5.9", "< 2.0""#),
+            "包含下限だけを進め、引数の形を保つべき: {updated}"
+        );
     }
 
     /// mise の一連の処理 (検出→解析→判定→書き込み) をネットワークなしでテストする。

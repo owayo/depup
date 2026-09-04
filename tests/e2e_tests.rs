@@ -574,6 +574,53 @@ mod cli_options_tests {
         );
     }
 
+    /// 非 PyPI 既定インデックスを設定した pyproject.toml は全依存がスキップされ、
+    /// 理由が警告として出ることを確認する。
+    ///
+    /// 依存が 0 件になるだけでは「更新なし」と区別がつかず、利用者は
+    /// private index の依存が意図的に外されていることに気づけない。
+    #[test]
+    fn test_non_pypi_default_index_warns_and_skips() {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp directory");
+        let pyproject = r#"[project]
+name = "internal-app"
+version = "1.0.0"
+dependencies = [
+    "requests>=2.28.0",
+]
+
+[[tool.poetry.source]]
+name = "internal"
+url = "https://pypi.internal.example.com/simple/"
+priority = "primary"
+"#;
+        fs::write(temp_dir.path().join("pyproject.toml"), pyproject).unwrap();
+
+        let binary = get_binary_path();
+        let output = Command::new(&binary)
+            .args([
+                "--dry-run",
+                "--python",
+                "--no-osv",
+                temp_dir.path().to_str().unwrap(),
+            ])
+            .output()
+            .expect("Failed to execute command");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("non-PyPI default index"),
+            "スキップ理由が警告として出るべき: {stderr}"
+        );
+
+        // マニフェストは書き換えられない
+        let after = fs::read_to_string(temp_dir.path().join("pyproject.toml")).unwrap();
+        assert!(
+            after.contains("requests>=2.28.0"),
+            "依存は書き換えられないべき: {after}"
+        );
+    }
+
     /// diff 出力モードを確認する
     #[test]
     fn test_diff_output_mode() {
