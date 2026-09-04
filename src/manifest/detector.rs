@@ -562,13 +562,18 @@ fn parse_go_work_uses(content: &str) -> Vec<String> {
 }
 
 /// go.work の 1 エントリからパストークンを取り出す (クォートと閉じ括弧を除く)
+///
+/// クォート付きは空白を含みうる (`use "./svc a"`) ため、先に空白で切ると
+/// 途中で千切れて先頭のクォートが残り、パス解決に失敗して無言で取りこぼす。
+/// クォートの有無で切り出し方を分ける。
 fn go_work_path_token(text: &str) -> Option<String> {
+    let text = text.trim_start();
+    if let Some(rest) = text.strip_prefix('"') {
+        let (quoted, _) = rest.split_once('"')?;
+        return (!quoted.is_empty()).then(|| quoted.to_string());
+    }
     let token = text.split_whitespace().next()?.trim_end_matches(')');
-    let unquoted = token
-        .strip_prefix('"')
-        .and_then(|rest| rest.strip_suffix('"'))
-        .unwrap_or(token);
-    (!unquoted.is_empty()).then(|| unquoted.to_string())
+    (!token.is_empty()).then(|| token.to_string())
 }
 
 /// settings.gradle(.kts) の `include` を展開してサブプロジェクトのビルドファイルを返す。
@@ -1431,6 +1436,31 @@ members = ["crates/nonexistent"]
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(file_name), "dependencies {}\n").unwrap();
         dir.join(file_name)
+    }
+
+    /// 回帰テスト: クォート付きパスに空白があっても取りこぼさない。
+    ///
+    /// 先に空白で切っていたときは `"./svc a"` が `"./svc` で千切れ、
+    /// 先頭のクォートが残ったまま返るためパス解決に失敗していた。
+    #[test]
+    fn test_go_work_path_token_handles_quoted_paths() {
+        assert_eq!(
+            go_work_path_token(r#""./svc a""#).as_deref(),
+            Some("./svc a")
+        );
+        assert_eq!(
+            go_work_path_token(r#""./svc-a""#).as_deref(),
+            Some("./svc-a")
+        );
+        assert_eq!(go_work_path_token("./svc-a").as_deref(), Some("./svc-a"));
+        assert_eq!(go_work_path_token("./svc-a)").as_deref(), Some("./svc-a"));
+        assert_eq!(
+            go_work_path_token("  ./svc-a  ").as_deref(),
+            Some("./svc-a")
+        );
+        // 閉じクォートが無い壊れた入力は取りこぼす (誤ったパスを作らない)
+        assert_eq!(go_work_path_token(r#""./svc-a"#), None);
+        assert_eq!(go_work_path_token("").as_deref(), None);
     }
 
     /// 回帰: ルートに go.mod が無い go.work 構成では、展開しないと Go 依存が

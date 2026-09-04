@@ -275,18 +275,33 @@ fn in_non_registry_block(block_stack: &[GemfileBlock]) -> bool {
 /// 解釈するため、`try_format_updated` の結果も 1 本の文字列 (`">= 1.5.0, < 2.0"`)
 /// になる。書き戻しでは元の引数へ分け直す必要がある。要素数が一致しない場合は
 /// どの引数へ何を書くか決められないため `None` を返し、呼び出し側でエラーにする。
-fn split_updated_constraint(formatted: &str, expected: usize) -> Option<Vec<String>> {
-    if expected <= 1 {
+fn split_updated_constraint(formatted: &str, original_parts: &[&str]) -> Option<Vec<String>> {
+    if original_parts.len() <= 1 {
         // 単一引数はカンマを含んでいてもそのまま 1 つの文字列として書き戻す
         // (`gem "pg", ">= 0.18, < 2.0"` の形)
         return Some(vec![formatted.to_string()]);
     }
 
-    let parts: Vec<String> = formatted
-        .split(',')
-        .map(|part| part.trim().into())
-        .collect();
-    (parts.len() == expected).then_some(parts)
+    // 元の引数自身がカンマを含むことがある (`gem 'pg', '>= 0.18, < 1.0', '<= 2.0'`)。
+    // 単純にカンマ数で割ると要素数が合わずエラーになるので、引数ごとの
+    // カンマ数だけトークンを取って配り直す。
+    let tokens: Vec<&str> = formatted.split(',').map(str::trim).collect();
+    let expected_tokens: usize = original_parts
+        .iter()
+        .map(|part| part.matches(',').count() + 1)
+        .sum();
+    if tokens.len() != expected_tokens {
+        return None;
+    }
+
+    let mut rebuilt = Vec::with_capacity(original_parts.len());
+    let mut cursor = 0usize;
+    for part in original_parts {
+        let take = part.matches(',').count() + 1;
+        rebuilt.push(tokens[cursor..cursor + take].join(", "));
+        cursor += take;
+    }
+    Some(rebuilt)
 }
 
 impl ManifestParser for GemfileParser {
@@ -527,11 +542,9 @@ impl ManifestParser for GemfileParser {
                     // 「複合は書き換え不可」にすると judge が Update を報告した更新を
                     // writer が必ず失敗させる (report/apply の矛盾) 。
                     _ => {
-                        let joined = version_parts
-                            .iter()
-                            .map(|part| part.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ");
+                        let original_parts: Vec<&str> =
+                            version_parts.iter().map(|part| part.as_str()).collect();
+                        let joined = original_parts.join(", ");
 
                         if let Some(spec) = parser.parse(&joined) {
                             // judge も同じ `try_format_updated` で更新可否を決めているため、
@@ -546,7 +559,7 @@ impl ManifestParser for GemfileParser {
                             };
 
                             let Some(new_parts) =
-                                split_updated_constraint(&formatted, version_parts.len())
+                                split_updated_constraint(&formatted, &original_parts)
                             else {
                                 return Err(ManifestError::InvalidVersionSpec {
                                     path: PathBuf::from("Gemfile"),
@@ -1221,14 +1234,39 @@ gem 'nokogiri'
         }
     }
 
-    /// カンマ分割の要素数が元の引数の個数と一致しない場合は、どの引数へ何を書くか
-    /// 決められないため安全側でエラーにする (誤書き込みを防ぐ)。
+    /// 回帰テスト: 元の引数自身がカンマを含んでいても、引数ごとのカンマ数で
+    /// トークンを配り直して書き戻せる。
+    ///
+    /// カンマ数だけで機械的に割っていたときは要素数が合わずエラーになり、
+    /// judge が Update を報告した更新を writer が必ず失敗させていた。
     #[test]
-    fn test_update_version_compound_constraint_part_count_mismatch_returns_err() {
-        // 1 つ目の引数が自前でカンマを含むため、更新後の文字列は 3 要素になる
-        let content = "gem 'pg', '>= 0.18, < 1.0', '<= 2.0'\n";
-        let result = GemfileParser.update_version(content, "pg", "1.5.0");
-        assert!(result.is_err(), "{result:?}");
+    fn test_update_version_compound_constraint_with_comma_inside_argument() {
+        let content = "gem 'pg', '>= 0.18, < 3.0', '<= 2.0'\n";
+        let result = GemfileParser
+            .update_version(content, "pg", "1.5.0")
+            .unwrap();
+        assert_eq!(result, "gem 'pg', '>= 1.5.0, < 3.0', '<= 2.0'\n");
+    }
+
+    /// カンマ分割の要素数が元の引数から期待される数と一致しない場合は、どの引数へ
+    /// 何を書くか決められないため安全側で `None` を返す (誤書き込みを防ぐ)。
+    #[test]
+    fn test_split_updated_constraint_token_count_mismatch() {
+        // 元は 3 トークン (2 + 1) を期待するのに 2 トークンしか無い
+        assert_eq!(
+            split_updated_constraint(">= 1.5.0, < 3.0", &[">= 0.18, < 3.0", "<= 2.0"]),
+            None
+        );
+        // 期待どおりなら引数ごとに配り直す
+        assert_eq!(
+            split_updated_constraint(">= 1.5.0, < 3.0, <= 2.0", &[">= 0.18, < 3.0", "<= 2.0"]),
+            Some(vec![">= 1.5.0, < 3.0".to_string(), "<= 2.0".to_string()])
+        );
+        // 単一引数はカンマを含んでもそのまま 1 本で返す
+        assert_eq!(
+            split_updated_constraint(">= 1.5.0, < 2.0", &[">= 0.18, < 2.0"]),
+            Some(vec![">= 1.5.0, < 2.0".to_string()])
+        );
     }
 
     /// 除外制約 (`!=`) を含む複合制約は judge が Skip するため writer には来ないが、

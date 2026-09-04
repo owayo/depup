@@ -1099,9 +1099,18 @@ impl GradleParser {
         // ブロックコメント内のオープナーや宣言を書き換えないよう、除去済みの行で検出する
         let stripped_lines = strip_gradle_comment_lines(content);
         let active_lines: Vec<&str> = stripped_lines.iter().map(|line| line.as_str()).collect();
+        // parse が依存として surface しないブロック (`constraints` /
+        // `resolutionStrategy` / `dependencySubstitution`) は書き換え対象からも外す。
+        // parse 側だけマスクすると、同じ座標を実依存と constraints の両方で宣言している
+        // ビルドで「実依存の版を更新した」と報告しながら constraints 側の
+        // `strictly(...)` を書き換えることになり、実依存は古いまま残る
+        let non_dependency_lines = non_dependency_block_mask(&active_lines);
         let parser = get_parser(Language::Java);
 
         for (line_index, active_line) in active_lines.iter().enumerate() {
+            if non_dependency_lines[line_index] {
+                continue;
+            }
             let Some(caps) = DEP_STRING_NO_VERSION.captures(active_line) else {
                 continue;
             };
@@ -2392,6 +2401,39 @@ dependencies {
             .update_version(content, "com.google.guava:guava", "33.4.0-jre")
             .unwrap();
         assert!(result.contains("implementation 'com.google.guava:guava:33.4.0-jre'"));
+    }
+
+    /// 回帰テスト: constraints ブロック内の rich version 宣言を書き換えない。
+    ///
+    /// parse だけをマスクしたとき、writer は最初に一致した宣言を書き換えるため
+    /// 「実依存 (2.0.9) を更新した」と報告しながら constraints 側の
+    /// `strictly("1.7.36")` を書き換え、実依存は古いまま残っていた。
+    #[test]
+    fn test_update_rich_version_skips_constraints_block() {
+        let content = r#"
+dependencies {
+    constraints {
+        implementation("org.slf4j:slf4j-api") { version { strictly("1.7.36") } }
+    }
+    implementation("org.slf4j:slf4j-api") { version { strictly("2.0.9") } }
+}
+"#;
+        // parse は実依存だけを surface する
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1, "{deps:?}");
+        assert_eq!(deps[0].version_spec.version, "2.0.9");
+
+        let result = GradleParser
+            .update_version(content, "org.slf4j:slf4j-api", "2.0.17")
+            .unwrap();
+        assert!(
+            result.contains(r#"strictly("1.7.36")"#),
+            "constraints 側は書き換えない: {result}"
+        );
+        assert!(
+            result.contains(r#"strictly("2.0.17")"#),
+            "実依存側を書き換える: {result}"
+        );
     }
 
     #[test]

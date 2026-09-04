@@ -911,7 +911,10 @@ fn index_url_is_pypi(url: &str) -> bool {
         .unwrap_or(authority);
     let host = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
     let host = host.trim_end_matches('.').to_ascii_lowercase();
-    host == "pypi.org" || host.ends_with(".pypi.org")
+    // `test.pypi.org` は本番と別のパッケージ集合を持つ独立したインデックスなので
+    // PyPI 扱いしない (サブドメイン一致で通すと、TestPyPI を既定にしたプロジェクトへ
+    // 本番 PyPI の版を書き込んでしまう)。インデックス URL にサブドメインは現れない
+    host == "pypi.org"
 }
 
 /// Poetry の `[[tool.poetry.source]]` が暗黙の PyPI を無効化しているか判定する。
@@ -930,17 +933,37 @@ fn poetry_disables_default_pypi(toml: &Value) -> bool {
         return false;
     };
 
+    // `name = "pypi"` の再宣言があれば PyPI は解決経路に残る。ただし
+    // `priority = "explicit"` は「依存側が source を明示したときだけ使う」優先度で
+    // 通常解決には参加しないため、これを PyPI 有効の根拠にしてはいけない
+    // (Poetry が private index 運用で推奨する書き方なので、素通しすると
+    // dependency confusion 対策が 1 行足すだけで無効化される)。
     let pypi_declared = sources.iter().any(|source| {
-        source
+        let is_pypi = source
             .get("name")
             .and_then(Value::as_str)
-            .is_some_and(|name| name.eq_ignore_ascii_case("pypi"))
+            .is_some_and(|name| name.eq_ignore_ascii_case("pypi"));
+        let explicit = source
+            .get("priority")
+            .and_then(Value::as_str)
+            .is_some_and(|priority| priority.eq_ignore_ascii_case("explicit"));
+        is_pypi && !explicit
     });
     if pypi_declared {
         return false;
     }
 
     sources.iter().any(|source| {
+        // URL が PyPI 自身を指しているソースは、名前が何であれ PyPI を無効化しない
+        // (uv / PDM の判定は URL を見ているので、Poetry だけ名前と優先度で判断すると
+        // 本物の PyPI をミラー扱いして全依存を取りこぼす)。
+        if source
+            .get("url")
+            .and_then(Value::as_str)
+            .is_some_and(index_url_is_pypi)
+        {
+            return false;
+        }
         match source.get("priority").and_then(Value::as_str) {
             Some(priority) => {
                 priority.eq_ignore_ascii_case("default") || priority.eq_ignore_ascii_case("primary")
@@ -3296,13 +3319,67 @@ url = "https://pypi.internal.example.com/simple/"
         assert_eq!(parse(extra).unwrap().len(), 1);
     }
 
+    /// 回帰テスト: `priority = "explicit"` の PyPI 宣言では非 PyPI ガードを外さない。
+    ///
+    /// explicit は「依存側が source を明示したときだけ使う」優先度で通常解決には
+    /// 参加しない。これを PyPI 有効の根拠にすると、Poetry が private index 運用で
+    /// 推奨する書き方 1 行で dependency confusion 対策が無効化されてしまう。
+    #[test]
+    fn test_poetry_explicit_pypi_does_not_reenable_updates() {
+        let content = r#"
+[[tool.poetry.source]]
+name = "internal"
+url = "https://pypi.internal.example.com/simple/"
+priority = "primary"
+
+[[tool.poetry.source]]
+name = "pypi"
+priority = "explicit"
+
+[tool.poetry.dependencies]
+internal-auth = "^1.2.0"
+"#;
+        assert!(
+            parse(content).unwrap().is_empty(),
+            "explicit な PyPI 宣言では更新対象にしない"
+        );
+
+        // 通常優先度の PyPI 再宣言なら従来どおり更新対象
+        let alive = content.replace(r#"priority = "explicit""#, r#"priority = "primary""#);
+        assert_eq!(parse(&alive).unwrap().len(), 1);
+    }
+
+    /// 回帰テスト: URL が本物の PyPI を指すソースは名前が何であれ PyPI を無効化しない。
+    ///
+    /// uv / PDM の判定は URL を見ているのに Poetry だけ名前と優先度で判断していたため、
+    /// `name = "corp-pypi"` で本番 PyPI を指すだけの宣言でも全依存が消えていた。
+    #[test]
+    fn test_poetry_primary_source_pointing_at_pypi_keeps_updates() {
+        let content = r#"
+[[tool.poetry.source]]
+name = "corp-pypi"
+url = "https://pypi.org/simple/"
+priority = "primary"
+
+[tool.poetry.dependencies]
+requests = "^2.28.0"
+"#;
+        assert_eq!(
+            parse(content).unwrap().len(),
+            1,
+            "PyPI を指すソースは更新を止めない"
+        );
+    }
+
     /// PyPI 判定はホスト部で行い、類似ホストを PyPI と誤認しない。
     #[test]
     fn test_index_url_is_pypi_host_matching() {
         assert!(index_url_is_pypi("https://pypi.org/simple"));
         assert!(index_url_is_pypi("https://PyPI.org/simple/"));
-        assert!(index_url_is_pypi("https://test.pypi.org/simple"));
         assert!(index_url_is_pypi("https://user:pass@pypi.org:443/simple"));
+        // TestPyPI は本番と別のパッケージ集合を持つ独立したインデックスなので
+        // PyPI 扱いしない (本番の版を書き込むと TestPyPI に存在しない可能性がある)
+        assert!(!index_url_is_pypi("https://test.pypi.org/simple"));
         assert!(!index_url_is_pypi("https://pypi.org.evil.example/simple"));
         assert!(!index_url_is_pypi("https://mypypi.org/simple"));
         assert!(!index_url_is_pypi(

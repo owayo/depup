@@ -36,7 +36,11 @@ const MAVEN_VERSION_TOKEN: &str = r"[vV]?\d[0-9A-Za-z]*(?:[.\-_+][0-9A-Za-z]+)*"
 /// これらを Range として受理するので、上限抽出が追随しないと上限フィルタが丸ごと
 /// 効かなくなり、下限が上限を追い越した空レンジ (`4.17.x - 2.3.x`) を書き戻して
 /// `npm install` を壊していた。
-const WILDCARD_BOUND_TOKEN: &str = r"[vV]?(?:\d+|[xX*])(?:\.(?:\d+|[xX*]))*(?:[-+][0-9A-Za-z.-]+)?";
+///
+/// `VERSION_TOKEN` と同じく PEP 440 の epoch (`1!2.0`) も 1 トークンとして扱う。
+/// これを落とすと `<=1!2.0` の上限が `1` に丸まり、epoch 付きの候補が全滅する。
+const WILDCARD_BOUND_TOKEN: &str =
+    r"[vV]?(?:\d+!)?(?:\d+|[xX*])(?:\.(?:\d+|[xX*]))*(?:[-+][0-9A-Za-z.-]+)?";
 
 /// Range 制約から包含上限 (`<=X`) を抽出する正規表現。
 /// ワイルドカードを含む上限 (`<=2.x`) も拾い、`strip_wildcard_tail` で
@@ -1537,6 +1541,23 @@ mod tests {
         assert_eq!(
             super::extract_upper_bound(">=1.0.0 <2.x"),
             Some(("2".to_string(), false))
+        );
+    }
+
+    /// 回帰テスト: PEP 440 の epoch 付き上限を `<=` でも取りこぼさない。
+    ///
+    /// ワイルドカード対応でトークンを差し替えたとき epoch (`1!`) を落としており、
+    /// `<=1!2.0` の上限が `1` に丸まって epoch 1 系の候補が全滅していた
+    /// (`<` 側は `VERSION_TOKEN` のままだったので `<=` だけが壊れていた)。
+    #[test]
+    fn test_extract_upper_bound_lte_with_epoch() {
+        assert_eq!(
+            super::extract_upper_bound(">=1!1.0,<=1!2.0"),
+            Some(("1!2.0".to_string(), true))
+        );
+        assert_eq!(
+            super::extract_upper_bound(">=1!1.0,<1!2.0"),
+            Some(("1!2.0".to_string(), false))
         );
     }
 
