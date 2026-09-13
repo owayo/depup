@@ -116,6 +116,24 @@ fn strip_wildcard_tail(version: &str) -> Option<String> {
     }
 }
 
+/// `<=` に部分バージョン (`<=0.61` / `<=2.0`) を書いたとき、その系列全体
+/// (`0.61.*` / `2.0.*`) を含むエコシステムかを返す。
+///
+/// - Rust (semver crate): `matches_impl` の `Op::LessEq` は `matches_exact || matches_less` で、
+///   `matches_exact` は comparator に patch が無ければ patch を比較しない。
+///   よって `<=0.61` は `0.61.2` にマッチする
+/// - Node (node-semver): `replaceXRange` が `<=2.0` を `<2.1.0` へ書き換える
+/// - PEP 440 / RubyGems / Composer: `<=1.2` は単純比較なので `1.2.1` を含まない
+/// - Java (Maven レンジ) は `MAVEN_RANGE_RE` の経路で処理されるためここには来ない
+///
+/// 実在例: `terminal_size` / `winreg` / `colored` / `tray-icon` などが
+/// `windows-sys = ">=0.59, <=0.61"` と書いている。包含上限のまま読むと `0.61.1` 以降が
+/// 候補から落ち、`0.61.0` を書き戻した後は毎回 AlreadyLatest になって
+/// `0.61.2` へ永久に到達できなかった。
+fn partial_upper_bound_covers_series(language: Language) -> bool {
+    matches!(language, Language::Rust | Language::Node)
+}
+
 /// npm / Composer のハイフンレンジ右辺を上限制約へ正規化する。
 ///
 /// 右辺が部分指定 (`2`, `2.3`) の場合はワイルドカード展開後の排他的上限へ進める。
@@ -231,7 +249,10 @@ fn stricter_upper_bound(
 /// - `<=X` と `A...B` は `(X, true)`
 ///
 /// `<` / `<=` が複数並ぶ場合 (例: `>=1,<2,<=3`) は最も厳しい上限を採用する。
-fn extract_upper_bound(raw: &str) -> Option<(String, bool)> {
+///
+/// `<=` に部分バージョン (`<=0.61` / `<=2.0`) が来たときの意味はエコシステムで割れる
+/// ため `language` を取る (`partial_upper_bound_covers_series` を参照)。
+fn extract_upper_bound(raw: &str, language: Language) -> Option<(String, bool)> {
     let trimmed = raw.trim();
     let trimmed = trimmed
         .split_once("!!")
@@ -283,7 +304,13 @@ fn extract_upper_bound(raw: &str) -> Option<(String, bool)> {
             // `<=2.x` は node-semver では `<3.0.0` (replaceXRange がリリースを +1 して
             // 排他的上限へ変換する)。包含上限のまま `<=2` と読むと 2.0.1 以降の候補を
             // すべて落とし、有効な更新を無言で取りこぼす。
-            let bound = if m.as_str().contains(['x', 'X', '*']) {
+            //
+            // ワイルドカードを書かない部分バージョン (`<=0.61` / `<=2.0`) も Cargo と npm
+            // では同じ意味になるため、同じ経路で排他的上限へ展開する
+            // (`partial_upper_bound_covers_series` を参照)。
+            let bound = if m.as_str().contains(['x', 'X', '*'])
+                || partial_upper_bound_covers_series(language)
+            {
                 normalize_hyphen_upper_bound(m.as_str())
             } else {
                 (normalize_bound_version(m.as_str()), true)
@@ -429,7 +456,8 @@ impl UpdateJudge {
         };
 
         let stable = self.stable_candidates(dependency, available_versions);
-        let age_filtered = self.apply_age_filter(stable);
+        let flavored = apply_java_flavor_filter(dependency, stable);
+        let age_filtered = self.apply_age_filter(flavored);
         let range_filtered = apply_range_upper_bound(dependency, age_filtered);
         let eligible = apply_rejected_versions(dependency, range_filtered);
 
@@ -517,7 +545,9 @@ fn apply_range_upper_bound<'a>(
     if dependency.version_spec.kind != VersionSpecKind::Range {
         return candidates;
     }
-    let Some((upper_bound, inclusive)) = extract_upper_bound(&dependency.version_spec.raw) else {
+    let Some((upper_bound, inclusive)) =
+        extract_upper_bound(&dependency.version_spec.raw, dependency.language)
+    else {
         return candidates;
     };
     candidates
@@ -629,6 +659,48 @@ fn apply_max_change_filter<'a>(
 /// 正規化後の値は判定・書き戻しの両方で使われる。書き戻し時は各パーサが
 /// マニフェスト上の元の表記から接頭辞を復元するため、ここで数値部へ揃えても
 /// `temurin-` が失われることはない。
+/// 同一座標で並行公開される Java の変種 (flavor) マーカーを返す。
+///
+/// `-jre` / `-android` は「安定版 qualifier」なのでプレリリース判定には掛からず、
+/// Gradle の version ordering では非数値どうしが辞書順で比較されるため
+/// 同一数値版なら必ず `jre > android` になる。
+fn java_flavor_marker(version: &str) -> Option<&'static str> {
+    const FLAVOR_MARKERS: [&str; 2] = ["jre", "android"];
+    let tail = version.rsplit(['-', '.']).next()?;
+    FLAVOR_MARKERS
+        .iter()
+        .find(|marker| tail.eq_ignore_ascii_case(marker))
+        .copied()
+}
+
+/// 現在版が flavor 付きなら、同じ flavor の候補だけを残す。
+///
+/// Guava は同じ `com.google.guava:guava` 座標へ JRE 版 (`33.4.0-jre`) と Android 版
+/// (`33.4.0-android`) を公開しており、Android では `-android` を使うことが公式に
+/// 求められている。絞り込まないと `33.4.0-android` の利用者が同一数値版の `-jre` へ
+/// 黙って乗り換えられる (数値コアが同じなので `--max-change patch` でも素通りする)。
+/// mise のベンダー接頭辞 (`temurin-` / `zulu-`) と同型の対策。
+///
+/// 「qualifier が一致するものだけ残す」という一般化はできない
+/// (`5.0.0.RELEASE` → `5.3.9` のように qualifier が消える正当な系列を全滅させる) ため、
+/// 既知の flavor マーカーだけを対象にする。同じ flavor の候補が 1 件も無ければ空を返し、
+/// 後段で `NoSuitableVersion` として止める (別 flavor へ乗り換えない)。
+fn apply_java_flavor_filter<'a>(
+    dependency: &Dependency,
+    candidates: Vec<&'a VersionInfo>,
+) -> Vec<&'a VersionInfo> {
+    if dependency.language != Language::Java {
+        return candidates;
+    }
+    let Some(flavor) = java_flavor_marker(dependency.version()) else {
+        return candidates;
+    };
+    candidates
+        .into_iter()
+        .filter(|v| java_flavor_marker(&v.version) == Some(flavor))
+        .collect()
+}
+
 fn mise_flavor_candidates(dependency: &Dependency, versions: &[VersionInfo]) -> Vec<VersionInfo> {
     let flavor = dependency
         .version_spec
@@ -725,6 +797,14 @@ mod tests {
     use chrono::TimeZone;
     use std::time::Duration;
 
+    /// `<=` の部分バージョンを包含上限として読むエコシステム (PEP 440 / RubyGems /
+    /// Composer) を代表して Python で評価するテスト用ラッパ。
+    /// Cargo / npm は同じ表記が系列全体を指すので、その挙動は
+    /// `test_extract_upper_bound_partial_lte_covers_series` で別途検証する。
+    fn extract_upper_bound(raw: &str) -> Option<(String, bool)> {
+        super::extract_upper_bound(raw, Language::Python)
+    }
+
     fn make_dependency(name: &str, version: &str, language: Language, pinned: bool) -> Dependency {
         let kind = if pinned {
             VersionSpecKind::Exact
@@ -790,6 +870,80 @@ mod tests {
         assert!(result.is_update(), "{:?}", result);
         if let UpdateResult::Update { new_version, .. } = result {
             assert_eq!(new_version, "3.27.3");
+        }
+    }
+
+    /// 回帰テスト: Guava のように同一座標へ JRE 版と Android 版を並行公開している
+    /// ライブラリでは、現在版と同じ flavor の候補だけを選ぶ。
+    ///
+    /// Gradle の version ordering は非数値どうしを辞書順で比較するため同一数値版なら
+    /// 必ず `jre > android` になり、絞り込まないと `-android` の利用者が `-jre` へ
+    /// 黙って乗り換えられていた (数値コアが同じなので `--max-change patch` でも止まらない)。
+    /// Guava 公式は Android では `-android` を使うよう明記している。
+    #[test]
+    fn test_judge_java_flavor_is_preserved() {
+        let judge = UpdateJudge::new(UpdateFilter::new());
+
+        let dep = make_dependency(
+            "com.google.guava:guava",
+            "31.0-android",
+            Language::Java,
+            false,
+        );
+        let versions = vec![
+            make_version_info("31.0-android", 400),
+            make_version_info("33.4.0-android", 30),
+            make_version_info("33.4.0-jre", 30),
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_update(), "{:?}", result);
+        if let UpdateResult::Update { new_version, .. } = result {
+            assert_eq!(new_version, "33.4.0-android");
+        }
+    }
+
+    /// 最新の android flavor を既に使っているなら、同一数値版の jre へは動かさない
+    #[test]
+    fn test_judge_java_flavor_already_latest_does_not_switch() {
+        let judge = UpdateJudge::new(UpdateFilter::new());
+
+        let dep = make_dependency(
+            "com.google.guava:guava",
+            "33.4.0-android",
+            Language::Java,
+            false,
+        );
+        let versions = vec![
+            make_version_info("33.4.0-android", 30),
+            make_version_info("33.4.0-jre", 30),
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(!result.is_update(), "{:?}", result);
+    }
+
+    /// flavor マーカーを持たない依存は従来どおり全候補が対象。
+    /// `.Final` のような JVM の安定版 qualifier を flavor と誤認しない。
+    #[test]
+    fn test_judge_java_without_flavor_is_unfiltered() {
+        let judge = UpdateJudge::new(UpdateFilter::new());
+
+        let dep = make_dependency(
+            "org.hibernate:hibernate-core",
+            "6.2.0.Final",
+            Language::Java,
+            false,
+        );
+        let versions = vec![
+            make_version_info("6.2.0.Final", 400),
+            make_version_info("6.4.4.Final", 30),
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(result.is_update(), "{:?}", result);
+        if let UpdateResult::Update { new_version, .. } = result {
+            assert_eq!(new_version, "6.4.4.Final");
         }
     }
 
@@ -1420,57 +1574,57 @@ mod tests {
     fn test_extract_upper_bound() {
         // Range 制約から上限を抽出する補助関数の確認
         assert_eq!(
-            super::extract_upper_bound(">=3.5.0,<4.0.0"),
+            extract_upper_bound(">=3.5.0,<4.0.0"),
             Some(("4.0.0".to_string(), false))
         );
         assert_eq!(
-            super::extract_upper_bound(">=1.0,<2.0"),
+            extract_upper_bound(">=1.0,<2.0"),
             Some(("2.0".to_string(), false))
         );
         assert_eq!(
-            super::extract_upper_bound(">=1.0, <2.0"),
+            extract_upper_bound(">=1.0, <2.0"),
             Some(("2.0".to_string(), false))
         );
         assert_eq!(
-            super::extract_upper_bound(">=1.0,<=2.0"),
+            extract_upper_bound(">=1.0,<=2.0"),
             Some(("2.0".to_string(), true))
         );
         assert_eq!(
-            super::extract_upper_bound("4.0.0...4.9.9"),
+            extract_upper_bound("4.0.0...4.9.9"),
             Some(("4.9.9".to_string(), true))
         );
         assert_eq!(
-            super::extract_upper_bound("4.0.0..<5.0.0"),
+            extract_upper_bound("4.0.0..<5.0.0"),
             Some(("5.0.0".to_string(), false))
         );
         assert_eq!(
-            super::extract_upper_bound("1.2.0 - 2.0.0"),
+            extract_upper_bound("1.2.0 - 2.0.0"),
             Some(("2.0.0".to_string(), true))
         );
         assert_eq!(
-            super::extract_upper_bound("[1.0,2.0)"),
+            extract_upper_bound("[1.0,2.0)"),
             Some(("2.0".to_string(), false))
         );
         assert_eq!(
-            super::extract_upper_bound("(,2.0]"),
+            extract_upper_bound("(,2.0]"),
             Some(("2.0".to_string(), true))
         );
         assert_eq!(
-            super::extract_upper_bound("]1.0,2.0["),
+            extract_upper_bound("]1.0,2.0["),
             Some(("2.0".to_string(), false))
         );
         assert_eq!(
-            super::extract_upper_bound("[1.0,2.0["),
+            extract_upper_bound("[1.0,2.0["),
             Some(("2.0".to_string(), false))
         );
         assert_eq!(
-            super::extract_upper_bound(">=1.0.0,<v2.0.0"),
+            extract_upper_bound(">=1.0.0,<v2.0.0"),
             Some(("2.0.0".to_string(), false))
         );
         // 上限なし
-        assert_eq!(super::extract_upper_bound(">=1.0"), None);
+        assert_eq!(extract_upper_bound(">=1.0"), None);
         // `>` のみで上限なし
-        assert_eq!(super::extract_upper_bound(">1.0"), None);
+        assert_eq!(extract_upper_bound(">1.0"), None);
     }
 
     /// 回帰テスト: ハイフンレンジの端点が x-range でも上限を抽出する。
@@ -1484,35 +1638,35 @@ mod tests {
     fn test_extract_upper_bound_hyphen_range_with_wildcard_endpoints() {
         // node-semver: `2.3.x` は `<2.4.0` 相当
         assert_eq!(
-            super::extract_upper_bound("1.2.x - 2.3.x"),
+            extract_upper_bound("1.2.x - 2.3.x"),
             Some(("2.4".to_string(), false))
         );
         // `2.x` は `<3.0.0` 相当
         assert_eq!(
-            super::extract_upper_bound("1.x - 2.x"),
+            extract_upper_bound("1.x - 2.x"),
             Some(("3".to_string(), false))
         );
         assert_eq!(
-            super::extract_upper_bound("1.X - 2.X"),
+            extract_upper_bound("1.X - 2.X"),
             Some(("3".to_string(), false))
         );
         assert_eq!(
-            super::extract_upper_bound("1.* - 2.*"),
+            extract_upper_bound("1.* - 2.*"),
             Some(("3".to_string(), false))
         );
         // 左端だけワイルドカード
         assert_eq!(
-            super::extract_upper_bound("1.x - 2.0.0"),
+            extract_upper_bound("1.x - 2.0.0"),
             Some(("2.0.0".to_string(), true))
         );
         // v 接頭辞付き
         assert_eq!(
-            super::extract_upper_bound("v1.x - v2.x"),
+            extract_upper_bound("v1.x - v2.x"),
             Some(("3".to_string(), false))
         );
         // 右端だけワイルドカード (従来から動いていた形)
         assert_eq!(
-            super::extract_upper_bound("1.0.0 - 2.3.x"),
+            extract_upper_bound("1.0.0 - 2.3.x"),
             Some(("2.4".to_string(), false))
         );
     }
@@ -1525,22 +1679,64 @@ mod tests {
     #[test]
     fn test_extract_upper_bound_lte_with_wildcard() {
         assert_eq!(
-            super::extract_upper_bound(">=1.0.0 <=2.x"),
+            extract_upper_bound(">=1.0.0 <=2.x"),
             Some(("3".to_string(), false))
         );
         assert_eq!(
-            super::extract_upper_bound(">=1.0.0 <=2.3.x"),
+            extract_upper_bound(">=1.0.0 <=2.3.x"),
             Some(("2.4".to_string(), false))
         );
         // ワイルドカードなしの `<=` は従来どおり包含上限
         assert_eq!(
-            super::extract_upper_bound(">=1.0.0 <=2.3.4"),
+            extract_upper_bound(">=1.0.0 <=2.3.4"),
             Some(("2.3.4".to_string(), true))
         );
         // 排他側は従来どおり
         assert_eq!(
-            super::extract_upper_bound(">=1.0.0 <2.x"),
+            extract_upper_bound(">=1.0.0 <2.x"),
             Some(("2".to_string(), false))
+        );
+    }
+
+    /// 回帰テスト: Cargo / npm の `<=` + 部分バージョンはその系列全体を含む。
+    ///
+    /// semver crate の `matches_exact` は comparator に patch が無ければ patch を
+    /// 比較しないため `<=0.61` は `0.61.2` にマッチし、node-semver の `replaceXRange`
+    /// も `<=2.0` を `<2.1.0` へ書き換える。包含上限のまま読むと `0.61.1` 以降が候補から
+    /// 落ち、`0.61.0` を書き戻した後は毎回 AlreadyLatest になって永久に到達できなかった
+    /// (実在例: `windows-sys = ">=0.59, <=0.61"` を書く terminal_size / winreg / colored)。
+    #[test]
+    fn test_extract_upper_bound_partial_lte_covers_series() {
+        assert_eq!(
+            super::extract_upper_bound(">=0.59, <=0.61", Language::Rust),
+            Some(("0.62".to_string(), false))
+        );
+        assert_eq!(
+            super::extract_upper_bound(">=1.0 <=2.0", Language::Node),
+            Some(("2.1".to_string(), false))
+        );
+        // 1 セグメントの上限も系列全体 (`<=1` は 1.* 全部)
+        assert_eq!(
+            super::extract_upper_bound(">=0.9, <=1", Language::Rust),
+            Some(("2".to_string(), false))
+        );
+        // 3 セグメントの完全指定は従来どおり包含上限
+        assert_eq!(
+            super::extract_upper_bound(">=1.0, <=2.0.0", Language::Rust),
+            Some(("2.0.0".to_string(), true))
+        );
+        // PEP 440 / RubyGems / Composer は単純比較なので部分指定でも包含上限のまま
+        assert_eq!(
+            super::extract_upper_bound(">=1.0,<=2.0", Language::Python),
+            Some(("2.0".to_string(), true))
+        );
+        assert_eq!(
+            super::extract_upper_bound(">= 1.0, <= 2.0", Language::Ruby),
+            Some(("2.0".to_string(), true))
+        );
+        assert_eq!(
+            super::extract_upper_bound(">=1.0 <=2.0", Language::Php),
+            Some(("2.0".to_string(), true))
         );
     }
 
@@ -1552,11 +1748,11 @@ mod tests {
     #[test]
     fn test_extract_upper_bound_lte_with_epoch() {
         assert_eq!(
-            super::extract_upper_bound(">=1!1.0,<=1!2.0"),
+            extract_upper_bound(">=1!1.0,<=1!2.0"),
             Some(("1!2.0".to_string(), true))
         );
         assert_eq!(
-            super::extract_upper_bound(">=1!1.0,<1!2.0"),
+            extract_upper_bound(">=1!1.0,<1!2.0"),
             Some(("1!2.0".to_string(), false))
         );
     }
@@ -1565,27 +1761,27 @@ mod tests {
     fn test_extract_upper_bound_whitespace_handling() {
         // 回帰テスト: 前後の空白を除去して判定できることを確認する
         assert_eq!(
-            super::extract_upper_bound("  >=1.0,<2.0  "),
+            extract_upper_bound("  >=1.0,<2.0  "),
             Some(("2.0".to_string(), false))
         );
         assert_eq!(
-            super::extract_upper_bound("  >=1.0,<=2.0  "),
+            extract_upper_bound("  >=1.0,<=2.0  "),
             Some(("2.0".to_string(), true))
         );
         assert_eq!(
-            super::extract_upper_bound(" 4.0.0..<5.0.0 "),
+            extract_upper_bound(" 4.0.0..<5.0.0 "),
             Some(("5.0.0".to_string(), false))
         );
         assert_eq!(
-            super::extract_upper_bound(" 4.0.0...4.9.9 "),
+            extract_upper_bound(" 4.0.0...4.9.9 "),
             Some(("4.9.9".to_string(), true))
         );
         assert_eq!(
-            super::extract_upper_bound("  1.2.0 - 2.0.0  "),
+            extract_upper_bound("  1.2.0 - 2.0.0  "),
             Some(("2.0.0".to_string(), true))
         );
         assert_eq!(
-            super::extract_upper_bound("  [1.0,2.0)  "),
+            extract_upper_bound("  [1.0,2.0)  "),
             Some(("2.0".to_string(), false))
         );
     }
@@ -1594,24 +1790,24 @@ mod tests {
     fn test_extract_upper_bound_maven_inclusive_bracket() {
         // Maven 形式の閉区間: `[1.0,2.0]`
         assert_eq!(
-            super::extract_upper_bound("[1.0,2.0]"),
+            extract_upper_bound("[1.0,2.0]"),
             Some(("2.0".to_string(), true))
         );
         // Maven 形式の開区間: `(1.0,2.0)`
         assert_eq!(
-            super::extract_upper_bound("(1.0,2.0)"),
+            extract_upper_bound("(1.0,2.0)"),
             Some(("2.0".to_string(), false))
         );
         // Maven 形式で下限なし: `(,2.0)`
         assert_eq!(
-            super::extract_upper_bound("(,2.0)"),
+            extract_upper_bound("(,2.0)"),
             Some(("2.0".to_string(), false))
         );
         // Maven 形式の単一指定: `[1.0]`
-        assert_eq!(super::extract_upper_bound("[1.0]"), None);
+        assert_eq!(extract_upper_bound("[1.0]"), None);
         // Maven qualifier 付き上限: `[1.0,2.0.Final)`
         assert_eq!(
-            super::extract_upper_bound("[1.0,2.0.Final)"),
+            extract_upper_bound("[1.0,2.0.Final)"),
             Some(("2.0.Final".to_string(), false))
         );
     }
@@ -1620,15 +1816,15 @@ mod tests {
     fn test_extract_upper_bound_v_prefix_normalization() {
         // 返却される上限値から `v` / `V` 接頭辞を除去する
         assert_eq!(
-            super::extract_upper_bound(">=v1.0.0,<V2.0.0"),
+            extract_upper_bound(">=v1.0.0,<V2.0.0"),
             Some(("2.0.0".to_string(), false))
         );
         assert_eq!(
-            super::extract_upper_bound("v1.0.0...v2.0.0"),
+            extract_upper_bound("v1.0.0...v2.0.0"),
             Some(("2.0.0".to_string(), true))
         );
         assert_eq!(
-            super::extract_upper_bound("v1.0.0..<v3.0.0"),
+            extract_upper_bound("v1.0.0..<v3.0.0"),
             Some(("3.0.0".to_string(), false))
         );
     }
@@ -1637,33 +1833,30 @@ mod tests {
     fn test_extract_upper_bound_pep440_prefix_match() {
         // PEP 440 の prefix-match wildcard (`==1.2.*`) は `<1.3` 相当の排他的上限を持つ
         assert_eq!(
-            super::extract_upper_bound("==1.2.*"),
+            extract_upper_bound("==1.2.*"),
             Some(("1.3".to_string(), false))
         );
         // `==1.*` は `<2` 相当
-        assert_eq!(
-            super::extract_upper_bound("==1.*"),
-            Some(("2".to_string(), false))
-        );
+        assert_eq!(extract_upper_bound("==1.*"), Some(("2".to_string(), false)));
         // `==1.2.3.*` は `<1.2.4` 相当 (最後のリリースセグメントを +1)
         assert_eq!(
-            super::extract_upper_bound("==1.2.3.*"),
+            extract_upper_bound("==1.2.3.*"),
             Some(("1.2.4".to_string(), false))
         );
         // 空白付き / `v` 接頭辞付きも許容する
         assert_eq!(
-            super::extract_upper_bound("== 1.2.*"),
+            extract_upper_bound("== 1.2.*"),
             Some(("1.3".to_string(), false))
         );
         // epoch 付き `1!2.3.*` は epoch を保持して上限を導出する
         assert_eq!(
-            super::extract_upper_bound("==1!2.3.*"),
+            extract_upper_bound("==1!2.3.*"),
             Some(("1!2.4".to_string(), false))
         );
         // `!=1.2.*` は除外制約であり上限ではないため None
-        assert_eq!(super::extract_upper_bound("!=1.2.*"), None);
+        assert_eq!(extract_upper_bound("!=1.2.*"), None);
         // 末尾が `.*` でない通常の `==1.2.3` は上限を持たない
-        assert_eq!(super::extract_upper_bound("==1.2.3"), None);
+        assert_eq!(extract_upper_bound("==1.2.3"), None);
     }
 
     #[test]
@@ -2508,22 +2701,22 @@ mod tests {
     #[test]
     fn test_extract_upper_bound_multiple_bounds_picks_strictest() {
         assert_eq!(
-            super::extract_upper_bound(">=1,<2,<=3"),
+            extract_upper_bound(">=1,<2,<=3"),
             Some(("2".to_string(), false))
         );
         // 順序を入れ替えても同じ結果になる
         assert_eq!(
-            super::extract_upper_bound(">=1,<=3,<2"),
+            extract_upper_bound(">=1,<=3,<2"),
             Some(("2".to_string(), false))
         );
         // 同値の上限が `<` と `<=` で並ぶ場合は排他的 (`<`) を優先する
         assert_eq!(
-            super::extract_upper_bound(">=1,<2,<=2"),
+            extract_upper_bound(">=1,<2,<=2"),
             Some(("2".to_string(), false))
         );
         // `<=` のみ複数なら最小の包含上限
         assert_eq!(
-            super::extract_upper_bound(">=1,<=3,<=2.5"),
+            extract_upper_bound(">=1,<=3,<=2.5"),
             Some(("2.5".to_string(), true))
         );
     }
@@ -2534,11 +2727,11 @@ mod tests {
     #[test]
     fn test_extract_upper_bound_maven_qualifier_lower_bound_not_hyphen_range() {
         assert_eq!(
-            super::extract_upper_bound("[1.0-2,2.0)"),
+            extract_upper_bound("[1.0-2,2.0)"),
             Some(("2.0".to_string(), false))
         );
         assert_eq!(
-            super::extract_upper_bound("[1.0-rc1,2.0]"),
+            extract_upper_bound("[1.0-rc1,2.0]"),
             Some(("2.0".to_string(), true))
         );
     }
@@ -2549,11 +2742,11 @@ mod tests {
     fn test_extract_upper_bound_hyphen_requires_spaces() {
         // スペースなしハイフンは prerelease/qualifier 付きバージョンであり、
         // 上限制約を持たない
-        assert_eq!(super::extract_upper_bound("1.0-2"), None);
-        assert_eq!(super::extract_upper_bound(">=1.0-beta"), None);
+        assert_eq!(extract_upper_bound("1.0-2"), None);
+        assert_eq!(extract_upper_bound(">=1.0-beta"), None);
         // スペース付きは従来どおりハイフンレンジ
         assert_eq!(
-            super::extract_upper_bound("1.0 - 2.0"),
+            extract_upper_bound("1.0 - 2.0"),
             Some(("2.1".to_string(), false))
         );
     }

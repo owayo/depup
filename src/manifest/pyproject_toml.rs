@@ -118,12 +118,14 @@ impl ManifestParser for PyprojectTomlParser {
             poetry.and_then(|p| p.get("dependencies")),
             parser,
             false,
+            &excluded,
             &mut dependencies,
         );
         collect_poetry_table(
             poetry.and_then(|p| p.get("dev-dependencies")),
             parser,
             true,
+            &excluded,
             &mut dependencies,
         );
 
@@ -134,7 +136,13 @@ impl ManifestParser for PyprojectTomlParser {
         {
             for (group_name, group) in groups {
                 let is_dev = group_name == "dev" || group_name == "test";
-                collect_poetry_table(group.get("dependencies"), parser, is_dev, &mut dependencies);
+                collect_poetry_table(
+                    group.get("dependencies"),
+                    parser,
+                    is_dev,
+                    &excluded,
+                    &mut dependencies,
+                );
             }
         }
 
@@ -721,18 +729,27 @@ fn update_pep508_array_line(
     // `# "requests>=1.0",` のようにコメントアウトされた依存指定は parse 側 (TOML パーサ)
     // でも無視されているため、書き換えも見送る。コメント前の部分だけマッチング対象とする。
     // インラインコメント (`"requests>=2.0",  # used in prod`) の左側は引き続き処理する。
+    //
+    // 置換はマッチした byte span に対して行い、行全体の文字列一致置換
+    // (`str::replace`) は使わない。`strip_toml_line_comment` は行の先頭からの
+    // 部分文字列を返すのでマッチ位置のオフセットは元の行にそのまま使えるが、
+    // 全出現を置換するとコメント側に同じ依存指定が引用符付きで書かれている行
+    // (`"requests>=2.0",  # TODO: revert to "requests>=2.0" if X breaks`) で
+    // コメント内まで書き換わり、「行末コメントの右側は触らない」という
+    // 不変条件が壊れる。Poetry 側の `replace_quoted_version` と同じ span 方式に揃える。
     let scan_target = strip_toml_line_comment(line);
-    let mut new_line = line.to_string();
+    let mut new_line = String::with_capacity(line.len());
+    // 出力へコピー済みの位置 (元の行のバイトオフセット)
+    let mut copied_to = 0;
     let mut updated = false;
 
     for caps in re.captures_iter(scan_target) {
-        let (quote, full_dep) = if let Some(m) = caps.get(1) {
-            ("\"", m.as_str())
-        } else if let Some(m) = caps.get(2) {
-            ("'", m.as_str())
-        } else {
-            ("\"", "")
+        // グループ 1 は `"..."`、グループ 2 は `'...'` の中身。
+        // クォート自体はマッチ範囲の外側なので、中身だけ差し替えれば種別は保たれる。
+        let Some(matched) = caps.get(1).or_else(|| caps.get(2)) else {
+            continue;
         };
+        let full_dep = matched.as_str();
         if let Some(pep_caps) = PEP508_RE.captures(full_dep) {
             let pkg_name = pep_caps.get(1).map(|m| m.as_str()).unwrap_or("");
             let after_name = &full_dep[pkg_name.len()..];
@@ -744,16 +761,22 @@ fn update_pep508_array_line(
                     format_pep508_updated_version(version_part, parser, new_version)
             {
                 let new_dep = format!("{}{}{}", package, extras_str, new_ver);
-                new_line = new_line.replace(
-                    &format!("{quote}{full_dep}{quote}"),
-                    &format!("{quote}{new_dep}{quote}"),
-                );
+                // `captures_iter` は重ならないマッチを前方から順に返すので、
+                // 直前のマッチ終端から今回のマッチ開始までをそのまま繋いでいけばよい
+                new_line.push_str(&line[copied_to..matched.start()]);
+                new_line.push_str(&new_dep);
+                copied_to = matched.end();
                 updated = true;
             }
         }
     }
 
-    updated.then_some(new_line)
+    if !updated {
+        return None;
+    }
+    // 残り (最後のマッチ以降。行コメントを含む) をそのまま繋ぐ
+    new_line.push_str(&line[copied_to..]);
+    Some(new_line)
 }
 
 fn normalize_python_package_name(name: &str) -> String {
@@ -1078,10 +1101,20 @@ impl Pep508Collector<'_> {
 
 /// Poetry の「名前 → 制約」テーブルを読む。
 /// Python 自体の要求バージョンは依存更新の対象にしない。
+///
+/// `excluded` (= `non_pypi_source_names`) に含まれる依存はエントリ自身に `source` が
+/// 無くてもスキップする。writer は先頭でこの集合による名前一致の除外を行い
+/// `Err("package uses a non-PyPI source")` を返すため、ここで見ないと
+/// 「片方の宣言にだけ `source` が付いている」構成 (`[tool.poetry.dependencies]` は
+/// `source = "internal"`、`[tool.poetry.group.dev.dependencies]` は素の制約) や
+/// uv の `[tool.uv.sources]` 由来の除外で parse だけが依存を surface し、
+/// 「N updated」と報告した直後に書き込みが失敗する (exit code 2) 非対称が生まれる。
+/// 社内パッケージ名で PyPI へ問い合わせが飛ぶのも同時に防ぐ。
 fn collect_poetry_table(
     value: Option<&Value>,
     parser: &dyn VersionParser,
     is_dev: bool,
+    excluded: &HashSet<String>,
     output: &mut Vec<Dependency>,
 ) {
     let Some(deps) = value.and_then(|v| v.as_table()) else {
@@ -1089,6 +1122,9 @@ fn collect_poetry_table(
     };
     for (name, value) in deps {
         if name == "python" {
+            continue;
+        }
+        if excluded.contains(&normalize_python_package_name(name)) {
             continue;
         }
         if let Some(parsed) = parse_poetry_dependency(name, value, parser, is_dev) {
@@ -3495,5 +3531,124 @@ torch = "2.1.0+cu121"
                 .update_version(content, "torch", "2.34.2")
                 .is_err()
         );
+    }
+
+    /// 回帰テスト: 行末コメントの右側に**引用符付きで**同じ依存指定が書かれていても、
+    /// 左側だけを更新する。以前は `str::replace` による行全体の全置換だったため、
+    /// マッチ探索はコメント除去後の文字列で行っていてもコメント内まで書き換わっていた。
+    #[test]
+    fn test_update_pep508_does_not_rewrite_quoted_dependency_in_trailing_comment() {
+        let content = r#"
+[project]
+dependencies = [
+    "requests>=2.0",  # TODO: revert to "requests>=2.0" if X breaks
+]
+"#;
+        let result = PyprojectTomlParser
+            .update_version(content, "requests", "2.31.0")
+            .unwrap();
+        assert!(result.contains(r#""requests>=2.31.0","#), "{result}");
+        assert!(
+            result.contains(r#"# TODO: revert to "requests>=2.0" if X breaks"#),
+            "コメント内の引用符付き依存指定は書き換えないこと: {result}"
+        );
+    }
+
+    /// 単一引用符版も同じくコメント内は触らない。
+    #[test]
+    fn test_update_pep508_does_not_rewrite_single_quoted_dependency_in_comment() {
+        let content = r#"
+[project]
+dependencies = [
+    'requests>=2.0',  # 旧: 'requests>=2.0'
+]
+"#;
+        let result = PyprojectTomlParser
+            .update_version(content, "requests", "2.31.0")
+            .unwrap();
+        assert!(result.contains(r#"'requests>=2.31.0',"#), "{result}");
+        assert!(
+            result.contains(r#"# 旧: 'requests>=2.0'"#),
+            "コメント内の引用符付き依存指定は書き換えないこと: {result}"
+        );
+    }
+
+    /// 回帰テスト: 1 行に同じパッケージが複数回現れる場合は全て更新する
+    /// (span 方式へ変えても複数マッチの処理が落ちないこと)。
+    #[test]
+    fn test_update_pep508_updates_every_occurrence_on_one_line() {
+        let content = r#"
+[project]
+dependencies = ["requests>=2.0", "flask>=2.0", "requests>=1.0"]
+"#;
+        let result = PyprojectTomlParser
+            .update_version(content, "requests", "2.31.0")
+            .unwrap();
+        assert!(
+            result.contains(r#"["requests>=2.31.0", "flask>=2.0", "requests>=2.31.0"]"#),
+            "{result}"
+        );
+    }
+
+    /// 回帰テスト: 片方の宣言にだけ `source` が付いた依存は、素の制約で書かれた
+    /// 別グループの宣言も含めて parse から外す。以前は dev 側だけ surface した結果、
+    /// 「N updated」と報告した直後に writer が
+    /// `package uses a non-PyPI source` で失敗して exit code 2 になっていた。
+    #[test]
+    fn test_parse_poetry_non_pypi_source_excludes_other_group_declaration() {
+        let content = r#"
+[tool.poetry.dependencies]
+private_pkg = { version = "^1.0", source = "internal" }
+requests = "^2.28.0"
+
+[tool.poetry.group.dev.dependencies]
+private-pkg = "^1.0"
+"#;
+        let deps = parse(content).unwrap();
+        let names: Vec<&str> = deps.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["requests"]);
+        // parse が外すものは writer も拒否する (report/apply の整合)
+        assert!(
+            PyprojectTomlParser
+                .update_version(content, "private-pkg", "1.2.0")
+                .is_err()
+        );
+    }
+
+    /// 回帰テスト: uv の `[tool.uv.sources]` 由来の除外も Poetry の依存テーブルへ効く。
+    #[test]
+    fn test_parse_poetry_table_respects_uv_sources_exclusion() {
+        let content = r#"
+[tool.poetry.dependencies]
+mylib = "^0.1.0"
+requests = "^2.28.0"
+
+[tool.uv.sources]
+mylib = { workspace = true }
+"#;
+        let deps = parse(content).unwrap();
+        let names: Vec<&str> = deps.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["requests"]);
+        assert!(
+            PyprojectTomlParser
+                .update_version(content, "mylib", "0.2.0")
+                .is_err()
+        );
+    }
+
+    /// 回帰テスト: source 指定が無ければ、同じ依存が複数セクションにあっても
+    /// 従来どおり全て surface する (除外集合の適用で取りこぼさないこと)。
+    #[test]
+    fn test_parse_poetry_without_source_still_collected_in_all_sections() {
+        let content = r#"
+[tool.poetry.dependencies]
+requests = "^2.28.0"
+
+[tool.poetry.group.dev.dependencies]
+requests = "^2.28.0"
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 2);
+        assert!(deps.iter().all(|d| d.name == "requests"));
     }
 }

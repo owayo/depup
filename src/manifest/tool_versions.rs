@@ -43,9 +43,17 @@ fn strip_comment(line: &str) -> &str {
 ///
 /// 誤判定でファイルを壊さないよう、`.tool-versions` と認めるのは
 /// **全ての実行に意味がある行**が `<tool> <version>...` 形式のときだけにする。
-/// TOML のセクションヘッダ (`[tools]`) や `=` を含む行が 1 行でもあれば、
+/// TOML のセクションヘッダ (`[tools]`) や `キー = 値` の行が 1 行でもあれば、
 /// 壊れた TOML であっても `.tool-versions` とは扱わない (TOML パーサ側で
 /// エラーにした方が安全)。
+///
+/// ただし `=` / `[` の判定は **キーとしての `=`** / **行頭の `[`** に限定する。
+/// mise のバックエンドオプションはツール名の末尾にブラケット記法で付き
+/// (`ubi:BurntSushi/ripgrep[exe=rg] 14.1.1`)、`=` と `[` を含むが TOML ではない。
+/// 素朴に「`=` を含めば TOML」と判定すると、この 1 行のせいでファイル全体が
+/// TOML パーサへ渡って `TomlParseError` になり、同じファイルにある他の全ツールまで
+/// 失われる。TOML の `キー = 値` では `=` が先頭トークンの外側に現れるため、
+/// 先頭トークン (= ツール名) の内側の `=` は `.tool-versions` として受け入れる。
 pub(crate) fn looks_like_tool_versions(content: &str) -> bool {
     let mut has_entry = false;
     for line in content.lines() {
@@ -53,16 +61,30 @@ pub(crate) fn looks_like_tool_versions(content: &str) -> bool {
         if body.is_empty() {
             continue;
         }
-        // TOML のセクションヘッダ / キー = 値 は .tool-versions には現れない
-        if body.starts_with('[') || body.contains('=') {
+        // TOML のセクションヘッダ (`[tools]` / `[tools."npm:prettier"]`) は行頭が `[`。
+        // ツール名末尾のブラケットオプションは行頭には来ない
+        if body.starts_with('[') {
             return false;
         }
         let mut tokens = body.split_whitespace();
-        if tokens.next().is_none() {
+        let Some(tool) = tokens.next() else {
             continue;
+        };
+        let rest: Vec<&str> = tokens.collect();
+        if rest.is_empty() {
+            // バージョンのない行 (`node` だけ / `node="26.7.0"` のような
+            // 空白なしの TOML キー行) は .tool-versions として不正
+            return false;
         }
-        if tokens.next().is_none() {
-            // バージョンのない行 (`node` だけ) は .tool-versions として不正
+        // 先頭トークンより後ろに `=` があれば TOML の `キー = 値`。
+        // `ubi:x/y[exe=rg] 1.2.3` は先頭トークン内なので .tool-versions と認める
+        if rest.iter().any(|token| token.contains('=')) {
+            return false;
+        }
+        // 先頭トークン内の `=` はブラケットオプションの中だけ許す
+        // (`node= 26.7.0` のような書き損じた TOML を取り込まない)
+        let tool_base = tool.split_once('[').map_or(tool, |(base, _)| base);
+        if tool_base.contains('=') {
             return false;
         }
         has_entry = true;
@@ -132,6 +154,17 @@ impl ManifestParser for ToolVersionsParser {
                 && let Some((tool, versions)) = split_tool_line(line)
                 && tool == package
                 && versions.len() == 1
+                // parse が依存として採用した行だけを書き換える。
+                // 浮動指定 (`python latest`) や VCS ref (`erlang ref:master`) の行は
+                // parse が捨てているため、ここで弾かないと
+                // ```
+                // python latest
+                // python 3.13.1
+                // ```
+                // で parse が 2 行目を読み writer が 1 行目を潰す。
+                // asdf/mise は先頭行を採用するので、意図した浮動指定が無言でピンに変わる
+                // (`format_mise_version` は parse 失敗時に new_version をそのまま返す)
+                && MiseVersionParser.parse(versions[0]).is_some()
             {
                 // 空白の並びとコメントを保つため、バージョントークンの
                 // バイト範囲だけを差し替える
@@ -320,6 +353,110 @@ mod tests {
                     "update was a no-op for: {content:?}"
                 );
             }
+        }
+    }
+
+    /// バグ回帰テスト: ブラケットオプション付きツール名を含む `.tool-versions` を
+    /// TOML と誤判定しない。
+    ///
+    /// mise の ubi バックエンドは `ubi:BurntSushi/ripgrep[exe=rg]` のように `=` を含む
+    /// ツール名を書ける。以前は「意味のある行が 1 つでも `=` を含めば TOML」と判定して
+    /// いたため、この 1 行のせいでファイル全体が TOML パーサへ渡って `TomlParseError` に
+    /// なり、同じファイルの `node` を含む全ツールが失われていた。
+    #[test]
+    fn test_looks_like_tool_versions_with_backend_options() {
+        let content = "ubi:BurntSushi/ripgrep[exe=rg] 14.1.1\nnode 26.7.0\n";
+        assert!(looks_like_tool_versions(content));
+
+        let deps = parse(content);
+        assert_eq!(deps.len(), 2);
+        assert_eq!(deps[0].name, "ubi:BurntSushi/ripgrep[exe=rg]");
+        assert_eq!(deps[0].version(), "14.1.1");
+        assert_eq!(deps[1].name, "node");
+
+        // 複数オプション / 正規表現オプションも同様
+        assert!(looks_like_tool_versions(
+            "ubi:cli/cli[exe=gh][provider=github] 2.60.1\n"
+        ));
+        assert!(looks_like_tool_versions(
+            r"ubi:cargo-bins/cargo-binstall[tag_regex=^\d+\.] 1.10.0"
+        ));
+    }
+
+    /// ブラケットオプション付きツール名も書き換えられること (parse/update の整合)
+    #[test]
+    fn test_update_tool_with_backend_options() {
+        let updated = ToolVersionsParser
+            .update_version(
+                "ubi:BurntSushi/ripgrep[exe=rg] 14.1.1\nnode 26.7.0\n",
+                "ubi:BurntSushi/ripgrep[exe=rg]",
+                "14.2.0",
+            )
+            .unwrap();
+        assert_eq!(
+            updated,
+            "ubi:BurntSushi/ripgrep[exe=rg] 14.2.0\nnode 26.7.0\n"
+        );
+    }
+
+    /// 「壊れた TOML を `.tool-versions` と誤認して黙って読み飛ばさない」既存の意図は維持する
+    #[test]
+    fn test_looks_like_tool_versions_rejects_toml_forms() {
+        // セクションヘッダ
+        assert!(!looks_like_tool_versions("[tools]\nnode = \"26.7.0\"\n"));
+        assert!(!looks_like_tool_versions(
+            "[tools.\"npm:prettier\"]\nversion = \"3.9.6\"\n"
+        ));
+        // キー = 値 (空白の有無を問わない)
+        assert!(!looks_like_tool_versions("node = \"26.7.0\"\n"));
+        assert!(!looks_like_tool_versions("node=\"26.7.0\"\n"));
+        assert!(!looks_like_tool_versions("node =\"26.7.0\"\n"));
+        assert!(!looks_like_tool_versions("node= 26.7.0\n"));
+        // dotted key / inline table
+        assert!(!looks_like_tool_versions("tools.node = \"26.7.0\"\n"));
+        assert!(!looks_like_tool_versions(
+            "[tools]\njava = { version = \"temurin-21\" }\n"
+        ));
+        // 壊れた TOML (閉じていない文字列) も .tool-versions とは認めない
+        assert!(!looks_like_tool_versions("[tools]\nnode = \"26.7.0\n"));
+        // バージョンのない行
+        assert!(!looks_like_tool_versions("node\n"));
+        // 空・コメントだけのファイルはエントリなし
+        assert!(!looks_like_tool_versions(""));
+        assert!(!looks_like_tool_versions("# comment only\n"));
+    }
+
+    /// バグ回帰テスト: parse が採用しなかった行を writer が書き換えない。
+    ///
+    /// `python latest` は parse が捨てる (浮動指定) ので依存の版は 2 行目由来。
+    /// 以前は writer が「ツール名が一致する最初の行」を無条件に潰しており、
+    /// asdf/mise が実際に採用する先頭行の `latest` が無言でピンに変わっていた。
+    #[test]
+    fn test_update_skips_unparsable_version_line() {
+        let content = "python latest\npython 3.13.1\n";
+        let updated = ToolVersionsParser
+            .update_version(content, "python", "3.14.0")
+            .unwrap();
+        assert_eq!(updated, "python latest\npython 3.14.0\n");
+    }
+
+    /// 浮動指定・VCS ref・path 指定の行だけなら書き換え対象が無くエラーになる
+    #[test]
+    fn test_update_only_unparsable_lines_is_error() {
+        for content in [
+            "python latest\n",
+            "erlang ref:master\n",
+            "shfmt path:./shfmt\n",
+            "node lts\n",
+            "python sub-0.1:latest\n",
+        ] {
+            let tool = content.split_whitespace().next().unwrap();
+            assert!(
+                ToolVersionsParser
+                    .update_version(content, tool, "9.9.9")
+                    .is_err(),
+                "unexpectedly updated an unparsable line: {content:?}"
+            );
         }
     }
 

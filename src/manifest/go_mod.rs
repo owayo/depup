@@ -53,11 +53,71 @@ static REPLACE_LHS_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"^\s*("[^"]+"|`[^`]+`|\S+)(?:\s+("[^"]+"|`[^`]+`|\S+))?\s*$"#).unwrap()
 });
 
-// pinned コメントの正規表現。
-// `// indirect` 判定 (`comment.contains("indirect")`) が語順非依存なのと整合させるため、
-// `pinned` がコメント内のどこに現れてもマッチさせる (`// indirect; pinned` のように
-// `//` 直後でない場合も拾う)。単語境界 `\b` で `repinned` / `unpinned` への誤マッチは防ぐ。
-static PINNED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"//.*\bpinned\b").unwrap());
+// pinned マーカーのトークン判定で、語の前後から取り除く飾り文字。
+//
+// `pinned:` / `pinned.` / `(pinned)` のような装飾は同じ意図の記述なので受け入れる。
+// 一方 `/` と `-` は**取り除かない** — 取り除くと URL の一部
+// (`https://example.com/pinned-deps`) やハイフン語 (`pinned-deps`) まで
+// マーカー扱いになり、`unpinned` / `repinned` を弾いている単語境界判定の意図が崩れる。
+const PINNED_TOKEN_TRIM: &[char] = &['.', ':', '!', '?', '(', ')', '"', '\''];
+
+/// 行から go の行コメント本体 (`//` 以降) を切り出す。
+///
+/// go の字句解析 (x/mod modfile の `read.go`) は引用文字列を先に読み切るため、
+/// `"..."` / `` `...` `` の内側にある `//` はコメント開始にならない。
+fn go_line_comment(line: &str) -> Option<&str> {
+    let bytes = line.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            // 二重引用符文字列。`\"` のエスケープを解釈して閉じ引用符まで読み飛ばす。
+            b'"' => {
+                index += 1;
+                while index < bytes.len() {
+                    match bytes[index] {
+                        b'\\' => index += 2,
+                        b'"' => {
+                            index += 1;
+                            break;
+                        }
+                        _ => index += 1,
+                    }
+                }
+            }
+            // raw string はエスケープを解釈しない。
+            b'`' => {
+                index += 1;
+                while index < bytes.len() && bytes[index] != b'`' {
+                    index += 1;
+                }
+                index += 1;
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'/') => return Some(&line[index + 2..]),
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+/// 行コメントに depup の `// pinned` マーカーが含まれるか判定する。
+///
+/// `// indirect` 判定 (`comment.contains("indirect")`) が語順非依存なのと整合させるため、
+/// `pinned` がコメント内のどこに現れても認識する (`// indirect; pinned` のように
+/// `//` 直後でない場合も拾う)。ただし判定は**コメント本体を空白 / `;` / `,` で区切った
+/// トークンの完全一致**で行う。以前は行全体に対する `//.*\bpinned\b` の正規表現だったため、
+/// `// indirect; see https://example.com/pinned-deps` のように URL を含む行コメントで
+/// `pinned-deps` の `pinned` が単語境界に一致し、依存が `--include-pinned` なしで
+/// 黙ってスキップされていた。トークン一致にすることで `unpinned` / `repinned` を
+/// 誤認しない従来の性質はそのまま保たれる。
+fn has_pinned_marker(line: &str) -> bool {
+    let Some(comment) = go_line_comment(line) else {
+        return false;
+    };
+
+    comment
+        .split(|c: char| c.is_whitespace() || c == ';' || c == ',')
+        .any(|token| token.trim_matches(PINNED_TOKEN_TRIM) == "pinned")
+}
 
 /// `require (` のようなブロック開始行かどうかを判定する。
 ///
@@ -219,13 +279,15 @@ impl ManifestParser for GoModParser {
                 continue;
             }
 
-            // replace ブロックはローカルオーバーライドなのでスキップする
-            if in_replace_block || trimmed.starts_with("replace ") {
+            // replace ブロックはローカルオーバーライドなのでスキップする。
+            // 単一行 replace の判定は `strip_go_directive` に寄せ、
+            // `replace\t...` のようなタブ区切りも取りこぼさない。
+            if in_replace_block || strip_go_directive(logical, "replace").is_some() {
                 continue;
             }
 
             // pinned コメントを確認する
-            let is_pinned = PINNED_RE.is_match(line);
+            let is_pinned = has_pinned_marker(line);
 
             // 単一 require 文をパースする
             if let Some(caps) = SINGLE_REQUIRE_RE.captures(trimmed) {
@@ -302,9 +364,12 @@ impl ManifestParser for GoModParser {
                 in_exclude_block = false;
             }
 
-            // replace/exclude ブロック内および単一行 replace/exclude は更新対象外
-            let in_replace = in_replace_block || trimmed.starts_with("replace ");
-            let in_exclude = in_exclude_block || trimmed.starts_with("exclude ");
+            // replace/exclude ブロック内および単一行 replace/exclude は更新対象外。
+            // 単一行の判定は `strip_go_directive` (空白種別非依存) に寄せる。
+            // 半角スペース固定だと `exclude\t<module> <version>` を require 相当と
+            // 見なして書き換えてしまい、go が無視するはずの版を混入させる。
+            let in_replace = in_replace_block || strip_go_directive(logical, "replace").is_some();
+            let in_exclude = in_exclude_block || strip_go_directive(logical, "exclude").is_some();
 
             // この行に対象パッケージが含まれているか確認する
             let updated_line = if !in_replace && !in_exclude && trimmed.contains(package) {
@@ -418,10 +483,16 @@ fn collect_excluded_versions(content: &str) -> HashMap<String, Vec<String>> {
             continue;
         }
 
+        // 単一行 `exclude` の判定は `strip_go_directive` (空白種別非依存) に寄せる。
+        // go の字句解析 (`read.go` の `readToken`) は `' '` / `'\t'` / `'\r'` を
+        // 等価に読み飛ばすため `exclude\t<module> <version>` は正当な構文であり、
+        // 半角スペース固定で取りこぼすと除外済みの版が更新候補に残る。Go 1.16 以降は
+        // exclude された版を要求する `require` が無視されて `go mod tidy` がより高い版を
+        // 足すため、depup の書き込みが黙って別の版に置き換えられる。
         let entry = if in_exclude_block {
             logical
-        } else if let Some(entry) = logical.strip_prefix("exclude ") {
-            entry.trim()
+        } else if let Some(entry) = strip_go_directive(logical, "exclude") {
+            entry
         } else {
             continue;
         };
@@ -701,6 +772,85 @@ require github.com/x/lib v1.0.0 // unpinned for now
         let deps = parse(content).unwrap();
         assert_eq!(deps.len(), 1);
         assert_ne!(deps[0].version_spec.kind, VersionSpecKind::GoPinned);
+    }
+
+    /// バグ回帰テスト: pinned 判定が行全体に対する `//.*\bpinned\b` の正規表現だったため、
+    /// 行コメントに URL が含まれるだけで pinned と誤認し、依存が `--include-pinned`
+    /// なしで黙ってスキップされていた (`/pinned-deps` の `pinned` が単語境界に一致する)。
+    #[test]
+    fn test_parse_pinned_ignores_url_in_comment() {
+        let content = r#"
+module example.com/myproject
+
+go 1.21
+
+require (
+	github.com/a/lib v1.0.0 // indirect; see https://example.com/pinned-deps
+	github.com/b/lib v2.0.0 // https://example.com/deps/pinned
+	github.com/c/lib v3.0.0 // pinned; see https://example.com/why
+)
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 3);
+
+        let find = |name: &str| deps.iter().find(|d| d.name == name).unwrap();
+
+        // URL の一部にすぎない `pinned` は マーカーではない
+        assert_ne!(
+            find("github.com/a/lib").version_spec.kind,
+            VersionSpecKind::GoPinned
+        );
+        assert_ne!(
+            find("github.com/b/lib").version_spec.kind,
+            VersionSpecKind::GoPinned
+        );
+        // 同じコメントに URL があっても、独立した語としての `pinned` は従来どおり効く
+        assert_eq!(
+            find("github.com/c/lib").version_spec.kind,
+            VersionSpecKind::GoPinned
+        );
+    }
+
+    /// pinned 判定は go と同じくコメント開始位置を特定してから行う。
+    /// 引用文字列の内側の `//` はコメントではないので、モジュールパスに紛れた
+    /// `pinned` をマーカーとして拾わない。
+    #[test]
+    fn test_parse_pinned_ignores_slashes_inside_quoted_module() {
+        let content = r#"
+module example.com/myproject
+
+go 1.21
+
+require "example.com//pinned" v1.0.0
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "example.com//pinned");
+        assert_ne!(deps[0].version_spec.kind, VersionSpecKind::GoPinned);
+    }
+
+    /// `pinned:` / `(pinned)` のような装飾付きのマーカーは従来どおり認識する。
+    #[test]
+    fn test_parse_pinned_allows_decorated_marker() {
+        let content = r#"
+module example.com/myproject
+
+go 1.21
+
+require (
+	github.com/a/lib v1.0.0 // pinned: upstream の修正待ち
+	github.com/b/lib v2.0.0 // indirect, pinned
+)
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 2);
+        assert!(
+            deps.iter()
+                .all(|dep| dep.version_spec.kind == VersionSpecKind::GoPinned)
+        );
     }
 
     /// バグ回帰テスト: 版なし replace の対象モジュールは全バージョンがローカルへ
@@ -1084,6 +1234,44 @@ exclude github.com/gin-gonic/gin v1.10.0
         assert_eq!(deps[0].version_spec.rejected_versions, vec!["v1.10.0"]);
     }
 
+    /// バグ回帰テスト: 単一行 `exclude` の判定が半角スペース固定だったため、
+    /// go が等価に扱うタブ区切り (`exclude\t<module> <version>`) を取りこぼし、
+    /// 除外済みの版が更新候補に残っていた。
+    #[test]
+    fn test_parse_applies_tab_separated_exclude() {
+        let content = "module example.com/myproject\n\
+\n\
+go 1.21\n\
+\n\
+require github.com/gin-gonic/gin v1.9.1\n\
+\n\
+exclude\tgithub.com/gin-gonic/gin v1.10.0\n";
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "github.com/gin-gonic/gin");
+        assert_eq!(deps[0].version_spec.rejected_versions, vec!["v1.10.0"]);
+    }
+
+    /// `exclude` を接頭辞に持つだけの別の綴りは exclude として扱わない
+    /// (空白種別非依存にしたことで過剰に拾わないことの確認)。
+    #[test]
+    fn test_parse_ignores_exclude_like_prefix() {
+        let content = r#"
+module example.com/myproject
+
+go 1.21
+
+require github.com/gin-gonic/gin v1.9.1
+
+excludes github.com/gin-gonic/gin v1.10.0
+"#;
+
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert!(deps[0].version_spec.rejected_versions.is_empty());
+    }
+
     #[test]
     fn test_parse_applies_exclude_block_to_matching_dependencies() {
         // exclude ブロックの複数指定を対応する依存関係へ反映すること
@@ -1425,6 +1613,30 @@ exclude github.com/gin-gonic/gin v1.9.0
         assert!(result.contains("require github.com/gin-gonic/gin v1.10.0"));
         // exclude 行は変更されない
         assert!(result.contains("exclude github.com/gin-gonic/gin v1.9.0"));
+    }
+
+    /// タブ区切りの単一行 `replace` / `exclude` も更新対象外として扱うこと
+    /// (更新側の判定も `strip_go_directive` に寄せ、空白種別に依存させない)。
+    #[test]
+    fn test_update_does_not_modify_tab_separated_directives() {
+        let content = "module example.com/myproject\n\
+\n\
+go 1.21\n\
+\n\
+require github.com/gin-gonic/gin v1.9.1\n\
+\n\
+exclude\tgithub.com/gin-gonic/gin v1.9.0\n\
+replace\tgithub.com/gin-gonic/gin v1.8.0 => github.com/fork/gin v1.8.1\n";
+
+        let result = GoModParser
+            .update_version(content, "github.com/gin-gonic/gin", "v1.10.0")
+            .unwrap();
+        assert!(result.contains("require github.com/gin-gonic/gin v1.10.0"));
+        assert!(result.contains("exclude\tgithub.com/gin-gonic/gin v1.9.0"));
+        assert!(
+            result
+                .contains("replace\tgithub.com/gin-gonic/gin v1.8.0 => github.com/fork/gin v1.8.1")
+        );
     }
 
     #[test]

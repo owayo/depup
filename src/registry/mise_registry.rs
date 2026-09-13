@@ -83,20 +83,60 @@ impl MiseAdapter {
     }
 }
 
+/// ツール名をバックエンドオプション (`[exe=rg]`) の手前で分割する。
+///
+/// mise の ubi / aqua 等のバックエンドは、ツール名の末尾へブラケット記法で
+/// オプションを付けられる (公式ドキュメント `dev-tools/backends/ubi.md`):
+///
+/// ```text
+/// ubi:BurntSushi/ripgrep[exe=rg]
+/// ubi:cli/cli[exe=gh][provider=github]
+/// ubi:cargo-bins/cargo-binstall[tag_regex=^\d+\.]
+/// ```
+///
+/// 戻り値は `(基底名, オプション部)`。オプション部は最初の `[` を含まない残り全体で、
+/// ブラケットが無ければ `None`。
+fn split_backend_options(name: &str) -> (&str, Option<&str>) {
+    match name.split_once('[') {
+        Some((base, options)) => (base, Some(options)),
+        None => (name, None),
+    }
+}
+
 /// ツール名として `mise ls-remote` に渡してよい文字列かを検証する。
 ///
-/// 引数は配列で渡す (シェルを経由しない) ため、混入しても任意コマンド実行には
-/// ならないが、`--` 始まりの名前はオプションと解釈されて意図しないフラグが立つ。
+/// 引数は配列で渡す (シェルを経由しない) 上に `--` でオプションを終端しているため、
+/// 混入しても任意コマンド実行にはならない。それでも `-` 始まりの名前はオプションと
+/// 解釈されうるので弾き、制御文字 (改行 / NUL 等) はエラー表示や引数の受け渡しを
+/// 壊すので拒否する。
+///
+/// 検証は **基底名** (バックエンドオプションを除いた部分) に対して行い、
 /// バックエンド接頭辞付きの名前 (`npm:@scope/pkg` / `ubi:owner/repo` /
-/// `go:github.com/x/y` / `cargo:ripgrep`) を通すため、記号は控えめに許可する。
+/// `go:github.com/x/y` / `cargo:ripgrep`) を通すため記号は控えめに許可する。
+/// オプション部 (`[exe=rg]` / `[tag_regex=^\d+\.]`) には `=` / `^` / `\` /
+/// バックエンド固有の任意文字が入るため文字種は絞らず、閉じブラケットで終わることと
+/// 制御文字を含まないことだけを確認する。以前は文字種ホワイトリストが `[` `]` `=` を
+/// 許しておらず、ブラケット記法のツールが `mise ls-remote` を起動する前に
+/// `InvalidPackageName` で落ち、恒久的に更新不能だった。
 fn is_valid_tool_name(name: &str) -> bool {
-    !name.is_empty()
-        && !name.starts_with('-')
+    let (base, options) = split_backend_options(name);
+
+    let base_is_valid = !base.is_empty()
+        && !base.starts_with('-')
         // `@` はバージョン指定の区切り (`node@20`) なので、ツール名側には
         // scope 付き npm パッケージ (`npm:@scope/pkg`) の先頭にしか現れない
-        && name.chars().all(|c| {
+        && base.chars().all(|c| {
             c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '/' | ':' | '@' | '+')
-        })
+        });
+
+    let options_are_valid = match options {
+        // `[` があるなら `]` で閉じていること (壊れた記法をそのまま mise へ渡さない)。
+        // `is_control` は改行・NUL を含む制御文字全般を弾く
+        Some(options) => options.ends_with(']') && !options.chars().any(char::is_control),
+        None => true,
+    };
+
+    base_is_valid && options_are_valid
 }
 
 /// mise が返す `created_at` を `DateTime<Utc>` に変換する。
@@ -267,6 +307,70 @@ mod tests {
         assert!(!is_valid_tool_name("node`whoami`"));
         assert!(!is_valid_tool_name("node $(id)"));
         assert!(!is_valid_tool_name("node\nls"));
+    }
+
+    /// バグ回帰テスト: バックエンドオプション付きのツール名を受理する。
+    ///
+    /// 以前は文字種ホワイトリストに `[` `]` `=` が無く、`mise ls-remote` を起動する前に
+    /// `InvalidPackageName` で落ちていた。parse はこのキーを依存として surface するため、
+    /// 毎回 `FetchFailed` でスキップされ **恒久的に更新不能**だった。
+    #[test]
+    fn test_is_valid_tool_name_accepts_backend_options() {
+        assert!(is_valid_tool_name("ubi:BurntSushi/ripgrep[exe=rg]"));
+        assert!(is_valid_tool_name("ubi:cli/cli[exe=gh][provider=github]"));
+        assert!(is_valid_tool_name(
+            r"ubi:cargo-bins/cargo-binstall[tag_regex=^\d+\.]"
+        ));
+        assert!(is_valid_tool_name(
+            "ubi:owner/repo[matching_regex=linux.*musl]"
+        ));
+        assert!(is_valid_tool_name("aqua:owner/repo[extract_all=true]"));
+        assert!(is_valid_tool_name(
+            "ubi:owner/repo[api_url=https://example.com/api]"
+        ));
+    }
+
+    /// オプション部を許しても、基底名の検証と `-` 始まりの拒否は緩めない
+    #[test]
+    fn test_is_valid_tool_name_still_validates_base_name() {
+        assert!(!is_valid_tool_name("-x[exe=rg]"));
+        assert!(!is_valid_tool_name("--json[exe=rg]"));
+        assert!(!is_valid_tool_name("[exe=rg]"));
+        assert!(!is_valid_tool_name("node; rm -rf /[exe=rg]"));
+        assert!(!is_valid_tool_name("node`whoami`[exe=rg]"));
+        // 閉じていないブラケットは壊れた記法なので渡さない
+        assert!(!is_valid_tool_name("ubi:owner/repo[exe=rg"));
+        // オプション部に制御文字 (改行 / NUL) は許さない
+        assert!(!is_valid_tool_name("ubi:owner/repo[exe=r\ng]"));
+        assert!(!is_valid_tool_name("ubi:owner/repo[exe=r\u{0}g]"));
+    }
+
+    #[test]
+    fn test_split_backend_options() {
+        assert_eq!(split_backend_options("node"), ("node", None));
+        assert_eq!(
+            split_backend_options("ubi:BurntSushi/ripgrep[exe=rg]"),
+            ("ubi:BurntSushi/ripgrep", Some("exe=rg]"))
+        );
+        assert_eq!(
+            split_backend_options("ubi:cli/cli[exe=gh][provider=github]"),
+            ("ubi:cli/cli", Some("exe=gh][provider=github]"))
+        );
+    }
+
+    /// バックエンドオプション付きの名前が `fetch_versions` の検証を通り、
+    /// 実際に `mise ls-remote` の起動まで進むこと (バイナリが無いので NetworkError)
+    #[tokio::test]
+    async fn test_fetch_versions_accepts_backend_options() {
+        let adapter = MiseAdapter::with_program("depup-nonexistent-mise-binary");
+        let err = adapter
+            .fetch_versions("ubi:BurntSushi/ripgrep[exe=rg]")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RegistryError::NetworkError { .. }),
+            "expected the tool name to pass validation, got: {err:?}"
+        );
     }
 
     #[test]

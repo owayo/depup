@@ -674,6 +674,122 @@ beta = { module = "com.example:beta", version.ref = "shared" }
     }
 
     #[test]
+    fn test_apply_updates_gradle_same_coordinate_in_multiple_configurations() {
+        // Lombok 公式セットアップ (同一座標を 4 つの configuration へ宣言する正式な手順) は
+        // 曖昧扱いで拒否せず、全宣言を更新すること。
+        // GradleParser の update_version は文字列記法の全出現を書き換えるため、
+        // parse が 1 依存へ畳んだ上で 1 回適用すれば 4 行すべてが更新される。
+        let temp_dir = TempDir::new().unwrap();
+        let original_content = r#"dependencies {
+    compileOnly 'org.projectlombok:lombok:1.18.30'
+    annotationProcessor 'org.projectlombok:lombok:1.18.30'
+    testCompileOnly 'org.projectlombok:lombok:1.18.30'
+    testAnnotationProcessor 'org.projectlombok:lombok:1.18.30'
+}
+"#;
+        let path = temp_dir.path().join("build.gradle");
+        fs::write(&path, original_content).unwrap();
+
+        let parser = crate::manifest::GradleParser;
+        let dependencies = parser.parse(original_content).unwrap();
+        assert_eq!(
+            dependencies.len(),
+            1,
+            "同一座標の 4 宣言は 1 依存として扱う"
+        );
+
+        let mut manifest_result = ManifestUpdateResult::new(&path, Language::Java);
+        manifest_result.add_result(UpdateResult::update(dependencies[0].clone(), "1.18.42"));
+
+        let result = ManifestWriter::new(false)
+            .apply_updates(&manifest_result, &parser)
+            .unwrap();
+
+        assert_eq!(result.updates_applied, 1);
+        assert_eq!(result.updates_failed, 0);
+        assert!(!result.has_errors(), "errors: {:?}", result.errors);
+        assert!(result.file_modified);
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            content
+                .matches("'org.projectlombok:lombok:1.18.42'")
+                .count(),
+            4,
+            "4 宣言すべてが更新されるべき: {content}"
+        );
+        assert!(!content.contains("1.18.30"));
+    }
+
+    #[test]
+    fn test_apply_updates_refuses_shared_gradle_version_variable() {
+        // 別々の依存が同じバージョン変数を共有する場合は従来どおり拒否する
+        // (変数定義を書き換えると、更新対象でない依存の版まで動いてしまう)
+        let temp_dir = TempDir::new().unwrap();
+        let original_content = r#"def sharedVersion = '31.0'
+
+dependencies {
+    implementation "com.google.guava:guava:$sharedVersion"
+    implementation "com.example:other-lib:$sharedVersion"
+}
+"#;
+        let path = temp_dir.path().join("build.gradle");
+        fs::write(&path, original_content).unwrap();
+
+        let parser = crate::manifest::GradleParser;
+        let dependency = parser
+            .parse(original_content)
+            .unwrap()
+            .into_iter()
+            .find(|dependency| dependency.name == "com.google.guava:guava")
+            .unwrap();
+
+        let mut manifest_result = ManifestUpdateResult::new(&path, Language::Java);
+        manifest_result.add_result(UpdateResult::update(dependency, "33.0.0-jre"));
+
+        let result = ManifestWriter::new(false)
+            .apply_updates(&manifest_result, &parser)
+            .unwrap();
+
+        assert_eq!(result.updates_applied, 0);
+        assert_eq!(result.updates_failed, 1);
+        assert!(!result.file_modified);
+        assert!(result.errors[0].contains("ambiguous dependency"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), original_content);
+    }
+
+    #[test]
+    fn test_apply_updates_refuses_gradle_declarations_with_mismatched_versions() {
+        // 同名でもバージョン生表記が食い違う宣言は 1 依存へ畳めないため、
+        // 従来どおり曖昧として拒否する
+        let temp_dir = TempDir::new().unwrap();
+        let original_content = r#"dependencies {
+    compileOnly 'org.projectlombok:lombok:1.18.28'
+    annotationProcessor "org.projectlombok:lombok:1.18.30!!"
+}
+"#;
+        let path = temp_dir.path().join("build.gradle");
+        fs::write(&path, original_content).unwrap();
+
+        let parser = crate::manifest::GradleParser;
+        let dependencies = parser.parse(original_content).unwrap();
+        assert_eq!(dependencies.len(), 2, "生表記が違う宣言は畳まない");
+
+        let mut manifest_result = ManifestUpdateResult::new(&path, Language::Java);
+        manifest_result.add_result(UpdateResult::update(dependencies[0].clone(), "1.18.42"));
+
+        let result = ManifestWriter::new(false)
+            .apply_updates(&manifest_result, &parser)
+            .unwrap();
+
+        assert_eq!(result.updates_applied, 0);
+        assert_eq!(result.updates_failed, 1);
+        assert!(!result.file_modified);
+        assert!(result.errors[0].contains("ambiguous dependency"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), original_content);
+    }
+
+    #[test]
     fn test_apply_updates_handles_failed_update() {
         let temp_dir = TempDir::new().unwrap();
         let original_content = r#"{

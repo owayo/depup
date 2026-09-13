@@ -358,8 +358,12 @@ fn add_flow_workspace_patterns(
 ///
 /// 対応形式: 直接パス / 末尾 `/*` / 末尾 `/**` (第 1 階層のみ) /
 /// 末尾セグメントの単純ワイルドカード (`crates/util-*`)。
+///
+/// 展開結果はそのままマニフェストの書き換え対象になるため、`.depup` や
+/// `go.work` / `settings.gradle` と同じくプロジェクト外へは出さない
+/// (`is_within_project` で最終検査する)。
 fn expand_workspace_pattern(dir: &Path, pattern: &str) -> Vec<PathBuf> {
-    if let Some(base) = pattern.strip_suffix("/*") {
+    let expanded = if let Some(base) = pattern.strip_suffix("/*") {
         list_subdirectories(&dir.join(base))
     } else if let Some(base) = pattern.strip_suffix("/**") {
         // ** パターンは現時点では第 1 階層のみを対象にする
@@ -381,17 +385,38 @@ fn expand_workspace_pattern(dir: &Path, pattern: &str) -> Vec<PathBuf> {
             && let Some((prefix, suffix)) = file.split_once('*')
             && !suffix.contains('*')
         {
-            return list_subdirectories(&dir.join(parent))
+            list_subdirectories(&dir.join(parent))
                 .into_iter()
                 .filter(|p| {
                     p.file_name()
                         .and_then(|n| n.to_str())
                         .is_some_and(|n| n.starts_with(prefix) && n.ends_with(suffix))
                 })
-                .collect();
+                .collect()
+        } else {
+            Vec::new()
         }
-        Vec::new()
-    }
+    };
+
+    expanded
+        .into_iter()
+        .filter(|path| is_within_project(dir, path))
+        .collect()
+}
+
+/// `candidate` が `dir` 配下の実体を指しているかを symlink 解決後で判定する。
+///
+/// `Path::join` は引数が絶対パスなら base を捨てるため、`members = ["/tmp/evil"]`
+/// はそのまま `/tmp/evil` に解決される。`..` も畳まれずに外へ出る。どちらも
+/// glob 展開経路には `resolve_project_subdir` の相対パス制約が掛かっていないので、
+/// 展開後の実体パスで防ぐ。
+fn is_within_project(dir: &Path, candidate: &Path) -> bool {
+    let (Ok(canonical_base), Ok(canonical_candidate)) =
+        (dir.canonicalize(), candidate.canonicalize())
+    else {
+        return false;
+    };
+    canonical_candidate.starts_with(&canonical_base)
 }
 
 /// ベースディレクトリ直下のサブディレクトリを列挙する (順序は名前順で安定)

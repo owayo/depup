@@ -13,7 +13,7 @@ use crate::error::ManifestError;
 use crate::manifest::{ManifestParser, gradle_version_catalog, line_utils::split_line_ending};
 use crate::parser::get_parser;
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
@@ -60,6 +60,21 @@ struct RichVersionSelection {
     value_start: usize,
     value_end: usize,
 }
+
+/// 依存宣言の記法種別。同一座標の複数宣言を 1 件へ畳めるかの判断に使う。
+///
+/// `update_direct_version` は記法ごとに書き換え経路が違い、
+/// 「全出現を書き換える」保証があるのは文字列記法と map 記法だけ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum DeclarationNotation {
+    /// 文字列記法 (`implementation 'group:name:version'`)
+    String,
+    /// map 記法 (`implementation group: 'x', name: 'y', version: 'z'`)
+    Map,
+}
+
+/// 重複排除に使う宣言の同一性キー (依存キー名 / バージョン生表記 / 変数名 / 記法種別)
+type DeclarationKey = (String, String, Option<String>, DeclarationNotation);
 
 // Gradle DSL 用の正規表現
 
@@ -406,6 +421,47 @@ fn lookup_variable<'a>(
         .get_key_value(last)
         .filter(|(_, def)| !def.ambiguous)
         .map(|(key, def)| (key.as_str(), def))
+}
+
+/// 同一座標の宣言を重複排除しながら依存一覧へ追加する。
+///
+/// Gradle では configuration ごとに同じ座標を書くのが正式な手順で、Lombok 公式セットアップ
+/// (`compileOnly` / `annotationProcessor` / `testCompileOnly` / `testAnnotationProcessor` の
+/// 同一座標 4 宣言) や `start.spring.io` の生成物がまさにこの形になる。行ごとに 1 依存を
+/// surface すると writer の曖昧性ガード (同名の宣言が複数あれば更新を拒否) に必ず引っかかり、
+/// 「4 updates」と報告しながら 1 バイトも書けず exit code 2 になっていた。
+///
+/// `update_direct_version` は文字列記法・map 記法の**全出現**を各自の旧値から整形して置換する
+/// (`replace_all_active_gradle_matches`) ため、依存キー名・バージョン生表記・変数名・記法種別が
+/// すべて一致する宣言は「1 依存 = 1 バージョン = 1 書き換え」として扱ってよい。畳むことで
+/// レジストリ照会と OSV 照会も 1 回で済む。
+///
+/// 逆に 1 つでも食い違う宣言は畳まない (= 従来どおり writer が曖昧として拒否する):
+/// - バージョン生表記が違う (`1.18.28` と `1.18.30!!`): 更新後の表記を 1 つに決められない
+/// - 参照する変数が違う: 変数定義は片方しか書き換えないため他方が古いまま残る
+/// - 文字列記法と map 記法の混在: `update_direct_version` は map 記法が 1 件でも当たると
+///   early return するため文字列記法側が書き換わらない
+/// - rich version ブロック由来の宣言: 更新が最初のブロックだけを書き換えるため、
+///   そもそもこの関数を通さない (畳まずに全宣言を surface する)
+///
+/// `is_dev` はキーに含めない。Lombok の 4 宣言は `compileOnly` (production) と
+/// `testCompileOnly` (development) にまたがるため、含めると畳めずガードに戻ってしまう。
+/// 残るのは最初の宣言なので、上記の並びでは production 側が採用される。
+fn push_unique_declaration(
+    dependencies: &mut Vec<Dependency>,
+    seen: &mut HashSet<DeclarationKey>,
+    dependency: Dependency,
+    notation: DeclarationNotation,
+) {
+    let key = (
+        dependency.manifest_name().to_string(),
+        dependency.version_spec.raw.clone(),
+        dependency.variable_name.clone(),
+        notation,
+    );
+    if seen.insert(key) {
+        dependencies.push(dependency);
+    }
 }
 
 impl GradleParser {
@@ -825,6 +881,8 @@ impl ManifestParser for GradleParser {
         }
 
         let mut dependencies = Vec::new();
+        // 同一座標を複数の configuration へ書く Gradle の正式な作法を 1 依存へ畳むための集合
+        let mut seen_declarations: HashSet<DeclarationKey> = HashSet::new();
         let parser = get_parser(Language::Java);
         let variables = self.extract_variables(content);
         // ブロックコメント内の宣言を生きた依存として拾わないよう、除去済みの行で判定する
@@ -857,7 +915,12 @@ impl ManifestParser for GradleParser {
                 } else {
                     dep
                 };
-                dependencies.push(dep);
+                push_unique_declaration(
+                    &mut dependencies,
+                    &mut seen_declarations,
+                    dep,
+                    DeclarationNotation::Map,
+                );
                 continue;
             }
 
@@ -870,11 +933,18 @@ impl ManifestParser for GradleParser {
                 } else {
                     dep
                 };
-                dependencies.push(dep);
+                push_unique_declaration(
+                    &mut dependencies,
+                    &mut seen_declarations,
+                    dep,
+                    DeclarationNotation::String,
+                );
                 continue;
             }
 
-            // rich version ブロック付き文字列記法を試す
+            // rich version ブロック付き文字列記法を試す。
+            // 更新は最初のブロックだけを書き換えるため重複排除せず、
+            // 同一座標が複数あれば writer の曖昧性ガードに委ねる。
             if let Some(dep) = self.parse_rich_version_notation(&lines, line_index, parser.as_ref())
             {
                 dependencies.push(dep);
@@ -2903,6 +2973,106 @@ dependencies {
         assert!(result.contains("compileOnly 'org.projectlombok:lombok:1.18.36'"));
         assert!(result.contains("annotationProcessor 'org.projectlombok:lombok:1.18.36'"));
         assert!(!result.contains("1.18.30"));
+    }
+
+    #[test]
+    fn test_parse_collapses_identical_declarations_of_same_coordinate() {
+        // Lombok 公式セットアップ (compileOnly + annotationProcessor + test 側 2 本) は
+        // 同一座標を 4 回宣言する正式な手順。行ごとに surface すると writer の
+        // 曖昧性ガードに引っかかって更新不能になるため、1 依存へ畳む。
+        let content = r#"
+dependencies {
+    compileOnly 'org.projectlombok:lombok:1.18.30'
+    annotationProcessor 'org.projectlombok:lombok:1.18.30'
+    testCompileOnly 'org.projectlombok:lombok:1.18.30'
+    testAnnotationProcessor 'org.projectlombok:lombok:1.18.30'
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "org.projectlombok:lombok");
+        assert_eq!(deps[0].version_spec.version, "1.18.30");
+        // 最初の宣言 (compileOnly) が残るので production 扱い
+        assert!(!deps[0].is_dev);
+    }
+
+    #[test]
+    fn test_parse_collapses_identical_variable_declarations_of_same_coordinate() {
+        // 同じ変数を参照する同一座標の複数宣言は、変数定義 1 箇所の書き換えで
+        // 全宣言が更新されるので畳んでよい (共有変数の曖昧性ガードにも掛からない)
+        let content = r#"
+def lombokVersion = '1.18.30'
+
+dependencies {
+    compileOnly "org.projectlombok:lombok:$lombokVersion"
+    annotationProcessor "org.projectlombok:lombok:$lombokVersion"
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "org.projectlombok:lombok");
+        assert_eq!(deps[0].variable_name.as_deref(), Some("lombokVersion"));
+    }
+
+    #[test]
+    fn test_parse_keeps_declarations_with_different_raw_versions() {
+        // 生表記が食い違う宣言は更新後の表記を 1 つに決められないため畳まない
+        // (writer が曖昧として拒否し続ける)
+        let content = r#"
+dependencies {
+    compileOnly 'org.projectlombok:lombok:1.18.28'
+    annotationProcessor "org.projectlombok:lombok:1.18.30!!"
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_keeps_declarations_with_different_variables() {
+        // 別々の変数を参照する宣言は、変数定義を片方しか書き換えられないため畳まない
+        let content = r#"
+def lombokCompile = '1.18.30'
+def lombokProcessor = '1.18.30'
+
+dependencies {
+    compileOnly "org.projectlombok:lombok:$lombokCompile"
+    annotationProcessor "org.projectlombok:lombok:$lombokProcessor"
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_keeps_mixed_notation_declarations() {
+        // update_direct_version は map 記法が当たると early return するため、
+        // 文字列記法との混在は畳まない (畳むと文字列記法側が黙って古いまま残る)
+        let content = r#"
+dependencies {
+    compileOnly 'org.projectlombok:lombok:1.18.30'
+    annotationProcessor group: 'org.projectlombok', name: 'lombok', version: '1.18.30'
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_keeps_duplicate_rich_version_declarations() {
+        // rich version ブロックの更新は最初のブロックだけを書き換えるため畳まない
+        let content = r#"
+dependencies {
+    compileOnly("org.projectlombok:lombok") {
+        version { strictly("1.18.30") }
+    }
+    annotationProcessor("org.projectlombok:lombok") {
+        version { strictly("1.18.30") }
+    }
+}
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 2);
     }
 
     #[test]

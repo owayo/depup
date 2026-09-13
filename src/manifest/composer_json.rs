@@ -96,6 +96,12 @@ fn is_platform_package(name: &str) -> bool {
     if name.contains('/') {
         return false;
     }
+    // composer の `PlatformRepository::PLATFORM_PACKAGE_REGEX` は `i` フラグ付きで、
+    // `ArrayLoader::parseLinks` も require キーを `strtolower` してから解決する。
+    // よって `"PHP": ">=8.1"` / `"Ext-Mbstring": "^8.0"` は完全に valid な platform 要求。
+    // 大小を区別したままだと通常パッケージとして Packagist へ問い合わせ、
+    // `vendor/package` 形式でないため InvalidPackageName になり exit code 2 で落ちていた。
+    let name = name.to_ascii_lowercase();
     name == "php"
         || name == "hhvm"
         || name.starts_with("php-")

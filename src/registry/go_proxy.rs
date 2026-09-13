@@ -14,7 +14,7 @@ use crate::domain::Language;
 use crate::error::RegistryError;
 use crate::manifest::GoModParser;
 use crate::registry::{HttpClient, RegistryAdapter};
-use crate::update::{VersionInfo, compare_semver_versions, is_prerelease_version};
+use crate::update::{VersionInfo, compare_semver_versions};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::stream::{self, StreamExt};
@@ -115,6 +115,26 @@ impl GoProxyAdapter {
     }
 }
 
+/// Go の `semver.Prerelease(v) != ""` と同じ規則でプレリリースか判定する。
+///
+/// Go 本体 (`modload.filterVersions`) はプレリリースかどうかを
+/// `semver.Prerelease(v) != ""`、つまり **build metadata を除いた版に `-` 以降が
+/// あるか**だけで決める。汎用の `is_prerelease_version` は `alpha` / `rc` 等の
+/// 識別子を語として探すヒューリスティックなので、`v1.2.3-1` のような純数値
+/// prerelease を release と誤判定し、Go 本体と違う版の `go.mod` を retract の
+/// 情報源にしてしまう。
+///
+/// 判定内容は `update::version_info::is_semver_prerelease_version` と同じだが、
+/// あちらは private モジュール内の `pub(crate)` 関数で `crate::update` から
+/// 再エクスポートされておらず、レジストリ層からは参照できないため同じ規則を
+/// ここへ置く (`+incompatible` は build metadata なので release 扱いになる)。
+fn is_go_prerelease_version(version: &str) -> bool {
+    let public = version.split('+').next().unwrap_or(version);
+    public
+        .split_once('-')
+        .is_some_and(|(_, prerelease)| !prerelease.is_empty())
+}
+
 /// プロキシのバージョン一覧から、retract 情報を保持する生の最新バージョンを選ぶ。
 ///
 /// Go の `@latest` と同じく、安定版が1件でもあれば最上位の安定版を選び、
@@ -127,7 +147,7 @@ fn latest_version_for_retractions<'a>(
     let mut latest_prerelease: Option<&str> = None;
 
     for version in versions {
-        let latest = if is_prerelease_version(version) {
+        let latest = if is_go_prerelease_version(version) {
             &mut latest_prerelease
         } else {
             &mut latest_release
@@ -292,10 +312,8 @@ fn parse_retractions(content: &str) -> Vec<Retraction> {
 
         let spec = if in_retract_block {
             logical
-        } else if let Some(rest) = logical.strip_prefix("retract")
-            && rest.starts_with(char::is_whitespace)
-        {
-            rest.trim()
+        } else if let Some(rest) = strip_retract_keyword(logical) {
+            rest
         } else {
             continue;
         };
@@ -306,6 +324,29 @@ fn parse_retractions(content: &str) -> Vec<Retraction> {
     }
 
     retractions
+}
+
+/// go.mod の字句解析 (`x/mod/modfile/read.go` の `isIdent`) と同じ ident 文字判定。
+///
+/// go は空白と `(` `)` `[` `]` `{` `}` `,` を ident から除き、それ以外の印字可能な
+/// 文字はトークンの一部として読む。
+fn is_go_ident_char(c: char) -> bool {
+    !matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ',') && !c.is_whitespace()
+}
+
+/// 単一行 `retract` 指示から、キーワードに続く指定部分を取り出す。
+///
+/// `isIdent` が `[` を ident 文字から除くため、`retract[v1.0.0, v1.2.0]` のように
+/// ブラケットの前に空白が無くても go は `retract` + `[` の 2 トークンとして読む。
+/// 以前はキーワード直後に空白を要求していたため、この記法の retract を取りこぼして
+/// 撤回済みの版が更新候補に残っていた (`retract(` のブロック形式は対応済みで、
+/// 同じ穴が単一行のブラケット形式だけに残っていた)。
+///
+/// 逆に `retract` の直後が ident 文字なら `retractfoo` のような別の綴りなので拾わない。
+fn strip_retract_keyword(logical: &str) -> Option<&str> {
+    let rest = logical.strip_prefix("retract")?;
+    let first = rest.chars().next()?;
+    (!is_go_ident_char(first)).then(|| rest.trim())
 }
 
 /// retract の単一バージョンまたは閉区間を解釈する。
@@ -648,6 +689,39 @@ mod tests {
         );
     }
 
+    /// Go の `semver.Prerelease(v) != ""` と同じ判定になっていること。
+    #[test]
+    fn test_is_go_prerelease_version_matches_go_semver() {
+        // 純数値の prerelease も prerelease (汎用ヒューリスティックでは release 扱い)
+        assert!(is_go_prerelease_version("v1.2.3-1"));
+        assert!(is_go_prerelease_version("v2.0.0-rc.1"));
+        // 疑似バージョンも prerelease
+        assert!(is_go_prerelease_version(
+            "v0.0.0-20191109021931-daa7c04131f5"
+        ));
+        assert!(!is_go_prerelease_version("v1.2.3"));
+        // build metadata は prerelease ではない (`+incompatible` を含む)
+        assert!(!is_go_prerelease_version("v6.0.23+incompatible"));
+        assert!(!is_go_prerelease_version("v1.2.3+build-1"));
+    }
+
+    /// バグ回帰テスト: retract 情報源の選定だけが汎用の `is_prerelease_version`
+    /// (識別子ヒューリスティック) を使っていたため、`v1.2.3-1` のような純数値
+    /// prerelease を release と誤判定し、Go 本体 (`modload.filterVersions` は
+    /// `semver.Prerelease(v) != ""` で判定) と違う版の go.mod を情報源にしていた。
+    #[test]
+    fn test_latest_version_for_retractions_treats_numeric_prerelease_as_prerelease() {
+        let versions = ["v1.0.0", "v1.2.3-1"];
+        assert_eq!(latest_version_for_retractions(versions), Some("v1.0.0"));
+
+        // 安定版が無ければ従来どおり最上位のプレリリースを選ぶ
+        let prereleases = ["v1.2.3-1", "v1.2.3-2"];
+        assert_eq!(
+            latest_version_for_retractions(prereleases),
+            Some("v1.2.3-2")
+        );
+    }
+
     #[test]
     fn test_parse_retractions_supports_single_block_range_and_quotes() {
         let content = r#"
@@ -853,6 +927,35 @@ retract(
         assert_eq!(
             parse_retractions("module example.com/lib\n\nretract\tv1.0.0\n"),
             vec![Retraction::Exact("v1.0.0".to_string())]
+        );
+    }
+
+    /// バグ回帰テスト: `retract` の直後に空白を要求していたため、
+    /// `retract[v1.0.0, v1.2.0]` (ブラケット前に空白なし) を取りこぼしていた。
+    /// go の `isIdent` は `[` を ident 文字から除くので、この記法も
+    /// `retract` + `[` の 2 トークンとして正しく読まれる
+    /// (`retract(` のブロック形式は対応済みで、単一行だけに穴が残っていた)。
+    #[test]
+    fn test_parse_retractions_supports_bracket_without_space() {
+        let content = r#"
+module example.com/lib
+
+retract[v1.0.0, v1.2.0]
+retract["v1.4.0", `v1.5.0`] // 引用符付きも同様
+"#;
+
+        assert_eq!(
+            parse_retractions(content),
+            vec![
+                Retraction::Range {
+                    lower: "v1.0.0".to_string(),
+                    upper: "v1.2.0".to_string(),
+                },
+                Retraction::Range {
+                    lower: "v1.4.0".to_string(),
+                    upper: "v1.5.0".to_string(),
+                },
+            ]
         );
     }
 

@@ -15,6 +15,7 @@ use crate::update::VersionInfo;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use std::collections::HashSet;
 
 /// GitHub API のベース URL
 const GITHUB_API_URL: &str = "https://api.github.com";
@@ -42,14 +43,49 @@ const MAX_TAG_PAGES: usize = 10;
 /// SPM の `Version` (semver 2.0.0 厳格パース) では invalid だが `2024 > 1` のため semver
 /// タグと混在するリポジトリでは必ず最新候補として選ばれ、`swift build` が
 /// `Invalid semantic version string` で manifest ごと読めなくなる版を書き込んでいた。
-fn extract_semver_tag(tag: &str) -> Option<&str> {
+///
+/// ただし **タグ表を作るとき** の SPM は 2 セグメントのコアを許す。
+/// `swift-package-manager` の `Version+Extensions.swift` の `init?(tag:)` は
+/// `usesLenientParsing: true` で `Version` を組み立てており、`swift-tools-support-core` の
+/// `Version.swift` が `versionCoreIdentifiers.count == 3 ||
+/// (usesLenientParsing && versionCoreIdentifiers.count == 2)` を許可して patch を 0 と
+/// みなす。つまり `v2.5` / `0.6` のようなタグは SPM から見て `2.5.0` / `0.6.0` として
+/// 解決できる (`ReactiveCocoa/ReactiveCocoa` / `Moya/Moya` / `mxcl/PromiseKit` が該当)。
+/// 取得側でこれを落とすと候補が 1 件も無いまま `AlreadyLatest` になり、警告もなく更新を
+/// 取りこぼす。そこで **取得側だけ** SPM に合わせて `X.Y` → `X.Y.0` へ正規化してから
+/// 積む。`Package.swift` 側の version requirement は 3 セグメント必須のままなので
+/// (`SwiftVersionParser` は変更しない)、正規化後の値は書き戻しでもそのまま通る。
+fn extract_semver_tag(tag: &str) -> Option<String> {
     let version = tag.strip_prefix(['v', 'V']).unwrap_or(tag);
     // パーサは前後の空白を許容するが、タグ名では空白付きの形を受理しない。
     // 取得側だけ余分な形を通すと、書き戻し時にマニフェスト側と食い違う
     if version.trim() != version {
         return None;
     }
-    SwiftVersionParser.parse(version).map(|_| version)
+    if SwiftVersionParser.parse(version).is_some() {
+        return Some(version.to_string());
+    }
+    // SPM の lenient parsing 相当。正規化後も最終判定は SwiftVersionParser に委ねるため、
+    // 先頭ゼロ (`1.02` → `1.02.0`) やプレリリース識別子の規則は既存のまま変わらない
+    let normalized = normalize_lenient_two_segment_core(version)?;
+    if SwiftVersionParser.parse(&normalized).is_some() {
+        return Some(normalized);
+    }
+    None
+}
+
+/// バージョンコアが 2 セグメント (`X.Y`) のタグを `X.Y.0` へ正規化する。
+///
+/// semver のコアは最初の `-` (プレリリース) か `+` (ビルドメタデータ) の手前までなので、
+/// 識別子部分はそのまま後ろに繋ぎ直す (`2.5-beta.1` → `2.5.0-beta.1`)。
+/// コアが 2 セグメントでなければ `None` (正規化の対象外)。
+fn normalize_lenient_two_segment_core(version: &str) -> Option<String> {
+    let core_end = version.find(['-', '+']).unwrap_or(version.len());
+    let core = &version[..core_end];
+    if core.split('.').count() != 2 {
+        return None;
+    }
+    Some(format!("{}.0{}", core, &version[core_end..]))
 }
 
 /// ページ取得ループが `MAX_TAG_PAGES` で打ち切られたかを判定する
@@ -71,6 +107,34 @@ fn page_limit_warning(package: &str) -> String {
         MAX_TAG_PAGES,
         MAX_TAG_PAGES * TAGS_PER_PAGE
     )
+}
+
+/// タグ名の一覧を候補リストへ積む。
+///
+/// 重複排除の状態 (`seen`) は呼び出し側が持つ。ページをまたいで同じバージョンへ
+/// 正規化されるタグ (`1.2` と `1.2.0`) が現れうるため、ページ単位では判定できない。
+/// SPM も `Git.convertTagsToVersionMap` で `[Version: [String]]` としてタグを束ねており、
+/// 同じ `Version` に解決される複数のタグを 1 つの候補として扱う。
+fn collect_tag_versions<I>(
+    tag_names: I,
+    seen: &mut HashSet<String>,
+    versions: &mut Vec<VersionInfo>,
+) where
+    I: IntoIterator<Item = String>,
+{
+    for name in tag_names {
+        // タグ名から semver を抽出 (SPM が読めない形のタグはここで落とす)
+        let Some(version) = extract_semver_tag(&name) else {
+            continue;
+        };
+        if !seen.insert(version.clone()) {
+            continue;
+        }
+        // GitHub Tags API はリリース日を返さない。
+        // `Utc::now()` を使うと `--age` フィルタが全 Swift 更新を抑制してしまうため、
+        // age フィルタを通過させるための「十分古い」値として UNIX_EPOCH を採用する。
+        versions.push(VersionInfo::new(version, DateTime::<Utc>::UNIX_EPOCH));
+    }
 }
 
 /// GitHub Tags API アダプタ
@@ -197,6 +261,8 @@ impl RegistryAdapter for GitHubTagsAdapter {
         self.validate_package_name(package)?;
 
         let mut versions = Vec::new();
+        // 正規化後のバージョン文字列の重複排除用 (`1.2` と `1.2.0` の同居に備える)
+        let mut seen_versions: HashSet<String> = HashSet::new();
         let mut url = self.build_url(package);
 
         // 次ページが残ったままページ上限に達したか (取りこぼしの通知用)
@@ -266,15 +332,11 @@ impl RegistryAdapter for GitHubTagsAdapter {
                         message: format!("failed to parse JSON: {}", e),
                     })?;
 
-            for tag in tags {
-                // タグ名から semver を抽出 (SPM が読めない形のタグはここで落とす)
-                if let Some(version) = extract_semver_tag(&tag.name) {
-                    // GitHub Tags API はリリース日を返さない。
-                    // `Utc::now()` を使うと `--age` フィルタが全 Swift 更新を抑制してしまうため、
-                    // age フィルタを通過させるための「十分古い」値として UNIX_EPOCH を採用する。
-                    versions.push(VersionInfo::new(version, DateTime::<Utc>::UNIX_EPOCH));
-                }
-            }
+            collect_tag_versions(
+                tags.into_iter().map(|tag| tag.name),
+                &mut seen_versions,
+                &mut versions,
+            );
 
             truncated = is_page_limit_truncated(page, next_url.is_some());
             match next_url {
@@ -358,9 +420,10 @@ mod tests {
         assert!(extract_semver_tag("v1.0.0-rc.1").is_some());
         assert!(extract_semver_tag("V1.0.0-rc.1+sha.abc").is_some());
         assert!(extract_semver_tag("1.0.0+build.123").is_some());
+        // SPM の `Version(tag:)` は 2 セグメントのコアを patch=0 として受理する
+        assert!(extract_semver_tag("1.0").is_some());
+        assert!(extract_semver_tag("v1.0").is_some());
         // 不正な形式は弾く
-        assert!(extract_semver_tag("1.0").is_none());
-        assert!(extract_semver_tag("v1.0").is_none());
         assert!(extract_semver_tag("not-a-version").is_none());
         assert!(extract_semver_tag("1.0.0-").is_none()); // 末尾ハイフンのみは不可
         assert!(extract_semver_tag("1.0.0+").is_none()); // 末尾プラスのみは不可
@@ -369,16 +432,86 @@ mod tests {
 
     #[test]
     fn test_extract_semver_tag_extracts_version() {
-        assert_eq!(extract_semver_tag("v1.2.3"), Some("1.2.3"));
-        assert_eq!(extract_semver_tag("V1.2.3"), Some("1.2.3"));
-        assert_eq!(extract_semver_tag("1.2.3"), Some("1.2.3"));
+        assert_eq!(extract_semver_tag("v1.2.3").as_deref(), Some("1.2.3"));
+        assert_eq!(extract_semver_tag("V1.2.3").as_deref(), Some("1.2.3"));
+        assert_eq!(extract_semver_tag("1.2.3").as_deref(), Some("1.2.3"));
 
         // プレリリース/ビルドメタデータも含めて返す ('v' プレフィックスのみ除去)
-        assert_eq!(extract_semver_tag("v1.2.3-beta.1"), Some("1.2.3-beta.1"));
         assert_eq!(
-            extract_semver_tag("1.2.3-rc.1+sha.abc"),
+            extract_semver_tag("v1.2.3-beta.1").as_deref(),
+            Some("1.2.3-beta.1")
+        );
+        assert_eq!(
+            extract_semver_tag("1.2.3-rc.1+sha.abc").as_deref(),
             Some("1.2.3-rc.1+sha.abc")
         );
+    }
+
+    /// バグ回帰テスト: 2 セグメントのタグ (`v2.5` / `0.6` / `1.2`) を候補に載せる。
+    ///
+    /// SwiftPM の `Version(tag:)` は `usesLenientParsing: true` なので、これらのタグは
+    /// `2.5.0` / `0.6.0` / `1.2.0` として解決できる (`ReactiveCocoa` / `Moya` /
+    /// `PromiseKit` が実際にこの形のタグを使っている)。以前は取得側で無言で落としており、
+    /// 候補が空のまま `AlreadyLatest` と判定されて更新を取りこぼしていた。
+    #[test]
+    fn test_extract_semver_tag_normalizes_two_segment_tags() {
+        assert_eq!(extract_semver_tag("1.2").as_deref(), Some("1.2.0"));
+        assert_eq!(extract_semver_tag("v2.5").as_deref(), Some("2.5.0"));
+        assert_eq!(extract_semver_tag("V0.6").as_deref(), Some("0.6.0"));
+        assert_eq!(extract_semver_tag("0.0").as_deref(), Some("0.0.0"));
+        // プレリリース / ビルドメタデータはコアの後ろへそのまま繋ぎ直す
+        assert_eq!(
+            extract_semver_tag("v2.5-beta.1").as_deref(),
+            Some("2.5.0-beta.1")
+        );
+        assert_eq!(
+            extract_semver_tag("1.2+build.5").as_deref(),
+            Some("1.2.0+build.5")
+        );
+        assert_eq!(
+            extract_semver_tag("v1.2-rc.1+sha.abc").as_deref(),
+            Some("1.2.0-rc.1+sha.abc")
+        );
+    }
+
+    /// 2 セグメント補完は既存の受理規則 (先頭ゼロ・セグメント数・空識別子) を緩めない
+    #[test]
+    fn test_extract_semver_tag_two_segment_keeps_existing_rules() {
+        // 1 セグメント / 4 セグメントは対象外
+        assert!(extract_semver_tag("1").is_none());
+        assert!(extract_semver_tag("v1").is_none());
+        assert!(extract_semver_tag("1.2.3.4").is_none());
+        // 補完後も先頭ゼロは invalid
+        assert!(extract_semver_tag("1.02").is_none());
+        assert!(extract_semver_tag("01.2").is_none());
+        // CalVer の 2 セグメント (`2024.01`) も先頭ゼロで弾かれる
+        assert!(extract_semver_tag("2024.01").is_none());
+        // 数値でないコアは補完しても invalid
+        assert!(extract_semver_tag("release-1.2").is_none());
+        assert!(extract_semver_tag("1.x").is_none());
+        // 空の識別子・末尾の区切りは従来どおり不可
+        assert!(extract_semver_tag("1.2-").is_none());
+        assert!(extract_semver_tag("1.2+").is_none());
+        assert!(extract_semver_tag("1.2-alpha..1").is_none());
+        // 空白付きは従来どおり不可
+        assert!(extract_semver_tag("v1.2 ").is_none());
+    }
+
+    #[test]
+    fn test_normalize_lenient_two_segment_core() {
+        assert_eq!(
+            normalize_lenient_two_segment_core("1.2"),
+            Some("1.2.0".to_string())
+        );
+        assert_eq!(
+            normalize_lenient_two_segment_core("1.2-rc.1"),
+            Some("1.2.0-rc.1".to_string())
+        );
+        // コアが 2 セグメントでなければ対象外
+        assert_eq!(normalize_lenient_two_segment_core("1.2.3"), None);
+        assert_eq!(normalize_lenient_two_segment_core("1"), None);
+        assert_eq!(normalize_lenient_two_segment_core(""), None);
+        assert_eq!(normalize_lenient_two_segment_core("-beta"), None);
     }
 
     /// バグ回帰テスト: 先頭ゼロを含むタグは候補にしない。
@@ -399,10 +532,14 @@ mod tests {
         assert!(extract_semver_tag("1.2.3-01").is_none());
     }
 
-    /// 取得側 (GitHub Tags) とマニフェスト側 (`Package.swift`) の受理範囲が一致すること。
-    /// 二重管理していた正規表現を `SwiftVersionParser` へ委譲した回帰テスト。
+    /// 取得側 (GitHub Tags) が返す値は必ずマニフェスト側 (`Package.swift`) で書ける形に
+    /// なっていること。二重管理していた正規表現を `SwiftVersionParser` へ委譲した回帰テスト。
+    ///
+    /// 受理**範囲**は SPM に合わせて取得側の方が広い (2 セグメントのタグを patch=0 として
+    /// 受理する) が、返す**値**は常に 3 セグメントへ正規化済みでなければならない。
+    /// ここが崩れると judge が選んだ候補を writer が書き戻せず report/apply が矛盾する。
     #[test]
-    fn test_extract_semver_tag_agrees_with_manifest_parser() {
+    fn test_extract_semver_tag_output_is_writable_by_manifest_parser() {
         for tag in [
             "1.2.3",
             "v1.2.3",
@@ -414,16 +551,27 @@ mod tests {
             "1.0.0-rc.1+sha.abc",
             "1.2.3-01",
             "1.0",
+            "v2.5",
+            "1.2-rc.1",
+            "1.2+build.5",
+            "1.02",
             "not-a-version",
         ] {
-            let extracted = extract_semver_tag(tag);
-            let body = tag.strip_prefix(['v', 'V']).unwrap_or(tag);
-            assert_eq!(
-                extracted.is_some(),
-                SwiftVersionParser.parse(body).is_some(),
-                "tag {} disagrees with SwiftVersionParser",
-                tag
+            let Some(extracted) = extract_semver_tag(tag) else {
+                continue;
+            };
+            assert!(
+                SwiftVersionParser.parse(&extracted).is_some(),
+                "tag {} produced {} which SwiftVersionParser rejects",
+                tag,
+                extracted
             );
+        }
+
+        // 3 セグメントのタグは正規化を挟まずそのまま通す (既存挙動)
+        for tag in ["1.2.3", "v1.2.3", "1.0.0-rc.1+sha.abc"] {
+            let body = tag.strip_prefix(['v', 'V']).unwrap_or(tag);
+            assert_eq!(extract_semver_tag(tag).as_deref(), Some(body));
         }
     }
 
@@ -432,6 +580,38 @@ mod tests {
         // タグ名に空白が混ざる形は受理しない (パーサ側の trim に引きずられない)
         assert!(extract_semver_tag(" 1.2.3").is_none());
         assert!(extract_semver_tag("1.2.3 ").is_none());
+    }
+
+    /// バグ回帰テスト: `1.2` と `1.2.0` が同居するリポジトリで候補を重複させない。
+    /// SPM も同じ `Version` に解決されるタグを 1 つに束ねている。
+    #[test]
+    fn test_collect_tag_versions_dedupes_normalized_tags() {
+        let mut seen = HashSet::new();
+        let mut versions = Vec::new();
+        collect_tag_versions(
+            ["v1.2", "1.2.0", "1.2", "v2.5", "not-a-version", "2.5.0"]
+                .into_iter()
+                .map(str::to_string),
+            &mut seen,
+            &mut versions,
+        );
+        let names: Vec<&str> = versions.iter().map(|v| v.version.as_str()).collect();
+        assert_eq!(names, vec!["1.2.0", "2.5.0"]);
+    }
+
+    /// ページをまたいで同じバージョンが現れても重複しない
+    #[test]
+    fn test_collect_tag_versions_dedupes_across_pages() {
+        let mut seen = HashSet::new();
+        let mut versions = Vec::new();
+        collect_tag_versions(["1.2".to_string()].into_iter(), &mut seen, &mut versions);
+        collect_tag_versions(
+            ["1.2.0".to_string(), "1.3".to_string()].into_iter(),
+            &mut seen,
+            &mut versions,
+        );
+        let names: Vec<&str> = versions.iter().map(|v| v.version.as_str()).collect();
+        assert_eq!(names, vec!["1.2.0", "1.3.0"]);
     }
 
     #[test]

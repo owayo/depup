@@ -323,6 +323,37 @@ fn format_tilde_like(raw: &str, current_version: &str, new_version: &str) -> Opt
     ))
 }
 
+/// バージョントークンの数値セグメントが 1 つ以上あり、その全てが 0 か判定する
+/// (`v` / `V` 接頭辞は許容。プレリリース等の非数値が混ざれば false)。
+fn all_numeric_segments_are_zero(token: &str) -> bool {
+    let core = token.trim();
+    let core = core
+        .strip_prefix('v')
+        .or_else(|| core.strip_prefix('V'))
+        .unwrap_or(core);
+    if core.is_empty() {
+        return false;
+    }
+    core.split('.')
+        .all(|segment| !segment.is_empty() && segment.bytes().all(|byte| byte == b'0'))
+}
+
+/// Caret の許容幅が「書かれたセグメント数」に依存するかを判定する。
+///
+/// caret の上限は**左端の非ゼロセグメント**で決まる:
+/// `^1.2` も `^1.2.3` も `<2.0.0`、`^0.25` も `^0.25.10` も `<0.26.0`、
+/// `^0.0.3` は `<0.0.4`。よってセグメント数が上限を左右するのは、書かれた
+/// セグメントが**全てゼロ**のときだけである:
+/// `^0` = `<1.0.0` / `^0.0` = `<0.1.0` / `^0.0.0` = `<0.0.1`。
+///
+/// このときレジストリの完全版をそのまま書き戻すと、`^0` (0.x 全域) が
+/// `^0.28.2` (0.28 系のみ) へ、`^0.0` が `^0.0.9` (単一版固定) へ黙って縮む。
+/// Cargo / node-semver / Composer / Poetry いずれもこの表は一致する。
+fn caret_width_depends_on_segment_count(raw: &str) -> bool {
+    find_first_version_token(raw)
+        .is_some_and(|(start, end)| all_numeric_segments_are_zero(&raw[start..end]))
+}
+
 fn preserve_version_prefix(template: &str, new_version: &str) -> String {
     let stripped = new_version
         .strip_prefix('v')
@@ -605,8 +636,13 @@ fn format_range_like(raw: &str, new_version: &str) -> Option<String> {
         // (上限 <1.10.0) へ黙って狭まり、以後マイナー系列を跨げなくなる。
         // 単体の Tilde は format_tilde_like がセグメント数を保つのに、comparator set へ
         // 入った途端に保護が外れる非対称を防ぐ。
-        // `^` は上限がセグメント数に依存しない (`^1` も `^1.9.3` も上限は <2.0.0) ため対象外。
-        if operator == "~=" || operator == "~" {
+        // `^` は上限が左端の非ゼロセグメントで決まる (`^1` も `^1.9.3` も <2.0.0) ため
+        // 通常は対象外だが、書かれたセグメントが全てゼロのとき (`^0` = <1.0.0 /
+        // `^0.0` = <0.1.0) だけはセグメント数で上限が変わるので保護する。
+        if operator == "~="
+            || operator == "~"
+            || (operator == "^" && all_numeric_segments_are_zero(&raw[start..end]))
+        {
             return replace_version_token_preserving_shape(raw, start, end, new_version);
         }
         return replace_version_token(raw, start, end, new_version);
@@ -699,6 +735,14 @@ impl VersionSpec {
             // Tilde は元のセグメント数が許容幅を決めるため、部分指定 (`~1.2` / `~> 7.0`)
             // は更新後もセグメント数を保つ。切り詰められない入力では完全版を使う。
             VersionSpecKind::Tilde => {
+                let body = format_tilde_like(&self.raw, &self.version, new_version)
+                    .unwrap_or_else(|| new_version.to_string());
+                Some(self.wrap_with_affixes(&body))
+            }
+            // Caret は「書かれたセグメントが全てゼロ」のときだけ許容幅がセグメント数で
+            // 決まる (`^0` = `<1.0.0` / `^0.0` = `<0.1.0`)。詳細は
+            // `caret_width_depends_on_segment_count` のコメントを参照。
+            VersionSpecKind::Caret if caret_width_depends_on_segment_count(&self.raw) => {
                 let body = format_tilde_like(&self.raw, &self.version, new_version)
                     .unwrap_or_else(|| new_version.to_string());
                 Some(self.wrap_with_affixes(&body))

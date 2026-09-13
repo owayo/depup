@@ -164,15 +164,35 @@ pub(crate) fn replace_string_property_in_top_level_sections(
     replace_string_property_in_ranges(content, ranges, property_name, &mut transform)
 }
 
+/// JSON のキー・値ペア (どちらも文字列リテラル) を、エスケープを含んだまま捉える。
+/// 一致したキー・値は生テキストのままなので、比較・書き戻しの前後で必ずデコード /
+/// エンコードを通す。
+const JSON_STRING_PROPERTY_PATTERN: &str = r#"("(?:[^"\\]|\\.)*")(\s*:\s*)("(?:[^"\\]|\\.)*")"#;
+
+/// JSON 文字列リテラル (引用符込み) をデコードする
+fn decode_json_string(raw: &str) -> Option<String> {
+    serde_json::from_str::<String>(raw).ok()
+}
+
+/// 文字列を JSON 文字列リテラル (引用符込み) へエンコードする
+fn encode_json_string(value: &str) -> Option<String> {
+    serde_json::to_string(value).ok()
+}
+
 pub(crate) fn replace_string_property_in_ranges(
     content: &str,
     mut ranges: Vec<(usize, usize)>,
     property_name: &str,
     transform: &mut impl FnMut(&str) -> Option<String>,
 ) -> Result<(String, bool), regex::Error> {
-    let escaped_property = regex::escape(property_name);
-    let pattern = format!(r#"("{}"\s*:\s*)"([^"]+)""#, escaped_property);
-    let re = Regex::new(&pattern)?;
+    // キーと値は生テキストのリテラルではなく、JSON 文字列としてデコードしてから
+    // 比較・変換する。PHP の `json_encode` は既定で `/` を `\/` へエスケープするため
+    // (`"monolog\/monolog"`)、リテラル一致では composer.json の依存キーに 1 つも
+    // 当たらず、judge が「更新あり」と報告した後に書き込みが必ず失敗していた
+    // (composer のパッケージ名は必ず `/` を含むので全依存が失敗する)。
+    // package.json の scoped 名 (`"@types\/node"`) や、Go の `encoding/json` が付ける
+    // `<` のような別表記も同じ経路で救われる。
+    let re = Regex::new(JSON_STRING_PROPERTY_PATTERN)?;
 
     let mut result = content.to_string();
     let mut updated = false;
@@ -182,14 +202,24 @@ pub(crate) fn replace_string_property_in_ranges(
         let replaced = {
             let section = &result[start..end];
             re.replace_all(section, |caps: &regex::Captures| {
-                let prefix = &caps[1];
-                let old_value = &caps[2];
-                if let Some(new_value) = transform(old_value) {
-                    updated = true;
-                    format!(r#"{}"{}""#, prefix, new_value)
-                } else {
-                    caps[0].to_string()
+                let raw_key = &caps[1];
+                let separator = &caps[2];
+                let raw_value = &caps[3];
+                // キーがデコードできない / 対象パッケージでない場合は素通しする
+                if decode_json_string(raw_key).as_deref() != Some(property_name) {
+                    return caps[0].to_string();
                 }
+                let Some(old_value) = decode_json_string(raw_value) else {
+                    return caps[0].to_string();
+                };
+                let Some(new_value) = transform(&old_value) else {
+                    return caps[0].to_string();
+                };
+                let Some(encoded) = encode_json_string(&new_value) else {
+                    return caps[0].to_string();
+                };
+                updated = true;
+                format!("{}{}{}", raw_key, separator, encoded)
             })
             .into_owned()
         };

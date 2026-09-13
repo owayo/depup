@@ -15,8 +15,9 @@ use crate::manifest::{
 };
 use crate::parser::get_parser;
 use regex::Regex;
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Mutex};
 
 /// `Gemfile` 用パーサ
 pub struct GemfileParser;
@@ -42,6 +43,17 @@ static GEM_RE: LazyLock<Regex> = LazyLock::new(|| {
     // ` if ...` でバックトラックして version 引数を取りこぼし Any と誤分類する。
     Regex::new(
         r#"^\s*gem(?:\s+|\s*\(\s*)['"]([^'"]+)['"](?:\s*,\s*['"]([^'"]+)['"])?(?:\s*,\s*['"]([^'"]+)['"])?(?:\s*,\s*['"]([^'"]+)['"])?(?:\s*,|\s*\)?\s*$|\s*\)?\s*#|\s*\)?\s+(?:if|unless)\b)"#,
+    )
+    .unwrap()
+});
+
+// バージョンなし `gem` 宣言へバージョンを挿入できる形かを判定する正規表現。
+// 末尾コンテキストは 行末 / コメント `#` / `)` / オプション (`, require:` / `, :require =>`) /
+// 行末条件修飾子 (`gem 'wdm' if Gem.win_platform?`) に限定する。
+// 先頭を `^` で固定し、インデントは capture 1 に含めて書き戻し時に復元する。
+static VERSIONLESS_GEM_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"^(\s*gem(?:\s+|\s*\(\s*))(['"])([^'"]+)(['"])(\s*(?:(?:\)\s*)?(?:#|$)|,\s*(?::\w+\s*=>|\w+\s*:)|(?:\)\s*)?(?:if|unless)\b))"#,
     )
     .unwrap()
 });
@@ -85,6 +97,18 @@ static NON_REGISTRY_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^\s*(?:git|github|gitlab|bitbucket|gist|path|source)\b").unwrap()
 });
 
+// ブロックを伴わない `source` / `path` 宣言:
+//   source "https://gems.internal.example.com"
+//   path "vendor/gems"
+// Bundler の `dsl.rb` では
+//   `def source(source, *args, &blk)` … `elsif block_given? ... else
+//     @sources.add_global_rubygems_remote(source) end`
+//   `def path(path, options = {}, &blk)` … `source_options["global"] = true unless block_given?`
+// のとおり、ブロックなしの宣言は **その Gemfile の全 gem に効く global source** になる。
+// (`git` はブロックなしだと DeprecatedError、`github` はブロック必須なので対象外)
+static GLOBAL_SOURCE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"^\s*(source|path)\b\s*\(?\s*['"]([^'"]*)['"]"#).unwrap());
+
 // `git_source(:stash) { |repo| "https://stash.example.com/#{repo}.git" }` の宣言。
 // Bundler はここで登録した名前を git ソースのショートハンドオプションとして受け付ける
 // (`gem 'rails', stash: 'forks/rails'`)。ブロックが `{ ... }` でも `do ... end` でも
@@ -101,10 +125,10 @@ fn is_dev_group(group_line: &str) -> bool {
 
 fn has_dev_group_option(line: &str) -> bool {
     let lowered = line.to_lowercase();
-    let has_group_option = lowered.contains("group:")
-        || lowered.contains("groups:")
-        || lowered.contains(":group =>")
-        || lowered.contains(":groups =>");
+    // `group:` / `:group => ` の綴り揺れは `has_option_key` に一本化する
+    // (固定文字列で見ていた頃は `:group  => :test` のように空白が 1 個でない
+    // hash rocket を取りこぼし、開発依存を本番依存として報告していた)
+    let has_group_option = has_option_key(&lowered, "group") || has_option_key(&lowered, "groups");
     has_group_option
         && (lowered.contains(":development")
             || lowered.contains(":test")
@@ -114,12 +138,45 @@ fn has_dev_group_option(line: &str) -> bool {
             || lowered.contains("'test'"))
 }
 
+/// オプションキー判定用の正規表現キャッシュ。
+///
+/// キーは組み込みの 7 種だけでなく `git_source(:NAME)` 由来の動的な名前も来るため、
+/// 静的テーブルではなく実行時キャッシュにする。1 つの Gemfile に現れるキーの種類は
+/// 高々数個なので、ロック競合もメモリ使用量も問題にならない。
+static OPTION_KEY_REGEX_CACHE: LazyLock<Mutex<HashMap<String, Arc<Regex>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// `key` を Ruby のハッシュキーとして検出する正規表現を返す (キャッシュ付き)。
+fn option_key_regex(key: &str) -> Arc<Regex> {
+    let mut cache = OPTION_KEY_REGEX_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(cached) = cache.get(key) {
+        return Arc::clone(cached);
+    }
+
+    // Ruby のハッシュキーには 3 通りの綴りがある。Bundler の `normalize_options` は
+    // `normalize_hash` を通してこれらをすべて同一キーとして扱う:
+    //   `:git => x` / `:git   =>x`   … シンボルキー + hash rocket (前後の空白は任意個)
+    //   `"git" => x` / `'git' => x`  … 文字列キー + hash rocket
+    //   `git: x` / `"git": x`        … ラベル記法
+    // ラベル記法は `mygit:` のような別キーへの部分一致を避けるため左境界を要求する
+    // (`.` と `:` を境界に含めないのは `Foo.path:` / `::path:` を弾くため)。
+    let escaped = regex::escape(key);
+    let pattern =
+        format!(r#"(?::{escaped}\s*=>|["']{escaped}["']\s*(?:=>|:)|(?:^|[^\w.:]){escaped}\s*:)"#);
+    let regex = Arc::new(Regex::new(&pattern).expect("option key pattern must compile"));
+    cache.insert(key.to_string(), Arc::clone(&regex));
+    regex
+}
+
 /// Ruby のオプションキーは `key: value` と `:key => value` の 2 通りで書ける。
-/// 両綴りを検出する (`has_dev_group_option` が `:group =>` を見ているのと揃える)。
+/// hash rocket は前後に任意個の空白を許すため、固定文字列の `contains` では
+/// `:git    => '...'` を取りこぼす。取りこぼすと git 依存が
+/// 「バージョンなしのレジストリ依存」に見え、rubygems.org の同名 gem の版が
+/// 書き込まれて `bundle install` が壊れる。
 fn has_option_key(lowered: &str, key: &str) -> bool {
-    lowered.contains(&format!("{key}:"))
-        || lowered.contains(&format!(":{key} =>"))
-        || lowered.contains(&format!(":{key}=>"))
+    option_key_regex(key).is_match(lowered)
 }
 
 /// Bundler が組み込みで登録する git source ショートハンド。
@@ -166,6 +223,134 @@ fn has_non_registry_source(line: &str, custom_git_sources: &[String]) -> bool {
         || custom_git_sources
             .iter()
             .any(|key| has_option_key(&lowered, key))
+}
+
+/// マニフェスト全体を更新対象から外す理由 (ブロックなしの global 宣言)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlobalSourceIssue {
+    /// rubygems.org 以外の global source (`source "https://gems.internal.example.com"`)
+    NonRubygemsSource,
+    /// global path source (`path "vendor/gems"`)
+    GlobalPathSource,
+}
+
+impl GlobalSourceIssue {
+    /// 利用者へ 1 度だけ通知する警告文 (無言で 0 件にすると「更新なし」と区別できない)
+    fn warning(self) -> &'static str {
+        match self {
+            Self::NonRubygemsSource => {
+                "⚠ Gemfile: a non-rubygems.org global source is configured; \
+                 all dependencies are skipped (depup only queries rubygems.org)"
+            }
+            Self::GlobalPathSource => {
+                "⚠ Gemfile: a blockless `path` declaration resolves every gem from a local path; \
+                 all dependencies are skipped (depup only queries rubygems.org)"
+            }
+        }
+    }
+
+    /// `update_version` が返すエラー本文 (parse と同じ範囲を拒否して report/apply を揃える)
+    fn reason(self) -> &'static str {
+        match self {
+            Self::NonRubygemsSource => "manifest configures a non-rubygems.org global source",
+            Self::GlobalPathSource => "manifest configures a global path source",
+        }
+    }
+}
+
+/// ブロックを伴わない global な `source` / `path` 宣言を検出する。
+///
+/// これらは Gemfile の全 gem に効くため、rubygems.org 以外を指していると
+/// 依存名が同じでも別物の gem を指す。取りこぼすと社内 private source の gem に
+/// rubygems.org の同名 gem (typosquat を含む) の版を書き込む dependency confusion に
+/// なるので、マニフェストごと更新対象から外す
+/// (Cargo の `registry = "..."` / pyproject の非 PyPI インデックスと同じ扱い)。
+///
+/// ブロック付き (`source "..." do ... end`) は宣言の内側にしか効かないため、
+/// 既存の `GemfileBlock::NonRegistry` 追跡に任せてここでは無視する。
+fn detect_global_source_issue(content: &str) -> Option<GlobalSourceIssue> {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        // コメントアウトされた宣言を拾わないよう、行コメント除去後に判定する
+        let code = strip_line_comment(trimmed);
+        let Some(caps) = GLOBAL_SOURCE_RE.captures(code) else {
+            continue;
+        };
+        // `do ... end` / `{ ... }` のブロック付き宣言はスコープ限定なので対象外
+        if DO_BLOCK_RE.is_match(code) {
+            continue;
+        }
+        let matched_end = caps.get(0).map(|m| m.end()).unwrap_or(code.len());
+        if code[matched_end..].trim_start().starts_with('{') {
+            continue;
+        }
+
+        let keyword = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        let value = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+        if keyword == "path" {
+            return Some(GlobalSourceIssue::GlobalPathSource);
+        }
+        if !is_rubygems_org(value) {
+            return Some(GlobalSourceIssue::NonRubygemsSource);
+        }
+    }
+    None
+}
+
+/// rubygems.org を指す global source かどうか。
+/// 末尾スラッシュの揺れと大文字小文字を吸収する (`https://RubyGems.org/` も同一視)。
+/// `source :rubygems` のシンボル形式は Bundler が rubygems.org へ解決するが、
+/// クォート付きでないため `GLOBAL_SOURCE_RE` に一致せず、そもそもここへ来ない。
+fn is_rubygems_org(url: &str) -> bool {
+    let normalized = url.trim().trim_end_matches('/').to_lowercase();
+    matches!(
+        normalized.as_str(),
+        "https://rubygems.org" | "http://rubygems.org"
+    )
+}
+
+/// バージョンなし `gem` 宣言へバージョンを挿入できる位置。
+struct VersionlessInsertion<'a> {
+    /// 行頭のインデントから `gem` キーワード (と開き括弧) まで
+    gem_keyword: &'a str,
+    quote_start: &'a str,
+    name: &'a str,
+    quote_end: &'a str,
+    /// 閉じクォート直後の末尾コンテキスト (`, require:` / ` if` / ` #` / `)`)
+    suffix: &'a str,
+    /// 行内でマッチした終端位置 (末尾コンテキストより後ろを保持するために使う)
+    end: usize,
+}
+
+/// バージョンなし `gem` 宣言にバージョンを挿入できるなら、その位置を返す。
+///
+/// parse の「バージョンなし = 更新可能」判定と `update_version` の実際の挿入で
+/// **同じ関数**を使うための唯一の情報源。片方にしかない判定を持つと report/apply が
+/// 矛盾する。Bundler の DSL は `def gem(name, *args)` でバージョン引数に任意の
+/// Ruby 式を許すため、次の形は挿入位置が決められず `None` を返し、parse でも
+/// 安全側で取りこぼす (以前は「更新あり」と報告した上で書き込みが必ず失敗し、
+/// exit code 2 になっていた):
+/// - `gem "rack", rack_version` (変数)
+/// - `gem "rails", ENV.fetch("RAILS_VERSION", "~> 7.0")` (メソッド呼び出し)
+/// - `gem "rails", "~> #{ENV.fetch('RAILS_VERSION', '7.1')}"` (文字列補間)
+/// - `gem "foo", **opts` (ハッシュ展開)
+/// - `gem "devise",` (引数が次行へ続く宣言)
+fn versionless_insertion_point<'a>(line: &'a str, name: &str) -> Option<VersionlessInsertion<'a>> {
+    let caps = VERSIONLESS_GEM_RE.captures(line)?;
+    if caps.get(3).map(|m| m.as_str()) != Some(name) {
+        return None;
+    }
+    Some(VersionlessInsertion {
+        gem_keyword: caps.get(1)?.as_str(),
+        quote_start: caps.get(2)?.as_str(),
+        name: caps.get(3)?.as_str(),
+        quote_end: caps.get(4)?.as_str(),
+        suffix: caps.get(5)?.as_str(),
+        end: caps.get(0)?.end(),
+    })
 }
 
 /// クォート外の `#` 以降 (行コメント) を取り除いた部分文字列を返す。
@@ -307,6 +492,17 @@ fn split_updated_constraint(formatted: &str, original_parts: &[&str]) -> Option<
 impl ManifestParser for GemfileParser {
     fn parse(&self, content: &str) -> Result<Vec<Dependency>, ManifestError> {
         let mut dependencies = Vec::new();
+
+        // ブロックなしの global `source` / `path` はマニフェストの全 gem に効くため、
+        // rubygems.org 以外を指していれば依存を丸ごと更新対象から外す。
+        // 依存が 0 件になるだけでは利用者に「更新なし」と区別がつかないので、
+        // 理由を 1 度だけ通知する (非 PyPI インデックスの pyproject と同じ方針)。
+        if let Some(issue) = detect_global_source_issue(content) {
+            use colored::Colorize as _;
+            eprintln!("{}", issue.warning().yellow());
+            return Ok(dependencies);
+        }
+
         let parser = get_parser(Language::Ruby);
         let mut block_stack = Vec::new();
         // `git_source(:NAME)` は宣言より後ろの gem でも先でも効くため、走査前に集める
@@ -358,11 +554,13 @@ impl ManifestParser for GemfileParser {
                     if has_non_registry_source(code, &custom_git_sources) {
                         continue;
                     }
-                    // 引数が次行へ続く宣言 (`gem "devise",` で行が終わる形) は、
-                    // 実際には次行に version や `git:` がある。この行だけを見て
-                    // 「バージョンなしのレジストリ依存」と報告すると、書き込み側は
-                    // 挿入位置を見つけられず必ず失敗する。安全側で取りこぼす。
-                    if code.trim_end().ends_with(',') {
+                    // 「バージョンなし = 更新可能」の判定は writer の挿入位置探索と
+                    // 同じ関数へ一本化する。挿入位置が決まらない形
+                    // (`gem "rack", rack_version` のような Ruby 式のバージョン引数や、
+                    // 引数が次行へ続く `gem "devise",`) を Any として報告すると、
+                    // judge が「更新あり」と言った後に writer が必ず失敗して
+                    // exit code 2 になる。安全側で取りこぼす。
+                    if versionless_insertion_point(line, &name).is_none() {
                         continue;
                     }
                     // バージョン指定がなければ `Any`
@@ -401,34 +599,20 @@ impl ManifestParser for GemfileParser {
         package: &str,
         new_version: &str,
     ) -> Result<String, ManifestError> {
+        // parse と同じ範囲を拒否する (report/apply の整合)。ブロックなしの global
+        // `source` / `path` があるマニフェストは parse が依存を 1 件も返さないため、
+        // ここへ来るのは呼び出し側の想定外だが、書き込みだけが通ると
+        // private source の gem に rubygems.org の版が入る。
+        if let Some(issue) = detect_global_source_issue(content) {
+            return Err(ManifestError::InvalidVersionSpec {
+                path: PathBuf::from("Gemfile"),
+                spec: package.to_string(),
+                message: issue.reason().to_string(),
+            });
+        }
+
         let parser = get_parser(Language::Ruby);
-        let escaped_name = regex::escape(package);
         let mut updated = false;
-        // 末尾コンテキストは 行末/コメント/`)`、オプション (`, require:` 等) に加え、
-        // 行末条件修飾子 (`gem 'wdm' if Gem.win_platform?`) も許容する。これがないと
-        // parse は versionless (Any=更新可能) として拾うのに update で挿入先が見つからず
-        // report/apply が矛盾する (GEM_RE 側は既に if/unless を許容済み)。
-        // if/unless の直前までを一致させ、修飾子本体は line[matched_range.end..] で保持する。
-        let no_version_pattern = format!(
-            r#"(gem(?:\s+|\s*\(\s*))(['"])({escaped_name})(['"])(\s*(?:(?:\)\s*)?(?:#|$)|,\s*(?::\w+\s*=>|\w+\s*:)|(?:\)\s*)?(?:if|unless)\b))"#
-        );
-
-        let no_version_re =
-            Regex::new(&no_version_pattern).map_err(|e| ManifestError::InvalidVersionSpec {
-                path: PathBuf::from("Gemfile"),
-                spec: package.to_string(),
-                message: format!("invalid regex pattern: {}", e),
-            })?;
-
-        let simple_pattern =
-            format!(r#"(gem(?:\s+|\s*\(\s*))(['"])({escaped_name})(['"])(\s*\)?\s*)$"#);
-
-        let simple_re =
-            Regex::new(&simple_pattern).map_err(|e| ManifestError::InvalidVersionSpec {
-                path: PathBuf::from("Gemfile"),
-                spec: package.to_string(),
-                message: format!("invalid regex pattern: {}", e),
-            })?;
 
         let mut lines = Vec::new();
         let mut block_stack = Vec::new();
@@ -485,54 +669,25 @@ impl ManifestParser for GemfileParser {
                             continue;
                         }
 
-                        if let Some(caps) = no_version_re.captures(line) {
-                            let gem_keyword = &caps[1];
-                            let quote_start = &caps[2];
-                            let name = &caps[3];
-                            let quote_end = &caps[4];
-                            let suffix = &caps[5];
-                            let matched_range = caps.get(0).unwrap().range();
+                        // 挿入位置の判定は parse と同じ関数を使う。parse が Any として
+                        // surface した宣言はここで必ず挿入でき、逆にここで挿入できない
+                        // 宣言は parse も surface しない (report/apply の整合)。
+                        if let Some(insertion) = versionless_insertion_point(line, package) {
                             updated = true;
-                            let inserted = format!(
-                                "{}{}{}{}, {}{}{}{}",
-                                gem_keyword,
-                                quote_start,
-                                name,
-                                quote_end,
-                                quote_start,
-                                new_version,
-                                quote_end,
-                                suffix
-                            );
                             let mut updated_line =
-                                String::with_capacity(raw_line.len() + inserted.len() + 8);
-                            updated_line.push_str(&line[..matched_range.start]);
-                            updated_line.push_str(&inserted);
-                            updated_line.push_str(&line[matched_range.end..]);
+                                String::with_capacity(raw_line.len() + new_version.len() + 8);
+                            updated_line.push_str(insertion.gem_keyword);
+                            updated_line.push_str(insertion.quote_start);
+                            updated_line.push_str(insertion.name);
+                            updated_line.push_str(insertion.quote_end);
+                            updated_line.push_str(", ");
+                            updated_line.push_str(insertion.quote_start);
+                            updated_line.push_str(new_version);
+                            updated_line.push_str(insertion.quote_end);
+                            updated_line.push_str(insertion.suffix);
+                            updated_line.push_str(&line[insertion.end..]);
                             updated_line.push_str(line_ending);
                             lines.push(updated_line);
-                            continue;
-                        }
-
-                        if let Some(caps) = simple_re.captures(line) {
-                            let gem_keyword = &caps[1];
-                            let quote_start = &caps[2];
-                            let name = &caps[3];
-                            let quote_end = &caps[4];
-                            let trailing = &caps[5];
-                            updated = true;
-                            lines.push(format!(
-                                "{}{}{}{}, {}{}{}{}{}",
-                                gem_keyword,
-                                quote_start,
-                                name,
-                                quote_end,
-                                quote_start,
-                                new_version,
-                                quote_end,
-                                trailing,
-                                line_ending
-                            ));
                             continue;
                         }
                     }
