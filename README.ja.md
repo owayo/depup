@@ -98,6 +98,12 @@
 brew install owayo/depup/depup
 ```
 
+### winget (Windows)
+
+```powershell
+winget install owayo.depup
+```
+
 ### ソースから
 
 ```bash
@@ -141,6 +147,8 @@ sudo mv depup /usr/local/bin/
 #### Windows
 
 `depup-x86_64-pc-windows-msvc.zip` を [Releases](https://github.com/owayo/depup/releases) からダウンロードし、展開してPATHに追加してください。
+
+> `winget install owayo.depup` を使えば PATH 登録まで自動で行われるため、手動ダウンロードが必要なのは winget を使わない場合だけです。winget でインストールした直後は PATH の変更を反映させるためにターミナルを開き直してください。
 
 ## クイックスタート
 

@@ -604,9 +604,9 @@ mod tests {
     fn test_collect_tag_versions_dedupes_across_pages() {
         let mut seen = HashSet::new();
         let mut versions = Vec::new();
-        collect_tag_versions(["1.2".to_string()].into_iter(), &mut seen, &mut versions);
+        collect_tag_versions(["1.2".to_string()], &mut seen, &mut versions);
         collect_tag_versions(
-            ["1.2.0".to_string(), "1.3".to_string()].into_iter(),
+            ["1.2.0".to_string(), "1.3".to_string()],
             &mut seen,
             &mut versions,
         );

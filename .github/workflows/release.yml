@@ -232,7 +232,12 @@ jobs:
             sudo mv depup /usr/local/bin/
             ```
 
-            #### Windows
+            #### Windows (winget)
+            ```powershell
+            winget install owayo.depup
+            ```
+
+            #### Windows (manual)
             Download `depup-x86_64-pc-windows-msvc.zip`, extract, and add to PATH.
 
           files: release/*
@@ -354,9 +359,47 @@ jobs:
           git commit -m "Update depup to ${TAG}"
           git push
 
+  publish-winget:
+    name: Publish to WinGet
+    needs: [prepare-release, release]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    steps:
+      # winget-pkgs への提出は任意。WINGET_TOKEN 未設定でもリリース全体を失敗させない。
+      # 必要な準備 (1 回だけ):
+      #   1. owayo アカウントで microsoft/winget-pkgs を fork する
+      #   2. classic PAT (scope: public_repo) を作り、secrets.WINGET_TOKEN に登録する
+      #      (fine-grained PAT はこの Action では使えない)
+      #   3. wingetcreate で owayo.depup の初版マニフェストを手動提出し、マージされるまで待つ
+      #      (winget-releaser は既存パッケージの「更新」しかできない)
+      - name: Check WinGet token
+        id: token
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          if [ -z "${WINGET_TOKEN}" ]; then
+            echo "::warning::WINGET_TOKEN is not set; skipping winget-pkgs submission"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # 既定の installers-regex は exe/msi/msix/appx しか拾わないため、
+      # zip 配布の depup では明示的に Windows 用 zip を指定する
+      - name: Submit manifest to winget-pkgs
+        if: steps.token.outputs.available == 'true'
+        uses: vedantmgoyal9/winget-releaser@v2
+        with:
+          identifier: owayo.depup
+          version: ${{ needs.prepare-release.outputs.version }}
+          release-tag: ${{ needs.prepare-release.outputs.tag }}
+          installers-regex: '-pc-windows-msvc\.zip$'
+          max-versions-to-keep: 5
+          token: ${{ secrets.WINGET_TOKEN }}
+
   release-summary:
     name: Release Summary
-    needs: [prepare-release, release, update-homebrew]
+    needs: [prepare-release, release, update-homebrew, publish-winget]
     if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     steps:
@@ -372,3 +415,4 @@ jobs:
           echo "  - depup-x86_64-pc-windows-msvc.zip"
           echo ""
           echo "🍺 Homebrew tap updated: owayo/homebrew-depup"
+          echo "📦 WinGet manifest PR submitted: owayo.depup (skipped if WINGET_TOKEN is unset)"
