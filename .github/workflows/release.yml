@@ -256,9 +256,11 @@ jobs:
         id: app-token
         uses: actions/create-github-app-token@v3
         with:
-          app-id: ${{ secrets.APP_ID }}
+          client-id: ${{ vars.APP_CLIENT_ID }}
           private-key: ${{ secrets.PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
           repositories: homebrew-depup
+          permission-contents: write
 
       - name: Download and Calculate SHA256
         id: sha256
