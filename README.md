@@ -32,6 +32,7 @@
   <img src="https://img.shields.io/badge/PHP-777BB4?logo=php&amp;logoColor=white" alt="PHP">
   <img src="https://img.shields.io/badge/Java-ED8B00?logo=openjdk&amp;logoColor=white" alt="Java">
   <img src="https://img.shields.io/badge/Swift-F05138?logo=swift&amp;logoColor=white" alt="Swift">
+  <img src="docs/images/badge-mise.svg" alt="mise">
 </p>
 
 <p align="center">
@@ -82,7 +83,7 @@
 | <img src="https://img.shields.io/badge/-777BB4?logo=php&logoColor=white" height="16"> PHP | composer.json | Packagist | composer.lock |
 | <img src="https://img.shields.io/badge/-ED8B00?logo=openjdk&logoColor=white" height="16"> Java | build.gradle, build.gradle.kts, gradle/*.versions.toml (settings.gradle subprojects auto-detected) | Maven Central | gradle.lockfile |
 | <img src="https://img.shields.io/badge/-F05138?logo=swift&logoColor=white" height="16"> Swift | Package.swift | GitHub Tags | Package.resolved |
-| mise | mise.toml, .mise.toml, .config/mise/config.toml, .tool-versions | `mise ls-remote` | mise.lock |
+| <img src="docs/images/badge-mise-icon.svg" height="16"> mise | mise.toml, .mise.toml, .config/mise/config.toml, .tool-versions | `mise ls-remote` | mise.lock |
 
 ## Requirements
 
