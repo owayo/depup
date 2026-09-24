@@ -265,7 +265,7 @@ Unless a dependency is pinned, depup looks up its published versions, picks the 
 This README uses two terms for a dependency that depup leaves unchanged:
 
 - **Skipped**: depup recognizes the dependency but does not update it. Skipped dependencies are counted in the output, and `--verbose` lists each one with its reason, such as `pinned` or `latest` ([When a Dependency Is Not Updated](#when-a-dependency-is-not-updated)).
-- **Not processed**: depup does not take the declaration as an updatable dependency, so it does not appear in the output at all. This happens when the declaration points to a non-registry source (such as a Cargo `path` dependency), names a platform package (such as `php` in Composer), or writes its version in a floating or unsupported form (such as `"*"` or `latest`).
+- **Not processed**: depup does not take the declaration as an updatable dependency, so it does not appear in the output at all. This happens when the declaration points to a non-registry source (such as a Cargo `path` dependency; Cargo git dependencies are the exception and are checked with `git ls-remote`), names a platform package (such as `php` in Composer), or writes its version in a floating or unsupported form (such as `"*"` or `latest`).
 
 Filters such as the age filter and the vulnerability check remove candidate versions, not the dependency itself. depup updates the dependency to the newest remaining candidate and reports it as skipped only when no candidate newer than the current version remains.
 
@@ -298,9 +298,9 @@ The age filter applies to the versions depup writes into manifests; for transiti
 
 #### Resolution Priority
 
-A minimum release age declared in the project (pnpm's or Bun's `minimumReleaseAge`, or mise's `minimum_release_age`) is treated as the **project policy** and takes precedence over any CLI or config value. The age that applies to a run is resolved in this order (highest first):
+A minimum release age declared in the project (pnpm's or Bun's `minimumReleaseAge`, or mise's `minimum_release_age`) is treated as the **project policy** and takes precedence over the CLI `--age` and the global configuration file. The age that applies to a run is resolved in this order (highest first):
 
-1. **Project policy** from pnpm, Bun, or mise settings (see the sources below)
+1. Project policy from pnpm, Bun, or mise settings (see below for the files read and how multiple values are combined)
 2. CLI `--age <DURATION>` or `--no-age` (the two cannot be combined; `--no-age` only takes effect when no project policy is set)
 3. `age` in `~/.config/depup/config.toml` (see [Global Configuration File](#global-configuration-file))
 4. Built-in default `1w`
@@ -334,7 +334,7 @@ minimumReleaseAge = 259200  # seconds (e.g. 3 days)
 minimum_release_age = "7d"  # s / m (minutes) / h / d / w / M / y
 ```
 
-If more than one of pnpm, Bun, and mise sets a value, depup uses the **stricter** (larger) one. Within pnpm, only the first value found is used.
+If more than one of pnpm, Bun, and mise sets a value, depup uses the stricter (larger) one. Within pnpm, only the first value found is used.
 
 ### Vulnerability Check (OSV.dev)
 
@@ -351,9 +351,10 @@ depup --osv
 depup --no-osv
 ```
 
-- The OSV.dev API is public and **does not require any authentication token**.
+- The OSV.dev API is public and does not require any authentication token.
 - Swift packages are not checked: OSV identifies Swift packages by their full repository URL, while depup identifies them by GitHub `owner/repo`, so the lookups would not match.
-- mise tools are not checked — each backend has its own version scheme and namespace, so they cannot be mapped onto a single OSV ecosystem. Cargo git dependencies are not checked either.
+- mise tools are not checked: each backend has its own version scheme and namespace, so they cannot be mapped onto a single OSV ecosystem.
+- Cargo git dependencies are not checked either.
 - A failed OSV lookup does not block the update: the version is adopted without a vulnerability check, so it does not get the `✓ OSV` mark. The failure is listed in the `Errors:` section (the `errors` array in JSON) and does not change the exit code.
 
 **Priority order (highest first):**
@@ -571,13 +572,27 @@ Constraints that cannot be rewritten safely are skipped instead of being rewritt
 
 npm has no `!=` comparator, so an npm constraint containing one is not processed at all.
 
-Floating selectors such as `"*"`, npm dist-tags like `"latest"`, and Gradle dynamic selectors (`"latest.release"`, `"latest.integration"`, `"latest.milestone"`, and any user-defined `latest.<status>`) are not processed, so they are never turned into exact versions. Multi-segment fully-floating wildcards without a numeric anchor (Composer's `*.*`, `v*`, `V*`, `x.x`) and empty Maven ranges (`[,]`, `(,)`) are not processed either, to prevent phantom updates or "always outdated" misjudgments. Wildcard tokens (`x`/`X`/`*`) followed by numeric segments (`1.x.3`, `^x.0.0`) are invalid x-ranges in node-semver / semver and would produce malformed output, so they are not processed.
+The following are not processed at all (rather than skipped), so they do not appear in the output:
+
+- Floating selectors, which always point to the newest version: `"*"`, npm dist-tags like `"latest"`, and Gradle dynamic selectors (`"latest.release"`, `"latest.integration"`, `"latest.milestone"`, and any user-defined `latest.<status>`). Rewriting them would turn them into exact versions.
+- Multi-segment fully-floating wildcards without a numeric anchor (Composer's `*.*`, `v*`, `V*`, `x.x`) and empty Maven ranges (`[,]`, `(,)`). Accepting them would cause phantom updates or "always outdated" misjudgments.
+- Wildcard tokens (`x`/`X`/`*`) followed by numeric segments (`1.x.3`, `^x.0.0`). They are invalid x-ranges in node-semver / semver and would produce malformed output, so they are rejected at parse time.
 
 ### Candidate Ordering and Prereleases
 
-Version candidates are ordered with ecosystem-specific rules. Node.js, Rust, Go, and Swift use SemVer (including numeric prereleases such as `1.0.0-1`) and ignore build metadata when comparing precedence, so `1.1.3` and `1.1.3+spec-1.1.0` do not trigger a metadata-only update. Python uses PEP 440 normalization; Ruby follows RubyGems segment ordering and treats alphabetic or hyphenated versions as prereleases; Composer patch aliases (`-p1`, `-pl1`, `-patch1`) sort after the corresponding release; and Java uses Gradle's documented version ordering. Numeric components are compared without a fixed integer-size limit.
+Version candidates are compared with ecosystem-specific rules:
 
-Prereleases (alpha, beta, rc, canary, dev, and similar) are removed from the candidates while the current version is stable. If the current version is already a prerelease, prerelease candidates are kept so it can move on to the next prerelease or to the final release. There is no option to offer prereleases to a stable dependency. Versions whose suffix marks them as deprecated are treated the same way, so `serde_yaml 0.9.33` is not moved to `0.9.34-deprecated`.
+| Ecosystem | Ordering |
+|-----------|----------|
+| Node.js / Rust / Go / Swift | SemVer. A purely numeric suffix such as `1.0.0-1` also counts as a prerelease and sorts before `1.0.0`. Build metadata is ignored, so `1.1.3` and `1.1.3+spec-1.1.0` do not trigger a metadata-only update |
+| Python | PEP 440 normalization and ordering |
+| Ruby | RubyGems segment ordering; versions containing letters or hyphens are prereleases |
+| PHP | composer/semver rules; patch aliases (`-p1`, `-pl1`, `-patch1`) sort after the corresponding release |
+| Java / mise | Gradle's documented version ordering |
+
+Numeric components are compared without a fixed integer-size limit, so very large numbers do not overflow.
+
+Prereleases (alpha, beta, rc, canary, dev, and similar) are removed from the candidates while the current version is stable. If the current version is already a prerelease, prerelease candidates are kept so it can move on to the next prerelease or to the stable release. There is no option to offer prereleases to a stable dependency. Versions whose suffix marks them as deprecated are treated the same way, so `serde_yaml 0.9.33` is not moved to `0.9.34-deprecated`.
 
 ### Writing Rules
 
@@ -635,9 +650,9 @@ The age filter decides which versions depup writes into manifests. Whether it al
 | mise | `MISE_MINIMUM_RELEASE_AGE=<seconds>s` (environment variable) | mise tools have no transitive dependencies; `mise install` applies the age when it resolves a partial version such as `node = "26"` |
 | npm, Yarn, Bun, pip, Poetry, Rye, Pipenv, Go, Bundler, Composer, Gradle, SwiftPM | Nothing | Not filtered; only direct dependencies follow the age filter |
 
-With `--verbose`, depup prints a note naming the package managers for which the age filter covers direct dependencies only. With `--no-age` and no project policy, nothing age-related is passed and the Rust audit does not run.
+With `--verbose`, depup prints a note naming the package managers used in the run for which the age filter covers direct dependencies only. With `--no-age` and no project policy, nothing age-related is passed and the Rust audit does not run.
 
-For Rust, depup audits the crates whose locked version the install changed, and rolls back any that violate the age filter:
+For Rust, depup checks the release dates of the crates whose version in `Cargo.lock` changed during the install, and rolls back any that violate the age filter to the newest version that satisfies it:
 
 ```
 ⠙ Auditing hyper [██████████████████████▓░░░░░░░] 18/24 (6s)
@@ -645,7 +660,7 @@ For Rust, depup audits the crates whose locked version the install changed, and 
     hyper 1.11.1 → 1.11.0
 ```
 
-Only changed entries are audited because depup limits crates.io requests to one per second, following its crawler policy; auditing an entire lock file (often hundreds of crates) would stall the run for several minutes with nothing on screen. The audit is capped at 180 seconds per `Cargo.lock`; any crates left over are reported as unchecked. If `Cargo.lock` did not exist before the install, every entry counts as changed, so the cap is more likely to be reached. Rollbacks are always reported, crates that could not be rolled back are listed with `--verbose`, and the audit never changes the exit code.
+Only changed entries are audited because depup limits crates.io requests to one per second, following its crawler policy; auditing an entire lock file (often hundreds of crates) would take several minutes on its own. The audit is capped at 180 seconds per `Cargo.lock`; any crates left over are reported as unchecked. If `Cargo.lock` did not exist before the install, every entry counts as changed, so the cap is more likely to be reached. Rollbacks are always reported, crates that could not be rolled back are listed with `--verbose`, and the audit never changes the exit code.
 
 ### uv Malware Check (Preview)
 
@@ -721,10 +736,18 @@ depup --diff
 | Code | Meaning |
 |------|---------|
 | `0` | No failures. This includes runs with no updates, dry runs, and runs whose only `Errors:` entries are OSV notices (fallbacks or failed lookups). |
-| `1` | A package manager install failed, `--cd` could not change the directory, or depup could not run at all (for example, the HTTP client failed to initialize or the output could not be written). |
+| `1` | A package manager install failed, `--cd` could not change the directory, or depup itself could not continue (for example, the HTTP client failed to initialize or the results could not be written). |
 | `2` | Part of the run failed: a manifest could not be read, parsed, or written (including a refused ambiguous write), or a registry lookup failed. Invalid command-line arguments also exit with `2`. |
 
-A code-2 failure does not stop the run. A failed lookup skips that dependency, and a manifest that cannot be read or parsed is left out; everything else is still written and installed. A failed write leaves that file unchanged, but its dependencies are still listed as updated and `--install` still runs for it. When both `1` and `2` apply, `1` wins. Three lookup problems leave the exit code unchanged: a failed `git ls-remote` for a Cargo git dependency, a registry that returns no usable versions (`fetch failed: no versions available`), and a missing `mise` command (mise config files are ignored with a warning). There is no dedicated code for "updates available"; use `--json` to inspect the result in CI.
+A code-2 failure does not stop the run. A failed lookup skips that dependency, and a manifest that cannot be read or parsed is left out; everything else is still written and installed. A failed write leaves that file unchanged, but its dependencies are still listed as updated and `--install` still runs for it. When both `1` and `2` apply, `1` wins.
+
+These lookup problems leave the exit code unchanged:
+
+- A failed `git ls-remote` for a Cargo git dependency (the dependency is skipped)
+- A registry that returns no usable versions (`fetch failed: no versions available`)
+- A missing `mise` command (mise config files are ignored with a warning)
+
+There is no dedicated code for "updates available"; use `--json` to inspect the result in CI.
 
 Errors are listed in the `Errors:` section of the text output and in the `errors` array of the JSON output. With `--diff`, or with `--quiet` in text output, the list is not printed unless `--verbose` is also given (it then goes to stderr), so check the exit code to detect failures.
 
@@ -820,7 +843,7 @@ depup accepts the node-semver-compatible legacy tilde spelling `~>1.2.3` and pre
 
 For npm partial comparators, `=1.2` and `=1` follow node-semver's partial-version rules instead of being treated as pinned exact versions: in node-semver, `=1.2` means any 1.2.x (`>=1.2.0 <1.3.0`). depup keeps the `=` operator and updates only the visible segment shape (`=1.2` → `=2.3`, `=1` → `=2`).
 
-For npm comparator sets, depup supports bare partial lower bounds such as `1.2 <2.0.0` and preserves the partial shape when updating the lower side.
+For npm comparator sets, depup supports bare partial lower bounds such as the `1.2` in `1.2 <2.0.0` and preserves the partial shape when updating the lower side (`1.2 <2.0.0` → `1.9 <2.0.0`).
 
 node-semver's `HYPHENRANGE` accepts `XRANGEPLAIN` on both sides, so x-range endpoints such as `1.x - 2.x` are valid and updatable. Endpoints that depup rejects elsewhere (a digit after a wildcard like `1.x.3`, or a fully floating `*`) stay rejected.
 
@@ -838,7 +861,7 @@ In `[project]`, `[tool.rye]`, and `[tool.uv]` sections, depup rewrites only the 
 
 A `pyproject.toml` that configures a non-PyPI default index — a Poetry `priority = "primary"` / `"default"` source, a uv `[[tool.uv.index]] default = true` or `[tool.uv] index-url`, or a PDM source overriding `pypi` — none of its dependencies are processed, and depup prints a warning once. depup only queries PyPI, so updating those dependencies would replace private packages with same-named public ones.
 
-Python compatible release clauses follow PEP 440: `~=1.2` (= `>=1.2,<2.0`) and `~=1.2.3` (= `>=1.2.3,<1.3.0`) are treated as ranges with an explicit upper bound, so updates stay within the compatible range (`~=1.2.3` stays in the 1.2 series, `~=1.2` stays in the 1.x series) and preserve the original segment count (`~=1.2` → `~=1.9`; writing `~=1.9.0` would narrow the upper bound to `<1.10.0`). The invalid single-segment form `~=1` is not processed.
+Python compatible release clauses follow PEP 440: `~=1.2` (= `>=1.2,<2.0`) and `~=1.2.3` (= `>=1.2.3,<1.3.0`) are treated as ranges with an upper bound, so updates stay within the compatible range (`~=1.2.3` stays in the 1.2 series, `~=1.2` stays in the 1.x series) and preserve the original segment count (`~=1.2` → `~=1.9`; writing `~=1.9.0` would narrow the upper bound to `<1.10.0`). The invalid single-segment form `~=1` is not processed.
 
 PEP 440 prefix matching is accepted only for release-segment `==` / `!=` specifiers such as `==1.2.*` and `!=1.2.*`. Invalid prefix forms such as `>=1.0.*`, `~=1.0.*`, `==1.0a1.*`, `==1.0.post1.*`, and `==1.0+local.*` are rejected at parse time and not processed. Arbitrary equality (`===1.0.*`) remains an exact pinned specifier, not prefix matching.
 
@@ -856,7 +879,15 @@ Cargo renamed dependencies such as `alias = { package = "actual-crate", version 
 
 Path dependencies (`{ path = "../common" }`) are not processed, even when they also declare a `version` for publishing, because they resolve to the local crate. Dependencies that point at a registry other than crates.io — a non-`crates-io` `registry = "..."` or any `registry-index = "..."` — are not processed either, because depup only queries crates.io.
 
-Git dependencies are checked with `git ls-remote` instead of a registry. A `tag` is updated to the newest stable semver tag; if that tag exceeds the `--max-change` cap, the dependency is skipped with `max-change=<LEVEL>` (older tags within the cap are not considered). A `branch` (or the default branch) is reported as updated when the remote head differs from the commit recorded in `Cargo.lock`, or when none is recorded. `Cargo.toml` stays as written, and the new commit is picked up only when `--install` runs `cargo update`; without `--install`, nothing is written. A `rev` is always skipped as `pinned`, even with `--include-pinned`. Tag updates are limited to the same dependency tables as version updates (in both inline and multiline form), preserve single or double quotes, and also support `[patch.<registry>]` / `[patch.<registry>.<package>]`. Git dependencies are not subject to the age filter or the OSV check, and a failed `git ls-remote` skips the dependency without changing the exit code.
+Git dependencies are checked with `git ls-remote` instead of a registry:
+
+| Reference | Behavior |
+|-----------|----------|
+| `tag` | Updated to the newest stable semver tag. If that tag exceeds the `--max-change` cap, the dependency is skipped with `max-change=<LEVEL>`; older tags within the cap are not considered |
+| `branch`, or none (default branch) | Reported as updated when the remote head differs from the commit recorded in `Cargo.lock`, or when none is recorded. `Cargo.toml` stays as written; the new commit is picked up only when `--install` runs `cargo update`, and without `--install` nothing is written |
+| `rev` | Always skipped as `pinned`, even with `--include-pinned` |
+
+Tag updates are limited to the same dependency tables as version updates and to `[patch.<registry>]` / `[patch.<registry>.<package>]`, and they preserve single or double quotes in both inline and multiline tables. Git dependencies are not subject to the age filter or the OSV check, and a failed `git ls-remote` skips the dependency without changing the exit code.
 
 Cargo comparison ranges may contain more than two comma-separated requirements, for example `>=1.0, <2.0, >=1.0.100`. Mixed multi-requirement constraints that combine caret/tilde/wildcard with comparators, such as `^1.2.2, <1.5`, are validated with `semver::VersionReq` and detected as ranges. Mixed constraints without an upper bound, such as `>=1.2.3, ^1.3`, cannot be rewritten safely and are skipped.
 
@@ -868,7 +899,7 @@ Versions listed in Go `exclude` directives are removed from the candidates; the 
 
 Go versions tagged `+incompatible` are handled with the same rule the `go` command applies: once a `+incompatible` version is reached in semver order, it and everything above it are removed from the candidates if the preceding compatible version has a real `go.mod` (not one synthesized by the Go proxy). Without this, a module like `github.com/libp2p/go-libp2p` would be "updated" from `v0.49.0` to a 2018-era `v6.0.23+incompatible`, and because that version still builds, the mistake would go unnoticed.
 
-Modules targeted by a `replace` directive are not processed. A `replace` without a version covers every `require` of that module, and a versioned `replace` covers only the `require` with the same version. Updating the `require` alone would stop the `replace` from matching and silently drop the local patch.
+Modules replaced by a `replace` directive are not processed, because updating the `require` alone would stop the `replace` from matching and silently drop the local patch. A `replace` without a version covers every `require` of that module, and a versioned `replace` covers only the `require` with the same version.
 
 For `go.mod`, depup treats block endings with trailing comments such as `) // direct deps` as normal block endings when parsing and updating `require`, `replace`, and `exclude` blocks.
 Quoted `go.mod` module paths and versions, such as `require "golang.org/x/text" "v0.14.0"`, are parsed and updated while preserving the quotes.
@@ -880,19 +911,25 @@ Gemfile declarations can use either the common Ruby DSL form (`gem "rack", "~> 3
 
 Gemfile compound constraints such as `gem "pg", ">= 0.18", "< 2.0"` are parsed and updated. depup advances only the inclusive lower bound and writes it back across the original arguments, preserving their count, order, quote style, spacing, parenthesized call form, and trailing conditional modifiers. The comparison baseline is the inclusive lower bound regardless of the order the constraints are written in, so `gem "pg", "< 2.0", ">= 0.18"` is compared against `0.18`. If the rewritten constraint cannot be split back into the original number of arguments (for example when one argument itself contains a comma), depup reports an error instead of applying an unsafe edit. Exclusion constraints such as `gem "rack", "!= 2.2.4"` are skipped, because replacing part of them can change their meaning.
 
-Gemfile entries that point to non-registry sources without a version (`git:`, `github:`, `bitbucket:`, `gist:`, `path:`, `source:`) are not processed, rather than being converted into RubyGems registry constraints. If such an entry explicitly includes a version, depup treats it as Bundler's gemspec constraint and can parse and update it while preserving the source option. Both Ruby option spellings are recognized — `git: '...'` and the hash-rocket form `:git => '...'`. Gems declared inside `git ... do` / `github ... do` / `path ... do` / `source ... do` blocks are not processed for the same reason, while ordinary blocks such as `platforms` and `install_if` are still processed. Declarations whose arguments continue on the next line (`gem "devise",`) are not processed, rather than being reported as versionless registry gems, because that line alone cannot determine the version. Inline `group:` / `groups:` options are used to classify development dependencies.
+The following Gemfile declarations are not processed:
+
+- Gems that point to a non-registry source without a version (`git:`, `github:`, `bitbucket:`, `gist:`, `path:`, `source:`), because they are not RubyGems registry dependencies. The hash-rocket spelling (`:git => '...'`) is recognized as well.
+- Gems declared inside `git ... do` / `github ... do` / `path ... do` / `source ... do` blocks, for the same reason.
+- Declarations whose arguments continue on the next line (`gem "devise",`), because that line alone cannot determine the version.
+
+If a gem with `git:` or a similar option explicitly includes a version, depup treats it as Bundler's gemspec constraint and parses and updates it while preserving the source option. Gems inside ordinary blocks such as `platforms` and `install_if` are processed like any other gem. Inline `group:` / `groups:` options are used to classify development dependencies.
 
 Custom Bundler git source shorthands registered with `git_source(:name) { ... }` (for example `gem 'rails', stash: 'forks/rails'`) follow the same rules as the built-in `git:` / `github:` shorthands: a declaration without a version is a non-registry dependency and is not processed.
 
 ### PHP
 
-In `composer.json`, depup updates `require` and `require-dev`; sections such as `replace`, `provide`, and `conflict` are left untouched. Composer accepts explicit equality (`=1.2.3`, `==1.2.3`), and depup preserves the operator when updating. Constraints using the `<>` exclusion spelling (`<>1.2.3`) are parsed but skipped rather than rewritten.
+In `composer.json`, depup updates `require` and `require-dev`; sections such as `replace`, `provide`, and `conflict` are left untouched. Composer accepts explicit equality (`=1.2.3`, `==1.2.3`), and depup preserves the operator when updating. Constraints using the `<>` exclusion spelling (`<>1.2.3`) are parsed but skipped rather than rewritten ([Constraints Left Unchanged](#constraints-left-unchanged)).
 
 Composer platform packages such as `php`, `hhvm`, `ext-*`, `lib-*`, and Composer API packages are not processed. Inline aliases such as `1.0.0 as 1.1.0` are not processed either, because overwriting them with the registry's latest version would break the alias declaration.
 
 Composer/Packagist accepts 1-4 segment numeric versions per `composer/semver`'s `VersionParser`, so depup parses and updates four-segment versions like `1.2.3.4`, `^1.0.0.0`, `~3.4.5.6`, and `1.0.0.*`, while forms with five or more segments are invalid and not processed.
 
-Composer modifiers may omit the separator or use `.` / `_` (`composer/semver` allows `[._-]?`), so depup treats `5.0.0alpha3`, `1.0.0.RC1`, and `1.0.0_beta1` as prereleases and `2.2.1p1` / `2.2.1pl1` / `2.2.1patch1` as patch aliases that sort **above** the base version. Both forms occur on Packagist today (`nikic/php-parser` publishes `5.0.0beta1`; `laminas/laminas-diactoros` ships security patches as `2.2.1p2`).
+Composer modifiers may omit the separator or use `.` / `_` (`composer/semver` allows `[._-]?`), so depup treats `5.0.0alpha3`, `1.0.0.RC1`, and `1.0.0_beta1` as prereleases and `2.2.1p1` / `2.2.1pl1` / `2.2.1patch1` as patch aliases that sort above the base version. Both forms occur on Packagist today (`nikic/php-parser` publishes `5.0.0beta1`; `laminas/laminas-diactoros` ships security patches as `2.2.1p2`).
 
 Composer rejects the `~>` operator (`Invalid operator "~>"`), so for PHP a `~>` constraint is not processed, rather than being rewritten into a constraint Composer cannot read. Node accepts `~>` because node-semver defines it as valid.
 
@@ -900,23 +937,29 @@ Composer rejects the `~>` operator (`Invalid operator "~>"`), so for PHP a `~>` 
 
 Gradle rich version declarations using `strictly`, `require`, `prefer`, and `reject` are parsed in dependency blocks such as `implementation("org.slf4j:slf4j-api") { version { ... } }`. String notation shorthand supports exact, dynamic-prefix, and range constraints, including `group:name:1.2.3!!`, `group:name:5.3.+!!`, `group:name:[1.7, 1.8[!!`, and a strict range with a preferred version such as `group:name:[1.7, 1.8[!!1.7.25`. When `strictly` or `require` declares a range and `prefer` declares the selected version, depup keeps the range as the upper-bound constraint and updates the `prefer` value. Versions listed with `reject` are removed from the candidates, including dynamic rejects such as `2.+` and ranges such as `[1.5,1.9)`.
 
-Gradle declaration wrappers are supported: `platform(...)`, `enforcedPlatform(...)`, and `testFixtures(...)`. BOM declarations such as `implementation platform('com.google.cloud:libraries-bom:26.1.0')` and `testImplementation(platform("org.junit:junit-bom:5.10.0"))` are parsed and updated, and the surrounding configuration name is still used for the dev/production classification. Gradle variables declared with `ext.<name> = '...'` / `project.ext.<name> = "..."` are resolved alongside `ext { ... }` blocks, and qualified references such as `${Versions.retrofit}` resolve by their final segment. A short name defined more than once with different values is not resolved, so dependencies that reference it are not processed; this avoids picking up the wrong object's value.
+Gradle declaration wrappers are supported: `platform(...)`, `enforcedPlatform(...)`, and `testFixtures(...)`. BOM declarations such as `implementation platform('com.google.cloud:libraries-bom:26.1.0')` and `testImplementation(platform("org.junit:junit-bom:5.10.0"))` are parsed and updated, and the surrounding configuration name is still used for the dev/production classification.
+
+Gradle variables declared with `ext.<name> = '...'` / `project.ext.<name> = "..."` are resolved alongside `ext { ... }` blocks, and qualified references such as `${Versions.retrofit}` resolve by their final segment. A short name defined more than once with different values is not resolved, so dependencies that reference it are not processed; this avoids picking up the wrong object's value.
 
 Gradle version catalogs under `gradle/*.versions.toml` are detected as Java manifests. depup parses `[libraries]` entries written as `alias = "group:name:version"`, `module = "group:name"`, `group` / `name` / `version`, and `version.ref`; referenced `[versions]` entries are updated in place. Rich version tables with `strictly`, `require`, `prefer`, `reject`, and `rejectAll` follow the same candidate rules as Gradle build files. `[plugins]` entries are not processed because Gradle plugin IDs are not Maven Central coordinates.
 
 For Gradle string notation, depup preserves classifier and extension suffixes such as `:resources@zip` or `@aar`, and ignores declarations that appear only in `//` line comments or `/* ... */` block comments. Gradle version catalog updates preserve the original TOML string or table shape where the version is declared.
 
-Gradle `-SNAPSHOT` / `.SNAPSHOT` versions are not processed. A snapshot is a moving reference that resolves to the newest timestamped build on every resolution, so rewriting it to a fixed release would silently change what the build uses. Stable qualifiers such as `.Final`, `.RELEASE`, `-jre`, and `-SP1` are still updated.
+Dependencies whose version is a `-SNAPSHOT` / `.SNAPSHOT` version (`1.2.3-SNAPSHOT`, `1.2.3-SNAPSHOT!!`, `[1.2.3-SNAPSHOT]`) are not processed. A snapshot is a moving reference that resolves to the newest timestamped build on every resolution, so rewriting it to a fixed release would silently change what the build uses. Stable qualifiers such as `.Final`, `.RELEASE`, `-jre`, and `-SP1` are still updated.
 
 Gradle coordinates declared inside `resolutionStrategy { force ... }`, `constraints { }`, and `dependencySubstitution { }` are not processed. They restate a version that is declared elsewhere, and treating them as separate declarations would make the coordinate ambiguous and block the update.
 
-JVM milestone releases are treated as prereleases and are removed from the candidates of a stable dependency: `4.0.0-M1`, the legacy Spring Boot dot form `2.0.0.M1`, and the spelled-out `-milestone1`. Without this, a project on `assertj-core 3.24.2` would be bumped to `4.0.0-M1`, `junit-bom 5.10.0` to `5.13.0-M3`, and `spring-core 5.3.23` to `7.0.0-M6`. Detection is limited to tokens where `m` is immediately followed by digits, so stable JVM qualifiers (`.Final`, `-jre`, `-android`, `.RELEASE`, `.GA`, `-SP1`) and identifiers like `-macos1` are never misclassified. As with other prereleases, a project already on a milestone keeps milestone candidates so it can advance to the next one.
+JVM milestone releases are treated as prereleases and are removed from the candidates while the current version is stable: `4.0.0-M1`, the legacy Spring Boot dot form `2.0.0.M1`, and the spelled-out `-milestone1`. Without this, a project on `assertj-core 3.24.2` would be bumped to `4.0.0-M1`, `junit-bom 5.10.0` to `5.13.0-M3`, and `spring-core 5.3.23` to `7.0.0-M6`. Detection is limited to tokens where `m` is immediately followed by digits, so stable JVM qualifiers (`.Final`, `-jre`, `-android`, `.RELEASE`, `.GA`, `-SP1`) and identifiers like `-macos1` are never misclassified. As with other prereleases, a project already on a milestone keeps milestone candidates so it can advance to the next one.
 
 ### Swift
 
-For Swift GitHub dependencies, depup accepts HTTPS URLs, scp-style SSH URLs (`git@github.com:owner/repo.git`), standard SSH URLs (`ssh://git@github.com/owner/repo.git`), and GitHub's SSH-over-443 URLs (`ssh://git@ssh.github.com:443/owner/repo.git`). It recognizes both `v1.2.3` and `V1.2.3` tag prefixes from GitHub tags, while `Package.swift` version requirement strings are validated as strict SemVer (`X.Y.Z`, no leading zeroes). depup also ignores `Package.swift` dependencies that appear inside `//` line comments or `/* ... */` block comments.
-Because SwiftPM follows Semantic Versioning 2.0.0, depup parses and updates dependencies that include prerelease identifiers (`1.0.0-beta.1`) and build metadata (`1.0.0+build.123`), including combined forms (`1.0.0-rc.1+sha.abc`).
-depup also parses `.package(...)` declarations with trailing arguments such as `traits: [...]` (SPM 6.1) or `moduleAliases: [...]`, updating only the version requirement while preserving the extra arguments. Swift Package Registry `id:` dependencies (`.package(id: "scope.name", ...)`) are not processed yet; support is planned once a registry API adapter is implemented. Only GitHub URL dependencies with a version requirement are processed; non-GitHub URLs and `branch:` / `revision:` requirements are not.
+Only dependencies on GitHub URLs with a version requirement are processed. Non-GitHub URLs and `branch:` / `revision:` requirements are not processed, and neither are Swift Package Registry `id:` dependencies (`.package(id: "scope.name", ...)`), because the registry API adapter is not implemented yet (support is planned).
+
+- URLs: HTTPS, scp-style SSH (`git@github.com:owner/repo.git`), standard SSH (`ssh://git@github.com/owner/repo.git`), and GitHub's SSH over port 443 (`ssh://git@ssh.github.com:443/owner/repo.git`) are accepted.
+- Tags: both `v1.2.3` and `V1.2.3` are recognized. `Package.swift` version requirement strings are validated as strict SemVer (`X.Y.Z`, no leading zeroes).
+- Because SwiftPM follows Semantic Versioning 2.0.0, depup parses and updates versions with prerelease identifiers (`1.0.0-beta.1`), build metadata (`1.0.0+build.123`), or both (`1.0.0-rc.1+sha.abc`).
+- `.package(...)` declarations with trailing arguments such as `traits: [...]` (SPM 6.1) or `moduleAliases: [...]` are parsed; only the version requirement is replaced, and the other arguments are preserved.
+- Dependencies that appear inside `//` line comments or `/* ... */` block comments are ignored.
 
 ### mise
 
