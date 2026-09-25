@@ -42,7 +42,7 @@ jobs:
     permissions:
       contents: write
     # push できるジョブなので、mise.toml に cargo update で使わないツールがあれば外す
-    # (名前は mise.toml の [tools] のキーのまま。mise-guide 9 章・17 章)
+    # (名前は mise.toml の [tools] のキーのまま書く。aqua:astral-sh/uv を uv と書くと外れない)
     # env:
     #   MISE_DISABLE_TOOLS: "python,aqua:astral-sh/uv"
     outputs:
