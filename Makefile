@@ -28,7 +28,7 @@ MISE := $(firstword $(shell command -v mise 2>/dev/null) $(wildcard $(MISE_CANDI
 endif
 ifeq ($(MISE),)
 ifneq ($(filter-out help,$(or $(MAKECMDGOALS),help)),)
-$(error mise not found. Install it from https://mise.jdx.dev, or pass SYSTEM_TOOLS=1 to use the tools on PATH)
+$(error mise was not found. Install it from https://mise.jdx.dev, or add SYSTEM_TOOLS=1 to use the tools on PATH)
 endif
 endif
 RUN := $(if $(MISE),$(MISE) exec --,)
@@ -38,24 +38,24 @@ endif
 
 ## Setup
 
-setup: ## Install the toolchain (mise.toml) and fetch dependencies
+setup: ## Install the toolchain (mise) and dependencies
 	@if [ -n "$(MISE)" ]; then "$(MISE)" install; fi
 	$(RUN) cargo fetch $(CARGO_FLAGS)
 
 ## Build
 
-build: ## Build debug version
+build: ## Build a debug binary
 	$(RUN) cargo build $(CARGO_FLAGS)
 
-release: ## Build release version
+release: ## Build a release binary
 	$(RUN) cargo build --release $(CARGO_FLAGS)
 
-run: ## Run the debug build (pass arguments with ARGS="...")
+run: ## Run the debug binary (arguments via ARGS="...")
 	$(RUN) cargo run $(CARGO_FLAGS) -- $(ARGS)
 
 ## Checks
 
-test: ## Run tests
+test: ## Run the tests
 	$(RUN) cargo test $(CARGO_FLAGS)
 
 test-e2e: ## Run E2E tests only
@@ -64,18 +64,18 @@ test-e2e: ## Run E2E tests only
 test-integration: ## Run integration tests only
 	$(RUN) cargo test $(CARGO_FLAGS) --test integration_tests
 
-lint: ## Run clippy on all targets with warnings as errors
+lint: ## Run clippy with warnings as errors
 	$(RUN) cargo clippy $(CARGO_FLAGS) --all-targets -- -D warnings
 
-fmt: ## Format code (rewrites files)
+fmt: ## Format the code (rewrites files)
 	$(RUN) cargo fmt --all
 
-fmt-check: ## Check formatting (does not rewrite files)
+fmt-check: ## Check the formatting (no changes)
 	$(RUN) cargo fmt --all -- --check
 
-check: fmt-check lint ## Run fmt-check and lint (does not rewrite files)
+check: fmt-check lint ## Run fmt-check and lint (no changes)
 
-ci: check test ## Run the same checks as CI (does not rewrite files)
+ci: check test ## Run the same checks as CI (no changes)
 
 ## Install
 
@@ -83,7 +83,7 @@ ci: check test ## Run the same checks as CI (does not rewrite files)
 # macOS caches code signature validation per inode, so overwriting a recently run
 # binary with cp gets the new one killed with SIGKILL right after launch (exit 137).
 # The temporary file lives in the same directory so that the rename swaps the inode.
-install: release ## Build release and install to INSTALL_PATH (default /usr/local/bin)
+install: release ## Install the release binary to INSTALL_PATH (default /usr/local/bin)
 	@mkdir -p "$(INSTALL_PATH)"
 	cp "target/release/$(BINARY_NAME)" "$(INSTALL_PATH)/$(BINARY_NAME).new"
 	mv -f "$(INSTALL_PATH)/$(BINARY_NAME).new" "$(INSTALL_PATH)/$(BINARY_NAME)"
@@ -91,20 +91,17 @@ install: release ## Build release and install to INSTALL_PATH (default /usr/loca
 uninstall: ## Remove the binary from INSTALL_PATH
 	rm -f "$(INSTALL_PATH)/$(BINARY_NAME)"
 
-clean: ## Clean build artifacts
+clean: ## Remove build artifacts
 	$(RUN) cargo clean
 
 ## Help
 
-help: ## Show this help message
-	@echo "depup Build Commands"
+help: ## Show this help
+	@echo "Development tasks for $(BINARY_NAME)"
 	@echo ""
-	@echo "Usage: make [target]"
+	@echo "Usage: make <target>"
 	@echo ""
-	@echo "Targets:"
-	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
 	@echo ""
 	@echo "Tool versions are pinned in mise.toml. Run make setup first."
-	@echo ""
-	@echo "Release:"
-	@echo "  Use GitHub Actions > Release > Run workflow"
+	@echo "Release: GitHub Actions > Release > Run workflow"
