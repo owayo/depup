@@ -124,6 +124,8 @@ make ci                # CI と同じ検査 (fmt-check + lint + test、書き換
 
 対応する make ターゲットが無い操作は、cargo を `mise exec --` 経由で直接呼ぶ (例: 特定のテストだけを回す `mise exec -- cargo test --locked <テスト名>`)。
 
+利用者向けの文書は、要約の `README.md` (英語) / `README.ja.md` (日本語) と、話題ごとの `docs/<話題>.md` / `docs/<話題>.ja.md` の対に分けている。話題は使い方の詳細 (`docs/usage`)、オプション・出力・終了コード (`docs/cli-reference`)、設定 (`docs/configuration`)、エコシステムとモノレポ (`docs/ecosystems`)、開発とリリース (`docs/development`) の 5 つ。挙動を変えたら該当する文書の英語版と日本語版を両方直す。README の `<!-- standard:<名前>:start -->` から `end` までは、ワークフロー・Makefile・Cargo.toml から生成するブロックなので手で書き換えない。
+
 ## Testing Strategy
 
 - **Unit tests**: 各モジュール内に `#[cfg(test)]` で配置
