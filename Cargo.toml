@@ -3,9 +3,10 @@ name = "depup"
 version = "26.9.100"
 edition = "2024"
 rust-version = "1.98"
-authors = ["owayo <yoheiowa@gmail.com>"]
+authors = ["owayo"]
 description = "Multi-language dependency updater CLI tool"
 license = "MIT"
+repository = "https://github.com/owayo/depup"
 
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }
@@ -31,3 +32,8 @@ which = "8.0.6"
 assert_cmd = "2.2.2"
 predicates = "3.1.4"
 tempfile = "3.27.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
