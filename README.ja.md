@@ -14,10 +14,12 @@
   <img src="https://img.shields.io/badge/Linux-FCC624?logo=linux&amp;logoColor=black" alt="Linux">
   <img src="https://img.shields.io/badge/macOS-000000?logo=apple&amp;logoColor=white" alt="macOS">
   <img src="https://img.shields.io/badge/Windows-0078D6" alt="Windows">
-  <br>
+</p>
+
+<p align="center">
   <a href="https://github.com/owayo/depup/actions/workflows/release.yml"><img src="https://github.com/owayo/depup/actions/workflows/release.yml/badge.svg?branch=main" alt="Release"></a>
   <a href="https://github.com/owayo/depup/actions/workflows/ci.yml"><img src="https://github.com/owayo/depup/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
-  <a href="https://github.com/owayo/depup/releases"><img src="https://img.shields.io/github/v/release/owayo/depup" alt="Release"></a>
+  <a href="https://github.com/owayo/depup/releases/latest"><img src="https://img.shields.io/github/v/release/owayo/depup" alt="Version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
 </p>
 
@@ -89,8 +91,8 @@
 ## 動作要件
 
 - **OS**: macOS、Linux、Windows
-- **Rust**: 1.85 以上（ソースからビルドする場合）
-- **mise**: mise のツールバージョンを更新する場合にのみ必要です（バージョン一覧を `mise ls-remote` から取得するため）。mise がない環境では mise の設定ファイルを読み飛ばし、警告を 1 回表示して他の言語の更新を続けます。
+- **Rust**: ソースからビルドする場合にだけ必要です。ツールチェーンの版は `mise.toml` で固定しており、`make setup` が mise で入れます（[開発](#開発)を参照）。
+- **mise**: 実行時には、mise のツールバージョンを更新する場合にのみ必要です（バージョン一覧を `mise ls-remote` から取得するため）。mise がない環境では mise の設定ファイルを読み飛ばし、警告を 1 回表示して他の言語の更新を続けます。
 
 ## インストール
 
@@ -104,14 +106,6 @@ brew install owayo/depup/depup
 
 ```powershell
 winget install owayo.depup
-```
-
-### ソースから
-
-```bash
-git clone https://github.com/owayo/depup.git
-cd depup
-cargo install --path .
 ```
 
 ### GitHub リリースから
@@ -151,6 +145,25 @@ sudo mv depup /usr/local/bin/
 `depup-x86_64-pc-windows-msvc.zip` を [Releases](https://github.com/owayo/depup/releases) からダウンロードし、展開して PATH に追加してください。
 
 > `winget install owayo.depup` を使えば PATH 登録まで自動で行われるため、手動ダウンロードが必要なのは winget を使わない場合だけです。winget でインストールした直後は、PATH の変更を反映させるためにターミナルを開き直してください。
+
+### ソースから
+
+ソースからのビルドには [mise](https://mise.jdx.dev/) を使います。`make setup` が、`mise.toml` で固定した Rust ツールチェーンを入れます。
+
+```bash
+git clone https://github.com/owayo/depup.git
+cd depup
+make setup
+make install
+```
+
+`make install` はリリースビルドを作り、`/usr/local/bin` に置きます。そこに書き込めない場合や別の場所に入れたい場合は、`INSTALL_PATH` で指定してください。
+
+```bash
+make install INSTALL_PATH="$HOME/.local/bin"
+```
+
+取り除くときは、同じ `INSTALL_PATH` を付けて `make uninstall` を実行します。mise を使わずに `PATH` 上の Rust でビルドするなら `SYSTEM_TOOLS=1` を付けます（例: `make install SYSTEM_TOOLS=1`）。その場合、ツールチェーンの版が CI と一致する保証はありません。
 
 ## クイックスタート
 
@@ -997,21 +1010,52 @@ mise の `[settings] minimum_release_age` が**明示的に書かれている**�
 
 `mise ls-remote` はデフォルトで mise 側の `minimum_release_age` を適用して新しいバージョンを隠しますが、depup は `--minimum-release-age 0` を渡してすべて取得し、age の判定を depup 側に一本化します。`minimum_release_age_excludes` は depup では解釈しないため、設定されている場合は警告を表示します。
 
-## ビルド
+## 開発
+
+開発には [mise](https://mise.jdx.dev/) が必要です。ツールの版は `mise.toml` で固定しています。`make` の各ターゲットは `mise exec` 経由でツールを呼ぶので、シェルで mise を有効にしていなくても固定した版で動きます。
 
 ```bash
-# デバッグビルド
-cargo build
-
-# リリースビルド
-cargo build --release
-
-# テスト実行
-cargo test
-
-# ローカルインストール
-cargo install --path .
+make setup   # ツールチェーンを入れ (mise install)、依存を取得する
+make ci      # CI と同じ検査を実行する
 ```
+
+CI の quality ジョブは、Linux と macOS で `make setup` と `make ci` を実行します。手元の `make ci` も同じ検査です。整形の確認、clippy、全テストを行います。Windows では、CI の build ジョブが `cargo test --locked` を直接実行します。mise を使わずに `PATH` 上のツールで動かす場合は `SYSTEM_TOOLS=1` を付けてください。その場合、版が CI と一致する保証はありません。
+
+表の説明は `make help` の表示と同じ英語のままにしています。
+
+| コマンド | 説明 |
+|---|---|
+| `make setup` | Install the toolchain (mise.toml) and fetch dependencies |
+| `make build` | Build debug version |
+| `make release` | Build release version |
+| `make run` | Run the debug build (pass arguments with ARGS="...") |
+| `make test` | Run tests |
+| `make test-e2e` | Run E2E tests only |
+| `make test-integration` | Run integration tests only |
+| `make lint` | Run clippy on all targets with warnings as errors |
+| `make fmt` | Format code (rewrites files) |
+| `make fmt-check` | Check formatting (does not rewrite files) |
+| `make check` | Run fmt-check and lint (does not rewrite files) |
+| `make ci` | Run the same checks as CI (does not rewrite files) |
+| `make install` | Build release and install to INSTALL_PATH (default /usr/local/bin) |
+| `make uninstall` | Remove the binary from INSTALL_PATH |
+| `make clean` | Clean build artifacts |
+| `make help` | Show this help message |
+
+## リリース
+
+リリースは GitHub Actions から行います。**Actions > Release > Run workflow** を開いて実行してください。
+
+最初は **dry_run** にチェックを入れて試せます。dry_run では次の版を計算して表示するだけで、コミット、タグ付け、ビルド、GitHub Release の作成、Homebrew tap の更新、winget への提出はどれも行いません。
+
+版は `yy.m.counter` の形式です（例: `26.9.100`）。counter は毎月 100 から始まり、その月のリリースごとに 1 ずつ増えます。
+
+dry_run を付けずに実行すると、次の順に処理します。
+
+1. `Cargo.toml` の版を上げ、`Cargo.lock` は depup 自身の項目だけを同期します（`cargo update --workspace`。依存は解決し直しません）。変更をコミットし、`v<版>` のタグを付けて両方を push します
+2. 5 つのターゲット（Linux x86_64 / ARM64、macOS Apple Silicon / Intel、Windows x86_64）をビルドし、アーカイブを添えて GitHub Release を作成します
+3. Homebrew tap（[owayo/homebrew-depup](https://github.com/owayo/homebrew-depup)）を更新します
+4. `WINGET_TOKEN` シークレットが設定され、`owayo.depup` が winget-pkgs に登録済みであれば、新しい版を winget-pkgs に提出します。条件を満たさないときは、この手順を飛ばします
 
 ## コントリビューション
 

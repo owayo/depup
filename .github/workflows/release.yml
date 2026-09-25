@@ -14,6 +14,9 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   BINARY_NAME: depup
+  # mise 自身の版の正はここ (mise.toml には mise 自身を書けない)。ci.yml と同じ値にそろえる。
+  # 公開から 14 日以上たった版を選ぶ
+  MISE_VERSION: "2026.9.5"
 
 jobs:
   prepare-release:
@@ -23,9 +26,17 @@ jobs:
       version: ${{ steps.bump.outputs.version }}
       tag: ${{ steps.bump.outputs.tag }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Cargo.lock の同期 (cargo update) を mise.toml の版の cargo で行う。これが無いと
+      # ランナーに最初から入っている Rust で動き、版が mise.toml とずれる。
+      # cache を切る理由は ci.yml の quality ジョブと同じ (jdx/mise-action#215)
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          version: ${{ env.MISE_VERSION }}
+          cache: false
 
       - name: Configure Git
         run: |
@@ -63,8 +74,11 @@ jobs:
           # Only replace the first occurrence (package version, not dependency versions)
           sed -i "0,/^version = \"[^\"]*\"/s//version = \"${NEW_VERSION}\"/" Cargo.toml
 
+          # Cargo.lock には depup 自身の版だけを同期する。`cargo generate-lockfile` は全依存を
+          # 最新へ解決し直すので、CI で検証していない版が配布物に入る。build は --locked で
+          # このコミットの Cargo.lock どおりに作る
           if [ -f "Cargo.lock" ]; then
-            cargo generate-lockfile 2>/dev/null || true
+            cargo update --workspace
           fi
 
           echo "version=${NEW_VERSION}" >> $GITHUB_OUTPUT
@@ -126,14 +140,24 @@ jobs:
             cross: false
 
     steps:
-      - uses: actions/checkout@v5
+      # Windows のランナーは既定で LF を CRLF に変えて checkout する。ci.yml の build と
+      # そろえ、CI で検証したファイルと配布物のビルドに使うファイルの改行を一致させる
+      - name: Keep LF line endings
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ needs.prepare-release.outputs.tag }}
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      # ツールの版は mise.toml が正 (cache を切る理由は ci.yml の quality ジョブと同じ)
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
-          targets: ${{ matrix.target }}
+          version: ${{ env.MISE_VERSION }}
+          cache: false
+
+      # mise.toml の rust はホストのツールチェーンと components だけを入れるので、配布ターゲットを足す
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
 
       - name: Install cross-compilation tools
         if: matrix.cross
@@ -145,11 +169,11 @@ jobs:
         if: matrix.cross
         run: |
           cargo install cross --git https://github.com/cross-rs/cross
-          cross build --release --target ${{ matrix.target }}
+          cross build --release --locked --target ${{ matrix.target }}
 
       - name: Build
         if: "!matrix.cross"
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
@@ -166,7 +190,7 @@ jobs:
           cd ../../..
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: ${{ matrix.asset_name }}
           path: ${{ matrix.asset_name }}
@@ -178,7 +202,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           path: artifacts
 
@@ -189,7 +213,7 @@ jobs:
           ls -la release/
 
       - name: Create Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ needs.prepare-release.outputs.tag }}
           name: ${{ needs.prepare-release.outputs.tag }}
@@ -254,7 +278,7 @@ jobs:
     steps:
       - name: Generate GitHub App Token
         id: app-token
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           client-id: ${{ vars.APP_CLIENT_ID }}
           private-key: ${{ secrets.PRIVATE_KEY }}
@@ -435,7 +459,7 @@ jobs:
       # zip 配布の depup では明示的に Windows 用 zip を指定する
       - name: Submit manifest to winget-pkgs
         if: steps.token.outputs.available == 'true' && steps.registration.outputs.registered == 'true'
-        uses: vedantmgoyal9/winget-releaser@v2
+        uses: vedantmgoyal9/winget-releaser@4ffc7888bffd451b357355dc214d43bb9f23917e # v2
         with:
           identifier: ${{ env.WINGET_IDENTIFIER }}
           version: ${{ needs.prepare-release.outputs.version }}

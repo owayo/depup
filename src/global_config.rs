@@ -216,9 +216,13 @@ mod tests {
     #[test]
     fn test_default_path_under_home_dot_config() {
         let path = GlobalConfig::default_path();
-        let s = path.to_string_lossy();
-        assert!(s.contains(".config"), "path should contain .config: {}", s);
-        assert!(s.ends_with("depup/config.toml"), "unexpected path: {}", s);
+        // 文字列ではなくパスの構成要素で比べる。Windows では区切りが `\` になり、
+        // 文字列の `ends_with("depup/config.toml")` は必ず偽になるため
+        assert!(
+            path.ends_with(".config/depup/config.toml"),
+            "unexpected path: {}",
+            path.display()
+        );
     }
 
     #[test]

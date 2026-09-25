@@ -24,3 +24,7 @@ target
 # Added by cargo
 
 /target
+
+# Personal mise overrides (not shared)
+mise.local.toml
+.mise.local.toml

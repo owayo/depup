@@ -108,16 +108,21 @@ tests/
 
 ## Development Commands
 
+開発コマンドの入口は `make help` (引数なしの `make` でも表示される)。ツールの版は `mise.toml` が正で、Rust のツールチェーンもここで固定している。各ターゲットは `mise exec --` 経由で固定した版を使う。CI の quality ジョブも `make setup` と `make ci` を呼ぶので、手元の `make ci` は CI と同じ検査になる。
+
 ```bash
-cargo build              # デバッグビルド
-cargo build --release    # リリースビルド
-cargo test               # 全テスト実行
-cargo test --test integration_tests  # 統合テストのみ
-cargo test --test e2e_tests          # E2Eテストのみ
-cargo clippy -- -D warnings         # Lint
-cargo fmt                # フォーマット
-make help                # Makefileヘルプ
+make setup             # ツールチェーン (mise install) と依存の取得
+make build             # デバッグビルド
+make release           # リリースビルド
+make test              # 全テスト実行
+make test-integration  # 統合テストのみ
+make test-e2e          # E2Eテストのみ
+make lint              # clippy (--all-targets、警告はエラー扱い)
+make fmt               # フォーマット (書き換える)
+make ci                # CI と同じ検査 (fmt-check + lint + test、書き換えない)
 ```
+
+対応する make ターゲットが無い操作は、cargo を `mise exec --` 経由で直接呼ぶ (例: 特定のテストだけを回す `mise exec -- cargo test --locked <テスト名>`)。
 
 ## Testing Strategy
 

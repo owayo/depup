@@ -14,10 +14,12 @@
   <img src="https://img.shields.io/badge/Linux-FCC624?logo=linux&amp;logoColor=black" alt="Linux">
   <img src="https://img.shields.io/badge/macOS-000000?logo=apple&amp;logoColor=white" alt="macOS">
   <img src="https://img.shields.io/badge/Windows-0078D6" alt="Windows">
-  <br>
+</p>
+
+<p align="center">
   <a href="https://github.com/owayo/depup/actions/workflows/release.yml"><img src="https://github.com/owayo/depup/actions/workflows/release.yml/badge.svg?branch=main" alt="Release"></a>
   <a href="https://github.com/owayo/depup/actions/workflows/ci.yml"><img src="https://github.com/owayo/depup/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
-  <a href="https://github.com/owayo/depup/releases"><img src="https://img.shields.io/github/v/release/owayo/depup" alt="Release"></a>
+  <a href="https://github.com/owayo/depup/releases/latest"><img src="https://img.shields.io/github/v/release/owayo/depup" alt="Version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
 </p>
 
@@ -89,8 +91,8 @@
 ## Requirements
 
 - **OS**: macOS, Linux, Windows
-- **Rust**: 1.85+ (for building from source)
-- **mise**: only needed to update mise tool versions (version lists come from `mise ls-remote`). Without it, depup ignores mise config files, warns once, and continues with the other languages
+- **Rust**: only needed to build from source. The toolchain is pinned in `mise.toml`, and `make setup` installs it through mise (see [Development](#development))
+- **mise**: at runtime, only needed to update mise tool versions (version lists come from `mise ls-remote`). Without it, depup ignores mise config files, warns once, and continues with the other languages
 
 ## Installation
 
@@ -104,14 +106,6 @@ brew install owayo/depup/depup
 
 ```powershell
 winget install owayo.depup
-```
-
-### From Source
-
-```bash
-git clone https://github.com/owayo/depup.git
-cd depup
-cargo install --path .
 ```
 
 ### From GitHub Releases
@@ -151,6 +145,25 @@ sudo mv depup /usr/local/bin/
 Download `depup-x86_64-pc-windows-msvc.zip` from [Releases](https://github.com/owayo/depup/releases), extract, and add to PATH.
 
 > `winget install owayo.depup` does this for you (it registers `depup` on PATH), so the manual download is only needed if you do not use winget. After a winget install, open a new terminal so the updated PATH takes effect.
+
+### From Source
+
+Building from source uses [mise](https://mise.jdx.dev/): `make setup` installs the Rust toolchain pinned in `mise.toml`.
+
+```bash
+git clone https://github.com/owayo/depup.git
+cd depup
+make setup
+make install
+```
+
+`make install` builds the release binary and places it in `/usr/local/bin`. If you cannot write there, or want another directory, set `INSTALL_PATH`:
+
+```bash
+make install INSTALL_PATH="$HOME/.local/bin"
+```
+
+To remove it, run `make uninstall` with the same `INSTALL_PATH`. To build with the Rust toolchain on your `PATH` instead of mise, add `SYSTEM_TOOLS=1` (for example `make install SYSTEM_TOOLS=1`); the toolchain version is then not guaranteed to match CI.
 
 ## Quickstart
 
@@ -997,21 +1010,50 @@ When `[settings] minimum_release_age` is **explicitly set**, depup treats it as 
 
 `mise ls-remote` applies mise's own `minimum_release_age` by default and hides newer releases, so depup passes `--minimum-release-age 0` to fetch everything and keeps age evaluation in one place. `minimum_release_age_excludes` is not interpreted by depup; if it is set, depup prints a warning.
 
-## Build
+## Development
+
+Requires [mise](https://mise.jdx.dev/). Tool versions are pinned in `mise.toml`, and the `make` targets run the tools through `mise exec`, so they use the pinned versions even if mise is not activated in your shell.
 
 ```bash
-# Debug build
-cargo build
-
-# Release build
-cargo build --release
-
-# Run tests
-cargo test
-
-# Install locally
-cargo install --path .
+make setup   # install the toolchain (mise install) and fetch dependencies
+make ci      # run the same checks as CI
 ```
+
+The CI quality job runs `make setup` and `make ci` on Linux and macOS, so running `make ci` locally performs the same checks: formatting, clippy, and the full test suite. On Windows, the CI build job runs `cargo test --locked` directly. To use the tools on your `PATH` instead of mise, pass `SYSTEM_TOOLS=1`; their versions may then differ from CI.
+
+| Command | Description |
+|---|---|
+| `make setup` | Install the toolchain (mise.toml) and fetch dependencies |
+| `make build` | Build debug version |
+| `make release` | Build release version |
+| `make run` | Run the debug build (pass arguments with ARGS="...") |
+| `make test` | Run tests |
+| `make test-e2e` | Run E2E tests only |
+| `make test-integration` | Run integration tests only |
+| `make lint` | Run clippy on all targets with warnings as errors |
+| `make fmt` | Format code (rewrites files) |
+| `make fmt-check` | Check formatting (does not rewrite files) |
+| `make check` | Run fmt-check and lint (does not rewrite files) |
+| `make ci` | Run the same checks as CI (does not rewrite files) |
+| `make install` | Build release and install to INSTALL_PATH (default /usr/local/bin) |
+| `make uninstall` | Remove the binary from INSTALL_PATH |
+| `make clean` | Clean build artifacts |
+| `make help` | Show this help message |
+
+## Release
+
+Releases are published from GitHub Actions: open **Actions > Release > Run workflow**.
+
+Try it with **dry_run** checked first. A dry run only computes and prints the next version; it does not commit, tag, build, create a GitHub Release, update the Homebrew tap, or submit to winget.
+
+Versions use the `yy.m.counter` format (for example `26.9.100`). The counter starts at 100 each month and goes up by one with each release in that month.
+
+A run without dry_run:
+
+1. Bumps the version in `Cargo.toml` and syncs only depup's own entry in `Cargo.lock` (`cargo update --workspace`; dependencies are not re-resolved), then commits the change, tags it `v<version>`, and pushes both
+2. Builds the five targets (Linux x86_64 / ARM64, macOS Apple Silicon / Intel, Windows x86_64) and creates the GitHub Release with the archives
+3. Updates the Homebrew tap ([owayo/homebrew-depup](https://github.com/owayo/homebrew-depup))
+4. Submits the new version to winget-pkgs when the `WINGET_TOKEN` secret is set and `owayo.depup` is already registered there; otherwise this step is skipped
 
 ## Contributing
 
