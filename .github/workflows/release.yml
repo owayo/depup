@@ -1,104 +1,135 @@
+# depup のリリース。Actions > Release > Run workflow で動かす (まず dry_run で次の版を確かめる)。
+#
+# 流れ: prepare-release (JST の yy.m.counter で版を決め、Cargo.toml と Cargo.lock を書き換えてコミットとタグを push)
+#   → build (target ごとに depup-<target>.tar.gz / .zip を作る) → release (SHA256SUMS と一緒に Release を作る)
+#   → update-homebrew (tap の owayo/homebrew-depup) と publish-winget (winget-pkgs の owayo.depup) → release-summary
+#
+# 配布の設定 (一度だけ。無ければそのジョブは警告を出して飛ばし、リリース全体は落とさない):
+#   Homebrew: tap に入れた GitHub App の Client ID を Variables の APP_CLIENT_ID、秘密鍵を Secrets の PRIVATE_KEY に置く
+#   winget:   microsoft/winget-pkgs を fork し、classic PAT (scope: public_repo) を Secrets の WINGET_TOKEN に置く
+#             (fine-grained PAT は winget-releaser で使えない)。winget-releaser は既存のパッケージの更新しか
+#             できないので、初版のマニフェストは wingetcreate / komac で手で出し、マージされるまで待つ
+#
+# build の matrix は ci.yml の build と同じ組にする (dry_run では build が走らないので、配布物を
+# 作れることは ci.yml の build で確かめる)。
 name: Release
 
 on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: 'Dry run (skip actual release)'
+        description: "Dry run (compute the next version only; no commit, tag or release)"
         type: boolean
         default: false
 
+# 書き込みはジョブ単位で与える (版のコミットとタグの push、Release の作成)
 permissions:
-  contents: write
+  contents: read
+
+# 同時に 2 つのリリースを走らせない (同じ番号を 2 回採る)。走っているものは止めない
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
   BINARY_NAME: depup
-  # mise 自身の版の正はここ (mise.toml には mise 自身を書けない)。ci.yml と同じ値にそろえる。
-  # 公開から 14 日以上たった版を選ぶ
-  MISE_VERSION: "2026.9.5"
 
 jobs:
   prepare-release:
-    name: Prepare Release
+    name: Prepare release
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # push できるジョブなので、mise.toml に cargo update で使わないツールがあれば外す
+    # (名前は mise.toml の [tools] のキーのまま。mise-guide 9 章・17 章)
+    # env:
+    #   MISE_DISABLE_TOOLS: "python,aqua:astral-sh/uv"
     outputs:
       version: ${{ steps.bump.outputs.version }}
       tag: ${{ steps.bump.outputs.tag }}
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      # 本番は既定のブランチからだけ出す (ほかのブランチから出すと、既定のブランチに無いコミットにタグが付く)。
+      # dry_run はどのブランチでも動くので、workflow の変更をブランチで試せる
+      - name: Check the branch
+        if: ${{ !inputs.dry_run }}
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if [ "${GITHUB_REF}" != "refs/heads/${DEFAULT_BRANCH}" ]; then
+            echo "::error::Run the release from ${DEFAULT_BRANCH} (this run is on ${GITHUB_REF})"
+            exit 1
+          fi
 
-      # Cargo.lock の同期 (cargo update) を mise.toml の版の cargo で行う。これが無いと
-      # ランナーに最初から入っている Rust で動き、版が mise.toml とずれる。
-      # cache を切る理由は ci.yml の quality ジョブと同じ (jdx/mise-action#215)
-      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+      - uses: actions/checkout@v7
+
+      # cargo update を mise.toml の版の Rust で実行する (無いとランナーに最初から入っている Rust で動く)
+      - uses: jdx/mise-action@v4
         with:
-          version: ${{ env.MISE_VERSION }}
+          minimum_release_age: 14d
           cache: false
 
-      - name: Configure Git
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-      - name: Bump version
+      - name: Bump the version
         id: bump
         run: |
-          # Use 2-digit year (YY) for Windows MSI compatibility (major version must be <= 255)
-          YEAR=$(date +%y)
-          MONTH=$(date +%-m)
-
-          CURRENT=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          set -euo pipefail
+          # 版は yy.m.counter。年は 2 桁 (Windows の MSI は major が 255 以下)。月はゼロ埋めしない
+          # (SemVer は数値の先頭の 0 を禁じ、Cargo は 26.08.100 を拒む)。連番は 100 から (桁がそろう)。
+          # 採番は JST で切る。ランナーは UTC なので、素の date では JST の月初 0〜9 時のリリースが
+          # 前の月の連番になる (実例: 9 月最初のリリースが v26.8.113 になった)
+          YEAR=$(TZ=Asia/Tokyo date +%y)
+          MONTH=$(TZ=Asia/Tokyo date +%-m)
+          CURRENT=$(awk -F '"' '/^version = /{ print $2; exit }' Cargo.toml)
           echo "Current version: ${CURRENT}"
-
-          if echo "${CURRENT}" | grep -qE '^[0-9]{2,4}\.[0-9]{1,2}\.[0-9]+$'; then
-            OLD_YEAR=$(echo "${CURRENT}" | cut -d. -f1)
-            OLD_MONTH=$(echo "${CURRENT}" | cut -d. -f2)
-            OLD_COUNTER=$(echo "${CURRENT}" | cut -d. -f3)
-            # Handle both 2-digit and 4-digit year formats
-            OLD_YEAR_2DIGIT=$(echo "${OLD_YEAR}" | sed 's/^20//')
-            if [ "${OLD_YEAR_2DIGIT}" = "${YEAR}" ] && [ "${OLD_MONTH}" = "${MONTH}" ]; then
-              NEW_COUNTER=$((OLD_COUNTER + 1))
-            else
-              NEW_COUNTER=100
+          COUNTER=100
+          if [[ "${CURRENT}" =~ ^([0-9]{2,4})\.([0-9]{1,2})\.([0-9]+)$ ]]; then
+            # 4 桁の年 (2026.9.105) の版からも続けて採番する
+            if [ "${BASH_REMATCH[1]#20}" = "${YEAR}" ] && [ "${BASH_REMATCH[2]}" = "${MONTH}" ]; then
+              COUNTER=$((BASH_REMATCH[3] + 1))
             fi
-          else
-            NEW_COUNTER=100
+          fi
+          VERSION="${YEAR}.${MONTH}.${COUNTER}"
+          TAG="v${VERSION}"
+          echo "Next version: ${VERSION}"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" > /dev/null; then
+            echo "::error::Tag ${TAG} already exists. Check the version in Cargo.toml against the existing tags"
+            exit 1
           fi
 
-          NEW_VERSION="${YEAR}.${MONTH}.${NEW_COUNTER}"
-          echo "New version: ${NEW_VERSION}"
+          # [package] の version (ファイルで最初の `version = ` の行) だけを書き換える (依存の version は触らない)
+          sed -i "0,/^version = \"[^\"]*\"/s//version = \"${VERSION}\"/" Cargo.toml
+          test "$(awk -F '"' '/^version = /{ print $2; exit }' Cargo.toml)" = "${VERSION}"
+          # Cargo.lock は自分のパッケージの版だけを合わせる (lockfile を作り直すと全依存が最新へ
+          # 解決し直され、CI で確かめていない版が配布物に入る)
+          cargo update --workspace
+          git diff --stat
 
-          # Only replace the first occurrence (package version, not dependency versions)
-          sed -i "0,/^version = \"[^\"]*\"/s//version = \"${NEW_VERSION}\"/" Cargo.toml
-
-          # Cargo.lock には depup 自身の版だけを同期する。`cargo generate-lockfile` は全依存を
-          # 最新へ解決し直すので、CI で検証していない版が配布物に入る。build は --locked で
-          # このコミットの Cargo.lock どおりに作る
-          if [ -f "Cargo.lock" ]; then
-            cargo update --workspace
-          fi
-
-          echo "version=${NEW_VERSION}" >> $GITHUB_OUTPUT
-          echo "tag=v${NEW_VERSION}" >> $GITHUB_OUTPUT
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Commit and tag
         if: ${{ !inputs.dry_run }}
+        env:
+          TAG: ${{ steps.bump.outputs.tag }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          git add Cargo.toml
-          [ -f "Cargo.lock" ] && git add Cargo.lock || true
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "Release ${TAG}"
+          git tag -a "${TAG}" -m "Release ${TAG}"
+          # ブランチとタグを 1 回で送る。--atomic で、ブランチが先に進んでいて片方だけが通ることを防ぐ
+          git push --atomic origin "HEAD:refs/heads/${DEFAULT_BRANCH}" "refs/tags/${TAG}"
 
-          git commit -m "Release ${{ steps.bump.outputs.tag }}"
-          git tag -a "${{ steps.bump.outputs.tag }}" -m "Release ${{ steps.bump.outputs.tag }}"
-          git push origin HEAD "${{ steps.bump.outputs.tag }}"
-
-      - name: Dry run info
+      - name: Dry run
         if: ${{ inputs.dry_run }}
+        env:
+          TAG: ${{ steps.bump.outputs.tag }}
         run: |
-          echo "🧪 Dry run mode - skipping commit and tag"
-          echo "Would release: ${{ steps.bump.outputs.tag }}"
+          echo "Dry run: would release ${TAG} (no commit, tag or release)"
+          git diff -- Cargo.toml Cargo.lock
 
   build:
     name: Build (${{ matrix.target }})
@@ -108,177 +139,210 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # ci.yml の build と同じ組。Linux ARM64 は arm64 のランナーでそのままビルドする (cross を使わない)
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact_name: depup
-            asset_name: depup-x86_64-unknown-linux-gnu.tar.gz
-            cross: false
-
-          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            artifact_name: depup
-            asset_name: depup-aarch64-unknown-linux-gnu.tar.gz
-            cross: true
-
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            artifact_name: depup
-            asset_name: depup-x86_64-apple-darwin.tar.gz
-            cross: false
-
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact_name: depup
-            asset_name: depup-aarch64-apple-darwin.tar.gz
-            cross: false
-
+          - os: macos-latest
+            target: x86_64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact_name: depup.exe
-            asset_name: depup-x86_64-pc-windows-msvc.zip
-            cross: false
-
     steps:
-      # Windows のランナーは既定で LF を CRLF に変えて checkout する。ci.yml の build と
-      # そろえ、CI で検証したファイルと配布物のビルドに使うファイルの改行を一致させる
+      # Windows のランナーは既定で LF を CRLF に変えて checkout する。ci.yml の build と同じく LF のまま取り、
+      # include_str! で埋め込むファイルの改行を CI で確かめたものとそろえる
       - name: Keep LF line endings
         run: git config --global core.autocrlf false
 
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare-release.outputs.tag }}
+          persist-credentials: false
 
-      # ツールの版は mise.toml が正 (cache を切る理由は ci.yml の quality ジョブと同じ)
-      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+      # ビルドのキャッシュ (rust-cache) は使わない。配布物を作るジョブがキャッシュを読むと、キャッシュを
+      # 書けるほかのジョブの汚染が配布物に入る。Rust の版と mise.toml の [env] は mise-action が渡す
+      - uses: jdx/mise-action@v4
         with:
-          version: ${{ env.MISE_VERSION }}
+          minimum_release_age: 14d
           cache: false
 
-      # mise.toml の rust はホストのツールチェーンと components だけを入れるので、配布ターゲットを足す
-      - name: Add Rust target
+      # mise.toml の rust はホストのツールチェーンと components だけを入れるので、配布のターゲットを足す
+      - name: Add the Rust target
         run: rustup target add ${{ matrix.target }}
 
-      - name: Install cross-compilation tools
-        if: matrix.cross
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-
-      - name: Build with cross
-        if: matrix.cross
-        run: |
-          cargo install cross --git https://github.com/cross-rs/cross
-          cross build --release --locked --target ${{ matrix.target }}
-
       - name: Build
-        if: "!matrix.cross"
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Package (Unix)
-        if: runner.os != 'Windows'
+      # 添付の名前は <bin>-<target>.tar.gz (Windows は .zip)。中身はバイナリだけを最上位に置く
+      # (Homebrew の formula と winget のマニフェストがこの形を前提にする)
+      - name: Package
+        id: package
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          TAR_GZ: ${{ env.BINARY_NAME }}-${{ matrix.target }}.tar.gz
+          ZIP: ${{ env.BINARY_NAME }}-${{ matrix.target }}.zip
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czvf ../../../${{ matrix.asset_name }} ${{ matrix.artifact_name }}
-          cd ../../..
+          set -euo pipefail
+          cd "target/${TARGET}/release"
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            7z a "../../../${ZIP}" "${BINARY_NAME}.exe"
+            echo "asset=${ZIP}" >> "$GITHUB_OUTPUT"
+          else
+            tar -czf "../../../${TAR_GZ}" "${BINARY_NAME}"
+            echo "asset=${TAR_GZ}" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          cd target/${{ matrix.target }}/release
-          7z a ../../../${{ matrix.asset_name }} ${{ matrix.artifact_name }}
-          cd ../../..
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+      # archive: false で添付のファイルをそのまま上げる (artifact の名前はファイル名になる)
+      - uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.asset_name }}
-          path: ${{ matrix.asset_name }}
+          path: ${{ steps.package.outputs.asset }}
+          archive: false
+          if-no-files-found: error
 
   release:
-    name: Create Release
+    name: Release
     needs: [prepare-release, build]
     if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      assets: ${{ steps.files.outputs.assets }}
     steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+      - uses: actions/download-artifact@v8
         with:
-          path: artifacts
+          path: release
+          merge-multiple: true
 
-      - name: Prepare release files
+      - name: Write SHA256SUMS
+        id: files
         run: |
-          mkdir -p release
-          find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec mv {} release/ \;
-          ls -la release/
+          set -euo pipefail
+          cd release
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+          echo "assets=$(printf '%s ' *)" >> "$GITHUB_OUTPUT"
 
-      - name: Create Release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+      # タイトルはタグ名だけ。本文は導入の手順で、変更点は generate_release_notes が後ろに足す
+      - name: Create the release
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.prepare-release.outputs.tag }}
           name: ${{ needs.prepare-release.outputs.tag }}
           body: |
-            ## depup ${{ needs.prepare-release.outputs.version }}
+            ## Install
 
-            Multi-language dependency updater CLI tool.
+            ### Homebrew (macOS / Linux)
 
-            ### Installation
-
-            #### Homebrew (macOS/Linux)
             ```bash
-            brew install owayo/depup/depup
+            brew install ${{ github.repository_owner }}/depup/depup
             ```
 
-            #### Manual Download
-            Download the appropriate binary for your platform and add it to your PATH.
+            ### winget (Windows)
 
-            #### macOS (Apple Silicon)
-            ```bash
-            curl -L https://github.com/${{ github.repository }}/releases/download/${{ needs.prepare-release.outputs.tag }}/depup-aarch64-apple-darwin.tar.gz | tar xz
-            sudo mv depup /usr/local/bin/
-            ```
-
-            #### macOS (Intel)
-            ```bash
-            curl -L https://github.com/${{ github.repository }}/releases/download/${{ needs.prepare-release.outputs.tag }}/depup-x86_64-apple-darwin.tar.gz | tar xz
-            sudo mv depup /usr/local/bin/
-            ```
-
-            #### Linux (x86_64)
-            ```bash
-            curl -L https://github.com/${{ github.repository }}/releases/download/${{ needs.prepare-release.outputs.tag }}/depup-x86_64-unknown-linux-gnu.tar.gz | tar xz
-            sudo mv depup /usr/local/bin/
-            ```
-
-            #### Linux (ARM64)
-            ```bash
-            curl -L https://github.com/${{ github.repository }}/releases/download/${{ needs.prepare-release.outputs.tag }}/depup-aarch64-unknown-linux-gnu.tar.gz | tar xz
-            sudo mv depup /usr/local/bin/
-            ```
-
-            #### Windows (winget)
             ```powershell
             winget install owayo.depup
             ```
 
-            #### Windows (manual)
-            Download `depup-x86_64-pc-windows-msvc.zip`, extract, and add to PATH.
+            Open a new terminal afterwards so that the updated `PATH` takes effect.
 
+            ### Download
+
+            Download `${{ env.BINARY_NAME }}-<target>.tar.gz` for your platform from the assets below (`.zip` on Windows), extract it and put `${{ env.BINARY_NAME }}` on your `PATH`. `SHA256SUMS` lists the checksums of all assets.
+
+            ```bash
+            curl -fLO https://github.com/${{ github.repository }}/releases/download/${{ needs.prepare-release.outputs.tag }}/${{ env.BINARY_NAME }}-aarch64-apple-darwin.tar.gz
+            tar -xzf ${{ env.BINARY_NAME }}-aarch64-apple-darwin.tar.gz
+            ```
+          generate_release_notes: true
           files: release/*
-          draft: false
-          prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          fail_on_unmatched_files: true
 
+      # 公開した添付が release/ と名前・大きさ・状態まで一致するか (アップロードの取りこぼしを見つける)。
+      # GitHub が添付の SHA-256 (digest) を返していれば、それも照らす
+      - name: Verify the published assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare-release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json assets > "${RUNNER_TEMP}/assets.json"
+          find release -type f -printf '%f %s uploaded\n' | LC_ALL=C sort > "${RUNNER_TEMP}/expected.txt"
+          jq -r '.assets[] | "\(.name) \(.size) \(.state)"' "${RUNNER_TEMP}/assets.json" | LC_ALL=C sort > "${RUNNER_TEMP}/published.txt"
+          if ! diff -u "${RUNNER_TEMP}/expected.txt" "${RUNNER_TEMP}/published.txt"; then
+            echo "::error::The published assets differ from the files in release/"
+            exit 1
+          fi
+          jq -r '.assets[] | select(.digest != null) | "\(.digest | ltrimstr("sha256:"))  \(.name)"' "${RUNNER_TEMP}/assets.json" > "${RUNNER_TEMP}/published.sha256"
+          if [ -s "${RUNNER_TEMP}/published.sha256" ]; then
+            (cd release && sha256sum --check --strict --quiet "${RUNNER_TEMP}/published.sha256")
+          else
+            echo "::warning::GitHub returned no asset digests; skipped the SHA-256 comparison"
+          fi
+
+  # ---- Homebrew のブロック (外し方は冒頭) --------------------------------------------------
+  # tap (homebrew-depup) の formula を、この版の添付の tar.gz を直接指す形に書き直す。tap は別の
+  # リポジトリなので GITHUB_TOKEN では push できず、GitHub App のトークンを使う (App の Client ID は
+  # Variables の APP_CLIENT_ID、秘密鍵は Secrets の PRIVATE_KEY。作り方は distribution.md)。
+  # GITHUB_TOKEN で作った Release は on: release のワークフローを起動しないので、同じワークフローの後続にする
   update-homebrew:
-    name: Update Homebrew Tap
+    name: Update the Homebrew tap
     needs: [prepare-release, release]
     if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ needs.prepare-release.outputs.tag }}
+    outputs:
+      # updated / unchanged / not-configured (空ならこのジョブが途中で落ちた)
+      state: ${{ steps.formula.outputs.state || steps.app.outputs.state }}
+      tap: ${{ github.repository_owner }}/homebrew-depup
     steps:
-      - name: Generate GitHub App Token
+      # App の設定が無ければリリース全体を落とさずに飛ばす (jobs.<id>.if では secrets を読めない)。
+      # 値そのものは渡さず、有無だけを式で渡す
+      - name: Check the GitHub App settings
+        id: app
+        env:
+          HAS_CLIENT_ID: ${{ vars.APP_CLIENT_ID != '' }}
+          HAS_PRIVATE_KEY: ${{ secrets.PRIVATE_KEY != '' }}
+        run: |
+          if [ "${HAS_CLIENT_ID}" = "true" ] && [ "${HAS_PRIVATE_KEY}" = "true" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::The GitHub App for the tap is not configured (variable APP_CLIENT_ID and secret PRIVATE_KEY); skipped the Homebrew tap"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "state=not-configured" >> "$GITHUB_OUTPUT"
+          fi
+
+      # 全部の添付を取り直さず、公開した SHA256SUMS から formula が指す 4 つの sha256 を読む
+      - name: Read the checksums
+        id: sums
+        if: steps.app.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "${TAG}" --repo "${GITHUB_REPOSITORY}" --pattern SHA256SUMS --dir "${RUNNER_TEMP}"
+          for target in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu; do
+            asset="${BINARY_NAME}-${target}.tar.gz"
+            sum=$(awk -v f="${asset}" '$2 == f { print $1 }' "${RUNNER_TEMP}/SHA256SUMS")
+            if [ "${#sum}" -ne 64 ]; then
+              echo "::error::SHA256SUMS has no entry for ${asset}"
+              exit 1
+            fi
+            echo "${target//-/_}=${sum}" >> "$GITHUB_OUTPUT"
+          done
+
+      # App のトークンは tap を触る直前に作る (トークンに手が届く時間を短くする)。対象は tap だけ、権限は contents: write だけ
+      - name: Create a token for the tap
         id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        if: steps.app.outputs.enabled == 'true'
+        uses: actions/create-github-app-token@v3
         with:
           client-id: ${{ vars.APP_CLIENT_ID }}
           private-key: ${{ secrets.PRIVATE_KEY }}
@@ -286,205 +350,232 @@ jobs:
           repositories: homebrew-depup
           permission-contents: write
 
-      - name: Download and Calculate SHA256
-        id: sha256
-        run: |
-          VERSION="${{ needs.prepare-release.outputs.version }}"
-          TAG="${{ needs.prepare-release.outputs.tag }}"
+      - uses: actions/checkout@v7
+        if: steps.app.outputs.enabled == 'true'
+        with:
+          repository: ${{ github.repository_owner }}/homebrew-depup
+          token: ${{ steps.app-token.outputs.token }}
+          path: tap
 
-          # Download tarballs and calculate SHA256
-          curl -sL "https://github.com/${{ github.repository }}/releases/download/${TAG}/depup-aarch64-apple-darwin.tar.gz" -o arm64.tar.gz
-          curl -sL "https://github.com/${{ github.repository }}/releases/download/${TAG}/depup-x86_64-apple-darwin.tar.gz" -o x86_64.tar.gz
-          curl -sL "https://github.com/${{ github.repository }}/releases/download/${TAG}/depup-x86_64-unknown-linux-gnu.tar.gz" -o linux_x86_64.tar.gz
-          curl -sL "https://github.com/${{ github.repository }}/releases/download/${TAG}/depup-aarch64-unknown-linux-gnu.tar.gz" -o linux_arm64.tar.gz
-
-          SHA256_ARM64=$(sha256sum arm64.tar.gz | cut -d' ' -f1)
-          SHA256_X86_64=$(sha256sum x86_64.tar.gz | cut -d' ' -f1)
-          SHA256_LINUX_X86_64=$(sha256sum linux_x86_64.tar.gz | cut -d' ' -f1)
-          SHA256_LINUX_ARM64=$(sha256sum linux_arm64.tar.gz | cut -d' ' -f1)
-
-          echo "sha256_arm64=${SHA256_ARM64}" >> $GITHUB_OUTPUT
-          echo "sha256_x86_64=${SHA256_X86_64}" >> $GITHUB_OUTPUT
-          echo "sha256_linux_x86_64=${SHA256_LINUX_X86_64}" >> $GITHUB_OUTPUT
-          echo "sha256_linux_arm64=${SHA256_LINUX_ARM64}" >> $GITHUB_OUTPUT
-
-      - name: Update Homebrew Formula
+      # formula は添付の tar.gz を OS と CPU ごとに直接指す (bottle もソースの url も持たない)。
+      # 変化が無ければ push しない (再実行しても壊れない)
+      - name: Update the formula
+        id: formula
+        if: steps.app.outputs.enabled == 'true'
+        working-directory: tap
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          HOMEPAGE: ${{ github.server_url }}/${{ github.repository }}
+          URL: ${{ github.server_url }}/${{ github.repository }}/releases/download/${{ needs.prepare-release.outputs.tag }}
+          SHA_MACOS_ARM: ${{ steps.sums.outputs.aarch64_apple_darwin }}
+          SHA_MACOS_INTEL: ${{ steps.sums.outputs.x86_64_apple_darwin }}
+          SHA_LINUX_ARM: ${{ steps.sums.outputs.aarch64_unknown_linux_gnu }}
+          SHA_LINUX_INTEL: ${{ steps.sums.outputs.x86_64_unknown_linux_gnu }}
         run: |
-          VERSION="${{ needs.prepare-release.outputs.version }}"
-          TAG="${{ needs.prepare-release.outputs.tag }}"
-          SHA256_ARM64="${{ steps.sha256.outputs.sha256_arm64 }}"
-          SHA256_X86_64="${{ steps.sha256.outputs.sha256_x86_64 }}"
-          SHA256_LINUX_X86_64="${{ steps.sha256.outputs.sha256_linux_x86_64 }}"
-          SHA256_LINUX_ARM64="${{ steps.sha256.outputs.sha256_linux_arm64 }}"
-
-          # Clone homebrew tap
-          git clone "https://x-access-token:${GH_TOKEN}@github.com/owayo/homebrew-depup.git"
-          cd homebrew-depup
-
-          # Create Formula directory if not exists
+          set -euo pipefail
+          # Homebrew のクラス名の規則 (Formulary.class_s): 先頭と - _ . の直後を大文字にしてつなぐ (git-sc → GitSc)
+          CLASS=$(printf '%s' "${BINARY_NAME}" | sed -E 's/(^|[-_.])([a-z0-9])/\U\2/g')
           mkdir -p Formula
-
-          # Create/update formula
-          cat > Formula/depup.rb << 'FORMULA'
-          class Depup < Formula
+          # シェルが展開するのは ${...} だけ (Ruby の #{...} はそのまま残る)。版は URL の /download/v<版>/ から
+          # Homebrew が読むので version は書かない (書くと brew audit --strict が冗長と指摘する)
+          cat > Formula/depup.rb <<FORMULA
+          class ${CLASS} < Formula
             desc "Multi-language dependency updater CLI tool"
-            homepage "https://github.com/owayo/depup"
-            version "VERSION_PLACEHOLDER"
+            homepage "${HOMEPAGE}"
             license "MIT"
 
             on_macos do
               if Hardware::CPU.arm?
-                url "URL_ARM64_PLACEHOLDER"
-                sha256 "SHA256_ARM64_PLACEHOLDER"
+                url "${URL}/${BINARY_NAME}-aarch64-apple-darwin.tar.gz"
+                sha256 "${SHA_MACOS_ARM}"
               else
-                url "URL_X86_64_PLACEHOLDER"
-                sha256 "SHA256_X86_64_PLACEHOLDER"
+                url "${URL}/${BINARY_NAME}-x86_64-apple-darwin.tar.gz"
+                sha256 "${SHA_MACOS_INTEL}"
               end
             end
 
             on_linux do
               if Hardware::CPU.arm?
-                url "URL_LINUX_ARM64_PLACEHOLDER"
-                sha256 "SHA256_LINUX_ARM64_PLACEHOLDER"
+                url "${URL}/${BINARY_NAME}-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "${SHA_LINUX_ARM}"
               else
-                url "URL_LINUX_X86_64_PLACEHOLDER"
-                sha256 "SHA256_LINUX_X86_64_PLACEHOLDER"
+                url "${URL}/${BINARY_NAME}-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "${SHA_LINUX_INTEL}"
               end
             end
 
             def install
-              bin.install "depup"
+              bin.install "${BINARY_NAME}"
             end
 
             test do
-              system "#{bin}/depup", "--version"
+              assert_match version.to_s, shell_output("#{bin}/${BINARY_NAME} --version")
             end
           end
           FORMULA
-
-          # Replace placeholders with actual values
-          sed -i "s|VERSION_PLACEHOLDER|${VERSION}|g" Formula/depup.rb
-          sed -i "s|URL_ARM64_PLACEHOLDER|https://github.com/owayo/depup/releases/download/${TAG}/depup-aarch64-apple-darwin.tar.gz|g" Formula/depup.rb
-          sed -i "s|SHA256_ARM64_PLACEHOLDER|${SHA256_ARM64}|g" Formula/depup.rb
-          sed -i "s|URL_X86_64_PLACEHOLDER|https://github.com/owayo/depup/releases/download/${TAG}/depup-x86_64-apple-darwin.tar.gz|g" Formula/depup.rb
-          sed -i "s|SHA256_X86_64_PLACEHOLDER|${SHA256_X86_64}|g" Formula/depup.rb
-          sed -i "s|URL_LINUX_ARM64_PLACEHOLDER|https://github.com/owayo/depup/releases/download/${TAG}/depup-aarch64-unknown-linux-gnu.tar.gz|g" Formula/depup.rb
-          sed -i "s|SHA256_LINUX_ARM64_PLACEHOLDER|${SHA256_LINUX_ARM64}|g" Formula/depup.rb
-          sed -i "s|URL_LINUX_X86_64_PLACEHOLDER|https://github.com/owayo/depup/releases/download/${TAG}/depup-x86_64-unknown-linux-gnu.tar.gz|g" Formula/depup.rb
-          sed -i "s|SHA256_LINUX_X86_64_PLACEHOLDER|${SHA256_LINUX_X86_64}|g" Formula/depup.rb
-
-          # Remove leading spaces from heredoc
-          sed -i 's/^          //' Formula/depup.rb
-
-          # Commit and push
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # 壊れた Ruby (desc の中の引用符、数字で始まるクラス名など) を tap に push しない
+          ruby -c Formula/depup.rb
+          # 新しく作った formula も差分に入るよう、add してから比べる
           git add Formula/depup.rb
-          git commit -m "Update depup to ${TAG}"
+          if git diff --cached --quiet; then
+            echo "The formula already points at ${TAG}"
+            echo "state=unchanged" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "${BINARY_NAME} ${TAG}"
           git push
+          echo "state=updated" >> "$GITHUB_OUTPUT"
 
+  # ---- winget のブロック (外し方は冒頭) ----------------------------------------------------
+  # winget-pkgs へ更新の PR を出す。トークンは classic PAT (public_repo) を Secrets の WINGET_TOKEN に置く。
+  # winget-releaser は「既に winget-pkgs にある版の更新」しかできないので、初版は手で出す (distribution.md)
   publish-winget:
-    name: Publish to WinGet
+    name: Publish to winget
     needs: [prepare-release, release]
     if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     env:
       WINGET_IDENTIFIER: owayo.depup
+    outputs:
+      submitted: ${{ steps.submit.outcome == 'success' }}
+      # no-token / not-registered / registered / unknown (提出しなかった理由を release-summary に渡す)
+      state: ${{ steps.registration.outputs.state || steps.token.outputs.state }}
     steps:
-      # winget-pkgs への提出は任意。WINGET_TOKEN 未設定でもリリース全体を失敗させない。
-      # 必要な準備 (1 回だけ):
-      #   1. owayo アカウントで microsoft/winget-pkgs を fork する
-      #   2. classic PAT (scope: public_repo) を作り、secrets.WINGET_TOKEN に登録する
-      #      (fine-grained PAT はこの Action では使えない)
-      #   3. wingetcreate / komac で初版マニフェストを手動提出し、マージされるまで待つ
-      #      (winget-releaser は既存パッケージの「更新」しかできない)
-      - name: Check WinGet token
+      # トークンが無ければリリース全体を落とさずに飛ばす (jobs.<id>.if では secrets を読めない)
+      - name: Check the winget token
         id: token
         env:
-          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          HAS_TOKEN: ${{ secrets.WINGET_TOKEN != '' }}
         run: |
-          if [ -z "${WINGET_TOKEN}" ]; then
-            echo "::warning::WINGET_TOKEN is not set; skipping winget-pkgs submission"
-            echo "available=false" >> "$GITHUB_OUTPUT"
-          else
+          if [ "${HAS_TOKEN}" = "true" ]; then
             echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::The secret WINGET_TOKEN is not set; skipped the winget-pkgs submission"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "state=no-token" >> "$GITHUB_OUTPUT"
           fi
 
-      # 初版マニフェストの PR は自動検査を通ってもモデレータの承認待ちで数日かかる。
-      # その間 winget-releaser は 1 ステップ目で
-      #   "Package <Id> does not exist in the winget-pkgs repository" と exit 1 するため、
-      # 提出前に登録の有無を自分で確かめて、未登録なら提出ステップごと飛ばす。
-      # continue-on-error は使わない (PAT 失効・regex 取り違えのような本当の失敗まで緑になる)。
-      - name: Check winget-pkgs registration
+      # 初版のマニフェストはモデレータの承認待ちで数日かかることがあり、その間 winget-releaser は
+      # "Package ... does not exist in the winget-pkgs repository" で落ちる。未登録はこの期間の正常な状態なので、
+      # 提出の前に登録を確かめて飛ばす。continue-on-error は PAT の失効や installers-regex の誤りまで緑にするので使わない
+      - name: Check the winget-pkgs registration
         id: registration
+        if: steps.token.outputs.available == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          # winget-releaser と同じ判定パス: manifests/<頭文字小文字>/<Publisher>/<Package>
+          set -euo pipefail
+          # winget-releaser と同じ判定のパス: manifests/<頭文字の小文字>/<Publisher>/<Package>
           INITIAL=$(printf '%s' "${WINGET_IDENTIFIER}" | cut -c1 | tr '[:upper:]' '[:lower:]')
           MANIFEST_DIR="manifests/${INITIAL}/${WINGET_IDENTIFIER//.//}"
-
+          # 接続の失敗でステップごと落ちないよう、HTTP の状態だけで判断する
           http_status() {
             curl --silent --output /dev/null --write-out '%{http_code}' "$@" || true
           }
-
           STATUS=$(http_status \
             --header "Authorization: Bearer ${GH_TOKEN}" \
             --header "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/microsoft/winget-pkgs/contents/${MANIFEST_DIR}")
-
-          # API が使えないとき (rate limit 等) は winget-releaser と同じ web パスで確かめ直す
+          # API が使えないとき (rate limit など) は、winget-releaser と同じ web のパスで確かめ直す
           if [ "${STATUS}" != "200" ] && [ "${STATUS}" != "404" ]; then
             STATUS=$(http_status "https://github.com/microsoft/winget-pkgs/tree/master/${MANIFEST_DIR}")
           fi
-
           case "${STATUS}" in
             200)
               echo "registered=true" >> "$GITHUB_OUTPUT"
+              echo "state=registered" >> "$GITHUB_OUTPUT"
               ;;
             404)
-              echo "::notice::${WINGET_IDENTIFIER} is not in winget-pkgs yet (initial manifest PR is awaiting moderator approval); skipping submission"
+              echo "::notice::${WINGET_IDENTIFIER} is not in winget-pkgs yet (the first manifest is waiting for a moderator); skipped the submission"
               echo "registered=false" >> "$GITHUB_OUTPUT"
+              echo "state=not-registered" >> "$GITHUB_OUTPUT"
               ;;
             *)
-              # 判定できなかったときは提出を試す (ここでスキップに倒すと更新が無言で止まる)
-              echo "::warning::Could not determine winget-pkgs registration (HTTP ${STATUS}); attempting submission anyway"
+              # 判定できないときは提出を試す (飛ばす側に倒すと、判定が失敗し続けたとき更新が黙って止まる)
+              echo "::warning::Could not check the winget-pkgs registration (HTTP ${STATUS}); submitting anyway"
               echo "registered=true" >> "$GITHUB_OUTPUT"
+              echo "state=unknown" >> "$GITHUB_OUTPUT"
               ;;
           esac
 
-      # 既定の installers-regex は exe/msi/msix/appx しか拾わないため、
-      # zip 配布の depup では明示的に Windows 用 zip を指定する
-      - name: Submit manifest to winget-pkgs
-        if: steps.token.outputs.available == 'true' && steps.registration.outputs.registered == 'true'
-        uses: vedantmgoyal9/winget-releaser@4ffc7888bffd451b357355dc214d43bb9f23917e # v2
+      - name: Submit the manifest to winget-pkgs
+        id: submit
+        if: steps.registration.outputs.registered == 'true'
+        uses: vedantmgoyal9/winget-releaser@v2
         with:
           identifier: ${{ env.WINGET_IDENTIFIER }}
           version: ${{ needs.prepare-release.outputs.version }}
+          # workflow_dispatch では既定値 (release イベントのタグ) が使えないので明示する
           release-tag: ${{ needs.prepare-release.outputs.tag }}
+          # 既定値は exe / msi / msix / appx だけで zip を拾わない
           installers-regex: '-pc-windows-msvc\.zip$'
           max-versions-to-keep: 5
           token: ${{ secrets.WINGET_TOKEN }}
 
+  # ---- 結果のまとめ ------------------------------------------------------------------------
+  # 途中のジョブが落ちても、飛ばされても (dry_run を含む) 結果を書く
   release-summary:
-    name: Release Summary
-    needs: [prepare-release, release, update-homebrew, publish-winget]
-    if: ${{ !inputs.dry_run }}
+    name: Release summary
+    needs: [prepare-release, build, release, update-homebrew, publish-winget]
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
-      - name: Summary
+      - name: Write the summary
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          TAG: ${{ needs.prepare-release.outputs.tag }}
+          PREPARE_RESULT: ${{ needs.prepare-release.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          RELEASE_RESULT: ${{ needs.release.result }}
+          ASSETS: ${{ needs.release.outputs.assets }}
+          HOMEBREW_RESULT: ${{ needs.update-homebrew.result }}
+          HOMEBREW_STATE: ${{ needs.update-homebrew.outputs.state }}
+          HOMEBREW_TAP: ${{ needs.update-homebrew.outputs.tap }}
+          WINGET_RESULT: ${{ needs.publish-winget.result }}
+          WINGET_SUBMITTED: ${{ needs.publish-winget.outputs.submitted }}
+          WINGET_STATE: ${{ needs.publish-winget.outputs.state }}
         run: |
-          echo "🚀 Released ${{ needs.prepare-release.outputs.tag }}"
-          echo ""
-          echo "Assets uploaded:"
-          echo "  - depup-x86_64-unknown-linux-gnu.tar.gz"
-          echo "  - depup-aarch64-unknown-linux-gnu.tar.gz"
-          echo "  - depup-x86_64-apple-darwin.tar.gz"
-          echo "  - depup-aarch64-apple-darwin.tar.gz"
-          echo "  - depup-x86_64-pc-windows-msvc.zip"
-          echo ""
-          echo "🍺 Homebrew tap updated: owayo/homebrew-depup"
-          echo "📦 WinGet manifest PR submitted: owayo.depup"
-          echo "   (skipped while WINGET_TOKEN is unset or the package is not yet merged into winget-pkgs)"
+          set -euo pipefail
+          {
+            if [ "${DRY_RUN}" = "true" ]; then
+              echo "## Dry run: ${TAG:-no version}"
+              echo
+              echo "prepare-release: ${PREPARE_RESULT}. Nothing was committed, tagged or released, and the build did not run (ci.yml builds every target)."
+              exit 0
+            fi
+            echo "## ${TAG:-no version}"
+            echo
+            echo "| Job | Result | Note |"
+            echo "|---|---|---|"
+            echo "| prepare-release | ${PREPARE_RESULT} | |"
+            echo "| build | ${BUILD_RESULT} | |"
+            echo "| release | ${RELEASE_RESULT} | |"
+            if [ -n "${HOMEBREW_RESULT:-}" ]; then
+              case "${HOMEBREW_STATE:-}" in
+                updated) note="updated ${HOMEBREW_TAP}" ;;
+                unchanged) note="${HOMEBREW_TAP} already had this version" ;;
+                not-configured) note="skipped: the GitHub App is not configured" ;;
+                *) note="not updated" ;;
+              esac
+              echo "| update-homebrew | ${HOMEBREW_RESULT} | ${note} |"
+            fi
+            if [ -n "${WINGET_RESULT:-}" ]; then
+              case "${WINGET_SUBMITTED:-}/${WINGET_STATE:-}" in
+                true/*) note="submitted a pull request to microsoft/winget-pkgs" ;;
+                */no-token) note="skipped: the secret WINGET_TOKEN is not set" ;;
+                */not-registered) note="skipped: the first manifest is not merged into winget-pkgs yet" ;;
+                *) note="not submitted" ;;
+              esac
+              echo "| publish-winget | ${WINGET_RESULT} | ${note} |"
+            fi
+            if [ -n "${ASSETS:-}" ]; then
+              echo
+              echo "Assets of ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${TAG}:"
+              echo
+              read -r -a assets <<< "${ASSETS}"
+              for asset in "${assets[@]}"; do
+                echo "- \`${asset}\`"
+              done
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

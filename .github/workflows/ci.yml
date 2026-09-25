@@ -15,9 +15,6 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # mise 自身の版の正はここ (mise.toml には mise 自身を書けない)。release.yml と同じ値にそろえる。
-  # 公開から 14 日以上たった版を選ぶ
-  MISE_VERSION: "2026.9.5"
 
 jobs:
   # 検査の中身は Makefile の ci が定義する (fmt-check / clippy / cargo test)。
@@ -28,26 +25,25 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # make ci を回す OS。README の対応 OS バッジは、ここと build ジョブでテストする OS だけにする。
-        # Windows には入れない: ランナーの make は MinGW の mingw32-make の写しで、レシピの
-        # POSIX シェル前提 ($$(...)、[ -n ... ] など) の解釈に癖がある。Windows のテストは build ジョブで回す
+        # make ci を回す OS。Windows には入れない: ランナーの make は MinGW の mingw32-make の写しで、
+        # レシピの POSIX シェル前提 ($$(...)、[ -n ... ] など) の解釈に癖がある。Windows のテストは build で回す
         os: [ubuntu-latest, macos-latest]
-
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-
-      # ツールの版は mise.toml が正。mise 本体は version の固定と署名付き checksum で検証される。
-      # cache は切る。mise-action のキャッシュは mise の導入済みの印だけを戻し、rustup が持つ
-      # ツールチェーンと components (clippy / rustfmt) を戻さないため、復元した回だけ
-      # 'cargo-clippy' is not installed で落ちる (jdx/mise-action#215)。rust だけの mise.toml では
-      # キャッシュしても省けるものが無い
-      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+      - uses: actions/checkout@v7
         with:
-          version: ${{ env.MISE_VERSION }}
+          persist-credentials: false
+
+      # ツールの版は mise.toml が正。mise 本体は公開から 14 日以上たった最新の版を、署名付きの checksum で
+      # 確かめて入れる。cache は切る。mise-action のキャッシュは mise の導入済みの印だけを戻し、rustup が持つ
+      # ツールチェーンと components (clippy / rustfmt) を戻さないため、復元した回だけ
+      # 'cargo-clippy' is not installed で落ちる (jdx/mise-action#215)
+      - uses: jdx/mise-action@v4
+        with:
+          minimum_release_age: 14d
           cache: false
 
-      # target/ と ~/.cargo のキャッシュ (キーに rustc の版が入るので、mise.toml の版を上げると作り直す)
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # target/ と ~/.cargo のキャッシュ (鍵に rustc の版が入るので、mise.toml の rust を上げると作り直す)
+      - uses: Swatinem/rust-cache@v2
 
       - name: Show toolchain
         run: mise ls --current
@@ -55,8 +51,8 @@ jobs:
       - run: make setup
       - run: make ci
 
-  # release.yml の build と同じ matrix とビルドの設定にする (cross の行と、その準備の apt も写す)。
-  # release.yml の dry_run では build が走らないので、配布物を作れることはここで確かめる
+  # release.yml の build と同じ組 (os / target) でビルドする。release.yml の dry_run では build が
+  # 走らないので、配布物を作れることはここで確かめる。Windows はここでテストも回す
   build:
     name: Build (${{ matrix.target }})
     needs: quality
@@ -64,66 +60,48 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # release.yml の build と同じ組 (行を足したら両方に足す)。Linux ARM64 は arm64 のランナーで
+        # そのままビルドする (cross を使わない)
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            cross: false
-
-          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            cross: true
-
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            cross: false
-
           - os: macos-latest
             target: aarch64-apple-darwin
-            cross: false
-
+          - os: macos-latest
+            target: x86_64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            cross: false
-
     steps:
-      # Windows のランナーは既定で LF を CRLF に変えて checkout する。release.yml の build と
-      # そろえ、CI で検証したファイルと配布物のビルドに使うファイルの改行を一致させる
+      # Windows のランナーは既定で LF を CRLF に変えて checkout する。release.yml の build と同じく LF のまま取り、
+      # CI で確かめたファイルと配布物のビルドに使うファイルの改行を一致させる
       - name: Keep LF line endings
         run: git config --global core.autocrlf false
 
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-
-      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+      - uses: actions/checkout@v7
         with:
-          version: ${{ env.MISE_VERSION }}
+          persist-credentials: false
+
+      # ビルドに効く環境変数 (MACOSX_DEPLOYMENT_TARGET など) は mise.toml の [env] に置く。mise-action が
+      # 後続のステップへ渡すので、ci.yml と release.yml と手元の make で同じ値になる
+      - uses: jdx/mise-action@v4
+        with:
+          minimum_release_age: 14d
           cache: false
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
 
-      # mise.toml の rust はホストのツールチェーンと components だけを入れるので、配布ターゲットを足す
-      - name: Add Rust target
+      # mise.toml の rust はホストのツールチェーンと components だけを入れるので、配布のターゲットを足す
+      - name: Add the Rust target
         run: rustup target add ${{ matrix.target }}
 
-      # Windows は make ci を回さない (quality の matrix の注記) ので、README の対応 OS に
-      # Windows を載せている分のテストをここで回す
+      # Windows は quality で make ci を回さないので、配る OS の裏付けとしてここでテストする
       - name: Test (Windows)
         if: runner.os == 'Windows'
         run: cargo test --locked
 
-      - name: Install cross-compilation tools
-        if: matrix.cross
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-
-      - name: Build with cross
-        if: matrix.cross
-        run: |
-          cargo install cross --git https://github.com/cross-rs/cross
-          cross build --release --locked --target ${{ matrix.target }}
-
       - name: Build
-        if: "!matrix.cross"
         run: cargo build --release --locked --target ${{ matrix.target }}
