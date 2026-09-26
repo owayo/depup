@@ -1,5 +1,3 @@
-use regex::Regex;
-
 fn find_json_string_end(bytes: &[u8], start: usize) -> Option<usize> {
     let mut escaped = false;
     let mut i = start + 1;
@@ -49,6 +47,48 @@ fn find_matching_json_object_end(bytes: &[u8], start: usize) -> Option<usize> {
     None
 }
 
+/// オブジェクト本文の直下にあるキー（引用符込み）と値の開始位置を返す。
+/// オブジェクトと配列の両方を追跡し、文字列内の括弧は構造として扱わない。
+fn direct_child_properties(content: &str, start: usize, end: usize) -> Vec<(&str, usize)> {
+    let bytes = content.as_bytes();
+    let end = end.min(bytes.len());
+    let mut properties = Vec::new();
+    let mut depth = 0usize;
+    let mut i = start;
+
+    while i < end {
+        match bytes[i] {
+            b'"' => {
+                let Some(string_end) = find_json_string_end(bytes, i).filter(|&pos| pos < end)
+                else {
+                    break;
+                };
+                if depth == 0 {
+                    let mut j = skip_json_ws(bytes, string_end + 1);
+                    if j < end && bytes[j] == b':' {
+                        j = skip_json_ws(bytes, j + 1);
+                        if j < end {
+                            properties.push((&content[i..=string_end], j));
+                        }
+                    }
+                }
+                i = string_end + 1;
+            }
+            b'{' | b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' | b']' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+
+    properties
+}
+
 pub(crate) fn direct_child_object_section_ranges(
     content: &str,
     parent_ranges: &[(usize, usize)],
@@ -56,51 +96,18 @@ pub(crate) fn direct_child_object_section_ranges(
 ) -> Vec<(usize, usize)> {
     let bytes = content.as_bytes();
     let mut ranges = Vec::new();
-
     for &(start, end) in parent_ranges {
-        let mut depth = 0usize;
-        let mut i = start;
-
-        while i < end && i < bytes.len() {
-            match bytes[i] {
-                b'"' => {
-                    let Some(string_end) = find_json_string_end(bytes, i) else {
-                        break;
-                    };
-
-                    if depth == 0 {
-                        let key = &content[i + 1..string_end];
-                        let mut j = skip_json_ws(bytes, string_end + 1);
-                        if j < end && bytes[j] == b':' {
-                            j = skip_json_ws(bytes, j + 1);
-                            if j < end
-                                && bytes[j] == b'{'
-                                && section_names.is_none_or(|names| names.contains(&key))
-                                && let Some(object_end) = find_matching_json_object_end(bytes, j)
-                                && object_end <= end
-                            {
-                                ranges.push((j + 1, object_end));
-                                i = object_end + 1;
-                                continue;
-                            }
-                        }
-                    }
-
-                    i = string_end + 1;
-                }
-                b'{' => {
-                    depth += 1;
-                    i += 1;
-                }
-                b'}' => {
-                    depth = depth.saturating_sub(1);
-                    i += 1;
-                }
-                _ => i += 1,
+        for (raw_key, value_start) in direct_child_properties(content, start, end) {
+            if bytes[value_start] == b'{'
+                && let Some(key) = decode_json_string(raw_key)
+                && section_names.is_none_or(|names| names.contains(&key.as_str()))
+                && let Some(object_end) = find_matching_json_object_end(bytes, value_start)
+                && object_end <= end
+            {
+                ranges.push((value_start + 1, object_end));
             }
         }
     }
-
     ranges
 }
 
@@ -109,49 +116,14 @@ pub(crate) fn top_level_object_section_ranges(
     section_names: &[&str],
 ) -> Vec<(usize, usize)> {
     let bytes = content.as_bytes();
-    let mut ranges = Vec::new();
-    let mut depth = 0usize;
-    let mut i = 0usize;
-
-    while i < bytes.len() {
-        match bytes[i] {
-            b'"' => {
-                let Some(end) = find_json_string_end(bytes, i) else {
-                    break;
-                };
-
-                if depth == 1 {
-                    let key = &content[i + 1..end];
-                    let mut j = skip_json_ws(bytes, end + 1);
-                    if j < bytes.len() && bytes[j] == b':' {
-                        j = skip_json_ws(bytes, j + 1);
-                        if j < bytes.len()
-                            && bytes[j] == b'{'
-                            && section_names.contains(&key)
-                            && let Some(object_end) = find_matching_json_object_end(bytes, j)
-                        {
-                            ranges.push((j + 1, object_end));
-                            i = object_end + 1;
-                            continue;
-                        }
-                    }
-                }
-
-                i = end + 1;
-            }
-            b'{' => {
-                depth += 1;
-                i += 1;
-            }
-            b'}' => {
-                depth = depth.saturating_sub(1);
-                i += 1;
-            }
-            _ => i += 1,
-        }
+    let start = skip_json_ws(bytes, 0);
+    if bytes.get(start) != Some(&b'{') {
+        return Vec::new();
     }
-
-    ranges
+    let Some(end) = find_matching_json_object_end(bytes, start) else {
+        return Vec::new();
+    };
+    direct_child_object_section_ranges(content, &[(start + 1, end)], Some(section_names))
 }
 
 pub(crate) fn replace_string_property_in_top_level_sections(
@@ -159,15 +131,10 @@ pub(crate) fn replace_string_property_in_top_level_sections(
     section_names: &[&str],
     property_name: &str,
     mut transform: impl FnMut(&str) -> Option<String>,
-) -> Result<(String, bool), regex::Error> {
+) -> (String, bool) {
     let ranges = top_level_object_section_ranges(content, section_names);
     replace_string_property_in_ranges(content, ranges, property_name, &mut transform)
 }
-
-/// JSON のキー・値ペア (どちらも文字列リテラル) を、エスケープを含んだまま捉える。
-/// 一致したキー・値は生テキストのままなので、比較・書き戻しの前後で必ずデコード /
-/// エンコードを通す。
-const JSON_STRING_PROPERTY_PATTERN: &str = r#"("(?:[^"\\]|\\.)*")(\s*:\s*)("(?:[^"\\]|\\.)*")"#;
 
 /// JSON 文字列リテラル (引用符込み) をデコードする
 fn decode_json_string(raw: &str) -> Option<String> {
@@ -181,57 +148,145 @@ fn encode_json_string(value: &str) -> Option<String> {
 
 pub(crate) fn replace_string_property_in_ranges(
     content: &str,
-    mut ranges: Vec<(usize, usize)>,
+    ranges: Vec<(usize, usize)>,
     property_name: &str,
     transform: &mut impl FnMut(&str) -> Option<String>,
-) -> Result<(String, bool), regex::Error> {
-    // キーと値は生テキストのリテラルではなく、JSON 文字列としてデコードしてから
-    // 比較・変換する。PHP の `json_encode` は既定で `/` を `\/` へエスケープするため
-    // (`"monolog\/monolog"`)、リテラル一致では composer.json の依存キーに 1 つも
-    // 当たらず、judge が「更新あり」と報告した後に書き込みが必ず失敗していた
-    // (composer のパッケージ名は必ず `/` を含むので全依存が失敗する)。
-    // package.json の scoped 名 (`"@types\/node"`) や、Go の `encoding/json` が付ける
-    // `<` のような別表記も同じ経路で救われる。
-    let re = Regex::new(JSON_STRING_PROPERTY_PATTERN)?;
-
-    let mut result = content.to_string();
-    let mut updated = false;
-
-    ranges.sort_by_key(|(start, _)| *start);
-    for (start, end) in ranges.into_iter().rev() {
-        let replaced = {
-            let section = &result[start..end];
-            re.replace_all(section, |caps: &regex::Captures| {
-                let raw_key = &caps[1];
-                let separator = &caps[2];
-                let raw_value = &caps[3];
-                // キーがデコードできない / 対象パッケージでない場合は素通しする
-                if decode_json_string(raw_key).as_deref() != Some(property_name) {
-                    return caps[0].to_string();
-                }
-                let Some(old_value) = decode_json_string(raw_value) else {
-                    return caps[0].to_string();
-                };
-                let Some(new_value) = transform(&old_value) else {
-                    return caps[0].to_string();
-                };
-                let Some(encoded) = encode_json_string(&new_value) else {
-                    return caps[0].to_string();
-                };
-                updated = true;
-                format!("{}{}{}", raw_key, separator, encoded)
-            })
-            .into_owned()
-        };
-        result.replace_range(start..end, &replaced);
+) -> (String, bool) {
+    let bytes = content.as_bytes();
+    let mut replacements = Vec::new();
+    for (start, end) in ranges {
+        for (raw_key, value_start) in direct_child_properties(content, start, end) {
+            // parse と同じく直下の文字列値だけを対象にし、キーもデコードして照合する。
+            if decode_json_string(raw_key).as_deref() == Some(property_name)
+                && bytes[value_start] == b'"'
+                && let Some(value_end) = find_json_string_end(bytes, value_start)
+                && value_end < end
+                && let Some(old_value) = decode_json_string(&content[value_start..=value_end])
+                && let Some(new_value) = transform(&old_value)
+                && let Some(encoded) = encode_json_string(&new_value)
+            {
+                replacements.push((value_start, value_end + 1, encoded));
+            }
+        }
     }
 
-    Ok((result, updated))
+    // 元の byte offset がずれないよう、ファイルの後方から値だけを差し替える。
+    replacements.sort_by_key(|(start, _, _)| *start);
+    let updated = !replacements.is_empty();
+    let mut result = content.to_string();
+    for (start, end, encoded) in replacements.into_iter().rev() {
+        result.replace_range(start..end, &encoded);
+    }
+    (result, updated)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::{
+        ManifestParser, composer_json::ComposerJsonParser, package_json::PackageJsonParser,
+    };
+
+    #[test]
+    fn test_escaped_section_names_are_updatable() {
+        let cases: &[(&dyn ManifestParser, &str, &str)] = &[
+            (
+                &PackageJsonParser,
+                r#"{"depend\u0065ncies":{"foo":"^1.0.0"}}"#,
+                "foo",
+            ),
+            (
+                &PackageJsonParser,
+                r#"{"devDepend\u0065ncies":{"foo":"^1.0.0"}}"#,
+                "foo",
+            ),
+            (
+                &PackageJsonParser,
+                r#"{"catal\u006fg":{"foo":"^1.0.0"}}"#,
+                "foo",
+            ),
+            (
+                &PackageJsonParser,
+                r#"{"catal\u006fgs":{"default":{"foo":"^1.0.0"}}}"#,
+                "foo",
+            ),
+            (
+                &PackageJsonParser,
+                r#"{"worksp\u0061ces":{"catal\u006fg":{"foo":"^1.0.0"}}}"#,
+                "foo",
+            ),
+            (
+                &PackageJsonParser,
+                r#"{"worksp\u0061ces":{"catal\u006fgs":{"default":{"foo":"^1.0.0"}}}}"#,
+                "foo",
+            ),
+            (
+                &ComposerJsonParser,
+                r#"{"requ\u0069re":{"vendor/foo":"^1.0.0"}}"#,
+                "vendor/foo",
+            ),
+            (
+                &ComposerJsonParser,
+                r#"{"requ\u0069re-dev":{"vendor/foo":"^1.0.0"}}"#,
+                "vendor/foo",
+            ),
+        ];
+        for &(parser, content, package) in cases {
+            let deps = parser.parse(content).unwrap();
+            assert_eq!(deps.len(), 1, "{content}");
+            let updated = parser.update_version(content, package, "2.0.0").unwrap();
+            assert_eq!(updated, content.replace("^1.0.0", "^2.0.0"));
+            assert_eq!(parser.parse(&updated).unwrap()[0].version(), "2.0.0");
+        }
+    }
+
+    #[test]
+    fn test_replacement_leaves_nested_non_dependency_values_untouched() {
+        let cases: &[(&dyn ManifestParser, &str, &str)] = &[
+            (
+                &PackageJsonParser,
+                r#"{"dependencies":{"foo":"^1.0.0","object":{"foo":"^0.1.0"},"array":[{"foo":"^0.2.0"}]}}"#,
+                "foo",
+            ),
+            (
+                &PackageJsonParser,
+                r#"{"workspaces":{"catalogs":{"default":{"foo":"^1.0.0","object":{"foo":"^0.1.0"},"array":[{"foo":"^0.2.0"}]}}}}"#,
+                "foo",
+            ),
+            (
+                &ComposerJsonParser,
+                r#"{"require":{"vendor/foo":"^1.0.0","object":{"vendor/foo":"^0.1.0"},"array":[{"vendor/foo":"^0.2.0"}]}}"#,
+                "vendor/foo",
+            ),
+        ];
+        for &(parser, content, package) in cases {
+            assert_eq!(parser.parse(content).unwrap().len(), 1);
+            let updated = parser.update_version(content, package, "2.0.0").unwrap();
+            assert_eq!(updated, content.replace("^1.0.0", "^2.0.0"));
+
+            // 直下に宣言がなければ、ネストした同名キーを更新成功と報告しない。
+            let nested_only = content.replace(&format!(r#""{package}":"^1.0.0","#), "");
+            assert!(parser.parse(&nested_only).unwrap().is_empty());
+            assert!(
+                parser
+                    .update_version(&nested_only, package, "2.0.0")
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn test_escaped_json_update_preserves_crlf_and_key_spelling() {
+        let content = "{\r\n\t\"requ\\u0069re\" : { \"vendor\\/foo\" : \"\\u005e1.0.0\" }\r\n}";
+        let updated = ComposerJsonParser
+            .update_version(content, "vendor/foo", "2.0.0")
+            .unwrap();
+        assert_eq!(updated, content.replace(r#""\u005e1.0.0""#, r#""^2.0.0""#));
+        assert_eq!(
+            ComposerJsonParser.parse(&updated).unwrap()[0].version(),
+            "2.0.0"
+        );
+    }
 
     #[test]
     fn test_top_level_ranges_ignore_braces_and_escaped_quotes_in_strings() {
@@ -279,8 +334,7 @@ mod tests {
             &["dependencies", "devDependencies"],
             "@scope/pkg",
             |old| Some(old.replace("1.0.0", "2.0.0")),
-        )
-        .unwrap();
+        );
 
         assert!(changed);
         assert!(updated.contains(r#""@scope/pkg": "^2.0.0""#));
@@ -316,8 +370,7 @@ mod tests {
             &["dependencies"],
             "serde",
             |_| Some("2.0".to_string()),
-        )
-        .unwrap();
+        );
         assert!(changed);
         assert!(updated.contains(r#""serde": "2.0""#));
         // 手前の多バイト文字列は無傷であること

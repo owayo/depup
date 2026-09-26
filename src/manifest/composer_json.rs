@@ -70,12 +70,7 @@ impl ManifestParser for ComposerJsonParser {
                 // 解釈できない制約は元の値を維持する
                 None
             },
-        )
-        .map_err(|e| ManifestError::InvalidVersionSpec {
-            path: PathBuf::from("composer.json"),
-            spec: package.to_string(),
-            message: format!("invalid regex pattern: {}", e),
-        })?;
+        );
 
         if !updated {
             return Err(ManifestError::InvalidVersionSpec {

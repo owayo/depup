@@ -48,6 +48,8 @@ Both packages are automatically adjusted to the same major.minor version (e.g., 
 
 This chapter is a reference. Look up your ecosystem when you need to know exactly which declarations depup reads and how it rewrites them; the shared rules are in [Version Specifiers and Rewriting](usage.md#version-specifiers-and-rewriting).
 
+For `package.json` (including Bun catalogs) and `composer.json`, JSON-escaped section and package names are recognized when updating. Only string values directly inside a dependency section are rewritten; nested objects and arrays are left untouched. The original key spelling, whitespace, and line endings are preserved.
+
 ### Node.js
 
 In `package.json`, depup updates `dependencies`, `devDependencies`, `peerDependencies`, and `optionalDependencies`; `overrides` and other sections are left untouched.

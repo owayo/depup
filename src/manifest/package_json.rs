@@ -82,21 +82,10 @@ impl ManifestParser for PackageJsonParser {
             &sections,
             package,
             |old_version| format_node_update(parser.as_ref(), old_version, new_version),
-        )
-        .map_err(|e| ManifestError::InvalidVersionSpec {
-            path: PathBuf::from("package.json"),
-            spec: package.to_string(),
-            message: format!("invalid regex pattern: {}", e),
-        })?;
+        );
 
         let (result, catalog_updated) =
-            replace_bun_catalog_versions(&result, package, new_version, parser.as_ref()).map_err(
-                |e| ManifestError::InvalidVersionSpec {
-                    path: PathBuf::from("package.json"),
-                    spec: package.to_string(),
-                    message: format!("invalid regex pattern: {}", e),
-                },
-            )?;
+            replace_bun_catalog_versions(&result, package, new_version, parser.as_ref());
         let updated = updated || catalog_updated;
 
         if !updated {
@@ -274,7 +263,7 @@ fn replace_bun_catalog_versions(
     package: &str,
     new_version: &str,
     parser: &dyn VersionParser,
-) -> Result<(String, bool), regex::Error> {
+) -> (String, bool) {
     let ranges = bun_catalog_object_ranges(content);
     let mut transform = |old_version: &str| format_node_update(parser, old_version, new_version);
     replace_string_property_in_ranges(content, ranges, package, &mut transform)

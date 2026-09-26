@@ -48,6 +48,8 @@ tauri: 2.9.0 → 2.10.1
 
 この章は参照用です。depup がどの宣言を読み、どう書き換えるかを正確に知りたいときに、使っているエコシステムの節を引いてください。すべてのエコシステムに共通する規則は「[バージョン指定と書き換え](usage.ja.md#バージョン指定と書き換え)」にあります。
 
+`package.json`（Bun catalogs を含む）と `composer.json` は、セクション名やパッケージ名が JSON エスケープで書かれていても更新できます。書き換えるのは依存セクション直下の文字列値だけで、ネストしたオブジェクトや配列は変更しません。元のキー表記、空白、改行コードは保持します。
+
 ### Node.js
 
 `package.json` で更新するのは `dependencies`、`devDependencies`、`peerDependencies`、`optionalDependencies` です。`overrides` などのセクションは変更しません。
