@@ -136,6 +136,9 @@ jobs:
     needs: prepare-release
     if: ${{ !inputs.dry_run }}
     runs-on: ${{ matrix.os }}
+    outputs:
+      # 添付の数 (matrix の行ごとに 1 つ)。release のジョブが、集めた添付の数と照らす
+      assets: ${{ strategy.job-total }}
     strategy:
       fail-fast: false
       matrix:
@@ -196,7 +199,8 @@ jobs:
             echo "asset=${TAR_GZ}" >> "$GITHUB_OUTPUT"
           fi
 
-      # archive: false で添付のファイルをそのまま上げる (artifact の名前はファイル名になる)
+      # archive: false で添付のファイルをそのまま上げる (artifact の名前はファイル名になる)。zip を展開させない
+      # ため、release のジョブは skip-decompress: true で落とす
       - uses: actions/upload-artifact@v7
         with:
           path: ${{ steps.package.outputs.asset }}
@@ -213,17 +217,46 @@ jobs:
     outputs:
       assets: ${{ steps.files.outputs.assets }}
     steps:
+      # 添付を build が上げた形 (tar.gz / zip) のまま集める。download-artifact@v8 は content-type が zip の
+      # artifact を展開するので、skip-decompress が無いと Windows の .zip が展開されて <bin>.exe だけが残る。
+      # skip-decompress はほかの artifact も zip の塊のまま落とすので、pattern で添付だけに絞る
       - uses: actions/download-artifact@v8
         with:
           path: release
+          pattern: ${{ env.BINARY_NAME }}-*
           merge-multiple: true
+          skip-decompress: true
 
       - name: Write SHA256SUMS
         id: files
+        env:
+          EXPECTED: ${{ needs.build.outputs.assets }}
         run: |
           set -euo pipefail
           cd release
-          sha256sum -- * > SHA256SUMS
+          # 添付は build の target ごとに 1 つ: <bin>-<target>.tar.gz か Windows の <bin>-<target>.zip の、空でない
+          # 通常のファイル。展開された .exe・ディレクトリ・隠しファイルが混ざったり数が合わなかったりしたら、
+          # Release を作る前に止める
+          shopt -s nullglob dotglob
+          files=(*)
+          for f in "${files[@]}"; do
+            case "${f}" in
+              "${BINARY_NAME}"-*-windows-*.zip | "${BINARY_NAME}"-*.tar.gz) ;;
+              *)
+                echo "::error::Unexpected entry in release/: ${f} (expected ${BINARY_NAME}-<target>.tar.gz or .zip)"
+                exit 1
+                ;;
+            esac
+            if [ ! -f "${f}" ] || [ -L "${f}" ] || [ ! -s "${f}" ]; then
+              echo "::error::${f} in release/ is not a non-empty regular file"
+              exit 1
+            fi
+          done
+          if [ "${#files[@]}" -ne "${EXPECTED}" ]; then
+            echo "::error::release/ has ${#files[@]} assets, expected ${EXPECTED} (one per build target)"
+            exit 1
+          fi
+          sha256sum -- "${files[@]}" > SHA256SUMS
           cat SHA256SUMS
           echo "assets=$(printf '%s ' *)" >> "$GITHUB_OUTPUT"
 
