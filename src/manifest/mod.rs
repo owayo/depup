@@ -29,8 +29,10 @@ mod writer;
 
 pub use bun_settings::{BunSettings, has_bunfig};
 pub use cargo_lock::{
-    GitLockEntry, RegistryLockEntries, find_cargo_lock_upward, parse_git_entries,
-    parse_registry_entries, read_git_entries, read_registry_entries,
+    CRATES_IO_LOCK_SOURCE, CRATES_IO_SPARSE_SOURCE, GitLockEntry, LockDependencyRef, LockPackage,
+    RegistryLockEntries, find_cargo_lock_upward, is_crates_io_source, parse_git_entries,
+    parse_lock_packages, parse_registry_entries, read_git_entries, read_lock_packages,
+    read_registry_entries,
 };
 pub use cargo_toml::CargoTomlParser;
 pub use composer_json::ComposerJsonParser;

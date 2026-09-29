@@ -328,7 +328,7 @@ With `--install`, depup runs each project's package manager after writing the ma
 - Without [`.depup`](configuration.md#depup-configuration-file), every install runs in the target directory (the `PATH` argument, or the current directory), even when the updated manifest belongs to a workspace member. With `.depup`, each install runs in the deepest listed directory that contains the updated manifest, so nested apps install in their own directories.
 - Installs run one at a time, in directory path order, and each language runs at most once per directory. The package manager's output is captured instead of streamed; its stderr is printed only when the install fails.
 
-If an install fails, depup still runs the remaining installs, prints the failed command with the package manager's stderr, and exits with code 1 at the end (`Error: Some package manager installs failed`). A package manager that is not installed counts as a failure. Manifests that were already rewritten are not rolled back, and the Rust age audit ([below](#transitive-dependencies-and-the-age-filter)) does not run for any project.
+If an install fails, depup still runs the remaining installs, prints the failed command with the package manager's stderr, and exits with code 1 at the end (`Error: Some package manager installs failed`). A package manager that is not installed counts as a failure. Manifests that were already rewritten are not rolled back, and the Rust age audit ([below](#auditing-cargolock-rust)) does not run for any project.
 
 ### Commands per Package Manager
 
@@ -366,21 +366,90 @@ The age filter decides which versions depup writes into manifests. Whether it al
 |-----------------|-------------------|-------------------------|
 | pnpm | `npm_config_minimum_release_age=<minutes>` (environment variable) | Filtered by pnpm v10.16 or later; older versions ignore the variable |
 | uv | `--exclude-newer <timestamp>` | Filtered when uv resolves them |
-| Cargo | Nothing; depup audits `Cargo.lock` after `cargo update` | Violations are rolled back (see below) |
+| Cargo | Nothing; depup audits `Cargo.lock` after `cargo update` | crates.io crates that violate the age filter are rolled back ([below](#auditing-cargolock-rust)) |
 | mise | `MISE_MINIMUM_RELEASE_AGE=<seconds>s` (environment variable) | mise tools have no transitive dependencies; `mise install` applies the age when it resolves a partial version such as `node = "26"` |
 | npm, Yarn, Bun, pip, Poetry, Rye, Pipenv, Go, Bundler, Composer, Gradle, SwiftPM | Nothing | Not filtered; only direct dependencies follow the age filter |
 
 With `--verbose`, depup prints a note naming the package managers used in the run for which the age filter covers direct dependencies only. With `--no-age` and no project policy, nothing age-related is passed and the Rust audit does not run.
 
-For Rust, depup checks the release dates of the crates whose version in `Cargo.lock` changed during the install, and rolls back any that violate the age filter to the newest version that satisfies it:
+#### Auditing `Cargo.lock` (Rust)
+
+For Rust, depup checks the release dates of the crates whose version in `Cargo.lock` changed during the install, direct and transitive dependencies alike, and rolls back any that violate the age filter:
 
 ```text
 ⠙ Auditing hyper [██████████████████████▓░░░░░░░] 18/24 (6s)
-  . — 1 transitive dep(s) rolled back to satisfy --age:
+  . — 1 crate(s) rolled back to satisfy --age:
     hyper 1.11.1 → 1.11.0
 ```
 
-Only changed entries are audited because depup limits crates.io requests to one per second, following its crawler policy; auditing an entire lock file (often hundreds of crates) would take several minutes on its own. The audit is capped at 180 seconds per `Cargo.lock`; any crates left over are reported as unchecked. If `Cargo.lock` did not exist before the install, every entry counts as changed, so the cap is more likely to be reached. Rollbacks are always reported, crates that could not be rolled back are listed with `--verbose`, and the audit never changes the exit code.
+Only changed entries are audited because depup limits crates.io requests to one per second, following its crawler policy; auditing an entire lock file (often hundreds of crates) would take several minutes on its own. The audit is capped at 180 seconds per `Cargo.lock`. If `Cargo.lock` did not exist before the install, every entry counts as changed, so the cap is more likely to be reached. Crates from registries other than crates.io are not audited and keep their locked versions, because their release dates cannot be looked up on crates.io.
+
+A crate is rolled back to the following version:
+
+- For a direct dependency that depup updated in this run, the version shown in its update line is preferred. That version has already passed the age filter, the OSV check, and `--max-change`.
+- For any other crate, the newest stable (non-prerelease) version that satisfies the age filter and is older than the locked one.
+
+In both cases, a rollback never goes below the version of the same semver series that `Cargo.lock` held before the install. If only older versions satisfy the age filter, the crate goes back to its pre-install version, so depup undoes only the change the install made. When that pre-install version is itself newer than the age filter allows, it is reported on a separate yellow line instead of as rolled back:
+
+```text
+  . — 1 crate(s) returned to the version locked before the install, which is also newer than --age:
+    foo 1.50.1 → 1.50.0
+```
+
+Crates such as `cc` and `syn` are rolled back one at a time with `cargo update -p <name>@<locked version> --precise <older version>`. This fails for groups of crates that pin each other with `=`, such as `wasm-bindgen`, `js-sys`, `web-sys`, `wasm-bindgen-futures`, and `wasm-bindgen-test`. `--precise` keeps the crates that depend on the target at their locked versions, and their `=` requirements do not allow an older target. When two or more crates in the group have no dependent within it, every one-at-a-time rollback conflicts. Instead, depup rolls back the conflicting crates together:
+
+1. It copies what Cargo needs to resolve the workspace into a temporary directory: the root and member `Cargo.toml` files, empty placeholders for their target source files, and `Cargo.lock`.
+2. It adds temporary pins to the copy and runs `cargo update` for those crates at once. Crates that depend on each other are resolved as one group, largest group first, so one crate that cannot be rolled back does not hold up the others. Within a group, depup first pins every crate to its rollback version; if Cargo cannot satisfy that, it pins only the crates that nothing else in the group depends on, and then allows any version up to the rollback version.
+3. It removes the pins, tidies the lock file, and replaces the project's `Cargo.lock` with it.
+4. It runs `cargo update --workspace --locked` in the project to confirm that your `Cargo.toml` accepts the new lock file as is. If it does not, the previous `Cargo.lock` is restored.
+
+Your `Cargo.toml` files are never modified. If `Cargo.toml` or `Cargo.lock` changes while this is in progress, depup keeps your change and gives up on these crates. If the previous `Cargo.lock` cannot be restored after a failed check, depup says so even without `--verbose` and tells you where it saved the previous content. Cargo runs in the project directory, so the project's `.cargo/config.toml` (for example, source replacement) and `rust-toolchain.toml` (or `rust-toolchain`) also apply when the copy is resolved.
+
+Crates rolled back together are reported with the others:
+
+```text
+  . — 10 crate(s) rolled back to satisfy --age:
+    js-sys 0.3.106 → 0.3.105
+    wasm-bindgen 0.2.129 → 0.2.128
+    ...
+```
+
+A crate that drops out of `Cargo.lock` during the joint resolution is listed as `tokio 1.53.1 → removed` and counted as rolled back. Any rollback, one at a time or joint, can also bring other new versions into `Cargo.lock`; depup audits those as well and rolls them back in turn, up to a fixed number of rounds.
+
+A rollback counts only when `Cargo.lock` actually changed; depup rereads the lock file after each `cargo update` instead of trusting its exit status, and builds the final report from the lock file as it stands when the audit ends. Rollbacks are always reported. Crates that could not be rolled back, crates whose release date is unavailable, and crates left unchecked when the time cap is reached are counted even without `--verbose`:
+
+```text
+  . — 2 crate(s) could not be rolled back to satisfy --age (use --verbose for details)
+  . — 1 crate(s) could not be checked against --age: release date unavailable (use --verbose for details)
+  . — age audit stopped after 180s; 3 crate(s) left unchecked
+```
+
+With `--verbose`, depup prints `Enforcing --age on crates changed in Cargo.lock...` when the audit starts, and gives the reason for each crate that could not be rolled back or whose release date is unavailable:
+
+```text
+  . — 2 crate(s) could not be rolled back to satisfy --age:
+    foo (2.1.3): Cargo.toml requires `^2.1.3`, which excludes every version that satisfies --age
+    bar (1.0.2): cargo update failed: <error from cargo>
+```
+
+| Reason | Meaning |
+|--------|---------|
+| `Cargo.toml requires ...` | The version requirement excludes every version old enough to satisfy the age filter. |
+| `no older version satisfies --age` | No version older than the locked one is old enough. |
+| `cargo update failed: ...` | Cargo rejected the rollback; its error message follows. |
+| `not attempted: ...` | depup did not try the rollback, because it reached its limit on rounds or its time budget. |
+| `release date unavailable` | The release date could not be retrieved, so the crate could not be checked. |
+
+The audit never changes the exit code.
+
+After `--install`, depup also compares each Rust update it reported with the version that ended up in `Cargo.lock`. When they differ, it prints a yellow note, even without `--verbose` and even when the age filter is off:
+
+```text
+  ./Cargo.toml — 1 update(s) locked at a different version than shown:
+    wasm-bindgen 0.2.127 → 0.2.128 (locked: 0.2.129)
+```
+
+This happens, for example, when `--max-change` or the OSV check made depup choose an older version, but `cargo update` locked a newer one that still satisfies the `^` requirement.
 
 ### uv Malware Check (Preview)
 

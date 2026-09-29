@@ -9,6 +9,7 @@
 //! - PHP（composer.json）対応
 //! - Java（build.gradle / build.gradle.kts）対応
 
+pub mod cargo_rollback;
 pub mod cli;
 pub mod config;
 pub mod domain;
@@ -23,4 +24,6 @@ pub mod parser;
 pub mod progress;
 pub mod registry;
 pub mod tauri_sync;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod update;

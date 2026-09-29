@@ -10,12 +10,17 @@
 //! - Java（build.gradle / build.gradle.kts）対応
 
 use clap::Parser;
+use colored::Colorize;
+use depup::cargo_rollback::report::{DisplayedUpdate, LockedVersionMismatch, lock_mismatches};
 use depup::cli::CliArgs;
 use depup::config::DepupConfig;
-use depup::domain::Language;
+use depup::domain::{Language, UpdateResult};
 use depup::global_config::{GlobalConfig, resolve_max_change, resolve_osv};
 use depup::manifest::RegistryLockEntries;
-use depup::orchestrator::{LOCK_AGE_AUDIT_BUDGET, Orchestrator, OrchestratorResult};
+use depup::orchestrator::{
+    LOCK_AGE_AUDIT_BUDGET, LockAgeAdjustment, LockAgeAuditResult, LockAgeStatus, Orchestrator,
+    OrchestratorResult, PreferredVersions,
+};
 use depup::output::{OutputConfig, create_formatter};
 use depup::package_manager::{SystemPackageManager, run_installs};
 use depup::progress::Progress;
@@ -148,10 +153,15 @@ async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
 
         run_package_installs(&args, &result, &monorepo_dirs, install_min_age)?;
 
-        // Rust の transitive 依存も age 制約を満たすよう Cargo.lock を整える。
+        // install で変わった Cargo.lock の crate (直接依存・推移依存とも) が
+        // age 制約を満たすよう差し戻す。
         if let Some(age) = install_min_age {
             enforce_rust_lock_age(&args, &orchestrator, &result, &lock_baselines, age).await;
         }
+
+        // 画面に出した更新先と、実際に Cargo.lock へ入った版の食い違いを知らせる。
+        // 結果の一覧は install 前に出しているので、ここで別に注記する
+        report_rust_lock_mismatches(&args, &result);
     }
 
     // 適切な終了コードを返す。
@@ -297,8 +307,8 @@ fn collect_rust_lock_baselines(
 }
 
 /// Rust プロジェクト (Cargo.toml を含む) ディレクトリに対し、
-/// `--age` を transitive 依存にも適用する。install 済み Cargo.lock を走査し、
-/// age 違反の依存を `cargo update -p --precise` で古いバージョンへ差し戻す。
+/// `--age` を install で変わった crate (直接依存・推移依存とも) にも適用する。
+/// install 済み Cargo.lock を走査し、age 違反の crate を古いバージョンへ差し戻す。
 async fn enforce_rust_lock_age(
     args: &CliArgs,
     orchestrator: &Orchestrator,
@@ -306,13 +316,14 @@ async fn enforce_rust_lock_age(
     baselines: &HashMap<PathBuf, RegistryLockEntries>,
     age: std::time::Duration,
 ) {
-    use depup::orchestrator::LockAgeStatus;
-
     // 対象となる Rust プロジェクトディレクトリを収集。
     // workspace メンバーや Tauri (src-tauri) の Cargo.lock はマニフェストと別の
     // 階層にあることがあるため、マニフェストのディレクトリから上方向に lock を
     // 探し、lock が実在するディレクトリを監査対象にする。
     let mut rust_dirs: Vec<PathBuf> = Vec::new();
+    // judge がこの実行で選んだ版 (画面に出した更新先) を lock ごとにまとめる。
+    // 差し戻し先の第一候補になるので、差し戻せれば表示と lock の版が揃う
+    let mut preferred: HashMap<PathBuf, PreferredVersions> = HashMap::new();
     for manifest in &result.summary.manifests {
         // 更新がなかった Rust manifest は cargo update も走らないため audit 不要
         if manifest.language != Language::Rust || !manifest.has_updates() {
@@ -324,13 +335,28 @@ async fn enforce_rust_lock_age(
         let Some(lock_path) = depup::manifest::find_cargo_lock_upward(parent, &args.path) else {
             if args.verbose {
                 eprintln!(
-                    "  {} — Cargo.lock not found; skipping transitive age audit",
+                    "  {} — Cargo.lock not found; skipping the age audit",
                     parent.display()
                 );
             }
             continue;
         };
         let lock_dir = lock_path.parent().unwrap_or(parent).to_path_buf();
+        let versions = preferred.entry(lock_dir.clone()).or_default();
+        for update in manifest.updates() {
+            if let UpdateResult::Update {
+                dependency,
+                new_version,
+                ..
+            } = update
+                && dependency.git_source.is_none()
+            {
+                versions
+                    .entry(dependency.name.clone())
+                    .or_default()
+                    .push(new_version.clone());
+            }
+        }
         if !rust_dirs.contains(&lock_dir) {
             rust_dirs.push(lock_dir);
         }
@@ -342,96 +368,271 @@ async fn enforce_rust_lock_age(
 
     if args.verbose {
         eprintln!();
-        eprintln!("Enforcing --age on transitive Rust dependencies...");
+        eprintln!("Enforcing --age on crates changed in Cargo.lock...");
     }
 
     // 監査は crates.io の 1 リクエスト/秒 制限に律速される。何件目を照会中かを
     // 出さないと、対象が多いときに無言のフリーズと区別がつかない。
     let mut progress = Progress::new(!args.quiet);
-    progress.start(0, "Auditing transitive Rust dependencies");
+    progress.start(0, "Auditing Cargo.lock against --age");
     let bar = progress.bar();
 
     for dir in &rust_dirs {
         let baseline = baselines.get(dir).cloned().unwrap_or_default();
+        let preferred = preferred.get(dir).cloned().unwrap_or_default();
         let audit = orchestrator
-            .enforce_lock_age_rust(dir, age, &baseline, bar.as_ref())
+            .enforce_lock_age_rust(dir, age, &baseline, &preferred, bar.as_ref())
             .await;
-        let adjustments = audit.adjustments;
-
-        if audit.unchecked > 0 {
+        let lines = lock_age_report_lines(dir, &audit, args.verbose);
+        if !lines.is_empty() {
             progress.suspend(|| {
-                eprintln!(
-                    "  {} — transitive age audit stopped after {}s; {} crate(s) left unchecked",
-                    dir.display(),
-                    LOCK_AGE_AUDIT_BUDGET.as_secs(),
-                    audit.unchecked
-                );
-            });
-        }
-
-        if adjustments.is_empty() {
-            // 予算切れで未検証が残っている場合は「全て age 内」とは言い切れない
-            // (直前に未検証件数を警告済み)
-            if args.verbose && audit.unchecked == 0 {
-                progress.suspend(|| {
-                    eprintln!("  {} — all transitive deps within --age", dir.display());
-                });
-            }
-            continue;
-        }
-
-        let downgraded: Vec<_> = adjustments
-            .iter()
-            .filter(|a| matches!(a.status, LockAgeStatus::Downgraded))
-            .collect();
-        let failures: Vec<_> = adjustments
-            .iter()
-            .filter(|a| !matches!(a.status, LockAgeStatus::Downgraded))
-            .collect();
-
-        if !downgraded.is_empty() {
-            progress.suspend(|| {
-                eprintln!(
-                    "  {} — {} transitive dep(s) rolled back to satisfy --age:",
-                    dir.display(),
-                    downgraded.len()
-                );
-                for adj in &downgraded {
-                    eprintln!(
-                        "    {} {} → {}",
-                        adj.name,
-                        adj.from,
-                        adj.to.as_deref().unwrap_or("?")
-                    );
-                }
-            });
-        }
-
-        if !failures.is_empty() && args.verbose {
-            progress.suspend(|| {
-                eprintln!(
-                    "  {} — {} transitive dep(s) could not be rolled back:",
-                    dir.display(),
-                    failures.len()
-                );
-                for adj in &failures {
-                    let detail = match &adj.status {
-                        LockAgeStatus::NoOlderCandidate => "no older candidate".to_string(),
-                        LockAgeStatus::ReleaseDateUnavailable => {
-                            "release date unavailable".to_string()
-                        }
-                        LockAgeStatus::UpdateCommandFailed(msg) => {
-                            format!("cargo update failed: {msg}")
-                        }
-                        LockAgeStatus::Downgraded => unreachable!(),
-                    };
-                    eprintln!("    {} ({}): {}", adj.name, adj.from, detail);
+                for line in &lines {
+                    if line.warning {
+                        eprintln!("{}", line.text.yellow());
+                    } else {
+                        eprintln!("{}", line.text);
+                    }
                 }
             });
         }
     }
 
     progress.finish_and_clear();
+}
+
+/// stderr に出す 1 行
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReportLine {
+    text: String,
+    /// `--age` を満たせなかった・確かめられなかったことを伝える行 (黄色で出す)
+    warning: bool,
+}
+
+impl ReportLine {
+    fn info(text: String) -> Self {
+        Self {
+            text,
+            warning: false,
+        }
+    }
+
+    fn warning(text: String) -> Self {
+        Self {
+            text,
+            warning: true,
+        }
+    }
+}
+
+/// 1 つの Cargo.lock の監査結果を、stderr に出す行へ変換する。
+///
+/// 差し戻せなかった crate の件数は `--verbose` が無くても必ず出す。`--age` は供給網
+/// 対策として使われるので、満たせなかったことを黙って捨てると、差し戻せた分だけが
+/// 表示されて `--age` が効いたように見えてしまう。
+fn lock_age_report_lines(dir: &Path, audit: &LockAgeAuditResult, verbose: bool) -> Vec<ReportLine> {
+    let mut lines = Vec::new();
+    let dir = dir.display();
+
+    // 元の Cargo.lock を戻せなかった等、差し戻せなかったことより深刻な問題は必ず出す
+    for problem in &audit.problems {
+        lines.push(ReportLine::warning(format!("  {dir} — {problem}")));
+    }
+
+    if audit.unchecked > 0 {
+        lines.push(ReportLine::warning(format!(
+            "  {dir} — age audit stopped after {}s; {} crate(s) left unchecked",
+            LOCK_AGE_AUDIT_BUDGET.as_secs(),
+            audit.unchecked
+        )));
+    }
+
+    if audit.adjustments.is_empty() {
+        // 予算切れで未検証が残っている場合は「全て age 内」とは言い切れない
+        // (直前に未検証件数を警告済み)
+        if verbose && audit.unchecked == 0 {
+            lines.push(ReportLine::info(format!(
+                "  {dir} — all crates changed by install are within --age"
+            )));
+        }
+        return lines;
+    }
+
+    let rolled_back: Vec<&LockAgeAdjustment> = audit
+        .adjustments
+        .iter()
+        .filter(|a| a.status.is_resolved())
+        .collect();
+    let unverified: Vec<&LockAgeAdjustment> = audit
+        .adjustments
+        .iter()
+        .filter(|a| a.status.is_unverified())
+        .collect();
+    let restored: Vec<&LockAgeAdjustment> = audit
+        .adjustments
+        .iter()
+        .filter(|a| a.status.is_restored())
+        .collect();
+    let remaining: Vec<&LockAgeAdjustment> = audit
+        .adjustments
+        .iter()
+        .filter(|a| !a.status.is_resolved() && !a.status.is_restored() && !a.status.is_unverified())
+        .collect();
+
+    if !rolled_back.is_empty() {
+        lines.push(ReportLine::info(format!(
+            "  {dir} — {} crate(s) rolled back to satisfy --age:",
+            rolled_back.len()
+        )));
+        for adj in &rolled_back {
+            let to = match adj.status {
+                LockAgeStatus::Removed => "removed",
+                _ => adj.to.as_deref().unwrap_or("?"),
+            };
+            lines.push(ReportLine::info(format!(
+                "    {} {} → {}",
+                adj.name, adj.from, to
+            )));
+        }
+    }
+
+    // install 前の版へ戻しただけで、その版も期間を満たさないもの。「satisfy --age」と
+    // 一緒に並べると、期間を満たしたと読めてしまう
+    if !restored.is_empty() {
+        lines.push(ReportLine::warning(format!(
+            "  {dir} — {} crate(s) returned to the version locked before the install, which is also newer than --age:",
+            restored.len()
+        )));
+        for adj in &restored {
+            lines.push(ReportLine::warning(format!(
+                "    {} {} → {}",
+                adj.name,
+                adj.from,
+                adj.to.as_deref().unwrap_or("?")
+            )));
+        }
+    }
+
+    if !remaining.is_empty() {
+        if verbose {
+            lines.push(ReportLine::warning(format!(
+                "  {dir} — {} crate(s) could not be rolled back to satisfy --age:",
+                remaining.len()
+            )));
+            for adj in &remaining {
+                lines.push(ReportLine::warning(format!(
+                    "    {} ({}): {}",
+                    adj.name,
+                    adj.from,
+                    lock_age_status_detail(&adj.status)
+                )));
+            }
+        } else {
+            lines.push(ReportLine::warning(format!(
+                "  {dir} — {} crate(s) could not be rolled back to satisfy --age (use --verbose for details)",
+                remaining.len()
+            )));
+        }
+    }
+
+    if !unverified.is_empty() {
+        if verbose {
+            lines.push(ReportLine::warning(format!(
+                "  {dir} — {} crate(s) could not be checked against --age:",
+                unverified.len()
+            )));
+            for adj in &unverified {
+                lines.push(ReportLine::warning(format!(
+                    "    {} ({}): {}",
+                    adj.name,
+                    adj.from,
+                    lock_age_status_detail(&adj.status)
+                )));
+            }
+        } else {
+            lines.push(ReportLine::warning(format!(
+                "  {dir} — {} crate(s) could not be checked against --age: release date unavailable (use --verbose for details)",
+                unverified.len()
+            )));
+        }
+    }
+
+    lines
+}
+
+/// 差し戻せなかった理由の説明
+fn lock_age_status_detail(status: &LockAgeStatus) -> String {
+    match status {
+        LockAgeStatus::Downgraded => "rolled back".to_string(),
+        LockAgeStatus::Removed => "removed from Cargo.lock".to_string(),
+        LockAgeStatus::Restored => {
+            "returned to the version locked before the install (also newer than --age)".to_string()
+        }
+        LockAgeStatus::NoOlderCandidate => "no older version satisfies --age".to_string(),
+        LockAgeStatus::UpdateCommandFailed(msg) => format!("cargo update failed: {msg}"),
+        LockAgeStatus::BlockedByManifest(requirement) => format!(
+            "Cargo.toml requires `{requirement}`, which excludes every version that satisfies --age"
+        ),
+        LockAgeStatus::NotAttempted(reason) => format!("not attempted: {reason}"),
+        LockAgeStatus::ReleaseDateUnavailable => "release date unavailable".to_string(),
+    }
+}
+
+/// `--install` の後、画面に出した更新先と Cargo.lock に入った版が違う Rust の更新を注記する。
+///
+/// 表示する更新先は Cargo.toml に書いた版だが、`cargo update` はその版要求 (`^0.2.128`)
+/// を満たす最新版 (`0.2.129`) を lock に入れる。差し戻しで揃えられなかった場合や、
+/// `--max-change` / OSV で古い版を選んだ場合は、表示とビルドに使われる版が食い違う。
+fn report_rust_lock_mismatches(args: &CliArgs, result: &OrchestratorResult) {
+    for manifest in &result.summary.manifests {
+        if manifest.language != Language::Rust || !manifest.has_updates() {
+            continue;
+        }
+        let Some(parent) = manifest.path.parent() else {
+            continue;
+        };
+        let Some(lock_path) = depup::manifest::find_cargo_lock_upward(parent, &args.path) else {
+            continue;
+        };
+        let entries = depup::manifest::read_registry_entries(&lock_path);
+        let updates: Vec<DisplayedUpdate> = manifest
+            .updates()
+            .filter_map(|update| match update {
+                UpdateResult::Update {
+                    dependency,
+                    new_version,
+                    ..
+                } if dependency.git_source.is_none() => Some(DisplayedUpdate {
+                    name: dependency.name.clone(),
+                    from: dependency.version_spec.display_version(),
+                    to: new_version.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
+        let mismatches = lock_mismatches(&updates, &entries);
+        for line in lock_mismatch_lines(&manifest.path, &mismatches) {
+            eprintln!("{}", line.yellow());
+        }
+    }
+}
+
+/// 表示と lock の食い違いを stderr に出す行へ変換する
+fn lock_mismatch_lines(manifest_path: &Path, mismatches: &[LockedVersionMismatch]) -> Vec<String> {
+    if mismatches.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![format!(
+        "  {} — {} update(s) locked at a different version than shown:",
+        manifest_path.display(),
+        mismatches.len()
+    )];
+    for mismatch in mismatches {
+        lines.push(format!(
+            "    {} {} → {} (locked: {})",
+            mismatch.name, mismatch.from, mismatch.to, mismatch.locked
+        ));
+    }
+    lines
 }
 
 /// 結果からディレクトリ -> install が必要な言語のマップを構築する
@@ -514,6 +715,214 @@ mod tests {
         let dirs = vec![root.clone(), app.clone()];
 
         assert_eq!(nearest_monorepo_dir(&manifest, &dirs, &root), app);
+    }
+
+    fn adjustment(
+        name: &str,
+        from: &str,
+        to: Option<&str>,
+        status: LockAgeStatus,
+    ) -> LockAgeAdjustment {
+        LockAgeAdjustment {
+            name: name.to_string(),
+            from: from.to_string(),
+            to: to.map(str::to_string),
+            status,
+        }
+    }
+
+    fn texts(lines: &[ReportLine]) -> Vec<&str> {
+        lines.iter().map(|line| line.text.as_str()).collect()
+    }
+
+    /// 差し戻せなかった crate の件数は `--verbose` が無くても 1 行出す。
+    /// 見出しは直接依存も含むので `transitive dep(s)` ではなく `crate(s)`
+    #[test]
+    fn test_lock_age_report_lines_counts_failures_without_verbose() {
+        let audit = LockAgeAuditResult {
+            adjustments: vec![
+                adjustment("cc", "1.5.1", Some("1.4.6"), LockAgeStatus::Downgraded),
+                adjustment(
+                    "wasm-bindgen",
+                    "0.2.129",
+                    None,
+                    LockAgeStatus::UpdateCommandFailed("conflict".to_string()),
+                ),
+                adjustment("web-sys", "0.3.106", None, LockAgeStatus::NoOlderCandidate),
+            ],
+            unchecked: 0,
+            problems: Vec::new(),
+        };
+
+        let lines = lock_age_report_lines(Path::new("./wasm"), &audit, false);
+
+        assert_eq!(
+            texts(&lines),
+            vec![
+                "  ./wasm — 1 crate(s) rolled back to satisfy --age:",
+                "    cc 1.5.1 → 1.4.6",
+                "  ./wasm — 2 crate(s) could not be rolled back to satisfy --age (use --verbose for details)",
+            ]
+        );
+        assert!(!lines[0].warning);
+        assert!(lines[2].warning);
+    }
+
+    /// `--verbose` では差し戻せなかった理由を 1 件ずつ出す
+    #[test]
+    fn test_lock_age_report_lines_lists_reasons_with_verbose() {
+        let audit = LockAgeAuditResult {
+            adjustments: vec![
+                adjustment(
+                    "foo",
+                    "2.1.3",
+                    None,
+                    LockAgeStatus::BlockedByManifest("^2.1.3".to_string()),
+                ),
+                adjustment(
+                    "bar",
+                    "1.0.2",
+                    None,
+                    LockAgeStatus::NotAttempted("audit time budget ran out".to_string()),
+                ),
+            ],
+            unchecked: 0,
+            problems: Vec::new(),
+        };
+
+        let lines = lock_age_report_lines(Path::new("."), &audit, true);
+
+        assert_eq!(
+            texts(&lines),
+            vec![
+                "  . — 2 crate(s) could not be rolled back to satisfy --age:",
+                "    foo (2.1.3): Cargo.toml requires `^2.1.3`, which excludes every version that satisfies --age",
+                "    bar (1.0.2): not attempted: audit time budget ran out",
+            ]
+        );
+    }
+
+    /// 解き直しで lock から外れた crate も違反が解消したものとして数える
+    #[test]
+    fn test_lock_age_report_lines_shows_removed_crates_as_rolled_back() {
+        let audit = LockAgeAuditResult {
+            adjustments: vec![adjustment("tokio", "1.53.1", None, LockAgeStatus::Removed)],
+            unchecked: 0,
+            problems: Vec::new(),
+        };
+
+        let lines = lock_age_report_lines(Path::new("."), &audit, false);
+
+        assert_eq!(
+            texts(&lines),
+            vec![
+                "  . — 1 crate(s) rolled back to satisfy --age:",
+                "    tokio 1.53.1 → removed",
+            ]
+        );
+    }
+
+    /// 公開日を取れなかった crate は「差し戻せなかった」とは分けて数える
+    #[test]
+    fn test_lock_age_report_lines_separates_unverified_crates() {
+        let audit = LockAgeAuditResult {
+            adjustments: vec![adjustment(
+                "private-crate",
+                "0.1.0",
+                None,
+                LockAgeStatus::ReleaseDateUnavailable,
+            )],
+            unchecked: 3,
+            problems: Vec::new(),
+        };
+
+        let lines = lock_age_report_lines(Path::new("."), &audit, false);
+
+        assert_eq!(
+            texts(&lines),
+            vec![
+                "  . — age audit stopped after 180s; 3 crate(s) left unchecked",
+                "  . — 1 crate(s) could not be checked against --age: release date unavailable (use --verbose for details)",
+            ]
+        );
+        assert!(lines.iter().all(|line| line.warning));
+    }
+
+    /// 何も変えずに全部 age 内なら、`--verbose` のときだけその旨を出す
+    #[test]
+    fn test_lock_age_report_lines_quiet_when_everything_is_within_age() {
+        let audit = LockAgeAuditResult::default();
+        assert!(lock_age_report_lines(Path::new("."), &audit, false).is_empty());
+        assert_eq!(
+            texts(&lock_age_report_lines(Path::new("."), &audit, true)),
+            vec!["  . — all crates changed by install are within --age"]
+        );
+    }
+
+    /// install 前の版へ戻しただけで、その版も期間内のものは「satisfy --age」と分けて出す
+    #[test]
+    fn test_lock_age_report_lines_separates_restored_crates() {
+        let audit = LockAgeAuditResult {
+            adjustments: vec![
+                adjustment("cc", "1.5.1", Some("1.4.6"), LockAgeStatus::Downgraded),
+                adjustment("foo", "1.50.1", Some("1.50.0"), LockAgeStatus::Restored),
+            ],
+            unchecked: 0,
+            problems: Vec::new(),
+        };
+
+        let lines = lock_age_report_lines(Path::new("."), &audit, false);
+
+        assert_eq!(
+            texts(&lines),
+            vec![
+                "  . — 1 crate(s) rolled back to satisfy --age:",
+                "    cc 1.5.1 → 1.4.6",
+                "  . — 1 crate(s) returned to the version locked before the install, which is also newer than --age:",
+                "    foo 1.50.1 → 1.50.0",
+            ]
+        );
+        assert!(lines[2].warning);
+    }
+
+    /// 元の Cargo.lock を戻せなかった等の問題は `--verbose` が無くても必ず出す
+    #[test]
+    fn test_lock_age_report_lines_always_shows_problems() {
+        let audit = LockAgeAuditResult {
+            adjustments: Vec::new(),
+            unchecked: 0,
+            problems: vec!["restoring the previous Cargo.lock also failed".to_string()],
+        };
+
+        let lines = lock_age_report_lines(Path::new("."), &audit, false);
+
+        assert_eq!(
+            texts(&lines),
+            vec!["  . — restoring the previous Cargo.lock also failed"]
+        );
+        assert!(lines[0].warning);
+    }
+
+    /// 表示した更新先と lock の版が違うときの注記
+    #[test]
+    fn test_lock_mismatch_lines_formats_locked_version() {
+        let mismatches = vec![LockedVersionMismatch {
+            name: "wasm-bindgen".to_string(),
+            from: "0.2.127".to_string(),
+            to: "0.2.128".to_string(),
+            locked: "0.2.129".to_string(),
+        }];
+
+        let lines = lock_mismatch_lines(Path::new("./Cargo.toml"), &mismatches);
+
+        assert_eq!(
+            lines,
+            vec![
+                "  ./Cargo.toml — 1 update(s) locked at a different version than shown:",
+                "    wasm-bindgen 0.2.127 → 0.2.128 (locked: 0.2.129)",
+            ]
+        );
+        assert!(lock_mismatch_lines(Path::new("./Cargo.toml"), &[]).is_empty());
     }
 
     #[test]

@@ -329,7 +329,7 @@ depup が書き換えるのは、解析した依存宣言だけです。依存�
 - [`.depup`](configuration.ja.md#depup-設定ファイル) がない場合は、更新したマニフェストがワークスペースのメンバーのものでも、install はすべて対象ディレクトリ（`PATH` 引数、省略時はカレントディレクトリ）で実行します。`.depup` がある場合は、更新したマニフェストを含む対象ディレクトリのうち最も深いもので実行するため、入れ子のアプリは各自のディレクトリで install されます。
 - install は 1 つずつ、ディレクトリのパス順に実行します。同じディレクトリでは、言語ごとに 1 回だけです。パッケージマネージャーの出力は画面に流さずに depup が受け取り、標準エラー出力は install が失敗したときだけ表示します。
 
-install が失敗しても、残りの install は続けます。失敗したコマンドとパッケージマネージャーの標準エラー出力を表示し、最後に `Error: Some package manager installs failed` を出して終了コード 1 で終わります。パッケージマネージャーがインストールされていない場合も失敗として扱います。書き換え済みのマニフェストは元に戻しません。また、どのプロジェクトでも Rust の監査（[推移的依存と age フィルター](#推移的依存と-age-フィルター)）を実行しません。
+install が失敗しても、残りの install は続けます。失敗したコマンドとパッケージマネージャーの標準エラー出力を表示し、最後に `Error: Some package manager installs failed` を出して終了コード 1 で終わります。パッケージマネージャーがインストールされていない場合も失敗として扱います。書き換え済みのマニフェストは元に戻しません。また、どのプロジェクトでも Rust の監査（[Rust の `Cargo.lock` 監査](#rust-の-cargolock-監査)）を実行しません。
 
 ### パッケージマネージャーごとのコマンド
 
@@ -367,21 +367,90 @@ age フィルターは、depup がマニフェストに書き込むバージョ�
 |------------------------|------------------|--------------------|
 | pnpm | 環境変数 `npm_config_minimum_release_age=<分>` | pnpm v10.16 以降が適用する（それより古い pnpm は環境変数を無視する） |
 | uv | `--exclude-newer <日時>` | uv が依存の解決時に適用する |
-| Cargo | なし（`cargo update` のあとに depup が `Cargo.lock` を監査する） | depup が条件を満たさないものを差し戻す（下記） |
+| Cargo | なし（`cargo update` のあとに depup が `Cargo.lock` を監査する） | 条件を満たさない crates.io のクレートを depup が差し戻す（[下記](#rust-の-cargolock-監査)） |
 | mise | 環境変数 `MISE_MINIMUM_RELEASE_AGE=<秒>s` | mise のツールに推移的依存はない。前方一致の指定（`node = "26"` など）を `mise install` が解決するときに適用する |
 | npm、Yarn、Bun、pip、Poetry、Rye、Pipenv、Go、Bundler、Composer、Gradle、SwiftPM | なし | 適用されない（age フィルターが効くのは直接依存だけ） |
 
 `--verbose` を付けると、今回使うパッケージマネージャーのうち、age フィルターが直接依存にしか効かないものを通知します。`--no-age` を指定し、プロジェクトポリシーもない場合は、age の値をどこにも渡さず、Rust の監査も行いません。
 
-Rust では、install の前後で `Cargo.lock` のバージョンが変わったクレートだけ公開日時を確認します。age フィルターの条件を満たさないものは、条件を満たす最新のバージョンへ差し戻します。
+#### Rust の `Cargo.lock` 監査
+
+Rust では、install の前後で `Cargo.lock` のバージョンが変わったクレートだけ、直接依存か推移的依存かを問わず公開日時を確認します。age フィルターの条件を満たさないものは差し戻します。
 
 ```text
 ⠙ Auditing hyper [██████████████████████▓░░░░░░░] 18/24 (6s)
-  . — 1 transitive dep(s) rolled back to satisfy --age:
+  . — 1 crate(s) rolled back to satisfy --age:
     hyper 1.11.1 → 1.11.0
 ```
 
-対象を「変わったもの」に限るのは、crates.io の利用ポリシーに従ってリクエストを 1 秒に 1 回までに抑えているためです。ロックファイル全体（多くは数百クレート）を調べると、それだけで数分かかります。監査には `Cargo.lock` ごとに 180 秒の上限があり、超えた分は未検証として報告します。install 前に `Cargo.lock` がなかった場合はすべてのエントリが新規扱いになるため、この上限に達しやすくなります。差し戻した結果は常に表示し、差し戻せなかったクレートは `--verbose` のときに表示します。監査の結果で終了コードが変わることはありません。
+対象を「変わったもの」に限るのは、crates.io の利用ポリシーに従ってリクエストを 1 秒に 1 回までに抑えているためです。ロックファイル全体（多くは数百クレート）を調べると、それだけで数分かかります。監査には `Cargo.lock` ごとに 180 秒の上限があります。install 前に `Cargo.lock` がなかった場合はすべてのエントリが新規扱いになるため、この上限に達しやすくなります。crates.io 以外のレジストリのクレートは、crates.io で公開日時を調べられないので監査せず、ロックされた版のまま残します。
+
+差し戻し先のバージョンは次のとおりです。
+
+- depup がこの実行で更新した直接依存は、更新結果に表示したバージョンを優先します。このバージョンは、age フィルター・脆弱性チェック・`--max-change` をすでに通っています。
+- それ以外のクレートは、age フィルターの条件を満たし、ロックされた版より古い安定版（プレリリースを除く）のうち最新のものです。
+
+どちらの場合も、install 前の `Cargo.lock` にあった同じ semver 系列のバージョンより古くはしません。条件を満たすバージョンがそれより古いものしかなければ、install 前のバージョンに戻します。install で入った変更だけを取り消すためです。戻した install 前のバージョンも age フィルターの条件を満たさない場合は、差し戻した一覧とは別の黄色い行で表示します。
+
+```text
+  . — 1 crate(s) returned to the version locked before the install, which is also newer than --age:
+    foo 1.50.1 → 1.50.0
+```
+
+`cc` や `syn` などは、`cargo update -p <名前>@<ロックされた版> --precise <古い版>` で 1 件ずつ差し戻します。ただし、`wasm-bindgen`・`js-sys`・`web-sys`・`wasm-bindgen-futures`・`wasm-bindgen-test` のように互いを `=` で固定し合うクレート群は、この方法では差し戻せません。`--precise` は対象に依存しているクレート（依存元）をロックされた版のまま据え置きますが、依存元の `=` 指定は対象の古い版を許さないからです。群の中に、群内のほかのクレートから依存されていないものが 2 つ以上あると、1 件ずつの差し戻しはどれも衝突します。そこで depup は、衝突したクレートをまとめて解決し直します。
+
+1. ワークスペースの依存解決に必要なものだけを一時ディレクトリに写します。ルートとメンバーの `Cargo.toml`、ビルド対象のソースファイルの代わりに置く空ファイル、`Cargo.lock` です。
+2. 写しに一時的な固定用の依存を足し、対象のクレートをまとめて `cargo update` します。依存関係でつながるクレートを 1 つのまとまりとし、大きいまとまりから順に解きます。差し戻せない 1 件がほかのクレートを巻き添えにしないためです。まとまりの中では、最初に全員を差し戻し先のバージョンに固定します。cargo がそれを満たせなければ、まとまりの中のほかのクレートから依存されていないものだけを固定する形、差し戻し先以下の範囲で固定する形の順に試します。
+3. 固定を外してロックファイルを整え、プロジェクトの `Cargo.lock` をその結果で置き換えます。
+4. プロジェクトで `cargo update --workspace --locked` を実行し、手元の `Cargo.toml` が新しいロックファイルをそのまま受け入れることを確かめます。受け入れられなければ、置き換える前の `Cargo.lock` に戻します。
+
+`Cargo.toml` は一切書き換えません。作業の途中で `Cargo.toml` や `Cargo.lock` が書き換えられた場合は、そちらを優先し、これらのクレートの差し戻しをやめます。確認に失敗したあと元の `Cargo.lock` に戻せなかった場合は、`--verbose` がなくてもその旨と、元の内容を退避した場所を表示します。cargo はプロジェクトのディレクトリで起動するため、写しで依存を解決するときにも、プロジェクトの `.cargo/config.toml`（source replacement など）と `rust-toolchain.toml`（または `rust-toolchain`）がそのまま効きます。
+
+まとめて差し戻したクレートも、ほかのクレートと一緒に表示します。
+
+```text
+  . — 10 crate(s) rolled back to satisfy --age:
+    js-sys 0.3.106 → 0.3.105
+    wasm-bindgen 0.2.129 → 0.2.128
+    ...
+```
+
+解決し直した結果 `Cargo.lock` から外れたクレートは `tokio 1.53.1 → removed` のように表示し、差し戻した件数に含めます。また、1 件ずつでもまとめてでも、差し戻すと別の新しいバージョンが `Cargo.lock` に入ることがあります。depup はそれも監査して差し戻し、これを決まった回数まで繰り返します。
+
+差し戻したと数えるのは、`Cargo.lock` が実際に変わったときだけです。`cargo update` の終了コードを信じず、毎回ロックファイルを読み直して確かめます。最後の報告も、監査を終えた時点のロックファイルの状態から組み立てます。差し戻した結果は常に表示します。差し戻せなかったクレート、公開日時を取得できなかったクレート、時間の上限で確認できなかったクレートも、`--verbose` なしで件数を表示します。
+
+```text
+  . — 2 crate(s) could not be rolled back to satisfy --age (use --verbose for details)
+  . — 1 crate(s) could not be checked against --age: release date unavailable (use --verbose for details)
+  . — age audit stopped after 180s; 3 crate(s) left unchecked
+```
+
+`--verbose` を付けると、監査の開始時に `Enforcing --age on crates changed in Cargo.lock...` と表示し、差し戻せなかったクレートと公開日時を取得できなかったクレートについて、1 件ずつ理由を示します。
+
+```text
+  . — 2 crate(s) could not be rolled back to satisfy --age:
+    foo (2.1.3): Cargo.toml requires `^2.1.3`, which excludes every version that satisfies --age
+    bar (1.0.2): cargo update failed: <cargo のエラー>
+```
+
+| 理由 | 意味 |
+|------|------|
+| `Cargo.toml requires ...` | バージョン指定が、age フィルターの条件を満たすバージョンをすべて除外している |
+| `no older version satisfies --age` | ロックされた版より古いバージョンに、条件を満たすものがない |
+| `cargo update failed: ...` | cargo が差し戻しを受け付けなかった（続けて cargo のエラーを表示する） |
+| `not attempted: ...` | 繰り返しの回数か時間の上限に達したため、差し戻しを試さなかった |
+| `release date unavailable` | 公開日時を取得できず、条件を満たすか確認できなかった |
+
+監査の結果で終了コードが変わることはありません。
+
+Rust のプロジェクトで `--install` を実行したあとは、更新結果に表示したバージョンと、`Cargo.lock` に入ったバージョンも突き合わせます。両者が違えば、黄色で注記します。この注記は、`--verbose` がなくても、age フィルターが無効でも表示します。
+
+```text
+  ./Cargo.toml — 1 update(s) locked at a different version than shown:
+    wasm-bindgen 0.2.127 → 0.2.128 (locked: 0.2.129)
+```
+
+たとえば、`--max-change` や脆弱性チェックのために depup が古いバージョンを選んだのに、`cargo update` が `^` の条件を満たすより新しいバージョンをロックした場合がこれにあたります。
 
 ### uv のマルウェアチェック（preview）
 
