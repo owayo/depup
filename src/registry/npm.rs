@@ -10,7 +10,7 @@ use crate::update::{VersionInfo, compare_semver_versions, is_prerelease_version}
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use serde::de::IgnoredAny;
+use serde_json::Value;
 use std::collections::HashMap;
 
 /// npm レジストリのベース URL
@@ -31,9 +31,66 @@ struct NpmPackageResponse {
     time: HashMap<String, String>,
     /// 利用可能なバージョン
     ///
-    /// キー (バージョン文字列) のみ使用する。値は packument 全体のメタデータで
-    /// 巨大になりうるため、`IgnoredAny` で読み捨ててメモリ/CPU を節約する。
-    versions: HashMap<String, IgnoredAny>,
+    /// 非推奨の判定に必要な値だけを保持し、dependencies / dist 等は読み捨てる。
+    versions: HashMap<String, NpmVersionMetadata>,
+}
+
+/// npm の各版のメタデータ。未知フィールドは serde が読み捨てる。
+#[derive(Debug, Deserialize)]
+struct NpmVersionMetadata {
+    /// 作者由来の値なので、型が違っても取得全体を失敗させない。
+    #[serde(default)]
+    deprecated: Option<Value>,
+}
+
+impl NpmVersionMetadata {
+    /// npm-pick-manifest と同じ JS の真偽値で非推奨を判定する。
+    /// 空文字列は npm deprecate による指定解除を意味する。
+    fn is_deprecated(&self) -> bool {
+        match &self.deprecated {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(flag)) => *flag,
+            Some(Value::String(message)) => !message.is_empty(),
+            Some(Value::Number(number)) => number.as_f64().is_some_and(|n| n != 0.0),
+            Some(Value::Array(_) | Value::Object(_)) => true,
+        }
+    }
+}
+
+impl NpmPackageResponse {
+    /// 更新候補を公開時刻付きのバージョン一覧へ変換する。
+    fn into_versions(self) -> Vec<VersionInfo> {
+        // dist-tags から公式の "latest" バージョンを取得
+        // npm が安定版とみなすバージョン
+        let latest_version = self.dist_tags.get("latest").map(|s| s.as_str());
+
+        let mut versions = Vec::new();
+
+        for (version, metadata) in self.versions {
+            if metadata.is_deprecated() {
+                continue;
+            }
+
+            // dist-tags.latest より新しい「安定版に見える」バージョンをスキップ
+            // (検出可能なプレリリース (canary/beta 等) は latest 超でも保持する。
+            //  詳細は should_skip_version のドキュメントコメントを参照)
+            if NpmAdapter::should_skip_version(&version, latest_version) {
+                continue;
+            }
+
+            // このバージョンの公開時刻を取得
+            if let Some(time_str) = self.time.get(&version)
+                && let Ok(released_at) = time_str.parse::<DateTime<Utc>>()
+            {
+                versions.push(VersionInfo::new(&version, released_at));
+            }
+        }
+
+        // バージョンでソート
+        versions.sort();
+
+        versions
+    }
 }
 
 impl NpmAdapter {
@@ -128,32 +185,7 @@ impl RegistryAdapter for NpmAdapter {
             .get_json(&url, package, self.registry_name())
             .await?;
 
-        // dist-tags から公式の "latest" バージョンを取得
-        // npm が安定版とみなすバージョン
-        let latest_version = response.dist_tags.get("latest").map(|s| s.as_str());
-
-        let mut versions = Vec::new();
-
-        for (version, _) in response.versions {
-            // dist-tags.latest より新しい「安定版に見える」バージョンをスキップ
-            // (検出可能なプレリリース (canary/beta 等) は latest 超でも保持する。
-            //  詳細は should_skip_version のドキュメントコメントを参照)
-            if Self::should_skip_version(&version, latest_version) {
-                continue;
-            }
-
-            // このバージョンの公開時刻を取得
-            if let Some(time_str) = response.time.get(&version)
-                && let Ok(released_at) = time_str.parse::<DateTime<Utc>>()
-            {
-                versions.push(VersionInfo::new(&version, released_at));
-            }
-        }
-
-        // バージョンでソート
-        versions.sort();
-
-        Ok(versions)
+        Ok(response.into_versions())
     }
 }
 
@@ -329,10 +361,9 @@ mod tests {
         assert!(!NpmAdapter::should_skip_version("19.3.0-canary.456", None));
     }
 
-    /// versions の値 (packument メタデータ) は IgnoredAny で読み捨てられ、
-    /// キーと dist-tags / time は正しくデシリアライズされる
+    /// 不要なメタデータは読み捨て、キーと dist-tags / time を保持する。
     #[test]
-    fn test_deserialize_npm_response_ignores_version_values() {
+    fn test_deserialize_npm_response_ignores_unused_metadata() {
         let json = r#"{
             "dist-tags": {"latest": "1.1.0"},
             "time": {
@@ -354,5 +385,173 @@ mod tests {
         assert!(response.versions.contains_key("1.0.0"));
         assert!(response.versions.contains_key("1.1.0"));
         assert_eq!(response.time.len(), 3);
+    }
+
+    /// レジストリの非推奨メタデータを経由して minor 更新先を決める回帰テスト。
+    #[test]
+    fn test_deprecated_release_is_not_selected_for_minor_update() {
+        use crate::domain::{ChangeLevel, UpdateResult};
+        use crate::manifest::{ManifestParser, PackageJsonParser};
+        use crate::update::{UpdateFilter, UpdateJudge};
+
+        let response: NpmPackageResponse = serde_json::from_value(serde_json::json!({
+            "dist-tags": {"latest": "7.0.0"},
+            "time": {
+                "6.4.6": "2024-01-01T00:00:00Z",
+                "6.9.1": "2024-02-01T00:00:00Z",
+                "6.10.0": "2024-03-01T00:00:00Z",
+                "7.0.0": "2024-04-01T00:00:00Z"
+            },
+            "versions": {
+                "6.4.6": {}, "6.9.1": {},
+                "6.10.0": {"deprecated": "Breaking changes; use 6.9.1 or 7.0.0"},
+                "7.0.0": {}
+            }
+        }))
+        .unwrap();
+        let versions = response.into_versions();
+        let deps = PackageJsonParser
+            .parse(r#"{"dependencies":{"@testing-library/jest-dom":"^6.4.6"}}"#)
+            .unwrap();
+        let judge = UpdateJudge::new(UpdateFilter::new().with_max_change(ChangeLevel::Minor));
+        assert!(matches!(judge.judge(&deps[0], &versions),
+            UpdateResult::Update { new_version, .. } if new_version == "6.9.1"));
+        // 現在版が非推奨でも、候補に残った古い版へ下げない。
+        let deps = PackageJsonParser
+            .parse(r#"{"dependencies":{"@testing-library/jest-dom":"^6.10.0"}}"#)
+            .unwrap();
+        assert!(judge.judge(&deps[0], &versions).is_skip());
+    }
+
+    #[test]
+    fn test_all_deprecated_releases_leave_dependency_unchanged() {
+        use crate::manifest::{ManifestParser, PackageJsonParser};
+        use crate::update::{UpdateFilter, UpdateJudge};
+
+        let response: NpmPackageResponse = serde_json::from_value(serde_json::json!({
+            "dist-tags": {"latest": "1.1.0"},
+            "time": {"1.0.0": "2024-01-01T00:00:00Z", "1.1.0": "2024-02-01T00:00:00Z"},
+            "versions": {
+                "1.0.0": {"deprecated": "Unsupported"},
+                "1.1.0": {"deprecated": "Unsupported"}
+            }
+        }))
+        .unwrap();
+        let versions = response.into_versions();
+        assert!(versions.is_empty());
+        let deps = PackageJsonParser
+            .parse(r#"{"dependencies":{"pkg":"^1.0.0"}}"#)
+            .unwrap();
+        assert!(
+            UpdateJudge::new(UpdateFilter::new())
+                .judge(&deps[0], &versions)
+                .is_skip()
+        );
+    }
+
+    /// 指定解除・未指定を保持し、プレリリースでも非推奨なら除外する。
+    #[test]
+    fn test_deprecation_metadata_without_latest_tag() {
+        let response: NpmPackageResponse = serde_json::from_value(serde_json::json!({
+            "dist-tags": {},
+            "time": {
+                "1.0.0": "2024-01-01T00:00:00Z",
+                "1.1.0": "2024-02-01T00:00:00Z",
+                "1.2.0": "2024-03-01T00:00:00Z",
+                "1.3.0-beta.1": "2024-04-01T00:00:00Z",
+                "1.3.0-beta.2": "2024-05-01T00:00:00Z",
+                "1.4.0": "invalid timestamp",
+                "1.6.0": "2024-06-01T00:00:00Z"
+            },
+            "versions": {
+                "1.0.0": {"deprecated": null},
+                "1.1.0": {"deprecated": ""},
+                "1.2.0": {"dependencies": {"other": "^1"}, "dist": {"tarball": "..."}},
+                "1.3.0-beta.1": {"deprecated": "Do not use"},
+                "1.3.0-beta.2": {},
+                "1.4.0": {}, "1.5.0": {}, "1.6.0": {"deprecated": " "}
+            }
+        }))
+        .unwrap();
+        let versions = response.into_versions();
+        assert_eq!(
+            versions
+                .iter()
+                .map(|v| v.version.as_str())
+                .collect::<Vec<_>>(),
+            ["1.0.0", "1.1.0", "1.2.0", "1.3.0-beta.2"]
+        );
+        assert_eq!(
+            versions[1].released_at,
+            "2024-02-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_deprecation_filter_preserves_latest_and_prerelease_rules() {
+        let response: NpmPackageResponse = serde_json::from_value(serde_json::json!({
+            "dist-tags": {"latest": "1.1.0"},
+            "time": {
+                "1.0.0": "2024-01-01T00:00:00Z",
+                "1.1.0": "2024-02-01T00:00:00Z",
+                "1.2.0": "2024-03-01T00:00:00Z",
+                "2.0.0-beta.1": "2024-04-01T00:00:00Z",
+                "2.0.0-beta.2": "2024-05-01T00:00:00Z"
+            },
+            "versions": {
+                "1.0.0": {}, "1.1.0": {"deprecated": "Use 1.0.0"},
+                "1.2.0": {}, "2.0.0-beta.1": {},
+                "2.0.0-beta.2": {"deprecated": "Broken prerelease"}
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            response
+                .into_versions()
+                .iter()
+                .map(|v| v.version.as_str())
+                .collect::<Vec<_>>(),
+            ["1.0.0", "2.0.0-beta.1"]
+        );
+    }
+
+    #[test]
+    fn test_deprecated_values_follow_npm_truthiness() {
+        // 型違いの値があっても、同じ応答の通常版は取得できる。
+        let mut manifests = serde_json::Map::new();
+        let mut time = serde_json::Map::new();
+        for (index, deprecated) in [
+            Value::Null,
+            serde_json::json!(false),
+            serde_json::json!(0),
+            serde_json::json!(""),
+            serde_json::json!(true),
+            serde_json::json!(1),
+            serde_json::json!(-1),
+            serde_json::json!(" "),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let version = format!("1.0.{index}");
+            manifests.insert(
+                version.clone(),
+                serde_json::json!({"deprecated": deprecated}),
+            );
+            time.insert(version, serde_json::json!("2024-01-01T00:00:00Z"));
+        }
+        let json =
+            serde_json::json!({"dist-tags": {}, "versions": manifests, "time": time}).to_string();
+        let response: NpmPackageResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            response
+                .into_versions()
+                .iter()
+                .map(|v| v.version.as_str())
+                .collect::<Vec<_>>(),
+            ["1.0.0", "1.0.1", "1.0.2", "1.0.3"]
+        );
     }
 }
