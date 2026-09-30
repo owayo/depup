@@ -54,6 +54,8 @@ For `package.json` (including Bun catalogs) and `composer.json`, JSON-escaped se
 
 In `package.json`, depup updates `dependencies`, `devDependencies`, `peerDependencies`, and `optionalDependencies`; `overrides` and other sections are left untouched.
 
+Versions with a non-empty `deprecated` message in npm registry metadata are excluded from update candidates, including prereleases and versions referenced by `latest`. An empty message clears deprecation. For non-string values, the flag follows npm's JavaScript truthiness (`null`, `false`, and zero are not deprecated). If no eligible version remains, depup skips the dependency and leaves its current version unchanged. If registry filtering removes every version, the existing skip reason is `fetch failed: no versions available`; this skip does not change the exit code.
+
 depup accepts the node-semver-compatible legacy tilde spelling `~>1.2.3` and preserves `~>` when updating.
 
 For npm partial comparators, `=1.2` and `=1` follow node-semver's partial-version rules instead of being treated as pinned exact versions: in node-semver, `=1.2` means any 1.2.x (`>=1.2.0 <1.3.0`). depup keeps the `=` operator and updates only the visible segment shape (`=1.2` → `=2.3`, `=1` → `=2`).
