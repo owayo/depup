@@ -5,9 +5,11 @@
 //! - レジストリから取得したリリース日時付きバージョン情報
 //! - 更新するかスキップするかを決める判定エンジン
 
+pub(crate) mod age_policy;
 mod filter;
 mod version_info;
 
+pub use age_policy::{AgeExemption, AgeExemptions, PublisherEvidence};
 pub use filter::UpdateFilter;
 pub(crate) use version_info::{NumericIdentifier, numeric_core};
 pub use version_info::{
@@ -457,7 +459,7 @@ impl UpdateJudge {
 
         let stable = self.stable_candidates(dependency, available_versions);
         let flavored = apply_java_flavor_filter(dependency, stable);
-        let age_filtered = self.apply_age_filter(flavored);
+        let age_filtered = self.apply_age_filter(dependency, flavored);
         let range_filtered = apply_range_upper_bound(dependency, age_filtered);
         let eligible = apply_rejected_versions(dependency, range_filtered);
 
@@ -489,7 +491,27 @@ impl UpdateJudge {
             );
         }
 
-        select_latest_candidate(dependency, &eligible, &allowed, self.filter.max_change)
+        let result =
+            select_latest_candidate(dependency, &eligible, &allowed, self.filter.max_change);
+        let exemption = match &result {
+            UpdateResult::Update { new_version, .. } => self
+                .filter
+                .min_age
+                .and_then(|age| crate::domain::cutoff_from(self.now, age))
+                .and_then(|cutoff| {
+                    allowed
+                        .iter()
+                        .find(|info| &info.version == new_version)
+                        .filter(|info| info.released_at > cutoff)
+                })
+                .and_then(|info| {
+                    self.filter
+                        .age_exempt
+                        .exemption(dependency.language, &dependency.name, info)
+                }),
+            _ => None,
+        };
+        result.with_age_exemption(exemption)
     }
 
     /// 既定ではプレリリースを除外する。現在版がプレリリースなら全候補を残す。
@@ -519,7 +541,11 @@ impl UpdateJudge {
     }
 
     /// `min_age` が設定されていれば、現在時刻から逆算したリリース時刻以前のものだけを残す。
-    fn apply_age_filter<'a>(&self, candidates: Vec<&'a VersionInfo>) -> Vec<&'a VersionInfo> {
+    fn apply_age_filter<'a>(
+        &self,
+        dependency: &Dependency,
+        candidates: Vec<&'a VersionInfo>,
+    ) -> Vec<&'a VersionInfo> {
         let Some(min_age) = self.filter.min_age else {
             return candidates;
         };
@@ -531,7 +557,14 @@ impl UpdateJudge {
         };
         candidates
             .into_iter()
-            .filter(|v| v.released_at <= min_release_time)
+            .filter(|v| {
+                self.filter.age_exempt.admits(
+                    dependency.language,
+                    &dependency.name,
+                    v,
+                    min_release_time,
+                )
+            })
             .collect()
     }
 }
@@ -792,6 +825,55 @@ fn select_latest_candidate(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn verified_publisher_exempts_only_age_and_marks_selected_version() {
+        let now = fixed_time();
+        let mut filter = UpdateFilter::new()
+            .with_min_age(Duration::from_secs(14 * 86400))
+            .with_max_change(crate::domain::ChangeLevel::Minor);
+        filter.age_exempt.github = vec!["example-dev".into()];
+        let judge = UpdateJudge::with_time(filter, now);
+        let dep = make_dependency("library", "1.0.0", Language::Rust, false);
+        let trusted = |version| {
+            let mut info = make_version_info_at(version, now - chrono::Duration::days(1));
+            info.publisher = PublisherEvidence::GithubUser {
+                login: "example-dev".into(),
+            };
+            info
+        };
+        let versions = vec![
+            make_version_info_at("1.0.0", now - chrono::Duration::days(30)),
+            trusted("1.1.0"),
+            trusted("2.0.0"),
+            trusted("1.2.0-beta.1"),
+            make_version_info_at("1.2.0", now - chrono::Duration::days(1)),
+        ];
+        let result = judge.judge(&dep, &versions);
+        match result {
+            UpdateResult::Update {
+                new_version,
+                age_exemption,
+                ..
+            } => {
+                assert_eq!(new_version, "1.1.0");
+                assert_eq!(age_exemption.unwrap().identity, "github:example-dev");
+            }
+            other => panic!("{other:?}"),
+        }
+        let pinned = make_dependency("library", "1.0.0", Language::Rust, true);
+        assert!(matches!(
+            judge.judge(&pinned, &versions),
+            UpdateResult::Skip {
+                reason: SkipReason::Pinned,
+                ..
+            }
+        ));
+        let mut range = dep;
+        range.version_spec =
+            crate::domain::VersionSpec::new(VersionSpecKind::Range, ">=1.0.0 <1.1.0", "1.0.0");
+        assert!(judge.judge(&range, &versions).is_skip());
+    }
+
     use super::*;
     use crate::domain::{Language, VersionSpec, VersionSpecKind};
     use chrono::TimeZone;

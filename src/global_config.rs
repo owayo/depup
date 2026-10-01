@@ -1,6 +1,6 @@
 //! グローバル設定ファイル (`~/.config/depup/config.toml`) のローダ
 //!
-//! ユーザー単位のデフォルトを定義する。現状は `age` と `osv` をサポート。
+//! ユーザー単位の age・公開者の例外・OSV・変更レベルのデフォルトを定義する。
 //! ファイルが無い場合は初回読み込み時にコメント付きの雛形を自動生成する
 //! (生成に失敗してもツールの動作は続行され、組み込みデフォルトが使われる)。
 
@@ -51,6 +51,11 @@ osv = true
 # or "major" (default — all bumps allowed).
 # Override per-run with --max-change <LEVEL>.
 # max_change = "minor"
+
+# Exempt releases published by verified GitHub identities from age filtering.
+# Self-declared repository URLs do not qualify. See docs/configuration.md.
+# [age_exempt]
+# github = ["example-dev"]
 "#;
 
 /// `~/.config/depup/config.toml` の内容。
@@ -73,6 +78,28 @@ pub struct GlobalConfig {
     /// 未指定の場合は制限なし (= major bumps も許可)。
     #[serde(default)]
     pub max_change: Option<String>,
+
+    /// age だけを免除する確認済みの公開者。
+    #[serde(default, deserialize_with = "deserialize_age_exempt")]
+    pub age_exempt: crate::update::AgeExemptions,
+}
+
+fn deserialize_age_exempt<'de, D>(deserializer: D) -> Result<crate::update::AgeExemptions, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = toml::Value::deserialize(deserializer)?;
+    match value.try_into::<crate::update::AgeExemptions>() {
+        Ok(mut exemptions) => {
+            exemptions.validate();
+            Ok(exemptions)
+        }
+        Err(error) => {
+            // 例外の typo で age=2w 等の他の設定まで失われないようにする。
+            eprintln!("Warning: invalid age_exempt configuration; exemptions disabled: {error}");
+            Ok(crate::update::AgeExemptions::default())
+        }
+    }
 }
 
 impl GlobalConfig {
@@ -210,6 +237,27 @@ pub fn resolve_osv(cli_osv: bool, no_osv: bool, config: Option<&GlobalConfig>) -
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn age_exempt_normalizes_logins_and_preserves_other_settings_on_errors() {
+        let config: super::GlobalConfig = toml::from_str("age = '2w'\nosv = true\n[age_exempt]\ngithub = ['EXAMPLE-dev', 'example-dev', 'bad/name']").unwrap();
+        assert_eq!(config.age.as_deref(), Some("2w"));
+        assert_eq!(config.age_exempt.github, ["example-dev"]);
+        for nested in [
+            "github = 42",
+            "githb = ['example-dev']",
+            "github = ['example-dev', 42]",
+        ] {
+            let config: super::GlobalConfig =
+                toml::from_str(&format!("age = '2w'\nosv = true\n[age_exempt]\n{nested}")).unwrap();
+            assert_eq!(
+                config.age_duration(),
+                Some(std::time::Duration::from_secs(14 * 86400))
+            );
+            assert_eq!(config.osv, Some(true));
+            assert!(config.age_exempt.is_empty());
+        }
+    }
+
     use super::*;
     use tempfile::TempDir;
 

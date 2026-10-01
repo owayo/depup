@@ -70,6 +70,9 @@ pub enum UpdateResult {
         /// API エラー時) を意味する。
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         osv_checked: bool,
+        /// age を免除した身元と、レジストリが確認した根拠。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        age_exemption: Option<crate::update::AgeExemption>,
     },
     /// 依存関係の更新がスキップされた
     Skip {
@@ -84,6 +87,13 @@ pub enum UpdateResult {
 }
 
 impl UpdateResult {
+    pub fn with_age_exemption(mut self, exemption: Option<crate::update::AgeExemption>) -> Self {
+        if let Self::Update { age_exemption, .. } = &mut self {
+            *age_exemption = exemption;
+        }
+        self
+    }
+
     /// リリース日なしのUpdate結果を作成する (後方互換性のため)
     pub fn update(dependency: Dependency, new_version: impl Into<String>) -> Self {
         UpdateResult::Update {
@@ -92,6 +102,7 @@ impl UpdateResult {
             released_at: None,
             osv_skipped: Vec::new(),
             osv_checked: false,
+            age_exemption: None,
         }
     }
 
@@ -107,6 +118,7 @@ impl UpdateResult {
             released_at: Some(released_at),
             osv_skipped: Vec::new(),
             osv_checked: false,
+            age_exemption: None,
         }
     }
 

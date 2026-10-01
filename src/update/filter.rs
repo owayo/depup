@@ -19,6 +19,8 @@ pub struct UpdateFilter {
     pub include_pinned: bool,
     /// バージョンが考慮されるための最小経過日数
     pub min_age: Option<Duration>,
+    /// レジストリが確認した公開者に対する age の例外。
+    pub age_exempt: super::AgeExemptions,
     /// 許容する変更レベルの上限 (例: `Patch` を指定すると patch のみ許可)
     pub max_change: Option<ChangeLevel>,
 }

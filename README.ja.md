@@ -210,7 +210,7 @@ depup は 3 か所から設定を読み取ります。どの設定も、コマ�
 
 | 設定 | 置き場所 | 用途 |
 |---|---|---|
-| グローバル設定 | `~/.config/depup/config.toml`（初回実行時に作成） | すべてのプロジェクトに共通する `age`・`osv`・`max_change` のデフォルト |
+| グローバル設定 | `~/.config/depup/config.toml`（初回実行時に作成） | 共通する `age`・`osv`・`max_change` のデフォルトと、確認済み公開者の例外（`age_exempt`） |
 | モノレポのディレクトリ | プロジェクトのルートの `.depup` | 追加で処理するディレクトリ |
 | プロジェクトの age 設定 | pnpm・Bun の設定の `minimumReleaseAge`、mise の設定の `minimum_release_age` | そのプロジェクトの最小公開期間 |
 

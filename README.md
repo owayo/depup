@@ -210,7 +210,7 @@ depup reads settings from three places. For each setting, a command-line flag ov
 
 | Setting | Location | Purpose |
 |---|---|---|
-| Global defaults | `~/.config/depup/config.toml`, created on the first run | Default `age`, `osv`, and `max_change` for every project |
+| Global defaults | `~/.config/depup/config.toml`, created on the first run | Default `age`, `osv`, and `max_change`, plus verified publisher exceptions (`age_exempt`) |
 | Monorepo directories | `.depup` at the project root | Additional directories to process |
 | Project age policy | `minimumReleaseAge` in the pnpm or Bun settings, `minimum_release_age` in the mise settings | Minimum release age of that project |
 
