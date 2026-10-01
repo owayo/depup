@@ -22,6 +22,22 @@ pub(crate) struct FakeCratesIo {
 }
 
 impl FakeCratesIo {
+    pub fn publisher(
+        mut self,
+        name: &str,
+        version: &str,
+        publisher: crate::update::PublisherEvidence,
+    ) -> Self {
+        self.releases
+            .get_mut(name)
+            .unwrap()
+            .iter_mut()
+            .find(|info| info.version == version)
+            .unwrap()
+            .publisher = publisher;
+        self
+    }
+
     /// 版を 1 つも持たない偽のレジストリを作る
     pub fn new() -> Self {
         Self {

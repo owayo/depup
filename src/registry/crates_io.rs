@@ -75,6 +75,39 @@ struct CrateVersion {
     created_at: String,
     /// このバージョンが yank されているか
     yanked: bool,
+    #[serde(default)]
+    published_by: serde_json::Value,
+    #[serde(default)]
+    trustpub_data: serde_json::Value,
+}
+
+impl CrateVersion {
+    fn publisher(&self) -> crate::update::PublisherEvidence {
+        use crate::update::PublisherEvidence;
+        if self.trustpub_data["provider"].as_str() == Some("github")
+            && let Some(repository) = self.trustpub_data["repository"].as_str()
+            && let Some((owner, repo)) = repository.split_once('/')
+            && crate::update::age_policy::valid_github_login(owner)
+            && crate::registry::is_valid_registry_id_segment(repo)
+        {
+            return PublisherEvidence::GithubTrustedPublisher {
+                owner: owner.into(),
+            };
+        }
+        // Trusted Publishing の実行元が不明なら、設定を作った利用者へ帰属させない。
+        if !self.trustpub_data.is_null() {
+            return PublisherEvidence::Unknown;
+        }
+        if self.published_by["github_username_matches"].as_bool() == Some(true)
+            && let Some(login) = self.published_by["login"].as_str()
+            && crate::update::age_policy::valid_github_login(login)
+        {
+            return PublisherEvidence::GithubUser {
+                login: login.into(),
+            };
+        }
+        PublisherEvidence::Unknown
+    }
 }
 
 impl CratesIoAdapter {
@@ -174,7 +207,9 @@ impl RegistryAdapter for CratesIoAdapter {
             }
 
             if let Ok(released_at) = version.created_at.parse::<DateTime<Utc>>() {
-                versions.push(VersionInfo::new(&version.num, released_at));
+                let mut info = VersionInfo::new(&version.num, released_at);
+                info.publisher = version.publisher();
+                versions.push(info);
             }
         }
 
@@ -188,6 +223,50 @@ impl RegistryAdapter for CratesIoAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publisher_requires_registry_verified_identity() {
+        use crate::update::PublisherEvidence;
+        let base =
+            serde_json::json!({"num":"1.2.3", "created_at":"2026-01-01T00:00:00Z", "yanked":false});
+        let parse = |metadata: serde_json::Value| {
+            let mut value = base.clone();
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(metadata.as_object().unwrap().clone());
+            serde_json::from_value::<CrateVersion>(value)
+                .unwrap()
+                .publisher()
+        };
+        assert_eq!(
+            parse(
+                serde_json::json!({"published_by":{"login":"example-dev", "github_username_matches":true}})
+            ),
+            PublisherEvidence::GithubUser {
+                login: "example-dev".into()
+            }
+        );
+        assert_eq!(
+            parse(
+                serde_json::json!({"trustpub_data":{"provider":"github", "repository":"example-dev/library"}})
+            ),
+            PublisherEvidence::GithubTrustedPublisher {
+                owner: "example-dev".into()
+            }
+        );
+        for metadata in [
+            serde_json::json!({}),
+            serde_json::json!({"published_by":{"login":"example-dev"}}),
+            serde_json::json!({"published_by":{"login":"example-dev", "github_username_matches":false}}),
+            serde_json::json!({"repository":"https://github.com/example-dev/library"}),
+            serde_json::json!({"published_by":"example-dev"}),
+            serde_json::json!({"trustpub_data":{"provider":"github", "repository":"example-dev/library/extra"}}),
+            serde_json::json!({"trustpub_data":{"provider":"gitlab", "repository":"example-dev/library"}, "published_by":{"login":"example-dev", "github_username_matches":true}}),
+        ] {
+            assert_eq!(parse(metadata), PublisherEvidence::Unknown);
+        }
+    }
 
     #[test]
     fn test_crates_io_adapter_language() {

@@ -394,6 +394,7 @@ impl Orchestrator {
             budget,
         } = *audit;
         let lock_path = project_dir.join("Cargo.lock");
+        let exemptions = self.resolved_age_exemptions();
         let mut log = AdjustmentLog::default();
         // 1 件ずつの `--precise` を試した組合せ。成否によらず 1 件ずつは再試行しない。
         // resolver 制約で失敗した組合せを 1 件ずつ試し直すと、パスごとに同じ
@@ -495,7 +496,7 @@ impl Orchestrator {
                         continue;
                     };
 
-                    if current_info.released_at <= cutoff {
+                    if exemptions.admits(Language::Rust, name, current_info, cutoff) {
                         continue;
                     }
 
@@ -505,6 +506,7 @@ impl Orchestrator {
                         cutoff,
                         preferred.get(name).map(Vec::as_slice),
                         baseline.get(name).map(Vec::as_slice),
+                        &exemptions,
                     ) else {
                         log.record(name, current, None, LockAgeStatus::NoOlderCandidate);
                         continue;
@@ -779,7 +781,7 @@ impl Orchestrator {
             let young = known.is_some_and(|all| {
                 all.iter().any(|info| {
                     compare_versions(&info.version, &to) == std::cmp::Ordering::Equal
-                        && info.released_at > cutoff
+                        && !exemptions.admits(Language::Rust, &name, info, cutoff)
                 })
             });
             if young {
@@ -801,14 +803,18 @@ impl Orchestrator {
                     })
                 });
                 match (known.as_ref(), info) {
-                    (Some(_), Some(info)) if info.released_at > cutoff => log.record(
-                        &name,
-                        &version,
-                        None,
-                        LockAgeStatus::NotAttempted(
-                            "the audit ended before rolling it back".to_string(),
-                        ),
-                    ),
+                    (Some(_), Some(info))
+                        if !exemptions.admits(Language::Rust, &name, info, cutoff) =>
+                    {
+                        log.record(
+                            &name,
+                            &version,
+                            None,
+                            LockAgeStatus::NotAttempted(
+                                "the audit ended before rolling it back".to_string(),
+                            ),
+                        )
+                    }
                     // 期間を満たす版、または crates.io の一覧に無い版 (yank 済みなど) は
                     // 監査中と同じく違反として扱わない
                     (Some(_), _) => {}
@@ -1031,7 +1037,7 @@ impl Orchestrator {
             };
         }
 
-        let judge = UpdateJudge::new(self.build_filter());
+        let filter = self.build_filter();
 
         // mise のバージョン解決は `mise` コマンドに委譲するため、未インストールなら
         // 依存ごとに同じ fetch エラーを並べる前にマニフェストごと外す。
@@ -1039,6 +1045,21 @@ impl Orchestrator {
         let manifests = manifests.as_slice();
 
         let parsed = self.parse_phase(manifests, progress, &mut errors);
+        if filter.min_age.is_some()
+            && !filter.age_exempt.is_empty()
+            && parsed.iter().any(|manifest| {
+                !manifest.dependencies.is_empty()
+                    && !matches!(
+                        manifest.info.language,
+                        Language::Rust | Language::Go | Language::Swift
+                    )
+            })
+        {
+            eprintln!(
+                "Notice: age_exempt.github is unavailable for other registries; their dependencies retain the age filter"
+            );
+        }
+        let judge = UpdateJudge::new(filter);
         self.check_phase(parsed, &judge, progress, &mut summary, &mut errors)
             .await;
         self.sync_tauri_if_needed(manifests, progress, &mut summary, &mut errors)
@@ -1235,6 +1256,14 @@ impl Orchestrator {
         if let Some(age) = resolved.duration {
             filter = filter.with_min_age(age);
         }
+        filter.age_exempt = self.resolved_age_exemptions();
+        if let Some(config) = &self.global_config
+            && !config.age_exempt.is_empty()
+            && filter.min_age.is_some()
+            && filter.age_exempt.is_empty()
+        {
+            eprintln!("Warning: project minimumReleaseAge takes precedence over age_exempt");
+        }
         // mise の除外設定・ツール単位の age は depup 側で解釈しないため、食い違いを通知する
         self.warn_mise_age_excludes();
         self.warn_mise_tool_age_overrides();
@@ -1266,6 +1295,16 @@ impl Orchestrator {
     /// notice は `build_filter` で既に発行済みのため、ここでは再発行しない。
     pub fn resolved_min_age(&self) -> Option<Duration> {
         self.resolve_age().duration
+    }
+
+    fn resolved_age_exemptions(&self) -> crate::update::AgeExemptions {
+        if self.read_project_minimum_release_age().is_some() {
+            return crate::update::AgeExemptions::default();
+        }
+        self.global_config
+            .as_ref()
+            .map(|config| config.age_exempt.clone())
+            .unwrap_or_default()
     }
 
     /// プロジェクト直下の minimumReleaseAge 設定を読む。
@@ -1548,7 +1587,7 @@ impl Orchestrator {
         };
 
         // 同期ヘルパーを作成し、同期後のバージョンを取得
-        let sync = TauriVersionSync::new(npm_versions, crate_versions);
+        let sync = TauriVersionSync::new(npm_versions, crate_versions.clone());
 
         let npm_update_result = npm_packages.first().map(|(_, _, r, _)| r);
         let crate_update_result = crate_info.as_ref().map(|(_, _, r, _)| r);
@@ -1576,6 +1615,17 @@ impl Orchestrator {
                 *result_idx,
                 original,
                 target.clone(),
+                cutoff
+                    .and_then(|cutoff| {
+                        crate_versions
+                            .iter()
+                            .find(|info| &info.version == target)
+                            .filter(|info| info.released_at > cutoff)
+                    })
+                    .and_then(|info| {
+                        self.resolved_age_exemptions()
+                            .exemption(Language::Rust, TAURI_CRATE, info)
+                    }),
             );
         }
     }
@@ -1622,8 +1672,20 @@ impl Orchestrator {
         // (同期が age ポリシーを迂回して新しすぎるバージョンを書かないように)
         let cutoff = self.resolved_min_age().and_then(crate::domain::cutoff_now);
         Some((
-            filter_versions_by_cutoff(npm_versions, cutoff),
-            filter_versions_by_cutoff(crate_versions, cutoff),
+            filter_versions_by_cutoff(
+                npm_versions,
+                cutoff,
+                Language::Node,
+                TAURI_NPM_PACKAGES[0],
+                &self.resolved_age_exemptions(),
+            ),
+            filter_versions_by_cutoff(
+                crate_versions,
+                cutoff,
+                Language::Rust,
+                TAURI_CRATE,
+                &self.resolved_age_exemptions(),
+            ),
             cutoff,
         ))
     }
@@ -1648,7 +1710,13 @@ impl Orchestrator {
             } else {
                 match self.fetch_versions(&*npm_adapter, pkg_name).await {
                     Ok(vs) => {
-                        let vs = filter_versions_by_cutoff(vs, cutoff);
+                        let vs = filter_versions_by_cutoff(
+                            vs,
+                            cutoff,
+                            Language::Node,
+                            pkg_name,
+                            &self.resolved_age_exemptions(),
+                        );
                         pick_sync_version(&vs, target)
                     }
                     // フェッチできない場合はこのパッケージの同期を見送る
@@ -1658,7 +1726,14 @@ impl Orchestrator {
             let Some(pkg_target) = pkg_target else {
                 continue;
             };
-            apply_sync_adjustment(summary, *manifest_idx, *result_idx, original, pkg_target);
+            apply_sync_adjustment(
+                summary,
+                *manifest_idx,
+                *result_idx,
+                original,
+                pkg_target,
+                None,
+            );
         }
     }
 
@@ -1912,6 +1987,7 @@ fn rollback_target(
     cutoff: chrono::DateTime<chrono::Utc>,
     preferred: Option<&[String]>,
     before: Option<&[String]>,
+    exemptions: &crate::update::AgeExemptions,
 ) -> Option<String> {
     let floor = version_floor(before, current);
     let at_least_floor = |version: &str| {
@@ -1928,14 +2004,14 @@ fn rollback_target(
         .filter(|version| {
             available.iter().any(|info| {
                 compare_versions(&info.version, version) == std::cmp::Ordering::Equal
-                    && info.released_at <= cutoff
+                    && exemptions.admits(Language::Rust, "", info, cutoff)
             })
         })
         .max_by(|a, b| compare_versions(a, b));
     if let Some(version) = from_judge {
         return Some(version.clone());
     }
-    match pick_older_within_age(available, current, cutoff) {
+    match pick_older_within_age(available, current, cutoff, exemptions) {
         Some(version) if at_least_floor(&version) => Some(version),
         // 期間を満たす版が下限より古い (または無い) なら、install 前の版に戻す
         _ => floor,
@@ -2137,13 +2213,14 @@ fn pick_older_within_age(
     available: &[VersionInfo],
     current: &str,
     cutoff: chrono::DateTime<chrono::Utc>,
+    exemptions: &crate::update::AgeExemptions,
 ) -> Option<String> {
     let mut best: Option<&VersionInfo> = None;
     for v in available {
         if v.is_prerelease() {
             continue;
         }
-        if v.released_at > cutoff {
+        if !exemptions.admits(Language::Rust, "", v, cutoff) {
             continue;
         }
         // 現在の lock バージョンと同じもしくはそれより新しいものは対象外
@@ -2322,6 +2399,7 @@ fn apply_sync_adjustment(
     result_idx: usize,
     original: &UpdateResult,
     target: String,
+    exemption: Option<crate::update::AgeExemption>,
 ) {
     // 同期先が現在版と同一なら Update を作らない。
     // judge 側は「書き換え結果が現在の raw と同一なら AlreadyLatest」という不変条件を
@@ -2332,7 +2410,8 @@ fn apply_sync_adjustment(
         return;
     }
 
-    let adjusted = UpdateResult::update(original.dependency().clone(), target);
+    let adjusted =
+        UpdateResult::update(original.dependency().clone(), target).with_age_exemption(exemption);
     summary.manifests[manifest_idx].results[result_idx] = adjusted;
     if matches!(original, UpdateResult::Skip { .. }) {
         summary.manifests[manifest_idx].modified = true;
@@ -2343,11 +2422,14 @@ fn apply_sync_adjustment(
 fn filter_versions_by_cutoff(
     versions: Vec<VersionInfo>,
     cutoff: Option<chrono::DateTime<chrono::Utc>>,
+    language: Language,
+    package: &str,
+    exemptions: &crate::update::AgeExemptions,
 ) -> Vec<VersionInfo> {
     match cutoff {
         Some(c) => versions
             .into_iter()
-            .filter(|v| v.released_at <= c)
+            .filter(|v| exemptions.admits(language, package, v, c))
             .collect(),
         None => versions,
     }
@@ -2739,7 +2821,7 @@ mod git_helper_tests {
         ];
         let cutoff = chrono::Utc::now() - chrono::Duration::days(14);
         assert_eq!(
-            pick_older_within_age(&versions, "1.5.0", cutoff).as_deref(),
+            pick_older_within_age(&versions, "1.5.0", cutoff, &Default::default()).as_deref(),
             Some("1.4.9"),
         );
     }
@@ -2749,7 +2831,7 @@ mod git_helper_tests {
         // 全候補が age 違反または現バージョン以上
         let versions = vec![version_at("1.5.0", 3), version_at("1.6.0", 1)];
         let cutoff = chrono::Utc::now() - chrono::Duration::days(14);
-        assert!(pick_older_within_age(&versions, "1.5.0", cutoff).is_none());
+        assert!(pick_older_within_age(&versions, "1.5.0", cutoff, &Default::default()).is_none());
     }
 
     #[test]
@@ -2762,7 +2844,7 @@ mod git_helper_tests {
         ];
         let cutoff = chrono::Utc::now() - chrono::Duration::days(14);
         assert_eq!(
-            pick_older_within_age(&versions, "1.5.0", cutoff).as_deref(),
+            pick_older_within_age(&versions, "1.5.0", cutoff, &Default::default()).as_deref(),
             Some("1.4.9"),
         );
     }
@@ -2778,7 +2860,7 @@ mod git_helper_tests {
         ];
         let cutoff = chrono::Utc::now() - chrono::Duration::days(14);
         assert_eq!(
-            pick_older_within_age(&versions, "2.0.0", cutoff).as_deref(),
+            pick_older_within_age(&versions, "2.0.0", cutoff, &Default::default()).as_deref(),
             Some("1.4.9"),
         );
     }
@@ -2789,7 +2871,7 @@ mod git_helper_tests {
         let versions = vec![version_at("1.4.0", 30), version_at("1.5.0", 3)];
         let cutoff = chrono::Utc::now() - chrono::Duration::days(14);
         assert_eq!(
-            pick_older_within_age(&versions, "1.5.0", cutoff).as_deref(),
+            pick_older_within_age(&versions, "1.5.0", cutoff, &Default::default()).as_deref(),
             Some("1.4.0"),
         );
     }
@@ -2806,7 +2888,15 @@ mod git_helper_tests {
         let cutoff = chrono::Utc::now() - chrono::Duration::days(14);
         let preferred = vec!["1.4.5".to_string()];
         assert_eq!(
-            rollback_target(&versions, "1.5.0", cutoff, Some(&preferred), None).as_deref(),
+            rollback_target(
+                &versions,
+                "1.5.0",
+                cutoff,
+                Some(&preferred),
+                None,
+                &Default::default()
+            )
+            .as_deref(),
             Some("1.4.5"),
         );
     }
@@ -2830,13 +2920,21 @@ mod git_helper_tests {
             vec!["0.9.0".to_string()],
         ] {
             assert_eq!(
-                rollback_target(&versions, "1.5.0", cutoff, Some(&preferred), None).as_deref(),
+                rollback_target(
+                    &versions,
+                    "1.5.0",
+                    cutoff,
+                    Some(&preferred),
+                    None,
+                    &Default::default()
+                )
+                .as_deref(),
                 Some("1.4.9"),
                 "preferred = {preferred:?}",
             );
         }
         assert_eq!(
-            rollback_target(&versions, "1.5.0", cutoff, None, None).as_deref(),
+            rollback_target(&versions, "1.5.0", cutoff, None, None, &Default::default()).as_deref(),
             Some("1.4.9"),
         );
     }
@@ -2852,7 +2950,15 @@ mod git_helper_tests {
         let cutoff = chrono::Utc::now() - chrono::Duration::days(14);
         let preferred = vec!["1.4.0".to_string(), "1.4.5".to_string()];
         assert_eq!(
-            rollback_target(&versions, "1.5.0", cutoff, Some(&preferred), None).as_deref(),
+            rollback_target(
+                &versions,
+                "1.5.0",
+                cutoff,
+                Some(&preferred),
+                None,
+                &Default::default()
+            )
+            .as_deref(),
             Some("1.4.5"),
         );
     }
@@ -2871,15 +2977,29 @@ mod git_helper_tests {
         let preferred = vec!["1.40.5".to_string()];
         let before = vec!["1.50.0".to_string()];
         assert_eq!(
-            rollback_target(&versions, "1.53.1", cutoff, Some(&preferred), Some(&before))
-                .as_deref(),
+            rollback_target(
+                &versions,
+                "1.53.1",
+                cutoff,
+                Some(&preferred),
+                Some(&before),
+                &Default::default()
+            )
+            .as_deref(),
             Some("1.52.0"),
         );
         // 別系列の install 前の版は下限にしない
         let before = vec!["0.9.0".to_string()];
         assert_eq!(
-            rollback_target(&versions, "1.53.1", cutoff, Some(&preferred), Some(&before))
-                .as_deref(),
+            rollback_target(
+                &versions,
+                "1.53.1",
+                cutoff,
+                Some(&preferred),
+                Some(&before),
+                &Default::default()
+            )
+            .as_deref(),
             Some("1.40.5"),
         );
     }
@@ -2997,13 +3117,29 @@ mod git_helper_tests {
         let cutoff = chrono::Utc::now() - chrono::Duration::days(14);
         let before = vec!["1.50.0".to_string()];
         assert_eq!(
-            rollback_target(&versions, "1.50.1", cutoff, None, Some(&before)).as_deref(),
+            rollback_target(
+                &versions,
+                "1.50.1",
+                cutoff,
+                None,
+                Some(&before),
+                &Default::default()
+            )
+            .as_deref(),
             Some("1.50.0"),
         );
 
         let only_young = vec![version_at("1.50.0", 5), version_at("1.50.1", 2)];
         assert_eq!(
-            rollback_target(&only_young, "1.50.1", cutoff, None, Some(&before)).as_deref(),
+            rollback_target(
+                &only_young,
+                "1.50.1",
+                cutoff,
+                None,
+                Some(&before),
+                &Default::default()
+            )
+            .as_deref(),
             Some("1.50.0"),
         );
     }
@@ -3011,6 +3147,115 @@ mod git_helper_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn explicit_project_age_overrides_global_publisher_exemptions() {
+        use crate::domain::{VersionSpec, VersionSpecKind};
+        let dir = TempDir::new().unwrap();
+        let config = GlobalConfig {
+            age: Some("2w".into()),
+            age_exempt: crate::update::AgeExemptions {
+                github: vec!["example-dev".into()],
+            },
+            ..Default::default()
+        };
+        let orchestrator = Orchestrator::new(make_args_with_path(dir.path(), &["--rust"]))
+            .unwrap()
+            .with_global_config(Some(config));
+        let dependency = Dependency::new(
+            "library",
+            VersionSpec::new(VersionSpecKind::Caret, "^1.0.0", "1.0.0"),
+            false,
+            Language::Rust,
+        );
+        let mut young = VersionInfo::now("1.1.0");
+        young.publisher = crate::update::PublisherEvidence::GithubUser {
+            login: "example-dev".into(),
+        };
+        let versions = [
+            VersionInfo::new("1.0.0", chrono::Utc::now() - chrono::Duration::days(30)),
+            young,
+        ];
+        assert!(
+            UpdateJudge::new(orchestrator.build_filter())
+                .judge(&dependency, &versions)
+                .is_update()
+        );
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages: []\nminimumReleaseAge: 14400\n",
+        )
+        .unwrap();
+        assert!(
+            UpdateJudge::new(orchestrator.build_filter())
+                .judge(&dependency, &versions)
+                .is_skip()
+        );
+        assert!(orchestrator.resolved_age_exemptions().is_empty());
+        assert_eq!(
+            orchestrator.resolved_min_age(),
+            Some(Duration::from_secs(10 * 86400))
+        );
+    }
+
+    #[test]
+    fn rollback_can_select_a_young_verified_release() {
+        let version_at = |version: &str, days: i64| {
+            VersionInfo::new(version, chrono::Utc::now() - chrono::Duration::days(days))
+        };
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(14);
+        let exemptions = crate::update::AgeExemptions {
+            github: vec!["example-dev".into()],
+        };
+        let mut young = version_at("1.4.9", 1);
+        young.publisher = crate::update::PublisherEvidence::GithubUser {
+            login: "example-dev".into(),
+        };
+        let versions = vec![version_at("1.4.5", 30), young, version_at("1.5.0", 1)];
+        assert_eq!(
+            pick_older_within_age(&versions, "1.5.0", cutoff, &exemptions).as_deref(),
+            Some("1.4.9")
+        );
+        let preferred = ["1.4.9".into()];
+        assert_eq!(
+            rollback_target(
+                &versions,
+                "1.5.0",
+                cutoff,
+                Some(&preferred),
+                None,
+                &exemptions
+            )
+            .as_deref(),
+            Some("1.4.9")
+        );
+        assert_eq!(
+            pick_older_within_age(&versions, "1.5.0", cutoff, &Default::default()).as_deref(),
+            Some("1.4.5")
+        );
+        assert_eq!(
+            filter_versions_by_cutoff(
+                versions.clone(),
+                Some(cutoff),
+                Language::Rust,
+                "library",
+                &exemptions
+            )
+            .len(),
+            2
+        );
+        assert_eq!(
+            filter_versions_by_cutoff(
+                versions,
+                Some(cutoff),
+                Language::Node,
+                "library",
+                &exemptions
+            )
+            .len(),
+            1
+        );
+    }
+
     use super::*;
     use async_trait::async_trait;
     use clap::Parser;
@@ -3474,6 +3719,7 @@ mod tests {
                 vec![VersionInfo {
                     version: "4.17.21".to_string(),
                     released_at: chrono::Utc::now(),
+                    publisher: Default::default(),
                 }],
             );
         }
@@ -3556,6 +3802,69 @@ mod lock_age_audit_tests {
     use crate::test_support::local_registry::{LocalRegistry, TestProject};
     use chrono::{DateTime, TimeZone, Utc};
     use clap::Parser;
+
+    #[tokio::test]
+    async fn verified_direct_and_transitive_releases_survive_final_lock_audit() {
+        let registry = LocalRegistry::new();
+        for version in ["1.0.0", "1.0.1"] {
+            registry.publish("trusted-child", version, &[]);
+            registry.publish("trusted-parent", version, &[("trusted-child", version)]);
+            registry.publish("ordinary", version, &[]);
+        }
+        let project = TestProject::new(
+            &registry,
+            &manifest("trusted-parent = '=1.0.0'\nordinary = '=1.0.0'\n"),
+        );
+        let unpinned = manifest("trusted-parent = '1.0.0'\nordinary = '1.0.0'\n");
+        let baseline = install(&project, &unpinned);
+        let mut dates = FakeCratesIo::new();
+        for name in ["trusted-parent", "trusted-child", "ordinary"] {
+            dates = dates
+                .release(name, "1.0.0", old())
+                .release(name, "1.0.1", fresh());
+        }
+        for name in ["trusted-parent", "trusted-child"] {
+            dates = dates.publisher(
+                name,
+                "1.0.1",
+                crate::update::PublisherEvidence::GithubTrustedPublisher {
+                    owner: "example-dev".into(),
+                },
+            );
+        }
+        let config = crate::global_config::GlobalConfig {
+            age: Some("2w".into()),
+            age_exempt: crate::update::AgeExemptions {
+                github: vec!["example-dev".into()],
+            },
+            ..Default::default()
+        };
+        let orchestrator = Orchestrator::new(CliArgs::parse_from(["depup"]))
+            .unwrap()
+            .with_global_config(Some(config));
+        let cargo = cargo_for(&project);
+        let result = orchestrator
+            .audit_lock_age(
+                &LockAgeAudit {
+                    project_dir: project.path(),
+                    cutoff: cutoff(),
+                    baseline: &baseline,
+                    preferred: &PreferredVersions::new(),
+                    adapter: &dates,
+                    cargo: &cargo,
+                    budget: LOCK_AGE_AUDIT_BUDGET,
+                },
+                None,
+            )
+            .await;
+        assert_eq!(project.locked_versions("trusted-parent"), ["1.0.1"]);
+        assert_eq!(project.locked_versions("trusted-child"), ["1.0.1"]);
+        assert_eq!(project.locked_versions("ordinary"), ["1.0.0"]);
+        assert_eq!(result.unchecked, 0);
+        assert_eq!(result.adjustments.len(), 1);
+        assert_eq!(project.read("Cargo.toml"), unpinned);
+        assert!(lock_is_accepted(&project));
+    }
 
     /// この日時より後に公開された版を違反とする
     fn cutoff() -> DateTime<Utc> {

@@ -19,6 +19,9 @@ pub struct VersionInfo {
     pub version: String,
     /// このバージョンがリリースされた日時
     pub released_at: DateTime<Utc>,
+    /// レジストリが確認した公開者。自己申告の repository URL は使わない。
+    #[serde(default, skip_serializing_if = "super::PublisherEvidence::is_unknown")]
+    pub publisher: super::PublisherEvidence,
 }
 
 impl VersionInfo {
@@ -27,6 +30,7 @@ impl VersionInfo {
         Self {
             version: version.into(),
             released_at,
+            publisher: super::PublisherEvidence::Unknown,
         }
     }
 
@@ -35,6 +39,7 @@ impl VersionInfo {
         Self {
             version: version.into(),
             released_at: Utc::now(),
+            publisher: super::PublisherEvidence::Unknown,
         }
     }
 

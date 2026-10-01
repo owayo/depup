@@ -324,3 +324,5 @@ make ci                # CI と同じ検査 (fmt-check + lint + test、書き換
 - Tauri バージョン同期の「既に一致」判定は npm パッケージ**全件**で行う。`@tauri-apps/api` と `@tauri-apps/cli` はパッチ集合差や age フィルタで judge 結果が非対称になりうるため、先頭 1 件 (依存はキー順に並ぶので通常 `api`) の一致で打ち切ると残りのずれが同期されない。OSV フォールバックで脆弱な候補を退けた結果 (`osv_skipped` が非空) も同期の上書きから保護する — 同期先はレジストリの生の一覧から最新を選ぶため、保護しないと judge が除外した脆弱版を選び直して OSV チェックを無効化してしまう
 - `--install` を走らせるディレクトリの順序はパス順に固定する。`HashMap` の `RandomState` 由来で実行のたびに入れ替わると、verbose 出力や失敗時の stderr の行順が変わって CI のログ比較で偽の差分になる
 - Rust の post-install age 監査では、fetch 失敗時も進捗位置を進める (末尾の数件が失敗するとバーが手前で止まったままになる)。差し戻しの `cargo update` は残り予算が `MIN_CARGO_UPDATE_SLICE` (10 秒) 未満なら着手しない — タイムアウトは残り予算でクランプされるので予算末尾で着手すると必ず失敗し、試行済みとして記録された組合せは二度と再試行されないため、本来差し戻せた依存が恒久的に「失敗」で確定する
+
+- 公開者による age 例外はグローバル設定の `[age_exempt].github` に閉じ、アカウント名を本体へ埋め込まない。`update/age_policy.rs` は版ごとの確認済み公開者（crates.io の GitHub ログイン一致 / Trusted Publishing）または Go・Swift の検証済み GitHub 取得元だけを照合する。自己申告 repository URL や現在の owner 一覧で過去の版を免除しない。候補選択・Tauri 同期・Rust post-install 監査（rollback 候補と最終 lock の照合を含む）で同じ `admits` 判定を共有する。例外は age のみを外し、プロジェクトの明示的な最小公開期間には優先しない。不正な例外設定は他のグローバル設定を維持したまま無効化する。

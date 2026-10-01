@@ -79,6 +79,8 @@ struct JsonManifest {
 /// 更新の JSON 表現
 #[derive(Serialize)]
 struct JsonUpdate {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    age_exemption: Option<crate::update::AgeExemption>,
     /// パッケージ名
     name: String,
     /// 種別: `registry` または `git`
@@ -167,6 +169,7 @@ impl JsonFormatter {
                 if let UpdateResult::Update {
                     dependency,
                     new_version,
+                    age_exemption,
                     ..
                 } = result
                 {
@@ -176,6 +179,7 @@ impl JsonFormatter {
                             _ => git.current_commit.clone().unwrap_or_default(),
                         };
                         Some(JsonUpdate {
+                            age_exemption: age_exemption.clone(),
                             name: dependency.name.clone(),
                             kind: "git",
                             from,
@@ -190,6 +194,7 @@ impl JsonFormatter {
                         })
                     } else {
                         Some(JsonUpdate {
+                            age_exemption: age_exemption.clone(),
                             name: dependency.name.clone(),
                             kind: "registry",
                             // `to` はレジストリが返す生の値なので、`from` も同じ書式
@@ -322,6 +327,38 @@ impl OutputFormatter for JsonFormatter {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn exemption_evidence_is_visible_in_json_and_text_only_when_used() {
+        let exemption = crate::update::AgeExemption {
+            identity: "github:example-dev".into(),
+            evidence: "crates_io_publisher".into(),
+        };
+        let mut manifest =
+            ManifestUpdateResult::new(std::path::PathBuf::from("Cargo.toml"), Language::Rust);
+        manifest.add_result(
+            UpdateResult::update(sample_dependency("library", "1.0.0"), "1.1.0")
+                .with_age_exemption(Some(exemption.clone())),
+        );
+        manifest.add_result(UpdateResult::update(
+            sample_dependency("ordinary", "1.0.0"),
+            "1.1.0",
+        ));
+        let output = JsonFormatter::new(Verbosity::Normal).manifest_to_json(&manifest);
+        let json = serde_json::to_value(output).unwrap();
+        assert_eq!(
+            json["updates"][0]["age_exemption"]["identity"],
+            exemption.identity
+        );
+        assert!(json["updates"][1].get("age_exemption").is_none());
+        let mut text = Vec::new();
+        crate::output::TextFormatter::with_color(Verbosity::Normal, false, false)
+            .format_manifest(&manifest, &mut text)
+            .unwrap();
+        let text = String::from_utf8(text).unwrap();
+        assert!(text.contains("age exempt: github:example-dev (crates_io_publisher)"));
+        assert_eq!(text.matches("age exempt:").count(), 1);
+    }
+
     use super::*;
     use crate::domain::{Dependency, GitSource, VersionSpec, VersionSpecKind};
     use std::path::PathBuf;

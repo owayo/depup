@@ -336,6 +336,7 @@ impl TextFormatter {
                 released_at,
                 osv_skipped,
                 osv_checked,
+                age_exemption,
             } = result
             {
                 // git 依存は専用フォーマットで表示
@@ -371,6 +372,13 @@ impl TextFormatter {
                     max_name_len,
                     writer,
                 )?;
+                if let Some(exemption) = age_exemption {
+                    writeln!(
+                        writer,
+                        "    age exempt: {} ({})",
+                        exemption.identity, exemption.evidence
+                    )?;
+                }
             }
         }
         Ok(())
