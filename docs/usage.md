@@ -393,9 +393,11 @@ Only changed entries are audited because depup limits crates.io requests to one 
 A crate is rolled back to the following version:
 
 - For a direct dependency that depup updated in this run, the version shown in its update line is preferred. That version has already passed the age filter, the OSV check, and `--max-change`.
-- For any other crate, the newest stable (non-prerelease) version that satisfies the age filter and is older than the locked one.
+- For any other crate, the newest stable (non-prerelease) version from the same semver series that satisfies the age filter and is older than the locked one.
 
-In both cases, a rollback never goes below the version of the same semver series that `Cargo.lock` held before the install. If only older versions satisfy the age filter, the crate goes back to its pre-install version, so depup undoes only the change the install made. When that pre-install version is itself newer than the age filter allows, it is reported on a separate yellow line instead of as rolled back:
+In both cases, a rollback never goes below an available pre-install version from the same semver series. Pre-install versions absent from usable crates.io metadata, including yanked versions and versions with unreadable release dates, are excluded from both this minimum and restoration. In that case, depup chooses an older compatible version that satisfies the age filter, or reports an unresolved violation if none exists.
+
+If only versions below an available minimum satisfy the age filter, the crate goes back to that pre-install version, so depup undoes only the change the install made. When that pre-install version is itself newer than the age filter allows, it is reported on a separate yellow line instead of as rolled back:
 
 ```text
   . — 1 crate(s) returned to the version locked before the install, which is also newer than --age:
