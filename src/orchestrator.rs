@@ -15,11 +15,12 @@ use crate::domain::{
     Dependency, GitReference, Language, ManifestUpdateResult, SkipReason, UpdateResult,
     UpdateSummary,
 };
-use crate::global_config::{DEFAULT_AGE, GlobalConfig};
+use crate::global_config::GlobalConfig;
+
+mod age;
 use crate::manifest::{
-    BunSettings, ManifestInfo, ManifestWriter, MiseSettings, PnpmSettings, RegistryLockEntries,
-    WriteResult, detect_manifests, find_cargo_lock_upward, get_parser, has_bunfig, has_mise_config,
-    has_pnpm_workspace, parse_registry_entries, read_git_entries,
+    ManifestInfo, ManifestWriter, MiseSettings, RegistryLockEntries, WriteResult, detect_manifests,
+    find_cargo_lock_upward, get_parser, has_mise_config, parse_registry_entries, read_git_entries,
 };
 use crate::osv::{OsvCheck, OsvChecker};
 use crate::progress::Progress;
@@ -30,7 +31,8 @@ use crate::registry::{
 };
 use crate::tauri_sync::{TAURI_CRATE, TAURI_NPM_PACKAGES, TauriVersionSync};
 use crate::update::{
-    UpdateFilter, UpdateJudge, VersionInfo, compare_dependency_versions, compare_versions,
+    AgePolicy, UpdateFilter, UpdateJudge, VersionInfo, compare_dependency_versions,
+    compare_versions,
 };
 use futures::stream::{self, StreamExt};
 use indicatif::ProgressBar;
@@ -103,124 +105,17 @@ pub type PreferredVersions = HashMap<String, Vec<String>>;
 pub type VersionCache = Arc<Mutex<HashMap<(Language, String), Vec<VersionInfo>>>>;
 type VersionFetchLocks = Arc<Mutex<HashMap<(Language, String), Arc<Mutex<()>>>>>;
 
-/// プロジェクト直下から検出した minimumReleaseAge とそのソース
-struct ProjectAge {
-    duration: Duration,
-    source: String,
-}
-
 /// パース済みマニフェスト (parse_phase → check_phase の受け渡し用)
 struct ParsedManifest<'a> {
     info: &'a ManifestInfo,
     dependencies: Vec<Dependency>,
 }
 
-/// `resolve_age_policy` が返す age 解決結果。
-/// `notice` の表示は呼び出し側で行う (副作用を解決ロジックから分離)。
-struct ResolvedAge {
-    duration: Option<Duration>,
-    notice: Option<AgeNotice>,
-}
-
-/// age 解決の過程でユーザーに伝えるべき通知。
-enum AgeNotice {
-    /// CLI 指定 (`--age` / `--no-age`) がプロジェクト minimumReleaseAge に上書きされた (警告)
-    CliOverriddenByProject {
-        cli_label: &'static str,
-        days: u64,
-        source: String,
-    },
-    /// CLI 指定なし、プロジェクト minimumReleaseAge を採用 (情報通知)
-    UsingProjectPolicy { days: u64, source: String },
-}
-
-/// age 制約を優先順位どおりに解決する (純粋関数)。
-///
-/// 優先順位:
-///   1. minimumReleaseAge (pnpm-workspace.yaml / bunfig.toml) — プロジェクトポリシー強制
-///   2. CLI の `--age`
-///   3. CLI の `--no-age`
-///   4. グローバル設定 (~/.config/depup/config.toml)
-///   5. 組み込みデフォルト (`DEFAULT_AGE`)
-fn resolve_age_policy(
-    project_age: Option<&ProjectAge>,
-    cli_age: Option<Duration>,
-    cli_no_age: bool,
-    config_age: Option<Duration>,
-) -> ResolvedAge {
-    if let Some(project) = project_age {
-        let days = project.duration.as_secs() / 86400;
-        let notice = if cli_age.is_some() || cli_no_age {
-            let cli_label = if cli_no_age { "--no-age" } else { "--age" };
-            AgeNotice::CliOverriddenByProject {
-                cli_label,
-                days,
-                source: project.source.clone(),
-            }
-        } else {
-            AgeNotice::UsingProjectPolicy {
-                days,
-                source: project.source.clone(),
-            }
-        };
-        return ResolvedAge {
-            duration: Some(project.duration),
-            notice: Some(notice),
-        };
-    }
-
-    let duration = if cli_no_age {
-        None
-    } else if let Some(age) = cli_age {
-        Some(age)
-    } else if let Some(cfg_age) = config_age {
-        Some(cfg_age)
-    } else {
-        Some(DEFAULT_AGE)
-    };
-    ResolvedAge {
-        duration,
-        notice: None,
-    }
-}
-
-/// `AgeNotice` を stderr に表示する。
-fn emit_age_notice(notice: &AgeNotice) {
-    use colored::Colorize as _;
-    fn unit(days: u64) -> &'static str {
-        if days == 1 { "day" } else { "days" }
-    }
-    match notice {
-        AgeNotice::CliOverriddenByProject {
-            cli_label,
-            days,
-            source,
-        } => {
-            let msg = format!(
-                "⚠ {} ignored: project's minimumReleaseAge ({} {} from {}) takes precedence",
-                cli_label,
-                days,
-                unit(*days),
-                source,
-            );
-            eprintln!("{}", msg.yellow());
-        }
-        AgeNotice::UsingProjectPolicy { days, source } => {
-            let msg = format!(
-                "ℹ Using project's minimumReleaseAge ({} {} from {})",
-                days,
-                unit(*days),
-                source,
-            );
-            eprintln!("{}", msg.cyan());
-        }
-    }
-}
-
 /// 更新ワークフローを調整するオーケストレータ
 pub struct Orchestrator {
     /// 設定用CLI引数
     args: CliArgs,
+    evaluated_at: chrono::DateTime<chrono::Utc>,
     /// レジストリリクエスト用HTTPクライアント
     client: HttpClient,
     /// 汎用同時実行制御用セマフォ
@@ -308,6 +203,7 @@ impl Orchestrator {
 
         Ok(Self {
             args,
+            evaluated_at: chrono::Utc::now(),
             client,
             general_semaphore: Arc::new(Semaphore::new(DEFAULT_CONCURRENCY)),
             crates_io_semaphore: Arc::new(Semaphore::new(CRATES_IO_CONCURRENCY)),
@@ -356,7 +252,22 @@ impl Orchestrator {
         preferred: &PreferredVersions,
         bar: Option<&ProgressBar>,
     ) -> LockAgeAuditResult {
-        let Some(cutoff) = crate::domain::cutoff_now(min_age) else {
+        let mut policy = self.resolved_age_policy_for(project_dir);
+        policy.min_age = Some(min_age);
+        self.enforce_lock_age_rust_with_policy(project_dir, &policy, baseline, preferred, bar)
+            .await
+    }
+
+    /// 共有 lock の全メンバーから解決済みの制約を使って監査する。
+    pub async fn enforce_lock_age_rust_with_policy(
+        &self,
+        project_dir: &Path,
+        policy: &AgePolicy,
+        baseline: &RegistryLockEntries,
+        preferred: &PreferredVersions,
+        bar: Option<&ProgressBar>,
+    ) -> LockAgeAuditResult {
+        let Some(cutoff) = policy.cutoff() else {
             return LockAgeAuditResult::default();
         };
         // check フェーズと同じレート制限状態を使う。別インスタンスにすると
@@ -368,6 +279,7 @@ impl Orchestrator {
         let audit = LockAgeAudit {
             project_dir,
             cutoff,
+            exemptions: &policy.exemptions,
             baseline,
             preferred,
             adapter: &adapter,
@@ -387,6 +299,7 @@ impl Orchestrator {
         let LockAgeAudit {
             project_dir,
             cutoff,
+            exemptions,
             baseline,
             preferred,
             adapter,
@@ -394,7 +307,6 @@ impl Orchestrator {
             budget,
         } = *audit;
         let lock_path = project_dir.join("Cargo.lock");
-        let exemptions = self.resolved_age_exemptions();
         let mut log = AdjustmentLog::default();
         // 1 件ずつの `--precise` を試した組合せ。成否によらず 1 件ずつは再試行しない。
         // resolver 制約で失敗した組合せを 1 件ずつ試し直すと、パスごとに同じ
@@ -506,7 +418,7 @@ impl Orchestrator {
                         cutoff,
                         preferred.get(name).map(Vec::as_slice),
                         baseline.get(name).map(Vec::as_slice),
-                        &exemptions,
+                        exemptions,
                     ) else {
                         log.record(name, current, None, LockAgeStatus::NoOlderCandidate);
                         continue;
@@ -1037,30 +949,13 @@ impl Orchestrator {
             };
         }
 
-        let filter = self.build_filter();
-
         // mise のバージョン解決は `mise` コマンドに委譲するため、未インストールなら
         // 依存ごとに同じ fetch エラーを並べる前にマニフェストごと外す。
         let manifests = self.filter_out_unusable_mise_manifests(manifests);
         let manifests = manifests.as_slice();
 
         let parsed = self.parse_phase(manifests, progress, &mut errors);
-        if filter.min_age.is_some()
-            && !filter.age_exempt.is_empty()
-            && parsed.iter().any(|manifest| {
-                !manifest.dependencies.is_empty()
-                    && !matches!(
-                        manifest.info.language,
-                        Language::Rust | Language::Go | Language::Swift
-                    )
-            })
-        {
-            eprintln!(
-                "Notice: age_exempt.github is unavailable for other registries; their dependencies retain the age filter"
-            );
-        }
-        let judge = UpdateJudge::new(filter);
-        self.check_phase(parsed, &judge, progress, &mut summary, &mut errors)
+        self.check_phase(parsed, progress, &mut summary, &mut errors)
             .await;
         self.sync_tauri_if_needed(manifests, progress, &mut summary, &mut errors)
             .await;
@@ -1108,7 +1003,7 @@ impl Orchestrator {
                 }
             };
             if info.language == Language::Rust {
-                enrich_with_cargo_lock(&info.path, &self.args.path, &mut dependencies);
+                enrich_with_cargo_lock(&info.path, &self.rust_lock_boundary(), &mut dependencies);
             }
             parsed.push(ParsedManifest { info, dependencies });
         }
@@ -1120,7 +1015,6 @@ impl Orchestrator {
     async fn check_phase<'a>(
         &self,
         parsed: Vec<ParsedManifest<'a>>,
-        judge: &UpdateJudge,
         progress: &mut Progress,
         summary: &mut UpdateSummary,
         errors: &mut Vec<OrchestratorError>,
@@ -1130,10 +1024,42 @@ impl Orchestrator {
         let progress_bar = progress.bar();
 
         for ParsedManifest { info, dependencies } in parsed {
+            let dir = info.path.parent().unwrap_or(&self.args.path);
+            let mut filter = self.build_filter_for(dir);
+            let policy = match self.resolved_age_policy_for_language(dir, info.language) {
+                Ok(policy) => policy,
+                Err(message) => {
+                    errors.push(OrchestratorError::ManifestParseError {
+                        path: info.path.display().to_string(),
+                        message,
+                    });
+                    continue;
+                }
+            };
+            filter.min_age = policy.min_age;
+            filter.age_exempt = policy.exemptions.clone();
+            if filter.min_age.is_some()
+                && !filter.age_exempt.is_empty()
+                && !dependencies.is_empty()
+                && !matches!(
+                    info.language,
+                    Language::Rust | Language::Go | Language::Swift
+                )
+            {
+                eprintln!(
+                    "Notice: age_exempt.github is unavailable for other registries; their dependencies retain the age filter"
+                );
+            }
+            let judge = UpdateJudge::with_time(filter, self.evaluated_at);
+            let judge = &judge;
             let mut manifest_result = ManifestUpdateResult::new(&info.path, info.language);
             // 複数 future から共有するため Arc に変換
-            let adapter: Arc<dyn RegistryAdapter + Send + Sync> =
-                Arc::from(self.get_adapter(info.language));
+            let adapter: Arc<dyn RegistryAdapter + Send + Sync> = if info.language == Language::Mise
+            {
+                Arc::new(MiseAdapter::for_project(dir, policy.cutoff()))
+            } else {
+                Arc::from(self.get_adapter(info.language))
+            };
 
             // 依存数に応じて並列度を調整 (1〜4)。
             // 結果は入力順で返るため出力順は安定する (`buffered`: ordered)。
@@ -1196,7 +1122,13 @@ impl Orchestrator {
             return;
         }
         progress.spinner("Synchronizing Tauri versions...");
-        self.synchronize_tauri_versions(summary, errors).await;
+        for manifest in manifests.iter().filter(|manifest| manifest.is_tauri_rust) {
+            let Some(project_dir) = manifest.path.parent().and_then(Path::parent) else {
+                continue;
+            };
+            self.synchronize_tauri_versions(summary, errors, project_dir)
+                .await;
+        }
         progress.finish_and_clear();
     }
 
@@ -1226,7 +1158,12 @@ impl Orchestrator {
     }
 
     /// CLI引数からUpdateFilterを構築する
+    #[cfg(test)]
     fn build_filter(&self) -> UpdateFilter {
+        self.build_filter_for(&self.args.path)
+    }
+
+    fn build_filter_for(&self, dir: &Path) -> UpdateFilter {
         let mut filter = UpdateFilter::new();
 
         // 言語フィルタ
@@ -1248,25 +1185,17 @@ impl Orchestrator {
             filter = filter.with_include_pinned(true);
         }
 
-        // 経過日数フィルタ (解決ロジックは `resolve_age` / `resolve_age_policy` に分離)
-        let resolved = self.resolve_age();
-        if let Some(notice) = resolved.notice.as_ref() {
-            emit_age_notice(notice);
-        }
-        if let Some(age) = resolved.duration {
-            filter = filter.with_min_age(age);
-        }
-        filter.age_exempt = self.resolved_age_exemptions();
-        if let Some(config) = &self.global_config
-            && !config.age_exempt.is_empty()
-            && filter.min_age.is_some()
-            && filter.age_exempt.is_empty()
-        {
-            eprintln!("Warning: project minimumReleaseAge takes precedence over age_exempt");
-        }
-        // mise の除外設定・ツール単位の age は depup 側で解釈しないため、食い違いを通知する
+        let resolved = age::resolve(
+            &self.args,
+            self.global_config.as_ref(),
+            dir,
+            self.evaluated_at,
+        );
+        resolved.emit_notice();
+        filter.min_age = resolved.policy.min_age;
+        filter.age_exempt = resolved.policy.exemptions;
+        // mise の除外設定は depup 側で解釈しないため、食い違いを通知する
         self.warn_mise_age_excludes();
-        self.warn_mise_tool_age_overrides();
 
         // 変更レベル上限
         if let Some(level) = self.args.max_change {
@@ -1276,72 +1205,46 @@ impl Orchestrator {
         filter
     }
 
-    /// age 制約を優先順位どおりに解決する。
-    /// judge (`build_filter`) と install フェーズ (`resolved_min_age`) で同じ解決ロジックを
-    /// 共有し、direct deps と transitive deps の age ポリシーを揃える。
-    fn resolve_age(&self) -> ResolvedAge {
-        let project_age = self.read_project_minimum_release_age();
-        resolve_age_policy(
-            project_age.as_ref(),
-            self.args.age,
-            self.args.no_age,
-            self.global_config.as_ref().and_then(|c| c.age_duration()),
+    /// ディレクトリの明示設定と実行ルート内の祖先設定から age を解決する。
+    pub fn resolved_age_policy_for(&self, dir: &Path) -> AgePolicy {
+        age::resolve(
+            &self.args,
+            self.global_config.as_ref(),
+            dir,
+            self.evaluated_at,
         )
+        .policy
     }
 
-    /// install フェーズ (PM install / Rust lock audit) に適用する解決済み age を返す。
-    /// judge と同じ優先順位で解決するため、CLI `--age` 未指定でもプロジェクト
-    /// minimumReleaseAge / グローバル設定 / 組み込みデフォルト (1w) が transitive 依存へ反映される。
-    /// notice は `build_filter` で既に発行済みのため、ここでは再発行しない。
-    pub fn resolved_min_age(&self) -> Option<Duration> {
-        self.resolve_age().duration
-    }
-
-    fn resolved_age_exemptions(&self) -> crate::update::AgeExemptions {
-        if self.read_project_minimum_release_age().is_some() {
-            return crate::update::AgeExemptions::default();
-        }
-        self.global_config
-            .as_ref()
-            .map(|config| config.age_exempt.clone())
-            .unwrap_or_default()
-    }
-
-    /// プロジェクト直下の minimumReleaseAge 設定を読む。
-    /// pnpm (`pnpm-workspace.yaml` / `.npmrc` / `package.json`)、
-    /// bun (`bunfig.toml`)、mise (`mise.toml` などの `[settings]`) を見て、
-    /// 複数ある場合はより厳しい方 (max) を採用する。
-    ///
-    /// mise 側の既定値 (24h) は「明示設定なし」なので採用しない。ファイルに
-    /// `minimum_release_age` が書かれている場合だけプロジェクトポリシーとして扱う。
-    fn read_project_minimum_release_age(&self) -> Option<ProjectAge> {
-        let mut candidates: Vec<(Duration, String)> = Vec::new();
-
-        if has_pnpm_workspace(&self.args.path)
-            && let Some((age, source)) =
-                PnpmSettings::minimum_release_age_with_source(&self.args.path)
+    /// PM 自身の明示設定を含め、より厳しい値を維持する。
+    pub fn resolved_age_policy_for_language(
+        &self,
+        dir: &Path,
+        language: Language,
+    ) -> Result<AgePolicy, String> {
+        let mut policy = self.resolved_age_policy_for(dir);
+        if let Some(age) =
+            crate::manifest::native_age::native_min_age(language, dir, self.evaluated_at)?
         {
-            // source は実際に値が読まれたファイル (.npmrc / pnpm-workspace.yaml / package.json)
-            candidates.push((age, source.to_string()));
+            policy.min_age = policy.min_age.max(Some(age));
+            policy.exemptions = crate::update::AgeExemptions::default();
         }
-        if has_bunfig(&self.args.path) {
-            let bun = BunSettings::from_dir(&self.args.path);
-            if let Some(age) = bun.minimum_release_age {
-                candidates.push((age, "bunfig.toml".to_string()));
-            }
-        }
-        if has_mise_config(&self.args.path) {
-            let mise = MiseSettings::from_dir(&self.args.path);
-            if let Some(age) = mise.minimum_release_age {
-                let source = mise.source.unwrap_or_else(|| "mise.toml".to_string());
-                candidates.push((age, source));
-            }
-        }
+        Ok(policy)
+    }
 
-        candidates
-            .into_iter()
-            .max_by_key(|(d, _)| *d)
-            .map(|(duration, source)| ProjectAge { duration, source })
+    /// member 内で起動した場合も、cargo が実際に更新する workspace lock を監査する。
+    pub fn rust_lock_boundary(&self) -> PathBuf {
+        age::cargo_workspace_root(&self.args.path)
+    }
+
+    /// 実行ルートの age (既存のライブラリ API)。
+    pub fn resolved_min_age(&self) -> Option<Duration> {
+        self.resolved_age_policy_for(&self.args.path).min_age
+    }
+
+    #[cfg(test)]
+    fn resolved_age_exemptions(&self) -> crate::update::AgeExemptions {
+        self.resolved_age_policy_for(&self.args.path).exemptions
     }
 
     /// `mise` コマンドが無い環境では mise マニフェストを処理対象から外す。
@@ -1396,33 +1299,6 @@ impl Orchestrator {
         eprintln!("{}", msg.yellow());
     }
 
-    /// mise のツール単位 `minimum_release_age` も depup 側では解釈しないため通知する。
-    ///
-    /// `[settings]` の値はプロジェクトポリシーとして CLI を上書きするが、
-    /// `node = { version = "22", minimum_release_age = "30d" }` のようなツール単位の
-    /// 指定は depup が読まない。黙って無視すると、そのツールだけ depup と
-    /// `mise install` の結果が食い違う (excludes 側には既に警告があるのに
-    /// こちらだけ無言、という非対称も解消する)。
-    fn warn_mise_tool_age_overrides(&self) {
-        use colored::Colorize as _;
-        if !has_mise_config(&self.args.path) {
-            return;
-        }
-        let overrides = MiseSettings::tool_minimum_release_ages_from_dir(&self.args.path);
-        if overrides.is_empty() {
-            return;
-        }
-        let listed = overrides
-            .iter()
-            .map(|entry| format!("{} = {}", entry.tool, entry.raw))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let msg = format!(
-            "⚠ mise's per-tool minimum_release_age ({listed}) is not applied by depup: the resolved project/CLI age is used for all tools"
-        );
-        eprintln!("{}", msg.yellow());
-    }
-
     /// CLI引数に基づいて言語を処理すべきかチェックする
     fn should_process_language(&self, language: Language) -> bool {
         if !self.args.has_language_filter() {
@@ -1466,6 +1342,15 @@ impl Orchestrator {
         adapter: &(dyn RegistryAdapter + Send + Sync),
         package: &str,
     ) -> Result<Vec<VersionInfo>, String> {
+        // mise は現在ディレクトリと native age により一覧自体が変わる。
+        // その一覧を別の age スコープへ再利用しない (mise 自身のリモートキャッシュは使える)。
+        if adapter.language() == Language::Mise {
+            let _permit = self.general_semaphore.acquire().await.unwrap();
+            return adapter
+                .fetch_versions(package)
+                .await
+                .map_err(|error| error.to_string());
+        }
         let cache_key = (adapter.language(), package.to_string());
 
         // まずキャッシュを確認
@@ -1526,19 +1411,22 @@ impl Orchestrator {
         &self,
         summary: &mut UpdateSummary,
         errors: &mut Vec<OrchestratorError>,
+        project_dir: &Path,
     ) {
         // Nodeマニフェスト内の全Tauri npmパッケージを検索
         // 戻り値: Vec<(manifest_idx, result_idx, result, current_version)>
         let npm_packages: Vec<(usize, usize, UpdateResult, String)> =
-            collect_tauri_packages(summary, Language::Node, |name| {
+            collect_tauri_packages(summary, project_dir, Language::Node, |name| {
                 TAURI_NPM_PACKAGES.contains(&name)
             });
 
         // Rustマニフェスト内のtauri crateを検索
         let crate_info: Option<(usize, usize, UpdateResult, String)> =
-            collect_tauri_packages(summary, Language::Rust, |name| name == TAURI_CRATE)
-                .into_iter()
-                .next();
+            collect_tauri_packages(summary, project_dir, Language::Rust, |name| {
+                name == TAURI_CRATE
+            })
+            .into_iter()
+            .next();
 
         // tauriパッケージが一つも見つからなければ、同期不要
         if npm_packages.is_empty() && crate_info.is_none() {
@@ -1581,7 +1469,7 @@ impl Orchestrator {
 
         // バージョンが不一致 - 同期が必要。両レジストリから候補を取得する
         let Some((npm_versions, crate_versions, cutoff)) =
-            self.fetch_tauri_sync_versions(errors).await
+            self.fetch_tauri_sync_versions(errors, project_dir).await
         else {
             return;
         };
@@ -1615,7 +1503,8 @@ impl Orchestrator {
                 *result_idx,
                 original,
                 target.clone(),
-                cutoff
+                self.resolved_age_policy_for(&project_dir.join("src-tauri"))
+                    .cutoff()
                     .and_then(|cutoff| {
                         crate_versions
                             .iter()
@@ -1623,7 +1512,8 @@ impl Orchestrator {
                             .filter(|info| info.released_at > cutoff)
                     })
                     .and_then(|info| {
-                        self.resolved_age_exemptions()
+                        self.resolved_age_policy_for(&project_dir.join("src-tauri"))
+                            .exemptions
                             .exemption(Language::Rust, TAURI_CRATE, info)
                     }),
             );
@@ -1637,6 +1527,7 @@ impl Orchestrator {
     async fn fetch_tauri_sync_versions(
         &self,
         errors: &mut Vec<OrchestratorError>,
+        project_dir: &Path,
     ) -> Option<(
         Vec<VersionInfo>,
         Vec<VersionInfo>,
@@ -1670,21 +1561,24 @@ impl Orchestrator {
 
         // 同期先の候補にも judge と同じ解決済み age を適用する
         // (同期が age ポリシーを迂回して新しすぎるバージョンを書かないように)
-        let cutoff = self.resolved_min_age().and_then(crate::domain::cutoff_now);
+        let npm_policy = self.resolved_age_policy_for(project_dir);
+        let crate_policy = self.resolved_age_policy_for(&project_dir.join("src-tauri"));
+        let cutoff = npm_policy.cutoff();
+        let crate_cutoff = crate_policy.cutoff();
         Some((
             filter_versions_by_cutoff(
                 npm_versions,
                 cutoff,
                 Language::Node,
                 TAURI_NPM_PACKAGES[0],
-                &self.resolved_age_exemptions(),
+                &npm_policy.exemptions,
             ),
             filter_versions_by_cutoff(
                 crate_versions,
-                cutoff,
+                crate_cutoff,
                 Language::Rust,
                 TAURI_CRATE,
-                &self.resolved_age_exemptions(),
+                &crate_policy.exemptions,
             ),
             cutoff,
         ))
@@ -1715,7 +1609,14 @@ impl Orchestrator {
                             cutoff,
                             Language::Node,
                             pkg_name,
-                            &self.resolved_age_exemptions(),
+                            &self
+                                .resolved_age_policy_for(
+                                    summary.manifests[*manifest_idx]
+                                        .path
+                                        .parent()
+                                        .unwrap_or(&self.args.path),
+                                )
+                                .exemptions,
                         );
                         pick_sync_version(&vs, target)
                     }
@@ -1868,6 +1769,7 @@ struct LockAgeAudit<'a> {
     project_dir: &'a Path,
     /// これより後に公開された版を違反とする
     cutoff: chrono::DateTime<chrono::Utc>,
+    exemptions: &'a crate::update::AgeExemptions,
     /// install 前の Cargo.lock (これと同じ版は監査しない)
     baseline: &'a RegistryLockEntries,
     /// judge がこの実行で選んだ版
@@ -2370,6 +2272,7 @@ fn same_effective_major_minor(npm_version: Option<&str>, crate_version: Option<&
 /// (manifest_idx, result_idx, 結果のクローン, 現在バージョン) を集める。
 fn collect_tauri_packages(
     summary: &UpdateSummary,
+    project_dir: &Path,
     language: Language,
     is_match: impl Fn(&str) -> bool,
 ) -> Vec<(usize, usize, UpdateResult, String)> {
@@ -2377,7 +2280,14 @@ fn collect_tauri_packages(
         .manifests
         .iter()
         .enumerate()
-        .filter(|(_, m)| m.language == language)
+        .filter(|(_, m)| {
+            m.language == language
+                && match language {
+                    Language::Node => m.path == project_dir.join("package.json"),
+                    Language::Rust => m.path == project_dir.join("src-tauri/Cargo.toml"),
+                    _ => false,
+                }
+        })
         .flat_map(|(mi, m)| {
             m.results
                 .iter()
@@ -3147,6 +3057,110 @@ mod git_helper_tests {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn monorepo_candidate_selection_respects_local_age() {
+        let root = TempDir::new().unwrap();
+        let app = root.path().join("app");
+        fs::create_dir_all(&app).unwrap();
+        for dir in [root.path(), app.as_path()] {
+            fs::write(
+                dir.join("package.json"),
+                r#"{"dependencies":{"library":"^1.0.0"}}"#,
+            )
+            .unwrap();
+        }
+        fs::write(app.join(".npmrc"), "minimum-release-age=30d\n").unwrap();
+        let orchestrator = Orchestrator::new(make_args_with_path(
+            root.path(),
+            &["--no-age", "--no-osv", "--dry-run", "--quiet"],
+        ))
+        .unwrap();
+        let now = chrono::Utc::now();
+        orchestrator.version_cache.lock().await.insert(
+            (Language::Node, "library".into()),
+            vec![
+                VersionInfo::new("1.0.0", now - chrono::Duration::days(60)),
+                VersionInfo::new("2.0.0", now - chrono::Duration::days(3)),
+            ],
+        );
+        let result = orchestrator
+            .run_directories(&[root.path().into(), app.clone()])
+            .await;
+        assert!(result.errors.is_empty());
+        let root_result = result
+            .summary
+            .manifests
+            .iter()
+            .find(|manifest| manifest.path == root.path().join("package.json"))
+            .unwrap();
+        let app_result = result
+            .summary
+            .manifests
+            .iter()
+            .find(|manifest| manifest.path == app.join("package.json"))
+            .unwrap();
+        assert_eq!(root_result.updates().count(), 1);
+        assert_eq!(app_result.updates().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn tauri_sync_is_scoped_to_each_project_age_policy() {
+        let root = TempDir::new().unwrap();
+        let app = root.path().join("app");
+        let other = root.path().join("other");
+        for dir in [&app, &other] {
+            fs::create_dir_all(dir.join("src-tauri")).unwrap();
+            fs::write(
+                dir.join("package.json"),
+                r#"{"dependencies":{"@tauri-apps/api":"^2.0.0","@tauri-apps/cli":"^2.0.0"}}"#,
+            )
+            .unwrap();
+            fs::write(
+                dir.join("src-tauri/Cargo.toml"),
+                "[package]\nname = 'app'\nversion = '0.1.0'\n[dependencies]\ntauri = '2.0.0'\n",
+            )
+            .unwrap();
+        }
+        fs::write(other.join(".npmrc"), "minimum-release-age=30d\n").unwrap();
+        let orchestrator = Orchestrator::new(make_args_with_path(
+            root.path(),
+            &["--no-age", "--no-osv", "--dry-run", "--quiet"],
+        ))
+        .unwrap();
+        let now = chrono::Utc::now();
+        let versions = vec![
+            VersionInfo::new("2.0.1", now - chrono::Duration::days(60)),
+            VersionInfo::new("2.2.0", now - chrono::Duration::days(3)),
+        ];
+        let mut npm_versions = versions.clone();
+        npm_versions.push(VersionInfo::new("2.3.0", now - chrono::Duration::days(3)));
+        {
+            let mut cache = orchestrator.version_cache.lock().await;
+            for name in TAURI_NPM_PACKAGES {
+                cache.insert((Language::Node, (*name).into()), npm_versions.clone());
+            }
+            cache.insert((Language::Rust, TAURI_CRATE.into()), versions);
+        }
+        let result = orchestrator
+            .run_directories(&[app.clone(), other.clone()])
+            .await;
+        assert!(result.errors.is_empty());
+        for manifest in &result.summary.manifests {
+            let expected = if manifest.path.starts_with(&other) {
+                "2.0.1"
+            } else {
+                "2.2.0"
+            };
+            for update in manifest.updates() {
+                assert!(
+                    matches!(update, UpdateResult::Update { new_version, .. } if new_version == expected),
+                    "{update:?}"
+                );
+            }
+            assert!(manifest.has_updates());
+        }
+    }
+
     #[test]
     fn explicit_project_age_overrides_global_publisher_exemptions() {
         use crate::domain::{VersionSpec, VersionSpecKind};
@@ -3848,6 +3862,7 @@ mod lock_age_audit_tests {
                 &LockAgeAudit {
                     project_dir: project.path(),
                     cutoff: cutoff(),
+                    exemptions: &orchestrator.resolved_age_exemptions(),
                     baseline: &baseline,
                     preferred: &PreferredVersions::new(),
                     adapter: &dates,
@@ -3943,6 +3958,7 @@ mod lock_age_audit_tests {
         let audit = LockAgeAudit {
             project_dir: project.path(),
             cutoff: cutoff(),
+            exemptions: &crate::update::AgeExemptions::default(),
             baseline,
             preferred,
             adapter,
@@ -4318,6 +4334,7 @@ mod lock_age_audit_tests {
         let audit = LockAgeAudit {
             project_dir: project.path(),
             cutoff: cutoff(),
+            exemptions: &crate::update::AgeExemptions::default(),
             baseline: &baseline,
             preferred: &PreferredVersions::new(),
             adapter: &dates,
@@ -4387,6 +4404,7 @@ mod lock_age_audit_tests {
         let audit = LockAgeAudit {
             project_dir: project.path(),
             cutoff: cutoff(),
+            exemptions: &crate::update::AgeExemptions::default(),
             baseline: &baseline,
             preferred: &PreferredVersions::new(),
             adapter: &dates,

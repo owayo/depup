@@ -3,8 +3,48 @@
 use crate::domain::Language;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 use super::VersionInfo;
+
+/// 候補選択・同期・install・lock 監査で共有する、解決済みの age 制約。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgePolicy {
+    pub min_age: Option<Duration>,
+    pub evaluated_at: DateTime<Utc>,
+    pub exemptions: AgeExemptions,
+}
+
+impl AgePolicy {
+    pub fn cutoff(&self) -> Option<DateTime<Utc>> {
+        self.min_age
+            .and_then(|age| crate::domain::cutoff_from(self.evaluated_at, age))
+    }
+
+    /// install 中に時間が進んでも、候補選択時の境界を緩めない。
+    pub fn install_min_age(&self) -> Option<Duration> {
+        self.cutoff()
+            .map(|cutoff| (Utc::now() - cutoff).to_std().unwrap_or_default())
+    }
+
+    /// 同じ install / lock を共有するマニフェストの制約をすべて守る。
+    pub fn merge(&mut self, other: &Self) {
+        let cutoff = match (self.cutoff(), other.cutoff()) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (left, right) => left.or(right),
+        };
+        self.evaluated_at = self.evaluated_at.max(other.evaluated_at);
+        self.min_age =
+            cutoff.map(|cutoff| (self.evaluated_at - cutoff).to_std().unwrap_or_default());
+        self.exemptions.github.retain(|login| {
+            other
+                .exemptions
+                .github
+                .iter()
+                .any(|other| login.eq_ignore_ascii_case(other))
+        });
+    }
+}
 
 /// GitHub の身元をレジストリが確認した、版ごとの公開者情報。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +175,35 @@ fn github_owner_repo(path: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_policy_keeps_the_oldest_cutoff_and_common_exemptions() {
+        let mut policy = AgePolicy {
+            min_age: Some(Duration::from_secs(14 * 86400)),
+            evaluated_at: "2026-10-01T00:00:00Z".parse().unwrap(),
+            exemptions: AgeExemptions {
+                github: vec!["example-dev".into(), "another-dev".into()],
+            },
+        };
+        let cutoff = policy.cutoff().unwrap();
+        let other = AgePolicy {
+            min_age: Some(Duration::from_secs(7 * 86400)),
+            evaluated_at: "2026-10-04T00:00:00Z".parse().unwrap(),
+            exemptions: AgeExemptions {
+                github: vec!["EXAMPLE-DEV".into()],
+            },
+        };
+        policy.merge(&other);
+        assert_eq!(policy.cutoff(), Some(cutoff));
+        assert_eq!(policy.exemptions.github, ["example-dev"]);
+        policy.merge(&AgePolicy {
+            min_age: None,
+            exemptions: Default::default(),
+            ..other
+        });
+        assert_eq!(policy.cutoff(), Some(cutoff));
+        assert!(policy.exemptions.is_empty());
+    }
 
     #[test]
     fn only_configured_and_verified_identities_bypass_age() {

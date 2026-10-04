@@ -9,10 +9,9 @@
 //! [{"version":"26.8.1","created_at":"2026-08-26T13:05:28.0Z"}, ...]
 //! ```
 //!
-//! `--minimum-release-age 0` は必須。mise 側の `minimum_release_age` (既定 24h) が
-//! 効いたままだと新しい版が最初から隠れてしまい、depup の age 判定
-//! (`--age` / プロジェクト設定 / 既定 1w) と二重にフィルタが掛かる。
-//! age の適用は depup 側に一本化する。
+//! マニフェストのディレクトリで、解決済みの age を CLI フラグとして渡す。
+//! native 設定を弱めず、公開日を返さないバックエンドの処理も mise に委譲する。
+//! age が無効の場合だけ `0` を渡す。
 
 use super::RegistryAdapter;
 use crate::domain::Language;
@@ -49,6 +48,8 @@ struct MiseRemoteVersion {
 pub struct MiseAdapter {
     /// 実行する mise のプログラム名 (テストでは差し替える)
     program: String,
+    directory: Option<std::path::PathBuf>,
+    cutoff: Option<DateTime<Utc>>,
 }
 
 impl Default for MiseAdapter {
@@ -62,6 +63,17 @@ impl MiseAdapter {
     pub fn new() -> Self {
         Self {
             program: "mise".to_string(),
+            directory: None,
+            cutoff: None,
+        }
+    }
+
+    /// マニフェストのスコープで native age を適用する。公開日を返さない backend にも委譲する。
+    pub fn for_project(dir: &std::path::Path, cutoff: Option<DateTime<Utc>>) -> Self {
+        Self {
+            directory: Some(dir.to_path_buf()),
+            cutoff,
+            ..Self::new()
         }
     }
 
@@ -70,6 +82,8 @@ impl MiseAdapter {
     fn with_program(program: impl Into<String>) -> Self {
         Self {
             program: program.into(),
+            directory: None,
+            cutoff: None,
         }
     }
 
@@ -213,19 +227,24 @@ impl RegistryAdapter for MiseAdapter {
             });
         }
 
-        let output_future = Command::new(&self.program)
+        let age = self
+            .cutoff
+            .map(|cutoff| cutoff.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+            .unwrap_or_else(|| "0".into());
+        let mut command = Command::new(&self.program);
+        if let Some(dir) = &self.directory {
+            command.current_dir(dir);
+        }
+        let output_future = command
             .arg("ls-remote")
             .arg("--json")
-            // mise 側の minimum_release_age を無効化し、age 判定は depup に一本化する。
-            // フラグと env の両方で無効化しておく (どちらか一方しか効かない
-            // バージョンでも取りこぼさないための二重防御)。
             .arg("--minimum-release-age")
-            .arg("0")
+            .arg(&age)
             // 以降を位置引数として扱わせ、`-` 始まりのツール名がオプションに
             // 化けるのを防ぐ
             .arg("--")
             .arg(package)
-            .env("MISE_MINIMUM_RELEASE_AGE", "0")
+            .env("MISE_MINIMUM_RELEASE_AGE", &age)
             // 対話プロンプト (未信頼 config の確認など) で止まらないようにする
             .env("MISE_YES", "1")
             .env("MISE_QUIET", "1")
@@ -370,6 +389,43 @@ mod tests {
         assert!(
             matches!(err, RegistryError::NetworkError { .. }),
             "expected the tool name to pass validation, got: {err:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn project_scope_and_cutoff_reach_the_mise_subprocess() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("mise-test");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' \"$PWD\" \"$@\" > invocation\nprintf '[]'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let cutoff = "2026-09-17T00:00:00Z".parse().unwrap();
+        let adapter = MiseAdapter {
+            program: script.to_string_lossy().into(),
+            ..MiseAdapter::for_project(dir.path(), Some(cutoff))
+        };
+        adapter.fetch_versions("node").await.unwrap();
+        let invocation = std::fs::read_to_string(dir.path().join("invocation")).unwrap();
+        let lines: Vec<_> = invocation.lines().collect();
+        assert_eq!(
+            std::fs::canonicalize(lines[0]).unwrap(),
+            std::fs::canonicalize(dir.path()).unwrap()
+        );
+        assert_eq!(
+            &lines[1..],
+            [
+                "ls-remote",
+                "--json",
+                "--minimum-release-age",
+                "2026-09-17T00:00:00Z",
+                "--",
+                "node"
+            ]
         );
     }
 

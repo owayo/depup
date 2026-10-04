@@ -9,7 +9,7 @@ pub(crate) mod age_policy;
 mod filter;
 mod version_info;
 
-pub use age_policy::{AgeExemption, AgeExemptions, PublisherEvidence};
+pub use age_policy::{AgeExemption, AgeExemptions, AgePolicy, PublisherEvidence};
 pub use filter::UpdateFilter;
 pub(crate) use version_info::{NumericIdentifier, numeric_core};
 pub use version_info::{

@@ -172,22 +172,41 @@ impl SystemPackageManager {
     ///
     /// `min_age` が指定されていれば CLI フラグでネイティブに受ける PM のみここで追加する:
     /// - uv: `--exclude-newer <RFC3339 datetime>` (公式 CLI フラグ)
+    /// - mise: `--minimum-release-age <期間>` (ツール単位の設定も上書きする)
     ///
     /// pnpm は `minimumReleaseAge` 用の公式 CLI フラグが無い (pnpm v10.33 時点で
     /// 未実装: https://github.com/pnpm/pnpm/issues/11224) ため、引数ではなく
     /// 環境変数経由で指定する。`get_install_env` を参照。
+    #[cfg(test)]
     fn get_install_command_args(&self, pm: &str, min_age: Option<Duration>) -> Vec<String> {
-        let base: Vec<&'static str> = self.get_install_command(pm);
-        let mut out: Vec<String> = base.into_iter().map(String::from).collect();
-        if let Some(age) = min_age
-            && pm == "uv"
-        {
-            // uv: `--exclude-newer <RFC3339>` で指定日時以降にリリースされた
-            // バージョンを resolve から除外する (transitive 含む)。
-            if let Some(cutoff) = crate::domain::cutoff_now(age) {
-                out.push("--exclude-newer".to_string());
-                out.push(cutoff.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+        self.get_install_command_args_for_policy(
+            pm,
+            &crate::update::AgePolicy {
+                min_age,
+                evaluated_at: chrono::Utc::now(),
+                exemptions: Default::default(),
+            },
+        )
+    }
+
+    fn get_install_command_args_for_policy(
+        &self,
+        pm: &str,
+        policy: &crate::update::AgePolicy,
+    ) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .get_install_command(pm)
+            .into_iter()
+            .map(String::from)
+            .collect();
+        if let Some(cutoff) = policy.cutoff() {
+            match pm {
+                "uv" => out.push("--exclude-newer".into()),
+                "mise" => out.push("--minimum-release-age".into()),
+                _ => return out,
             }
+            // 絶対日時を渡して、子プロセス開始までの待ち時間で境界を動かさない。
+            out.push(cutoff.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
         }
         out
     }
@@ -214,7 +233,9 @@ impl SystemPackageManager {
         if let Some(age) = min_age
             && pm == "pnpm"
         {
-            let minutes = age.as_secs() / 60;
+            // 分への切り捨てでプロジェクトの秒単位の制約を弱めない。
+            let minutes = age.as_secs().div_ceil(60)
+                + u64::from(age.subsec_nanos() != 0 && age.as_secs().is_multiple_of(60));
             env.push((
                 "npm_config_minimum_release_age".to_string(),
                 minutes.to_string(),
@@ -226,7 +247,7 @@ impl SystemPackageManager {
             // mise は humantime 表記を受け付ける (`604800s` のような秒指定も可)
             env.push((
                 "MISE_MINIMUM_RELEASE_AGE".to_string(),
-                format!("{}s", age.as_secs()),
+                format!("{}s", age.as_secs() + u64::from(age.subsec_nanos() != 0)),
             ));
         }
         if pm == "uv" {
@@ -361,23 +382,24 @@ impl SystemPackageManager {
     }
 }
 
-impl PackageManagerRunner for SystemPackageManager {
-    fn run_install(
+impl SystemPackageManager {
+    /// 候補選択時の cutoff を保持したまま install を実行する。
+    pub fn run_install_with_age_policy(
         &self,
         language: Language,
         working_dir: &Path,
-        min_age: Option<Duration>,
+        policy: &crate::update::AgePolicy,
     ) -> InstallResult {
         let Some((effective_dir, pm)) = self.resolve_package_manager(language, working_dir) else {
             return InstallResult::skipped(language);
         };
 
-        let command_parts = self.get_install_command_args(pm, min_age);
+        let command_parts = self.get_install_command_args_for_policy(pm, policy);
         if command_parts.is_empty() {
             return InstallResult::skipped(language);
         }
 
-        let env = self.get_install_env(pm, min_age);
+        let env = self.get_install_env(pm, policy.install_min_age());
         let command_refs: Vec<&str> = command_parts.iter().map(|s| s.as_str()).collect();
 
         // 表示用コマンド文字列: env var 付与時は `KEY=VALUE cmd args...` で表現
@@ -409,6 +431,25 @@ impl PackageManagerRunner for SystemPackageManager {
     }
 }
 
+impl PackageManagerRunner for SystemPackageManager {
+    fn run_install(
+        &self,
+        language: Language,
+        working_dir: &Path,
+        min_age: Option<Duration>,
+    ) -> InstallResult {
+        self.run_install_with_age_policy(
+            language,
+            working_dir,
+            &crate::update::AgePolicy {
+                min_age,
+                evaluated_at: chrono::Utc::now(),
+                exemptions: Default::default(),
+            },
+        )
+    }
+}
+
 /// 指定された全言語のインストールコマンドを実行する
 pub fn run_installs<R: PackageManagerRunner>(
     runner: &R,
@@ -425,6 +466,20 @@ pub fn run_installs<R: PackageManagerRunner>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uv_and_mise_receive_the_original_absolute_cutoff() {
+        let pm = SystemPackageManager::new();
+        let policy = crate::update::AgePolicy {
+            min_age: Some(Duration::from_secs(14 * 86400)),
+            evaluated_at: "2026-10-01T00:00:00Z".parse().unwrap(),
+            exemptions: Default::default(),
+        };
+        for (manager, flag) in [("uv", "--exclude-newer"), ("mise", "--minimum-release-age")] {
+            let command = pm.get_install_command_args_for_policy(manager, &policy);
+            assert_eq!(&command[2..], [flag, "2026-09-17T00:00:00Z"]);
+        }
+    }
 
     /// テスト用のモックパッケージマネージャランナー
     struct MockPackageManager {
@@ -633,6 +688,23 @@ mod tests {
         let pm = SystemPackageManager::new();
         let env = pm.get_install_env("pnpm", None);
         assert!(env.is_empty());
+    }
+
+    #[test]
+    fn pnpm_age_rounds_up_without_weakening_seconds() {
+        let pm = SystemPackageManager::new();
+        for (age, minutes) in [
+            (Duration::from_secs(0), "0"),
+            (Duration::from_secs(1), "1"),
+            (Duration::from_secs(60), "1"),
+            (Duration::from_secs(61), "2"),
+            (Duration::from_millis(60_001), "2"),
+        ] {
+            assert_eq!(
+                pm.get_install_env("pnpm", Some(age)),
+                vec![("npm_config_minimum_release_age".into(), minutes.into())]
+            );
+        }
     }
 
     #[test]

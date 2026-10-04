@@ -20,7 +20,7 @@ use std::time::Duration;
 /// プロジェクト直下で mise が読む設定ファイル (優先度の高い順)。
 ///
 /// `mise.local.toml` / `.mise.local.toml` は個人のローカル上書き (通常 gitignore)
-/// なので、depup は更新対象にも age の読み取り元にもしない。
+/// なので更新対象にはしない。native age の解決では明示制約を読み取る。
 pub const MISE_CONFIG_FILENAMES: &[&str] = &[
     "mise.toml",
     ".mise.toml",
@@ -105,7 +105,7 @@ impl MiseSettings {
 pub struct ToolMinimumReleaseAge {
     /// ツール名 (`[tools]` のキー)
     pub tool: String,
-    /// 設定値の生表記 (`"30d"`)。警告表示に使う
+    /// 設定値の生表記 (`"30d"`)。native age の解決に使う
     pub raw: String,
     /// 相対表記として解釈できた場合の値 (絶対日付などは `None`)
     pub age: Option<Duration>,
@@ -126,10 +126,8 @@ impl MiseSettings {
     /// node = { version = "22", minimum_release_age = "30d" }
     /// ```
     ///
-    /// depup は age を「プロジェクト全体で 1 つの値」として judge / install に渡すため、
-    /// ツール単位の値は適用できない。黙って無視すると mise 側の解決結果と depup の
-    /// 報告が食い違うので、`minimum_release_age_excludes` と同じく呼び出し側が警告を
-    /// 出せるように検出結果を返す。
+    /// native age の解決で使う。ツール単位の値も集め、スコープ内の最も厳しい
+    /// 制約を judge / install へ渡せるようにする。
     ///
     /// dotted key (`node.minimum_release_age = "30d"`) も toml クレートが inline table と
     /// 同じ構造へ畳むためそのまま拾える。返り値はツール名の昇順で安定させる。
@@ -141,20 +139,31 @@ impl MiseSettings {
             return Vec::new();
         };
 
-        let mut found: Vec<ToolMinimumReleaseAge> = tools
-            .iter()
-            .filter_map(|(tool, value)| {
+        let mut found = Vec::new();
+        for (tool, value) in tools {
+            // mise install は複数バージョンの table 配列も読む。更新対象外でも制約を維持する。
+            let entries: &[toml::Value] = value
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_else(|| std::slice::from_ref(value));
+            for entry in entries {
+                let Some(value) = entry.get("minimum_release_age") else {
+                    continue;
+                };
+                if value.as_bool() == Some(false) {
+                    continue;
+                }
                 let raw = value
-                    .as_table()?
-                    .get("minimum_release_age")
-                    .and_then(|v| v.as_str())?;
-                Some(ToolMinimumReleaseAge {
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| value.to_string());
+                found.push(ToolMinimumReleaseAge {
                     tool: tool.trim().to_string(),
-                    raw: raw.to_string(),
-                    age: parse_mise_duration(raw),
-                })
-            })
-            .collect();
+                    age: parse_mise_duration(&raw),
+                    raw,
+                });
+            }
+        }
 
         // TOML のテーブルは順序を保持しないため、表示順を安定させる
         found.sort_by(|a, b| a.tool.cmp(&b.tool));
@@ -207,7 +216,7 @@ pub fn mise_config_paths(dir: &Path) -> Vec<PathBuf> {
 /// `mise ls-remote --minimum-release-age` は絶対日付 (`2024-06-01`) も受け付けるが、
 /// depup の age は「現在からの経過時間」なので相対表記だけを採用し、
 /// 絶対日付は `None` (設定なし扱い) にする。
-fn parse_mise_duration(value: &str) -> Option<Duration> {
+pub(super) fn parse_mise_duration(value: &str) -> Option<Duration> {
     let text = value.trim();
     if text.is_empty() {
         return None;

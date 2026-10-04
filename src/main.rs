@@ -22,8 +22,9 @@ use depup::orchestrator::{
     OrchestratorResult, PreferredVersions,
 };
 use depup::output::{OutputConfig, create_formatter};
-use depup::package_manager::{SystemPackageManager, run_installs};
+use depup::package_manager::SystemPackageManager;
 use depup::progress::Progress;
+use depup::update::AgePolicy;
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -137,31 +138,14 @@ async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
 
     // dry-run でない場合、要求があればパッケージマネージャの install を実行
     if args.install && !args.dry_run {
-        // install フェーズも judge と同じ解決済み age を使う。
-        // これにより direct deps と install 後の transitive 依存で age ポリシーが揃う
-        // (CLI --age 未指定でもプロジェクト minimumReleaseAge / グローバル設定 / デフォルト 1w が反映される)。
-        let install_min_age = orchestrator.resolved_min_age();
-
-        // install 前の Cargo.lock を控えておく。post-install の age 監査は
-        // 「install で新しく入った / 版が変わった」依存だけを対象にする
-        // (crates.io は 1 リクエスト/秒 のため lock 全体を舐めると数分かかる)。
-        let lock_baselines = if install_min_age.is_some() {
-            collect_rust_lock_baselines(&args, &result)
-        } else {
-            HashMap::new()
-        };
-
-        run_package_installs(&args, &result, &monorepo_dirs, install_min_age)?;
-
-        // install で変わった Cargo.lock の crate (直接依存・推移依存とも) が
-        // age 制約を満たすよう差し戻す。
-        if let Some(age) = install_min_age {
-            enforce_rust_lock_age(&args, &orchestrator, &result, &lock_baselines, age).await;
-        }
+        let lock_baselines =
+            collect_rust_lock_baselines(&orchestrator.rust_lock_boundary(), &result);
+        run_package_installs(&args, &result, &monorepo_dirs, &orchestrator)?;
+        enforce_rust_lock_age(&args, &orchestrator, &result, &lock_baselines).await;
 
         // 画面に出した更新先と、実際に Cargo.lock へ入った版の食い違いを知らせる。
         // 結果の一覧は install 前に出しているので、ここで別に注記する
-        report_rust_lock_mismatches(&args, &result);
+        report_rust_lock_mismatches(&orchestrator.rust_lock_boundary(), &result);
     }
 
     // 適切な終了コードを返す。
@@ -185,7 +169,7 @@ fn run_package_installs(
     args: &CliArgs,
     result: &OrchestratorResult,
     monorepo_dirs: &Option<Vec<PathBuf>>,
-    min_age: Option<std::time::Duration>,
+    orchestrator: &Orchestrator,
 ) -> anyhow::Result<()> {
     // ディレクトリ -> install が必要な言語のマップを構築
     let install_map = build_install_map(result, monorepo_dirs, &args.path);
@@ -199,7 +183,10 @@ fn run_package_installs(
     if args.verbose {
         eprintln!();
         eprintln!("Running package manager install...");
-        if min_age.is_some() {
+        if install_map
+            .iter()
+            .any(|(dir, _)| orchestrator.resolved_age_policy_for(dir).min_age.is_some())
+        {
             // age が有効な場合、transitive 依存へネイティブ対応しない PM を通知する。
             //
             // 判定は言語単位ではなく **実際に選ばれる PM 単位**で行う。Node の
@@ -236,8 +223,9 @@ fn run_package_installs(
     for (dir, languages) in &install_map {
         for language in languages {
             progress.spinner(&format!("Running {} install...", language.display_name()));
-            let install_results =
-                run_installs(&pm_runner, std::slice::from_ref(language), dir, min_age);
+            let policy = install_age_policy(orchestrator, result, dir, *language)
+                .map_err(anyhow::Error::msg)?;
+            let install_results = [pm_runner.run_install_with_age_policy(*language, dir, &policy)];
             progress.finish_and_clear();
 
             for install_result in &install_results {
@@ -277,6 +265,25 @@ fn run_package_installs(
     Ok(())
 }
 
+/// install が解決する配下のマニフェストの age を統合する。
+fn install_age_policy(
+    orchestrator: &Orchestrator,
+    result: &OrchestratorResult,
+    dir: &Path,
+    language: Language,
+) -> Result<AgePolicy, String> {
+    let mut policy = orchestrator.resolved_age_policy_for_language(dir, language)?;
+    for manifest in &result.summary.manifests {
+        if manifest.language == language
+            && manifest.path.starts_with(dir)
+            && let Some(parent) = manifest.path.parent()
+        {
+            policy.merge(&orchestrator.resolved_age_policy_for_language(parent, language)?);
+        }
+    }
+    Ok(policy)
+}
+
 /// 更新対象の Rust プロジェクトについて、install 前の Cargo.lock の内容を控える。
 ///
 /// post-install の age 監査は「install によって新しく入った / 版が変わった」依存だけを
@@ -284,7 +291,7 @@ fn run_package_installs(
 /// ディレクトリは記録しない (install で生成された lock は全エントリが新規となり、
 /// 監査側で空のベースラインとして扱われる)。
 fn collect_rust_lock_baselines(
-    args: &CliArgs,
+    boundary: &Path,
     result: &OrchestratorResult,
 ) -> HashMap<PathBuf, RegistryLockEntries> {
     let mut baselines: HashMap<PathBuf, RegistryLockEntries> = HashMap::new();
@@ -295,7 +302,7 @@ fn collect_rust_lock_baselines(
         let Some(parent) = manifest.path.parent() else {
             continue;
         };
-        let Some(lock_path) = depup::manifest::find_cargo_lock_upward(parent, &args.path) else {
+        let Some(lock_path) = depup::manifest::find_cargo_lock_upward(parent, boundary) else {
             continue;
         };
         let lock_dir = lock_path.parent().unwrap_or(parent).to_path_buf();
@@ -306,6 +313,56 @@ fn collect_rust_lock_baselines(
     baselines
 }
 
+/// 起動場所や更新対象に含まれないメンバーも、共有 lock の制約へ統合する。
+fn collect_rust_lock_policies(
+    orchestrator: &Orchestrator,
+    result: &OrchestratorResult,
+) -> HashMap<PathBuf, AgePolicy> {
+    let boundary = orchestrator.rust_lock_boundary();
+    let mut paths: Vec<PathBuf> = result
+        .summary
+        .manifests
+        .iter()
+        .filter(|manifest| manifest.language == Language::Rust)
+        .map(|manifest| manifest.path.clone())
+        .collect();
+    let mut roots = Vec::new();
+    for path in &paths {
+        if let Some(lock) = path
+            .parent()
+            .and_then(|dir| depup::manifest::find_cargo_lock_upward(dir, &boundary))
+            && let Some(root) = lock.parent()
+            && !roots.iter().any(|dir| dir == root)
+        {
+            roots.push(root.to_path_buf());
+        }
+    }
+    for root in roots {
+        paths.extend(
+            depup::manifest::detect_manifests(&root)
+                .into_iter()
+                .filter(|manifest| manifest.language == Language::Rust)
+                .map(|manifest| manifest.path),
+        );
+    }
+    let mut policies: HashMap<PathBuf, AgePolicy> = HashMap::new();
+    for path in paths {
+        let Some(parent) = path.parent() else {
+            continue;
+        };
+        let Some(lock) = depup::manifest::find_cargo_lock_upward(parent, &boundary) else {
+            continue;
+        };
+        let dir = lock.parent().unwrap_or(parent).to_path_buf();
+        let policy = orchestrator.resolved_age_policy_for(parent);
+        policies
+            .entry(dir)
+            .and_modify(|existing| existing.merge(&policy))
+            .or_insert(policy);
+    }
+    policies
+}
+
 /// Rust プロジェクト (Cargo.toml を含む) ディレクトリに対し、
 /// `--age` を install で変わった crate (直接依存・推移依存とも) にも適用する。
 /// install 済み Cargo.lock を走査し、age 違反の crate を古いバージョンへ差し戻す。
@@ -314,7 +371,6 @@ async fn enforce_rust_lock_age(
     orchestrator: &Orchestrator,
     result: &OrchestratorResult,
     baselines: &HashMap<PathBuf, RegistryLockEntries>,
-    age: std::time::Duration,
 ) {
     // 対象となる Rust プロジェクトディレクトリを収集。
     // workspace メンバーや Tauri (src-tauri) の Cargo.lock はマニフェストと別の
@@ -324,6 +380,7 @@ async fn enforce_rust_lock_age(
     // judge がこの実行で選んだ版 (画面に出した更新先) を lock ごとにまとめる。
     // 差し戻し先の第一候補になるので、差し戻せれば表示と lock の版が揃う
     let mut preferred: HashMap<PathBuf, PreferredVersions> = HashMap::new();
+    let policies = collect_rust_lock_policies(orchestrator, result);
     for manifest in &result.summary.manifests {
         // 更新がなかった Rust manifest は cargo update も走らないため audit 不要
         if manifest.language != Language::Rust || !manifest.has_updates() {
@@ -332,7 +389,9 @@ async fn enforce_rust_lock_age(
         let Some(parent) = manifest.path.parent() else {
             continue;
         };
-        let Some(lock_path) = depup::manifest::find_cargo_lock_upward(parent, &args.path) else {
+        let Some(lock_path) =
+            depup::manifest::find_cargo_lock_upward(parent, &orchestrator.rust_lock_boundary())
+        else {
             if args.verbose {
                 eprintln!(
                     "  {} — Cargo.lock not found; skipping the age audit",
@@ -378,10 +437,13 @@ async fn enforce_rust_lock_age(
     let bar = progress.bar();
 
     for dir in &rust_dirs {
+        let Some(policy) = policies.get(dir).filter(|policy| policy.min_age.is_some()) else {
+            continue;
+        };
         let baseline = baselines.get(dir).cloned().unwrap_or_default();
         let preferred = preferred.get(dir).cloned().unwrap_or_default();
         let audit = orchestrator
-            .enforce_lock_age_rust(dir, age, &baseline, &preferred, bar.as_ref())
+            .enforce_lock_age_rust_with_policy(dir, policy, &baseline, &preferred, bar.as_ref())
             .await;
         let lines = lock_age_report_lines(dir, &audit, args.verbose);
         if !lines.is_empty() {
@@ -582,7 +644,7 @@ fn lock_age_status_detail(status: &LockAgeStatus) -> String {
 /// 表示する更新先は Cargo.toml に書いた版だが、`cargo update` はその版要求 (`^0.2.128`)
 /// を満たす最新版 (`0.2.129`) を lock に入れる。差し戻しで揃えられなかった場合や、
 /// `--max-change` / OSV で古い版を選んだ場合は、表示とビルドに使われる版が食い違う。
-fn report_rust_lock_mismatches(args: &CliArgs, result: &OrchestratorResult) {
+fn report_rust_lock_mismatches(boundary: &Path, result: &OrchestratorResult) {
     for manifest in &result.summary.manifests {
         if manifest.language != Language::Rust || !manifest.has_updates() {
             continue;
@@ -590,7 +652,7 @@ fn report_rust_lock_mismatches(args: &CliArgs, result: &OrchestratorResult) {
         let Some(parent) = manifest.path.parent() else {
             continue;
         };
-        let Some(lock_path) = depup::manifest::find_cargo_lock_upward(parent, &args.path) else {
+        let Some(lock_path) = depup::manifest::find_cargo_lock_upward(parent, boundary) else {
             continue;
         };
         let entries = depup::manifest::read_registry_entries(&lock_path);
@@ -690,6 +752,69 @@ mod tests {
     use depup::domain::{
         Dependency, ManifestUpdateResult, UpdateResult, UpdateSummary, VersionSpec, VersionSpecKind,
     };
+
+    #[test]
+    fn shared_install_includes_a_member_with_no_updates_and_does_not_mix_siblings() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let member = root.join("member");
+        let sibling = temp.path().join("other");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(member.join(".npmrc"), "minimum-release-age=30d\n").unwrap();
+        std::fs::write(sibling.join(".npmrc"), "minimum-release-age=90d\n").unwrap();
+        let mut args = CliArgs::parse_from(["depup", "--no-age"]);
+        args.path = temp.path().to_path_buf();
+        let orchestrator = Orchestrator::new(args).unwrap();
+        let mut result = result_with_update(root.join("package.json"), Language::Node);
+        for dir in [&member, &sibling] {
+            result.summary.add_manifest(ManifestUpdateResult::new(
+                dir.join("package.json"),
+                Language::Node,
+            ));
+        }
+        let policy = install_age_policy(&orchestrator, &result, &root, Language::Node).unwrap();
+        assert_eq!(
+            policy.min_age,
+            Some(std::time::Duration::from_secs(30 * 86400))
+        );
+        assert!(policy.exemptions.is_empty());
+    }
+
+    #[test]
+    fn lock_policy_includes_siblings_when_started_inside_a_member() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let member = root.join("member");
+        let other = root.join("other");
+        for dir in [&member, &other] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(
+                dir.join("Cargo.toml"),
+                "[package]\nname = 'example'\nversion = '1.0.0'\n",
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = ['member', 'other']\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("Cargo.lock"), "version = 4\n").unwrap();
+        std::fs::write(other.join(".npmrc"), "minimum-release-age=30d\n").unwrap();
+        let mut args = CliArgs::parse_from(["depup", "--no-age"]);
+        args.path = member.clone();
+        let orchestrator = Orchestrator::new(args).unwrap();
+        let result = result_with_update(member.join("Cargo.toml"), Language::Rust);
+        let policies = collect_rust_lock_policies(&orchestrator, &result);
+        assert_eq!(policies.len(), 1);
+        let policy = policies.values().next().unwrap();
+        assert_eq!(
+            policy.min_age,
+            Some(std::time::Duration::from_secs(30 * 86400))
+        );
+        assert!(policy.exemptions.is_empty());
+    }
 
     fn result_with_update(path: PathBuf, language: Language) -> OrchestratorResult {
         let spec = VersionSpec::new(VersionSpecKind::Caret, "1.0.0", "1.0.0");

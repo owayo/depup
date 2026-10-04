@@ -46,11 +46,22 @@ pub fn read_git_entries(path: &Path) -> HashMap<String, Vec<GitLockEntry>> {
 /// マニフェストと同じディレクトリだけを見ると見つからないことがある。
 /// `boundary` (通常は実行対象のルートディレクトリ) を越えては探さない。
 pub fn find_cargo_lock_upward(start: &Path, boundary: &Path) -> Option<PathBuf> {
-    let mut dir = start;
+    // 相対・絶対パスや symlink 表記の違いで境界判定を素通りしない。
+    let original_boundary = boundary;
+    let boundary = std::fs::canonicalize(boundary).ok()?;
+    let start = std::fs::canonicalize(start).ok()?;
+    if !start.starts_with(&boundary) {
+        return None;
+    }
+    let mut dir = start.as_path();
     loop {
         let candidate = dir.join("Cargo.lock");
         if candidate.exists() {
-            return Some(candidate);
+            return Some(
+                original_boundary
+                    .join(dir.strip_prefix(&boundary).ok()?)
+                    .join("Cargo.lock"),
+            );
         }
         if dir == boundary {
             return None;
@@ -398,6 +409,18 @@ source = "git+https://github.com/fork/foo.git?branch=main#0000000000000000000000
         );
         // boundary より上には探しに行かない
         assert_eq!(find_cargo_lock_upward(&member, &member), None);
+    }
+
+    #[test]
+    fn lock_search_rejects_paths_outside_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let outside = dir.path().join("other");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(dir.path().join("Cargo.lock"), "version = 4\n").unwrap();
+        assert_eq!(find_cargo_lock_upward(&root, &root.join(".")), None);
+        assert_eq!(find_cargo_lock_upward(&outside, &root), None);
     }
 
     #[test]

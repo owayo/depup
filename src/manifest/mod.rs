@@ -20,6 +20,7 @@ mod line_utils;
 mod mise;
 mod mise_settings;
 mod mise_toml;
+pub(crate) mod native_age;
 mod package_json;
 mod package_swift;
 mod pnpm_settings;
