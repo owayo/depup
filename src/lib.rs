@@ -15,6 +15,7 @@ pub mod config;
 pub mod domain;
 pub mod error;
 pub mod global_config;
+pub mod install;
 pub mod manifest;
 pub mod orchestrator;
 pub mod osv;

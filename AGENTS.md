@@ -27,6 +27,7 @@ src/
   global_config.rs - グローバル設定ファイル (~/.config/depup/config.toml) パーサ
   osv.rs           - OSV.dev API による脆弱性チェック
   orchestrator.rs  - ワークフロー制御 (detect → parse → fetch → judge → write)
+  install.rs       - install 実行単位と共有 Cargo.lock の監査計画 (制約・更新先・install 前の版を集約)
   error.rs         - エラー型定義 (thiserror)
   progress.rs      - プログレスバー表示
   package_manager.rs - パッケージマネージャinstall連携
@@ -83,7 +84,7 @@ src/
     audit.rs         - 公開日検査・単独差し戻し・まとめ解き・最終照合 (lock ごとの状態と時間予算を保持)
     batch.rs         - まとめ解き (1 件ずつの `--precise` で衝突した crate を workspace の一時写しでまとめて解き直す)
     graph.rs         - Cargo.lock の依存グラフ (頂点・連結成分)
-    report.rs        - 表示と lock の突き合わせ (表示した更新先と Cargo.lock に入った版の食い違いの注記)
+    report.rs        - 監査結果の表示と lock の突き合わせ (表示した更新先と Cargo.lock に入った版の食い違いの注記)
     scratch.rs       - workspace の一時写しと cargo の起動設定
     series.rs        - semver 互換系列の判定
   test_support/    - テスト専用: local-registry 形式の偽 crates.io と公開日を固定する偽 adapter
