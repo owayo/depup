@@ -136,16 +136,20 @@ async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
         }
     }
 
+    let mut age_audit_failed = false;
     // dry-run でない場合、要求があればパッケージマネージャの install を実行
     if args.install && !args.dry_run {
         let lock_baselines =
             collect_rust_lock_baselines(&orchestrator.rust_lock_boundary(), &result);
-        run_package_installs(&args, &result, &monorepo_dirs, &orchestrator)?;
-        enforce_rust_lock_age(&args, &orchestrator, &result, &lock_baselines).await;
+        // 他の言語の install が失敗しても、変更された Rust lock の監査は行う。
+        let install_result = run_package_installs(&args, &result, &monorepo_dirs, &orchestrator);
+        age_audit_failed =
+            enforce_rust_lock_age(&args, &orchestrator, &result, &lock_baselines).await;
 
         // 画面に出した更新先と、実際に Cargo.lock へ入った版の食い違いを知らせる。
         // 結果の一覧は install 前に出しているので、ここで別に注記する
         report_rust_lock_mismatches(&orchestrator.rust_lock_boundary(), &result);
+        install_result?;
     }
 
     // 適切な終了コードを返す。
@@ -156,7 +160,7 @@ async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
         .iter()
         .any(|e| !matches!(e, depup::orchestrator::OrchestratorError::OsvWarning { .. }));
 
-    if has_errors {
+    if has_errors || age_audit_failed {
         // 部分的な成功 - 一部エラーが発生
         Ok(ExitCode::from(2))
     } else {
@@ -371,7 +375,7 @@ async fn enforce_rust_lock_age(
     orchestrator: &Orchestrator,
     result: &OrchestratorResult,
     baselines: &HashMap<PathBuf, RegistryLockEntries>,
-) {
+) -> bool {
     // 対象となる Rust プロジェクトディレクトリを収集。
     // workspace メンバーや Tauri (src-tauri) の Cargo.lock はマニフェストと別の
     // 階層にあることがあるため、マニフェストのディレクトリから上方向に lock を
@@ -381,6 +385,7 @@ async fn enforce_rust_lock_age(
     // 差し戻し先の第一候補になるので、差し戻せれば表示と lock の版が揃う
     let mut preferred: HashMap<PathBuf, PreferredVersions> = HashMap::new();
     let policies = collect_rust_lock_policies(orchestrator, result);
+    let mut missing_lock = false;
     for manifest in &result.summary.manifests {
         // 更新がなかった Rust manifest は cargo update も走らないため audit 不要
         if manifest.language != Language::Rust || !manifest.has_updates() {
@@ -392,11 +397,16 @@ async fn enforce_rust_lock_age(
         let Some(lock_path) =
             depup::manifest::find_cargo_lock_upward(parent, &orchestrator.rust_lock_boundary())
         else {
-            if args.verbose {
+            if orchestrator
+                .resolved_age_policy_for(parent)
+                .min_age
+                .is_some()
+            {
                 eprintln!(
-                    "  {} — Cargo.lock not found; skipping the age audit",
+                    "  {} — cannot audit --age: Cargo.lock not found",
                     parent.display()
                 );
+                missing_lock = true;
             }
             continue;
         };
@@ -422,7 +432,7 @@ async fn enforce_rust_lock_age(
     }
 
     if rust_dirs.is_empty() {
-        return;
+        return missing_lock;
     }
 
     if args.verbose {
@@ -436,6 +446,7 @@ async fn enforce_rust_lock_age(
     progress.start(0, "Auditing Cargo.lock against --age");
     let bar = progress.bar();
 
+    let mut has_unresolved = missing_lock;
     for dir in &rust_dirs {
         let Some(policy) = policies.get(dir).filter(|policy| policy.min_age.is_some()) else {
             continue;
@@ -445,6 +456,7 @@ async fn enforce_rust_lock_age(
         let audit = orchestrator
             .enforce_lock_age_rust_with_policy(dir, policy, &baseline, &preferred, bar.as_ref())
             .await;
+        has_unresolved |= audit.has_unresolved();
         let lines = lock_age_report_lines(dir, &audit, args.verbose);
         if !lines.is_empty() {
             progress.suspend(|| {
@@ -460,6 +472,7 @@ async fn enforce_rust_lock_age(
     }
 
     progress.finish_and_clear();
+    has_unresolved
 }
 
 /// stderr に出す 1 行
@@ -511,7 +524,7 @@ fn lock_age_report_lines(dir: &Path, audit: &LockAgeAuditResult, verbose: bool) 
     if audit.adjustments.is_empty() {
         // 予算切れで未検証が残っている場合は「全て age 内」とは言い切れない
         // (直前に未検証件数を警告済み)
-        if verbose && audit.unchecked == 0 {
+        if verbose && audit.unchecked == 0 && audit.problems.is_empty() {
             lines.push(ReportLine::info(format!(
                 "  {dir} — all crates changed by install are within --age"
             )));
@@ -779,6 +792,16 @@ mod tests {
             Some(std::time::Duration::from_secs(30 * 86400))
         );
         assert!(policy.exemptions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_missing_lock_is_an_unverified_age_audit() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut args = CliArgs::parse_from(["depup", "--age", "2w", "--quiet"]);
+        args.path = temp.path().to_path_buf();
+        let orchestrator = Orchestrator::new(args.clone()).unwrap();
+        let result = result_with_update(temp.path().join("Cargo.toml"), Language::Rust);
+        assert!(enforce_rust_lock_age(&args, &orchestrator, &result, &HashMap::new()).await);
     }
 
     #[test]

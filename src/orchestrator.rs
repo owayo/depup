@@ -7,6 +7,7 @@
 //! - 言語・パッケージフィルタの適用
 //! - 部分的な継続を伴うエラーハンドリング
 
+use crate::cargo_rollback::audit::read_audit_lock;
 use crate::cargo_rollback::batch::{RollbackCandidate, TogetherOutcome, resolve_together};
 use crate::cargo_rollback::scratch::CargoCommand;
 use crate::cargo_rollback::series::same_series;
@@ -20,7 +21,7 @@ use crate::global_config::GlobalConfig;
 mod age;
 use crate::manifest::{
     ManifestInfo, ManifestWriter, MiseSettings, RegistryLockEntries, WriteResult, detect_manifests,
-    find_cargo_lock_upward, get_parser, has_mise_config, parse_registry_entries, read_git_entries,
+    find_cargo_lock_upward, get_parser, has_mise_config, read_git_entries,
 };
 use crate::osv::{OsvCheck, OsvChecker};
 use crate::progress::Progress;
@@ -327,8 +328,13 @@ impl Orchestrator {
         // これが無いと、最後のパスの差し戻しで新しく入った版が監査されないまま終わる
         for pass in 0..=MAX_ENFORCE_LOCK_AGE_PASSES {
             let verify_only = pass == MAX_ENFORCE_LOCK_AGE_PASSES;
-            let lock_content = std::fs::read_to_string(&lock_path).unwrap_or_default();
-            let entries = parse_registry_entries(&lock_content);
+            let (_, entries) = match read_audit_lock(&lock_path) {
+                Ok(lock) => lock,
+                Err(error) => {
+                    problems.push(error);
+                    break;
+                }
+            };
             // install 前と同じバージョンで lock されていた依存は depup の更新で入った
             // ものではないため監査しない。crates.io は 1 リクエスト/秒に直列化される
             // ので、lock 全体 (数百件) を舐めると監査だけで数分の無音待ちになる。
@@ -381,7 +387,7 @@ impl Orchestrator {
                     budget_exhausted = true;
                     break;
                 };
-                let all_versions = match fetched {
+                let mut all_versions = match fetched {
                     Ok(v) => v,
                     Err(_) => {
                         for v in versions {
@@ -400,11 +406,39 @@ impl Orchestrator {
                     }
                 };
 
+                if versions.iter().any(|current| {
+                    !all_versions.iter().any(|info| {
+                        compare_versions(&info.version, current) == std::cmp::Ordering::Equal
+                    })
+                }) {
+                    // check と install の間に公開された版を、古いキャッシュだけで未確認にしない。
+                    let remaining = budget.saturating_sub(started.elapsed());
+                    match tokio::time::timeout(
+                        remaining,
+                        self.refresh_audit_versions(adapter, name),
+                    )
+                    .await
+                    {
+                        Ok(Ok(fresh)) => all_versions = fresh,
+                        Ok(Err(_)) => {}
+                        Err(_) => {
+                            budget_exhausted = true;
+                            break;
+                        }
+                    }
+                }
+
                 for current in versions {
                     let key = (name.clone(), current.clone());
                     let Some(current_info) = all_versions.iter().find(|v| {
                         compare_versions(&v.version, current) == std::cmp::Ordering::Equal
                     }) else {
+                        log.record_if_absent(
+                            name,
+                            current,
+                            None,
+                            LockAgeStatus::ReleaseDateUnavailable,
+                        );
                         continue;
                     };
 
@@ -497,9 +531,13 @@ impl Orchestrator {
                     // 読み直し、実際に今の版から外れたことを確かめてから差し戻しとして数える
                     let status = match status {
                         LockAgeStatus::Downgraded => {
-                            let locked = parse_registry_entries(
-                                &std::fs::read_to_string(&lock_path).unwrap_or_default(),
-                            );
+                            let locked = match read_audit_lock(&lock_path) {
+                                Ok((_, entries)) => entries,
+                                Err(error) => {
+                                    problems.push(error);
+                                    break 'audit;
+                                }
+                            };
                             match locked_after_rollback(&locked, name, current) {
                                 Some(moved) => {
                                     any_downgraded = true;
@@ -538,10 +576,14 @@ impl Orchestrator {
             // 1 件ずつでは衝突して戻せなかった crate を、まとめて解き直す
             if !together.is_empty() && !verify_only {
                 // 同じパスの 1 件ずつの差し戻しで lock は変わっているので、直前の状態で判定する
-                let state = together_fingerprint(
-                    &std::fs::read_to_string(&lock_path).unwrap_or_default(),
-                    &together,
-                );
+                let (content, _) = match read_audit_lock(&lock_path) {
+                    Ok(lock) => lock,
+                    Err(error) => {
+                        problems.push(error);
+                        break;
+                    }
+                };
+                let state = together_fingerprint(&content, &together);
                 let remaining = budget.saturating_sub(started.elapsed());
                 if remaining < MIN_TOGETHER_SLICE {
                     for candidate in &together {
@@ -670,34 +712,54 @@ impl Orchestrator {
         // 報告は最終的な Cargo.lock の状態から組み立て直す。途中の記録だけで「差し戻した」と
         // 言うと、後の差し戻しで版が動いた・まとめ解きの結果を確かめる前に予算が尽きた等の
         // 場合に、lock の実態と食い違う
-        let final_entries =
-            parse_registry_entries(&std::fs::read_to_string(&lock_path).unwrap_or_default());
+        let final_entries = match read_audit_lock(&lock_path) {
+            Ok((_, entries)) => entries,
+            Err(error) => {
+                if !problems.contains(&error) {
+                    problems.push(error);
+                }
+                return LockAgeAuditResult {
+                    problems,
+                    ..Default::default()
+                };
+            }
+        };
         log.reconcile_with_lock(&final_entries);
-        // install 前の版へ戻しただけで、その版も期間を満たさないものは「期間を満たすよう
-        // 差し戻した」と区別する (供給網対策として --age を使う利用者に、満たしたと読ませない)
-        let returned: Vec<(String, String, String)> = log
+        // 途中で記録した移動先ではなく、最終 lock の公開日を確認する。
+        let moved: Vec<(String, String, String)> = log
             .entries
             .values()
             .filter(|adjustment| adjustment.status == LockAgeStatus::Downgraded)
             .filter_map(|adjustment| {
-                let to = adjustment.to.as_ref()?;
-                let locked_before = baseline
-                    .get(&adjustment.name)
-                    .is_some_and(|versions| versions.contains(to));
-                locked_before
-                    .then(|| (adjustment.name.clone(), adjustment.from.clone(), to.clone()))
+                Some((
+                    adjustment.name.clone(),
+                    adjustment.from.clone(),
+                    adjustment.to.clone()?,
+                ))
             })
             .collect();
-        for (name, from, to) in returned {
+        for (name, from, to) in moved {
             let known = self.cached_versions(adapter, &name).await;
-            let young = known.is_some_and(|all| {
-                all.iter().any(|info| {
-                    compare_versions(&info.version, &to) == std::cmp::Ordering::Equal
-                        && !exemptions.admits(Language::Rust, &name, info, cutoff)
-                })
+            let info = known.as_ref().and_then(|all| {
+                all.iter()
+                    .find(|info| compare_versions(&info.version, &to) == std::cmp::Ordering::Equal)
             });
-            if young {
-                log.record(&name, &from, Some(to), LockAgeStatus::Restored);
+            let status = match info {
+                None => Some(LockAgeStatus::ReleaseDateUnavailable),
+                Some(info) if exemptions.admits(Language::Rust, &name, info, cutoff) => None,
+                Some(_)
+                    if baseline
+                        .get(&name)
+                        .is_some_and(|versions| versions.contains(&to)) =>
+                {
+                    Some(LockAgeStatus::Restored)
+                }
+                Some(_) => Some(LockAgeStatus::NotAttempted(format!(
+                    "final locked version {to} does not satisfy --age"
+                ))),
+            };
+            if let Some(status) = status {
+                log.record(&name, &from, Some(to), status);
             }
         }
         let mut unchecked = 0usize;
@@ -727,9 +789,10 @@ impl Orchestrator {
                             ),
                         )
                     }
-                    // 期間を満たす版、または crates.io の一覧に無い版 (yank 済みなど) は
-                    // 監査中と同じく違反として扱わない
-                    (Some(_), _) => {}
+                    (Some(_), Some(_)) => {}
+                    (Some(_), None) => {
+                        log.record(&name, &version, None, LockAgeStatus::ReleaseDateUnavailable)
+                    }
                     (None, _) => unchecked += 1,
                 }
             }
@@ -740,6 +803,28 @@ impl Orchestrator {
             unchecked,
             problems,
         }
+    }
+
+    /// install がキャッシュにない版を選んだ場合に、共有レート制限付きで一覧を更新する。
+    async fn refresh_audit_versions(
+        &self,
+        adapter: &(dyn RegistryAdapter + Send + Sync),
+        package: &str,
+    ) -> Result<Vec<VersionInfo>, String> {
+        let _permit = self
+            .crates_io_semaphore
+            .acquire()
+            .await
+            .map_err(|error| error.to_string())?;
+        let versions = adapter
+            .fetch_versions(package)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.version_cache
+            .lock()
+            .await
+            .insert((adapter.language(), package.to_string()), versions.clone());
+        Ok(versions)
     }
 
     /// 監査中に取得済みの版一覧 (レジストリへは問い合わせない)
@@ -1678,6 +1763,17 @@ pub struct LockAgeAuditResult {
     pub problems: Vec<String>,
 }
 
+impl LockAgeAuditResult {
+    /// install による age 違反や未確認の状態が残ったか。既存版への復元は変更の取り消し。
+    pub fn has_unresolved(&self) -> bool {
+        self.unchecked > 0
+            || !self.problems.is_empty()
+            || self.adjustments.iter().any(|adjustment| {
+                !adjustment.status.is_resolved() && !adjustment.status.is_restored()
+            })
+    }
+}
+
 /// install 前の Cargo.lock (`baseline`) から見て、新規に入った / バージョンが変わった
 /// registry エントリだけを名前順で抽出する。
 ///
@@ -1834,7 +1930,11 @@ impl AdjustmentLog {
     /// (後の差し戻しでさらに動いた場合も、報告を lock の実態に揃える)
     fn reconcile_with_lock(&mut self, entries: &RegistryLockEntries) {
         for adjustment in self.entries.values_mut() {
-            if !adjustment.status.is_resolved() {
+            if !adjustment.status.is_resolved()
+                && entries
+                    .get(&adjustment.name)
+                    .is_some_and(|versions| versions.contains(&adjustment.from))
+            {
                 continue;
             }
             let (to, status) =
@@ -3811,7 +3911,119 @@ mod tests {
 /// cargo はテスト専用の CARGO_HOME とオフラインで起動する (利用者の設定とネットワークに触れない)
 #[cfg(test)]
 mod lock_age_audit_tests {
+    #[tokio::test]
+    async fn a_release_absent_from_the_check_cache_is_refetched_and_rolled_back() {
+        let registry = LocalRegistry::new();
+        for version in ["1.0.0", "1.0.1"] {
+            registry.publish("library", version, &[]);
+        }
+        let project = TestProject::new(&registry, &manifest("library = '=1.0.0'\n"));
+        let baseline = install(&project, &manifest("library = '1.0.0'\n"));
+        let dates = FakeCratesIo::new()
+            .release("library", "1.0.0", old())
+            .release("library", "1.0.1", fresh());
+        let orchestrator = Orchestrator::new(CliArgs::parse_from(["depup"])).unwrap();
+        orchestrator.version_cache.lock().await.insert(
+            (Language::Rust, "library".into()),
+            vec![VersionInfo::new("1.0.0", old())],
+        );
+        let cargo = cargo_for(&project);
+        let result = orchestrator
+            .audit_lock_age(
+                &LockAgeAudit {
+                    project_dir: project.path(),
+                    cutoff: cutoff(),
+                    exemptions: &Default::default(),
+                    baseline: &baseline,
+                    preferred: &PreferredVersions::new(),
+                    adapter: &dates,
+                    cargo: &cargo,
+                    budget: LOCK_AGE_AUDIT_BUDGET,
+                },
+                None,
+            )
+            .await;
+        assert_eq!(project.locked_versions("library"), ["1.0.0"]);
+        assert_eq!(dates.fetch_count(), 1);
+        assert!(!result.has_unresolved(), "{result:?}");
+        assert!(lock_is_accepted(&project));
+    }
+
+    #[tokio::test]
+    async fn missing_locked_version_metadata_is_unverified() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.lock"),
+            r#"
+    version = 4
+    [[package]]
+    name = "library"
+    version = "1.0.1"
+    source = "registry+https://github.com/rust-lang/crates.io-index"
+    "#,
+        )
+        .unwrap();
+        let dates = FakeCratesIo::new().release("library", "1.0.0", old());
+        let orchestrator = Orchestrator::new(CliArgs::parse_from(["depup"])).unwrap();
+        let result = orchestrator
+            .audit_lock_age(
+                &LockAgeAudit {
+                    project_dir: dir.path(),
+                    cutoff: cutoff(),
+                    exemptions: &crate::update::AgeExemptions::default(),
+                    baseline: &RegistryLockEntries::new(),
+                    preferred: &PreferredVersions::new(),
+                    adapter: &dates,
+                    cargo: &CargoCommand::new(),
+                    budget: LOCK_AGE_AUDIT_BUDGET,
+                },
+                None,
+            )
+            .await;
+        assert_eq!(
+            adjustment(&result, "library").status,
+            LockAgeStatus::ReleaseDateUnavailable
+        );
+        assert!(result.has_unresolved());
+        assert_eq!(dates.fetch_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn unreadable_or_invalid_lock_cannot_pass_the_audit() {
+        let dir = tempfile::tempdir().unwrap();
+        let dates = FakeCratesIo::new();
+        let orchestrator = Orchestrator::new(CliArgs::parse_from(["depup"])).unwrap();
+        for content in [
+            None,
+            Some("broken {{{"),
+            Some("[[package]]\nname = 'library'\n"),
+        ] {
+            if let Some(content) = content {
+                std::fs::write(dir.path().join("Cargo.lock"), content).unwrap();
+            }
+            let result = orchestrator
+                .audit_lock_age(
+                    &LockAgeAudit {
+                        project_dir: dir.path(),
+                        cutoff: cutoff(),
+                        exemptions: &crate::update::AgeExemptions::default(),
+                        baseline: &RegistryLockEntries::new(),
+                        preferred: &PreferredVersions::new(),
+                        adapter: &dates,
+                        cargo: &CargoCommand::new(),
+                        budget: LOCK_AGE_AUDIT_BUDGET,
+                    },
+                    None,
+                )
+                .await;
+            assert!(!result.problems.is_empty());
+            assert!(result.has_unresolved());
+        }
+        assert_eq!(dates.fetch_count(), 0);
+    }
+
     use super::*;
+    use crate::manifest::parse_registry_entries;
     use crate::test_support::fake_crates_io::FakeCratesIo;
     use crate::test_support::local_registry::{LocalRegistry, TestProject};
     use chrono::{DateTime, TimeZone, Utc};

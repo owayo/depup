@@ -5,6 +5,7 @@
 //! ([`batch::resolve_together`])。そのための依存グラフ・semver 系列の判定・一時写しと、
 //! install 後の lock と表示の突き合わせ ([`report::lock_mismatches`]) を置く。
 
+pub(crate) mod audit;
 pub mod batch;
 pub mod graph;
 pub mod report;
