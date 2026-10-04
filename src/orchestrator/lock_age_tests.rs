@@ -573,6 +573,103 @@ async fn test_crate_returns_to_young_version_locked_before_install() {
     assert!(lock_is_accepted(&project));
 }
 
+/// install 前の版が yank 済みでも、`--precise` で復活させず有効な古い版へ戻す。
+#[tokio::test]
+async fn a_yanked_baseline_is_not_restored_by_precise_rollback() {
+    let registry = LocalRegistry::new();
+    for version in ["0.8.2", "0.8.3", "0.8.4"] {
+        registry.publish("solo", version, &[]);
+    }
+    let project = TestProject::new(&registry, &manifest("solo = '=0.8.3'\n"));
+    project.cargo_ok(&["generate-lockfile"]);
+    let baseline = parse_registry_entries(&project.read("Cargo.lock"));
+    registry.yank("solo", "0.8.3");
+    project.write("Cargo.toml", &manifest("solo = '0.8.2'\n"));
+    project.cargo_ok(&["update"]);
+    assert_eq!(project.locked_versions("solo"), ["0.8.4"]);
+
+    // 本物の crates.io adapter と同じく、yank 済み版は候補一覧に含めない。
+    let dates =
+        FakeCratesIo::new()
+            .release("solo", "0.8.2", old())
+            .release("solo", "0.8.4", fresh());
+    let result = audit(&project, &baseline, &dates).await;
+
+    assert_eq!(project.locked_versions("solo"), ["0.8.2"]);
+    assert_eq!(
+        adjustment(&result, "solo").status,
+        LockAgeStatus::Downgraded
+    );
+    assert!(!result.has_unresolved());
+    assert!(lock_is_accepted(&project));
+}
+
+/// 有効な差し戻し候補がなければ、yank 済みの install 前の版へ戻さず未解消を報告する。
+#[tokio::test]
+async fn a_yanked_baseline_without_a_mature_candidate_is_unresolved() {
+    let registry = LocalRegistry::new();
+    for version in ["0.8.2", "0.8.3", "0.8.4"] {
+        registry.publish("solo", version, &[]);
+    }
+    let project = TestProject::new(&registry, &manifest("solo = '=0.8.3'\n"));
+    project.cargo_ok(&["generate-lockfile"]);
+    let baseline = parse_registry_entries(&project.read("Cargo.lock"));
+    registry.yank("solo", "0.8.3");
+    project.write("Cargo.toml", &manifest("solo = '0.8.2'\n"));
+    project.cargo_ok(&["update"]);
+
+    let dates = FakeCratesIo::new()
+        .release("solo", "0.8.2", fresh())
+        .release("solo", "0.8.4", fresh());
+    let result = audit(&project, &baseline, &dates).await;
+
+    assert_eq!(project.locked_versions("solo"), ["0.8.4"]);
+    assert_eq!(
+        adjustment(&result, "solo").status,
+        LockAgeStatus::NoOlderCandidate
+    );
+    assert!(result.has_unresolved());
+}
+
+/// まとめ解きの下限にも yank 済みの install 前の版を使わない。
+#[tokio::test]
+async fn a_yanked_baseline_does_not_block_joint_rollback() {
+    let registry = LocalRegistry::new();
+    for version in ["0.8.2", "0.8.3", "0.8.4"] {
+        let exact = format!("={version}");
+        registry.publish("fam-core", version, &[]);
+        for name in ["fam-a", "fam-b"] {
+            registry.publish(name, version, &[("fam-core", &exact)]);
+        }
+    }
+    let project = TestProject::new(&registry, &manifest("fam-a = '=0.8.3'\nfam-b = '=0.8.3'\n"));
+    project.cargo_ok(&["generate-lockfile"]);
+    let baseline = parse_registry_entries(&project.read("Cargo.lock"));
+    for name in ["fam-core", "fam-a", "fam-b"] {
+        registry.yank(name, "0.8.3");
+    }
+    project.write(
+        "Cargo.toml",
+        &manifest("fam-a = '0.8.2'\nfam-b = '0.8.2'\n"),
+    );
+    project.cargo_ok(&["update"]);
+    let mut dates = FakeCratesIo::new();
+    for name in ["fam-core", "fam-a", "fam-b"] {
+        assert_eq!(project.locked_versions(name), ["0.8.4"]);
+        dates = dates
+            .release(name, "0.8.2", old())
+            .release(name, "0.8.4", fresh());
+    }
+    let result = audit(&project, &baseline, &dates).await;
+
+    for name in ["fam-core", "fam-a", "fam-b"] {
+        assert_eq!(project.locked_versions(name), ["0.8.2"]);
+        assert_eq!(adjustment(&result, name).status, LockAgeStatus::Downgraded);
+    }
+    assert!(!result.has_unresolved());
+    assert!(lock_is_accepted(&project));
+}
+
 /// 期間を満たす古い版が 1 つも無い crate は、差し戻せないものとして報告する
 #[tokio::test]
 async fn test_crate_without_older_mature_version_is_reported() {

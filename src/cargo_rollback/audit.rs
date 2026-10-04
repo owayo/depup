@@ -314,9 +314,10 @@ impl AdjustmentLog {
 /// judge がこの実行で選んだ版 (`preferred`) のうち、期間を満たし、今の版より古く、
 /// 同じ semver 系列にあるものがあれば、その最大を採る。表示した更新先と lock の版が
 /// 一致し、judge が OSV や `--max-change` で退けた版を差し戻しで選び直すこともない。
-/// 該当が無ければ、期間を満たす版のうち今の版より古い最新 ([`pick_older_within_age`])。
+/// 該当が無ければ、同じ semver 系列で期間を満たす版のうち今の版より古い最新
+/// ([`pick_older_within_age`])。
 ///
-/// どちらの場合も、install 前の lock (`before`) にあった同じ系列の版 ([`version_floor`])
+/// どちらの場合も、install 前の lock (`before`) にあった利用可能な同系列の版 ([`version_floor`])
 /// より古くはしない。manifest の版要求が lock より古いまま (`^1.40.0` で lock は 1.50.0)
 /// judge が `--max-change` で 1.40.x を選んだ場合や、install 前から期間内の版が入っていた
 /// 場合に、install 前より古い版まで下げると、それまで使えていた API が消えてビルドが壊れる。
@@ -329,7 +330,7 @@ pub(crate) fn rollback_target(
     before: Option<&[String]>,
     exemptions: &crate::update::AgeExemptions,
 ) -> Option<String> {
-    let floor = version_floor(before, current);
+    let floor = version_floor(available, before, current);
     let at_least_floor = |version: &str| {
         floor
             .as_deref()
@@ -352,20 +353,31 @@ pub(crate) fn rollback_target(
         return Some(version.clone());
     }
     match pick_older_within_age(available, current, cutoff, exemptions) {
-        Some(version) if at_least_floor(&version) => Some(version),
+        Some(version) if same_series(&version, current) && at_least_floor(&version) => {
+            Some(version)
+        }
         // 期間を満たす版が下限より古い (または無い) なら、install 前の版に戻す
         _ => floor,
     }
 }
 
 /// install 前の lock (`before`) にあった、`current` と同じ semver 系列で `current` より古い版の
-/// うち最新。差し戻しでこれより古くしない下限
-fn version_floor(before: Option<&[String]>, current: &str) -> Option<String> {
+/// うち利用可能な最新。yank 済み・公開日不明などで取得一覧にない版は、下限にも戻し先にも使わない。
+fn version_floor(
+    available: &[VersionInfo],
+    before: Option<&[String]>,
+    current: &str,
+) -> Option<String> {
     before
         .unwrap_or_default()
         .iter()
         .filter(|version| same_series(version, current))
         .filter(|version| compare_versions(version, current) == std::cmp::Ordering::Less)
+        .filter(|version| {
+            available
+                .iter()
+                .any(|info| compare_versions(&info.version, version) == std::cmp::Ordering::Equal)
+        })
         .max_by(|a, b| compare_versions(a, b))
         .cloned()
 }
@@ -714,7 +726,11 @@ impl<'a> LockAgeAuditor<'a> {
                     name: name.clone(),
                     current: current.clone(),
                     target: target.clone(),
-                    minimum: version_floor(baseline.get(name).map(Vec::as_slice), current),
+                    minimum: version_floor(
+                        &all_versions,
+                        baseline.get(name).map(Vec::as_slice),
+                        current,
+                    ),
                 };
 
                 if verify_only {

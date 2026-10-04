@@ -448,3 +448,51 @@ fn test_rollback_target_returns_to_version_locked_before_install() {
         Some("1.50.0"),
     );
 }
+
+#[test]
+fn an_unavailable_baseline_does_not_allow_another_semver_series() {
+    let versions = vec![version_at("0.7.9", 90), version_at("0.8.4", 2)];
+    let before = vec!["0.8.3".to_string()];
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(14);
+    assert!(
+        rollback_target(
+            &versions,
+            "0.8.4",
+            cutoff,
+            None,
+            Some(&before),
+            &Default::default()
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn a_new_crate_is_not_rolled_back_across_semver_series() {
+    let versions = vec![version_at("0.7.9", 90), version_at("0.8.4", 2)];
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(14);
+    assert!(rollback_target(&versions, "0.8.4", cutoff, None, None, &Default::default()).is_none());
+}
+
+#[test]
+fn an_available_baseline_still_prevents_going_below_the_preinstall_version() {
+    let versions = vec![
+        version_at("0.8.1", 90),
+        version_at("0.8.2", 5),
+        version_at("0.8.4", 2),
+    ];
+    let before = vec!["0.8.2".to_string(), "0.8.3".to_string()];
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(14);
+    assert_eq!(
+        rollback_target(
+            &versions,
+            "0.8.4",
+            cutoff,
+            None,
+            Some(&before),
+            &Default::default()
+        )
+        .as_deref(),
+        Some("0.8.2")
+    );
+}

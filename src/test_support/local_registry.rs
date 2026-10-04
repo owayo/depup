@@ -163,6 +163,27 @@ impl LocalRegistry {
             .unwrap_or_else(|e| panic!("{} へ書き込めない: {e}", path.display()));
         self
     }
+
+    /// 公開済みの版を yank する。既存の lock からの更新と `--precise` の再採用を検証するため。
+    pub fn yank(&self, name: &str, version: &str) -> &Self {
+        let path = self.path().join("index").join(index_relative_path(name));
+        let mut entries: Vec<serde_json::Value> = fs::read_to_string(&path)
+            .expect("公開済みクレートの index を読めない")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("index の版情報を解析できない"))
+            .collect();
+        entries
+            .iter_mut()
+            .find(|entry| entry["vers"] == version)
+            .expect("yank 対象の版が index にない")["yanked"] = true.into();
+        let content = entries
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, format!("{content}\n")).expect("yank 後の index を書けない");
+        self
+    }
 }
 
 /// crates.io と同じ index のパス規則 (名前を小文字にしてから、長さで振り分ける)
