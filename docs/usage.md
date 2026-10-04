@@ -49,7 +49,7 @@ The age filter applies to the versions depup writes into manifests; for transiti
 
 #### Resolution Priority
 
-A minimum release age declared in the project (pnpm's or Bun's `minimumReleaseAge`, or mise's `minimum_release_age`) is treated as the **project policy** and takes precedence over the CLI `--age` and the global configuration file. The age that applies to a run is resolved in this order (highest first):
+A minimum release age declared in the project (pnpm's or Bun's `minimumReleaseAge`, or mise's `minimum_release_age`) is treated as the **project policy** and takes precedence over the CLI `--age` and the global configuration file. The age for each manifest is resolved in this order (highest first):
 
 1. Project policy from pnpm, Bun, or mise settings (see below for the files read and how multiple values are combined)
 2. CLI `--age <DURATION>` or `--no-age` (the two cannot be combined; `--no-age` only takes effect when no project policy is set)
@@ -85,7 +85,13 @@ minimumReleaseAge = 259200  # seconds (e.g. 3 days)
 minimum_release_age = "7d"  # s / m (minutes) / h / d / w / M / y
 ```
 
-If more than one of pnpm, Bun, and mise sets a value, depup uses the stricter (larger) one. Within pnpm, only the first value found is used.
+If more than one of pnpm, Bun, and mise sets a value, depup uses the stricter (larger) one. Within pnpm, only the first value found in each directory is used; a pnpm lockfile is not required.
+
+Each manifest inherits explicit settings from its directory up to the run root and uses the strictest inherited value. Settings in sibling projects do not affect its candidate selection. When started inside a Cargo, pnpm, or uv workspace, depup also reads the workspace root's policy. Tauri synchronization is confined to each app and respects the frontend and Rust scopes separately.
+
+For Python and mise, depup also preserves stricter native settings: uv's `exclude-newer` in `uv.toml`, `[tool.uv]`, the user configuration, or `UV_EXCLUDE_NEWER`, including `UV_CONFIG_FILE` and system settings; and mise's global, local, and per-tool `minimum_release_age` or `MISE_MINIMUM_RELEASE_AGE`, including `MISE_CONFIG_FILE` and active `MISE_ENV` overlays. Native settings inherited above the run root are preserved too. These values can tighten the resolved depup policy even with `--no-age`. Per-tool mise ages and stricter uv package/index cutoffs are combined into the strictest age for that scope. Such native constraints disable publisher exemptions in that scope. Dates, timestamps, single-unit durations, and fixed ISO 8601 durations are supported; a native setting that cannot be read or interpreted stops that manifest's update instead of being replaced with a weaker value.
+
+The cutoff is fixed when the run starts. Candidate selection, Tauri synchronization, and the Cargo audit use that same instant. uv and mise receive absolute cutoffs during install; pnpm receives minutes rounded up so seconds are never discarded.
 
 ### Vulnerability Check (OSV.dev)
 
@@ -328,7 +334,7 @@ With `--install`, depup runs each project's package manager after writing the ma
 - Without [`.depup`](configuration.md#depup-configuration-file), every install runs in the target directory (the `PATH` argument, or the current directory), even when the updated manifest belongs to a workspace member. With `.depup`, each install runs in the deepest listed directory that contains the updated manifest, so nested apps install in their own directories.
 - Installs run one at a time, in directory path order, and each language runs at most once per directory. The package manager's output is captured instead of streamed; its stderr is printed only when the install fails.
 
-If an install fails, depup still runs the remaining installs, prints the failed command with the package manager's stderr, and exits with code 1 at the end (`Error: Some package manager installs failed`). A package manager that is not installed counts as a failure. Manifests that were already rewritten are not rolled back, and the Rust age audit ([below](#auditing-cargolock-rust)) does not run for any project.
+If an install fails, depup still runs the remaining installs, prints the failed command with the package manager's stderr, and exits with code 1 at the end (`Error: Some package manager installs failed`). A package manager that is not installed counts as a failure. Manifests that were already rewritten are not rolled back, and the Rust age audit ([below](#auditing-cargolock-rust)) still runs even when another install fails.
 
 ### Commands per Package Manager
 
@@ -360,17 +366,17 @@ When `--install` processes a PHP project, depup runs `composer update` rather th
 
 ### Transitive Dependencies and the Age Filter
 
-The age filter decides which versions depup writes into manifests. Whether it also reaches transitive dependencies during `--install` depends on the package manager. The age passed here is the same value that was resolved for the update ([Resolution Priority](#resolution-priority)):
+The age filter decides which versions depup writes into manifests. Whether it also reaches transitive dependencies during `--install` depends on the package manager. An install that resolves multiple manifests uses the strictest policy of those manifests, including members with no updates ([Resolution Priority](#resolution-priority)):
 
 | Package manager | What depup passes | Transitive dependencies |
 |-----------------|-------------------|-------------------------|
 | pnpm | `npm_config_minimum_release_age=<minutes>` (environment variable) | Filtered by pnpm v10.16 or later; older versions ignore the variable |
 | uv | `--exclude-newer <timestamp>` | Filtered when uv resolves them |
 | Cargo | Nothing; depup audits `Cargo.lock` after `cargo update` | crates.io crates that violate the age filter are rolled back ([below](#auditing-cargolock-rust)) |
-| mise | `MISE_MINIMUM_RELEASE_AGE=<seconds>s` (environment variable) | mise tools have no transitive dependencies; `mise install` applies the age when it resolves a partial version such as `node = "26"` |
+| mise | `--minimum-release-age <timestamp>` and `MISE_MINIMUM_RELEASE_AGE` | Fuzzy top-level versions are filtered when timestamps are available. Only the `npm:` and `pypi:` backends pass the cutoff to unpinned transitive dependencies; exact pins and locked top-level versions bypass native filtering |
 | npm, Yarn, Bun, pip, Poetry, Rye, Pipenv, Go, Bundler, Composer, Gradle, SwiftPM | Nothing | Not filtered; only direct dependencies follow the age filter |
 
-With `--verbose`, depup prints a note naming the package managers used in the run for which the age filter covers direct dependencies only. With `--no-age` and no project policy, nothing age-related is passed and the Rust audit does not run.
+With `--verbose`, depup prints a note naming the package managers used in the run for which the age filter covers direct dependencies only. With `--no-age` and no project or native policy, nothing age-related is passed and the Rust audit does not run. Native package/index exemptions configured in uv still follow uv's own semantics.
 
 #### Auditing `Cargo.lock` (Rust)
 
@@ -416,6 +422,8 @@ Crates rolled back together are reported with the others:
 
 A crate that drops out of `Cargo.lock` during the joint resolution is listed as `tokio 1.53.1 → removed` and counted as rolled back. Any rollback, one at a time or joint, can also bring other new versions into `Cargo.lock`; depup audits those as well and rolls them back in turn, up to a fixed number of rounds.
 
+A shared workspace lock uses the strictest member policy and only publisher exemptions common to every member. If a locked version is absent from cached registry metadata, depup refreshes that metadata once. Missing metadata, unreadable or invalid locks, failed rollbacks, and an unfinished audit cause exit code `2` (an install failure still takes priority as `1`). Restoring the pre-install version counts as undoing the install and does not by itself fail the run.
+
 A rollback counts only when `Cargo.lock` actually changed; depup rereads the lock file after each `cargo update` instead of trusting its exit status, and builds the final report from the lock file as it stands when the audit ends. Rollbacks are always reported. Crates that could not be rolled back, crates whose release date is unavailable, and crates left unchecked when the time cap is reached are counted even without `--verbose`:
 
 ```text
@@ -440,7 +448,7 @@ With `--verbose`, depup prints `Enforcing --age on crates changed in Cargo.lock.
 | `not attempted: ...` | depup did not try the rollback, because it reached its limit on rounds or its time budget. |
 | `release date unavailable` | The release date could not be retrieved, so the crate could not be checked. |
 
-The audit never changes the exit code.
+An unresolved audit exits with code `2`.
 
 After `--install`, depup also compares each Rust update it reported with the version that ended up in `Cargo.lock`. When they differ, it prints a yellow note, even without `--verbose` and even when the age filter is off:
 

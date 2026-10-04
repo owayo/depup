@@ -44,9 +44,10 @@ Add `--install` to let each project's package manager refresh its lock file afte
 - **Smart Version Handling**: Preserves version range formats (`^`, `~`, `>=`) while keeping upper bounds intact
 - **Pinned Version Detection**: Skips intentionally pinned versions by default
 - **Age Filter**: Only updates to versions that have been public for at least N days or weeks (1 week by default)
-- **Project Age Policies**: Applies the minimum release age set in pnpm, Bun, or mise settings automatically
+- **Project Age Policies**: Inherits pnpm, Bun, and mise policies per directory and preserves stricter uv and mise native cutoffs
 - **Vulnerability Check**: Looks up the chosen version on OSV.dev and avoids versions with known vulnerabilities (enabled by default)
 - **Package Manager Install**: `--install` runs each project's package manager after the update and passes the age filter on to pnpm, uv, and mise
+- **Cargo Lock Age Audit**: Checks changed direct and transitive crates after install; unresolved violations or unverified entries exit with code `2`
 - **Bun Catalogs**: Updates Bun `catalog` / `catalogs` definitions in `package.json`
 - **Monorepo Support**: `.depup`, Cargo/pnpm/Go workspaces, Gradle multi-project builds, nested package installs, and Tauri projects
 - **Multiple Output Formats**: Colored text with the release date of each new version, JSON, and diff
@@ -206,13 +207,16 @@ Unless a dependency is pinned, depup looks up its published versions, picks the 
 
 ## Configuration
 
-depup reads settings from three places. For each setting, a command-line flag overrides the global configuration file for that run. The release age is the exception: a minimum release age set in the project takes precedence over `--age` as well.
+depup reads its defaults, monorepo directories, and release-age policies from the sources below. A command-line flag overrides depup's global defaults for that run. Explicit project age policies take precedence over `--age`; stricter uv and mise native constraints are also preserved.
 
 | Setting | Location | Purpose |
 |---|---|---|
 | Global defaults | `~/.config/depup/config.toml`, created on the first run | Default `age`, `osv`, and `max_change`, plus verified publisher exceptions (`age_exempt`) |
 | Monorepo directories | `.depup` at the project root | Additional directories to process |
 | Project age policy | `minimumReleaseAge` in the pnpm or Bun settings, `minimum_release_age` in the mise settings | Minimum release age of that project |
+| Native age constraints | uv's `exclude-newer` and mise's global, local, and per-tool age settings | Preserve stricter cutoffs during candidate selection and install |
+
+Each manifest inherits age settings from its ancestors. Shared installs and Cargo workspace locks use the strictest applicable member policy, including members with no updates. See [Age Filter](docs/usage.md#age-filter) for sources, precedence, and limits.
 
 For example, to wait two weeks instead of one and to rule out major bumps in every project:
 

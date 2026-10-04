@@ -74,9 +74,11 @@ api       # Backend API
 shared    # Shared libraries
 ```
 
-Run `depup` from the root directory to update dependencies across all listed directories at once. The root directory itself is always scanned in addition to the listed directories. Version lookups are cached, so shared packages are only fetched once.
+Run `depup` from the root directory to update dependencies across all listed directories at once. The root directory itself is always scanned in addition to the listed directories. Version lookups are cached, so shared packages are only fetched once. mise candidates are scoped to their directory and age policy and use mise's own cache.
 
 When `--install` is used, depup runs each package manager in the deepest listed directory that contains the updated manifest, so nested apps install in their own directories instead of the repository root ([Running the Package Manager](usage.md#running-the-package-manager---install)).
+
+Each listed directory inherits explicit age settings from its ancestors up to the run root. Sibling policies remain separate for candidate selection; a shared install or Cargo workspace lock uses the strictest member policy. See [Resolution Priority](usage.md#resolution-priority).
 
 The `.depup` format:
 

@@ -184,7 +184,7 @@ mise（[jdx/mise](https://mise.jdx.dev)）の設定ファイルに書かれた�
 
 `mise.toml` / `.mise.toml` / `mise/config.toml` / `.mise/config.toml` / `.config/mise.toml` / `.config/mise/config.toml` / `.tool-versions`
 
-`mise.local.toml`（個人のローカル上書き。通常は gitignore の対象）と `mise.<env>.toml`（環境別の上書き設定）は、特定の環境だけに効く設定です。更新すると、その環境の設定だけが利用者の気づかないうちに変わってしまうため、意図的に読み込みません。
+`mise.local.toml`（個人のローカル上書き。通常は gitignore の対象）と `mise.<env>.toml`（環境別の上書き設定）は、特定の環境だけに効く設定です。更新すると、その環境の設定だけが利用者の気づかないうちに変わってしまうため、更新対象としては読み込みません。ただしローカル設定と、有効な `MISE_ENV` の環境設定にある明示 age は読み取り、制約を弱めないようにします。
 
 #### バージョン指定の扱い
 
@@ -210,4 +210,6 @@ mise の `[settings] minimum_release_age` が**明示的に書かれている**�
 
 > **注意**: mise の `m` は**分**（humantime 準拠）で、depup CLI の `--age 1m`（1 か月）とは単位が違います。`minimum_release_age = "1m"` は 1 分として扱われます。プロジェクトポリシーは CLI の `--age` より優先されるため、pnpm や Bun にもっと大きな値がなければ、age フィルターは実質的に効かなくなります。1 か月にしたい場合は `"1M"` か `"30d"` と書いてください。
 
-`mise ls-remote` はデフォルトで mise 側の `minimum_release_age` を適用して新しいバージョンを隠しますが、depup は `--minimum-release-age 0` を渡してすべて取得し、age の判定を depup 側に一本化します。`minimum_release_age_excludes` は depup では解釈しないため、設定されている場合は警告を表示します。
+`mise ls-remote` は各マニフェストのスコープで実行し、解決済みの cutoff を `--minimum-release-age <日時>` で渡します。グローバル・ローカル・ツール単位の明示 age と環境変数も読み、depup の値より厳しい制約を維持します。ツール単位の値はスコープ全体の最も厳しい値にまとめます。age が無効で明示制約もない場合だけ `0` を渡します。age で絞られた候補はスコープごとに異なるため、depup の共有キャッシュには入れず、mise 自身のキャッシュを使います。`minimum_release_age_excludes` は depup では適用せず、設定されている場合は警告を表示します。
+
+公開日時を返さないバックエンドの age 制御は mise に委譲します。ただし、mise 自身も日時不明の版を許可します。トップレベルの完全固定・lock 済みの版も native の age 制限から外れます。推移的依存に cutoff を渡すのは `npm:`・`pypi:` の未固定依存だけです（[mise の仕様](https://mise.jdx.dev/configuration/settings.html#minimum_release_age)）。

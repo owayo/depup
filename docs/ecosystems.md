@@ -188,7 +188,7 @@ Tool versions declared in [mise](https://mise.jdx.dev) config files go through t
 
 `mise.toml`, `.mise.toml`, `mise/config.toml`, `.mise/config.toml`, `.config/mise.toml`, `.config/mise/config.toml`, `.tool-versions`
 
-`mise.local.toml` (personal local override, usually gitignored) and `mise.<env>.toml` (per-environment overlay) are intentionally not read, so depup never rewrites a single environment behind your back.
+`mise.local.toml` (personal local override, usually gitignored) and `mise.<env>.toml` (per-environment overlay) are not updated, so depup never rewrites a single environment behind your back. Explicit ages in local files and active `MISE_ENV` overlays are still read so their constraints are not weakened.
 
 #### Version Specifiers
 
@@ -214,4 +214,6 @@ When `[settings] minimum_release_age` is **explicitly set**, depup treats it as 
 
 > **Caution**: mise's `m` means **minutes** (humantime convention), unlike depup's `--age 1m`, which means one month. `minimum_release_age = "1m"` is read as one minute, and because a project policy overrides the CLI `--age`, it effectively disables the age filter unless pnpm or Bun sets a larger value. Write `"1M"` or `"30d"` for one month.
 
-`mise ls-remote` applies mise's own `minimum_release_age` by default and hides newer releases, so depup passes `--minimum-release-age 0` to fetch everything and keeps age evaluation in one place. `minimum_release_age_excludes` is not interpreted by depup; if it is set, depup prints a warning.
+depup runs `mise ls-remote` in each manifest's scope and passes the resolved cutoff with `--minimum-release-age <timestamp>`. It also reads explicit global, local, and per-tool ages and the environment, preserving constraints stricter than depup's own value. Per-tool values are combined into the strictest age for that scope. Only a disabled age without native constraints passes `0`. Filtered candidates can differ by scope, so they use mise's own cache rather than depup's shared version cache. `minimum_release_age_excludes` is not applied by depup; if it is set, depup prints a warning.
+
+Release-date filtering for backends without timestamps is delegated to mise. However, mise itself includes versions with unknown timestamps and exempts exact pins and locked top-level versions from native filtering. Only the `npm:` and `pypi:` backends pass the cutoff to unpinned transitive dependencies ([mise's specification](https://mise.jdx.dev/configuration/settings.html#minimum_release_age)).
