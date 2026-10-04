@@ -24,7 +24,10 @@ use crate::domain::{Dependency, Language};
 use crate::error::ManifestError;
 use crate::manifest::{
     ManifestParser,
-    line_utils::{HashCommentMode, parse_toml_section_header, strip_hash_line_comment},
+    line_utils::{
+        HashCommentMode, opens_unclosed_multiline_string, parse_toml_section_header,
+        scan_toml_line_outside_strings, skip_single_line_string, strip_hash_line_comment,
+    },
 };
 use crate::parser::{VersionParser, get_parser};
 use regex::Regex;
@@ -389,85 +392,6 @@ fn poetry_target(path: &[String], package: &str) -> Option<PoetryTarget> {
         return Some(PoetryTarget::EntryVersion);
     }
     None
-}
-
-/// TOML の 1 行を走査し、文字列リテラルの外側にある文字だけを `visit` へ渡す。
-///
-/// - 単一行の基本文字列 (`"..."`、バックスラッシュエスケープを解釈) とリテラル文字列
-///   (`'...'`) の内側は訪問しない。
-/// - 文字列外の `#` に達した時点で走査を打ち切る (行コメント)。
-/// - 行内で閉じないマルチライン文字列 (`"""` / `'''`) を開いた場合はその区切りを返す。
-///
-/// マルチライン区切りを単一行クォートより**先に**判定するのが要点。逆にすると
-/// `"""` の 1 文字目で単一行の基本文字列に入ったと誤認する。
-fn scan_toml_line_outside_strings(
-    line: &str,
-    mut visit: impl FnMut(usize, char),
-) -> Option<&'static str> {
-    let mut idx = 0;
-    'scan: while idx < line.len() {
-        let rest = &line[idx..];
-
-        for delim in ["\"\"\"", "'''"] {
-            if let Some(after_open) = rest.strip_prefix(delim) {
-                match after_open.find(delim) {
-                    // 同一行で閉じるので読み飛ばして走査を続ける
-                    Some(close) => {
-                        idx += delim.len() + close + delim.len();
-                        continue 'scan;
-                    }
-                    // 開いたまま行が終わる = 以降の行はマルチライン文字列の内側
-                    None => return Some(delim),
-                }
-            }
-        }
-
-        let Some(ch) = rest.chars().next() else {
-            break;
-        };
-        match ch {
-            '"' | '\'' => idx += skip_single_line_string(rest, ch == '"'),
-            // 行コメント以降は TOML 構文として解釈しない
-            '#' => return None,
-            _ => {
-                visit(idx, ch);
-                idx += ch.len_utf8();
-            }
-        }
-    }
-    None
-}
-
-/// 単一行の TOML 文字列を読み飛ばし、消費したバイト数を返す。
-/// `basic` が true なら基本文字列 (`"..."`) としてバックスラッシュエスケープを解釈する。
-/// 閉じクォートが無ければ行末まで消費する。
-fn skip_single_line_string(rest: &str, basic: bool) -> usize {
-    let quote = if basic { '"' } else { '\'' };
-    let start = quote.len_utf8();
-    let mut escaped = false;
-    for (offset, ch) in rest[start..].char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if basic && ch == '\\' {
-            escaped = true;
-            continue;
-        }
-        if ch == quote {
-            return start + offset + ch.len_utf8();
-        }
-    }
-    rest.len()
-}
-
-/// 行がマルチライン文字列 (`"""` / `'''`) を開いて同一行内で閉じない場合、その区切りを返す。
-///
-/// 行コメント内 (`# ... """`) や別種クォートの内側 (`description = "Ain't got '''"`) の
-/// 区切りは無視する。以前は行全体を `find("\"\"\"")` するだけだったため、コメントや
-/// 文字列内の区切りで docstring 状態が立ち、以降のファイル全体が更新不能になっていた。
-fn opens_unclosed_multiline_string(line: &str) -> Option<&'static str> {
-    scan_toml_line_outside_strings(line, |_, _| {})
 }
 
 /// 文字列リテラル・行コメントの外側で数えた括弧の増減を返す。

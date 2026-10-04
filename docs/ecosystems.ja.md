@@ -204,6 +204,8 @@ mise（[jdx/mise](https://mise.jdx.dev)）の設定ファイルに書かれた�
 
 `[tools]` セクションだけを書き換え、`[settings]` / `[env]` / `[tasks]` / `[alias]` に同名のキーがあっても変更しません。引用符の種類（`"` / `'`）、行末コメント、改行コード（CRLF）、`.tool-versions` の空白の並びはすべて保持します。
 
+タスクの複数行文字列に含まれるツール宣言は無視します。通常の文字列やコメントの中に三重引用符があっても、その後の `[tools]` 宣言は更新対象として読み取ります。
+
 #### mise と age フィルター
 
 mise の `[settings] minimum_release_age` が**明示的に書かれている**場合は、pnpm・Bun の `minimumReleaseAge` と同じ[プロジェクトポリシー](usage.ja.md#適用される-age-の優先順位)として、CLI の `--age` より優先します。採用するのは設定ファイルに書かれた値だけで、mise の組み込みのデフォルト（24 時間）は採用しません。書き方は「[`minimumReleaseAge` を読み取る設定ファイル](usage.ja.md#minimumreleaseage-を読み取る設定ファイル)」を参照してください。

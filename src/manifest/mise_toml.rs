@@ -23,7 +23,7 @@
 
 use super::ManifestParser;
 use super::line_utils::{
-    HashCommentMode, parse_toml_section_header, split_line_ending, strip_hash_line_comment,
+    opens_unclosed_multiline_string, parse_toml_section_header, split_line_ending,
 };
 use crate::domain::{Dependency, Language};
 use crate::error::ManifestError;
@@ -151,41 +151,6 @@ fn tools_dotted_key_value_start(line: &str, tool: &str) -> Option<usize> {
     pos += after_dot.len() - after_dot.trim_start().len();
 
     Some(pos + tool_key_value_start(&line[pos..], tool)?)
-}
-
-/// 行がマルチライン文字列 (`"""` / `'''`) を開いて同一行で閉じない場合、その区切りを返す。
-///
-/// mise のトップレベルには `tasks` / `task_templates` / `hooks` / `bootstrap` /
-/// `env` があり、いずれもシェルスクリプトをマルチライン文字列で書くのが普通。
-/// その中に `[tools]` や `node = "0.0.1"` がそのまま現れても、TOML 仕様上は
-/// 文字列の中身なので構文として解釈してはいけない。行走査でこれを追跡しないと
-/// タスクスクリプト側を書き換えてしまい、本物の宣言は `updated` ガードで
-/// スキップされる (parse 側の toml クレートは当然無視するので report/apply が
-/// 食い違う)。
-///
-/// pyproject_toml.rs が同じ問題を独自に塞いでいる。将来 line_utils へ共通化する
-/// 余地があるが、今は各パーサでローカルに閉じている。
-fn opens_unclosed_multiline_string(line: &str) -> Option<&'static str> {
-    // 行コメント (`# ... """ ...`) 内の区切りを開始と誤検出しない。
-    // TOML なのでバックスラッシュはリテラル扱い (Plain)。
-    let body = strip_hash_line_comment(line, HashCommentMode::Plain);
-
-    // 行内で最初に現れる区切り (""" / ''') を選ぶ
-    let mut earliest: Option<(usize, &'static str)> = None;
-    for delim in ["\"\"\"", "'''"] {
-        if let Some(pos) = body.find(delim)
-            && earliest.map(|(p, _)| pos < p).unwrap_or(true)
-        {
-            earliest = Some((pos, delim));
-        }
-    }
-    let (pos, delim) = earliest?;
-    // 開始区切りの直後に同じ区切りが再度現れれば、同一行で閉じている
-    if body[pos + delim.len()..].contains(delim) {
-        None
-    } else {
-        Some(delim)
-    }
 }
 
 /// 値部分がマルチライン文字列リテラル (`"""..."""` / `'''...'''`) かどうか。
@@ -529,6 +494,29 @@ mod tests {
     use super::*;
     use crate::domain::VersionSpecKind;
 
+    #[test]
+    fn quoted_multiline_markers_do_not_hide_tools() {
+        for description in [
+            r#""Ain't got '''""#,
+            r#"'see """ marker'"#,
+            r##""escaped \"#'''""##,
+        ] {
+            for newline in ["\n", "\r\n"] {
+                let content = format!(
+                    "description = {description}{newline}[tools]{newline}node = '26.7.0'{newline}"
+                );
+                let deps = MiseTomlParser.parse(&content).unwrap();
+                assert_eq!(deps.len(), 1, "{content}");
+                assert_eq!(deps[0].name, "node");
+                assert_eq!(
+                    MiseTomlParser
+                        .update_version(&content, "node", "27.0.0")
+                        .unwrap(),
+                    content.replace("26.7.0", "27.0.0")
+                );
+            }
+        }
+    }
     fn parse(content: &str) -> Vec<Dependency> {
         MiseTomlParser.parse(content).unwrap()
     }

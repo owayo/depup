@@ -208,6 +208,8 @@ Most of the 3000+ entries `mise ls-remote java` returns carry a vendor prefix (`
 
 Only the `[tools]` section is rewritten; identically named keys under `[settings]`, `[env]`, `[tasks]`, or `[alias]` are untouched. Quote style (`"` / `'`), trailing comments, CRLF line endings, and the column alignment of `.tool-versions` are all preserved.
 
+Tool declarations inside multiline task strings are ignored. Triple-quote markers inside ordinary strings or comments do not hide subsequent `[tools]` declarations.
+
 #### mise and the Age Filter
 
 When `[settings] minimum_release_age` is **explicitly set**, depup treats it as a [project policy](usage.md#resolution-priority), just like pnpm's and Bun's `minimumReleaseAge`, so it takes precedence over the CLI `--age`. Only a value written in a config file counts; mise's built-in 24-hour default is ignored. The syntax is shown under [Supported `minimumReleaseAge` Sources](usage.md#supported-minimumreleaseage-sources).
