@@ -42,7 +42,6 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, Semaphore};
 
 /// レジストリリクエストのデフォルト同時実行数
 const DEFAULT_CONCURRENCY: usize = 10;
@@ -102,9 +101,7 @@ const MIN_TOGETHER_SLICE: Duration = Duration::from_secs(20);
 /// 第一候補に使う (`rollback_target`)。
 pub type PreferredVersions = HashMap<String, Vec<String>>;
 
-/// バージョン情報のキャッシュ (言語, パッケージ名) をキーとする
-pub type VersionCache = Arc<Mutex<HashMap<(Language, String), Vec<VersionInfo>>>>;
-type VersionFetchLocks = Arc<Mutex<HashMap<(Language, String), Arc<Mutex<()>>>>>;
+pub use crate::registry::versions::VersionCache;
 
 /// パース済みマニフェスト (parse_phase → check_phase の受け渡し用)
 struct ParsedManifest<'a> {
@@ -119,17 +116,11 @@ pub struct Orchestrator {
     evaluated_at: chrono::DateTime<chrono::Utc>,
     /// レジストリリクエスト用HTTPクライアント
     client: HttpClient,
-    /// 汎用同時実行制御用セマフォ
-    general_semaphore: Arc<Semaphore>,
-    /// crates.io 専用レート制限セマフォ
-    crates_io_semaphore: Arc<Semaphore>,
     /// crates.io の 1 リクエスト/秒 間隔を実行全体で共有する状態。
     /// アダプタごとに持たせるとマニフェスト境界やフェーズ境界で間隔がリセットされる
     crates_io_rate_limit: Arc<CratesIoRateLimit>,
-    /// ディレクトリ間で共有されるバージョンキャッシュ
-    version_cache: VersionCache,
-    /// 同一パッケージの取得を一つにまとめるキー単位のロック
-    version_fetch_locks: VersionFetchLocks,
+    /// ディレクトリ・フェーズ間で共有するバージョン取得状態
+    versions: crate::registry::versions::VersionFetcher,
     /// URL 単位でキャッシュされる git ls-remote クライアント
     git_remote: GitRemote,
     /// OSV チェッカー (`args.osv` が true のときのみ初期化)
@@ -206,11 +197,11 @@ impl Orchestrator {
             args,
             evaluated_at: chrono::Utc::now(),
             client,
-            general_semaphore: Arc::new(Semaphore::new(DEFAULT_CONCURRENCY)),
-            crates_io_semaphore: Arc::new(Semaphore::new(CRATES_IO_CONCURRENCY)),
             crates_io_rate_limit: Arc::new(CratesIoRateLimit::new()),
-            version_cache: Arc::new(Mutex::new(HashMap::new())),
-            version_fetch_locks: Arc::new(Mutex::new(HashMap::new())),
+            versions: crate::registry::versions::VersionFetcher::new(
+                DEFAULT_CONCURRENCY,
+                CRATES_IO_CONCURRENCY,
+            ),
             git_remote: GitRemote::new(),
             osv_checker,
             global_config: None,
@@ -805,26 +796,13 @@ impl Orchestrator {
         }
     }
 
-    /// install がキャッシュにない版を選んだ場合に、共有レート制限付きで一覧を更新する。
+    /// install がキャッシュにない版を選んだ場合に、共有取得元を更新する。
     async fn refresh_audit_versions(
         &self,
         adapter: &(dyn RegistryAdapter + Send + Sync),
         package: &str,
     ) -> Result<Vec<VersionInfo>, String> {
-        let _permit = self
-            .crates_io_semaphore
-            .acquire()
-            .await
-            .map_err(|error| error.to_string())?;
-        let versions = adapter
-            .fetch_versions(package)
-            .await
-            .map_err(|error| error.to_string())?;
-        self.version_cache
-            .lock()
-            .await
-            .insert((adapter.language(), package.to_string()), versions.clone());
-        Ok(versions)
+        self.versions.refresh(adapter, package).await
     }
 
     /// 監査中に取得済みの版一覧 (レジストリへは問い合わせない)
@@ -833,7 +811,7 @@ impl Orchestrator {
         adapter: &(dyn RegistryAdapter + Send + Sync),
         package: &str,
     ) -> Option<Vec<VersionInfo>> {
-        let cache = self.version_cache.lock().await;
+        let cache = self.versions.cache.lock().await;
         cache
             .get(&(adapter.language(), package.to_string()))
             .cloned()
@@ -1421,71 +1399,13 @@ impl Orchestrator {
         }
     }
 
-    /// 同時実行制御とキャッシュ付きでレジストリからバージョンを取得する
+    /// チェック・同期・監査で共有する取得状態を使う。
     async fn fetch_versions(
         &self,
         adapter: &(dyn RegistryAdapter + Send + Sync),
         package: &str,
     ) -> Result<Vec<VersionInfo>, String> {
-        // mise は現在ディレクトリと native age により一覧自体が変わる。
-        // その一覧を別の age スコープへ再利用しない (mise 自身のリモートキャッシュは使える)。
-        if adapter.language() == Language::Mise {
-            let _permit = self.general_semaphore.acquire().await.unwrap();
-            return adapter
-                .fetch_versions(package)
-                .await
-                .map_err(|error| error.to_string());
-        }
-        let cache_key = (adapter.language(), package.to_string());
-
-        // まずキャッシュを確認
-        {
-            let cache = self.version_cache.lock().await;
-            if let Some(cached) = cache.get(&cache_key) {
-                return Ok(cached.clone());
-            }
-        }
-
-        // 同一キーの取得だけを直列化する。異なるパッケージの並列性は維持する。
-        let fetch_lock = {
-            let mut locks = self.version_fetch_locks.lock().await;
-            Arc::clone(
-                locks
-                    .entry(cache_key.clone())
-                    .or_insert_with(|| Arc::new(Mutex::new(()))),
-            )
-        };
-        let _fetch_guard = fetch_lock.lock().await;
-
-        // キー単位ロックの待機中に先行取得が完了している場合はキャッシュを返す。
-        {
-            let cache = self.version_cache.lock().await;
-            if let Some(cached) = cache.get(&cache_key) {
-                return Ok(cached.clone());
-            }
-        }
-
-        // レジストリに応じて適切なセマフォを使用
-        let semaphore = if adapter.language() == Language::Rust {
-            &self.crates_io_semaphore
-        } else {
-            &self.general_semaphore
-        };
-
-        let _permit = semaphore.acquire().await.unwrap();
-
-        let result = adapter
-            .fetch_versions(package)
-            .await
-            .map_err(|e| e.to_string())?;
-
-        // キャッシュに保存
-        {
-            let mut cache = self.version_cache.lock().await;
-            cache.insert(cache_key, result.clone());
-        }
-
-        Ok(result)
+        self.versions.fetch(adapter, package).await
     }
 
     /// Tauriパッケージバージョンを同期する (@tauri-apps/api, @tauri-apps/cli, tauri crate)
@@ -3176,7 +3096,7 @@ mod tests {
         ))
         .unwrap();
         let now = chrono::Utc::now();
-        orchestrator.version_cache.lock().await.insert(
+        orchestrator.versions.cache.lock().await.insert(
             (Language::Node, "library".into()),
             vec![
                 VersionInfo::new("1.0.0", now - chrono::Duration::days(60)),
@@ -3235,7 +3155,7 @@ mod tests {
         let mut npm_versions = versions.clone();
         npm_versions.push(VersionInfo::new("2.3.0", now - chrono::Duration::days(3)));
         {
-            let mut cache = orchestrator.version_cache.lock().await;
+            let mut cache = orchestrator.versions.cache.lock().await;
             for name in TAURI_NPM_PACKAGES {
                 cache.insert((Language::Node, (*name).into()), npm_versions.clone());
             }
@@ -3827,7 +3747,7 @@ mod tests {
         // 既知のパッケージでキャッシュを事前に設定
         let cache_key = (Language::Node, "lodash".to_string());
         {
-            let mut cache = orchestrator.version_cache.lock().await;
+            let mut cache = orchestrator.versions.cache.lock().await;
             cache.insert(
                 cache_key,
                 vec![VersionInfo {
@@ -3923,7 +3843,7 @@ mod lock_age_audit_tests {
             .release("library", "1.0.0", old())
             .release("library", "1.0.1", fresh());
         let orchestrator = Orchestrator::new(CliArgs::parse_from(["depup"])).unwrap();
-        orchestrator.version_cache.lock().await.insert(
+        orchestrator.versions.cache.lock().await.insert(
             (Language::Rust, "library".into()),
             vec![VersionInfo::new("1.0.0", old())],
         );

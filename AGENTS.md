@@ -61,6 +61,7 @@ src/
   parser/           - 言語別パース処理
   registry/
     client.rs        - HTTP共通クライアント
+    versions.rs      - フェーズ間で共有するバージョン取得 (キャッシュ・single-flight・並行数制御)
     npm.rs           - npm Registry
     pypi.rs          - PyPI
     crates_io.rs     - crates.io

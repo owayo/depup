@@ -19,6 +19,7 @@ mod npm;
 mod packagist;
 mod pypi;
 mod rubygems;
+pub(crate) mod versions;
 
 pub use client::HttpClient;
 pub use crates_io::{CratesIoAdapter, CratesIoRateLimit};
