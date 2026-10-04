@@ -80,6 +80,7 @@ src/
     json.rs          - JSON出力
     diff.rs          - diff出力
   cargo_rollback/  - `--install` 後の Cargo.lock の age 違反の差し戻し
+    audit.rs         - 公開日検査・単独差し戻し・まとめ解き・最終照合 (lock ごとの状態と時間予算を保持)
     batch.rs         - まとめ解き (1 件ずつの `--precise` で衝突した crate を workspace の一時写しでまとめて解き直す)
     graph.rs         - Cargo.lock の依存グラフ (頂点・連結成分)
     report.rs        - 表示と lock の突き合わせ (表示した更新先と Cargo.lock に入った版の食い違いの注記)

@@ -117,4 +117,16 @@ impl VersionFetcher {
             .insert((adapter.language(), package.to_string()), versions.clone());
         Ok(versions)
     }
+
+    /// 監査中に取得済みの版一覧 (レジストリへは問い合わせない)
+    pub(crate) async fn cached(
+        &self,
+        adapter: &(dyn RegistryAdapter + Send + Sync),
+        package: &str,
+    ) -> Option<Vec<VersionInfo>> {
+        let cache = self.cache.lock().await;
+        cache
+            .get(&(adapter.language(), package.to_string()))
+            .cloned()
+    }
 }
