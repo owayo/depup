@@ -114,6 +114,19 @@ fn test_changed_entries_no_changes_is_empty() {
 }
 
 #[test]
+fn full_audit_includes_unchanged_versions_after_changed_crates() {
+    let baseline = lock_entries(&[("alpha", &["1.0.0"]), ("zeta", &["1.0.0"])]);
+    let current = lock_entries(&[("alpha", &["1.0.0"]), ("zeta", &["1.0.0", "1.0.1"])]);
+    assert_eq!(
+        audit_entries(&current, &baseline),
+        vec![
+            ("zeta".into(), vec!["1.0.0".into(), "1.0.1".into()]),
+            ("alpha".into(), vec!["1.0.0".into()]),
+        ]
+    );
+}
+
+#[test]
 fn test_pick_older_within_age_basic() {
     // age cutoff = 14 日前。現在 lock = 1.5.0 (3 日前) は age 違反。
     // 1.4.9 (30 日前) が最新の「古くて age 内」候補。
@@ -358,6 +371,7 @@ fn test_adjustment_log_reconciles_with_final_lock() {
         LockAgeStatus::UpdateCommandFailed(ref m) if m.contains("still has still 1.0.2")
     ));
     assert_eq!(by_name("still").to, None);
+    assert_eq!(by_name("still").target.as_deref(), Some("1.0.1"));
     assert_eq!(by_name("moved").status, LockAgeStatus::Downgraded);
     assert_eq!(by_name("moved").to.as_deref(), Some("1.0.0"));
     assert_eq!(by_name("gone").status, LockAgeStatus::Removed);

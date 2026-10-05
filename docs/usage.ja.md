@@ -332,21 +332,21 @@ depup が書き換えるのは、解析した依存宣言だけです。依存�
 `--install` を指定すると、depup はマニフェストを書き換えたあと、プロジェクトごとにパッケージマネージャーを実行します。ロックファイルやインストール済みのパッケージを、新しいバージョンに合わせるためです。
 
 - install を実行するのは、1 件以上更新したマニフェストだけです。`--dry-run` のときは実行しません。
-- [`.depup`](configuration.ja.md#depup-設定ファイル) がない場合は、更新したマニフェストがワークスペースのメンバーのものでも、install はすべて対象ディレクトリ（`PATH` 引数、省略時はカレントディレクトリ）で実行します。`.depup` がある場合は、更新したマニフェストを含む対象ディレクトリのうち最も深いもので実行するため、入れ子のアプリは各自のディレクトリで install されます。
+- Node は pnpm workspace の共有ルート、またはマニフェストのあるディレクトリで install を実行します。他言語は [`.depup`](configuration.ja.md#depup-設定ファイル) がなければ対象ディレクトリ（PATH 引数）を使い、あれば更新したマニフェストを含む対象のうち最も深いディレクトリを使います。
 - install は 1 つずつ、ディレクトリのパス順に実行します。同じディレクトリでは、言語ごとに 1 回だけです。パッケージマネージャーの出力は画面に流さずに depup が受け取り、標準エラー出力は install が失敗したときだけ表示します。
 
-install が失敗しても、残りの install は続けます。失敗したコマンドとパッケージマネージャーの標準エラー出力を表示し、最後に `Error: Some package manager installs failed` を出して終了コード 1 で終わります。パッケージマネージャーがインストールされていない場合も失敗として扱います。書き換え済みのマニフェストは元に戻しません。別の install が失敗しても、Rust の監査（[Rust の `Cargo.lock` 監査](#rust-の-cargolock-監査)）は実行します。
+install が失敗しても、残りの install は続けます。失敗したコマンドとパッケージマネージャーの標準エラー出力を表示し、最後に `Error: Some package manager installs failed` を出して終了コード 1 で終わります。パッケージマネージャーがインストールされていない場合も失敗として扱います。書き換え済みのマニフェストは元に戻しません。別の install が失敗しても、Rust と Node の lock の監査は実行します。更新がない `--install` の再実行でも既存 lock を監査しますが、更新がなければパッケージマネージャーは再実行しません。
 
 ### パッケージマネージャーごとのコマンド
 
-パッケージマネージャーは、install を実行するディレクトリにあるファイルから判定します。親ディレクトリはたどりません。各言語で、上の行から順に最初に見つかったものを使います。
+パッケージマネージャーは、install を実行するディレクトリにあるファイルから判定します。検出された pnpm workspace の Node メンバーは、ルートの install と lock の監査を共有します。それ以外は親ディレクトリをたどりません。各言語で、上の行から順に最初に見つかったものを使います。
 
 | 言語 | 判定に使うファイル | 実行するコマンド |
 |------|--------------------|------------------|
 | Node.js | `pnpm-lock.yaml` | `pnpm install` |
 | | `yarn.lock` | `yarn install` |
 | | `bun.lock` / `bun.lockb` | `bun install` |
-| | `package-lock.json`、または `package.json` のみ | `npm install` |
+| | `npm-shrinkwrap.json` / `package-lock.json`、または `package.json` のみ | `npm install` |
 | Python | `uv.lock` | `uv sync` |
 | | `poetry.lock` | `poetry install` |
 | | `requirements.lock` / `requirements-dev.lock` | `rye sync` |
@@ -371,17 +371,31 @@ age フィルターは、depup がマニフェストに書き込むバージョ�
 
 | パッケージマネージャー | depup が渡すもの | 推移的依存への効果 |
 |------------------------|------------------|--------------------|
-| pnpm | 環境変数 `npm_config_minimum_release_age=<分>` | pnpm v10.16 以降が適用する（それより古い pnpm は環境変数を無視する） |
+| pnpm | 環境変数 `npm_config_minimum_release_age=<分>` と `pnpm_config_minimum_release_age=<分>` の両方 | 対応版の pnpm が解決時に適用し、depup が install 後の lock も監査する。両方の接頭辞で pnpm 10 と pnpm 11 以降に対応する |
 | uv | `--exclude-newer <日時>` | uv が依存の解決時に適用する |
 | Cargo | なし（`cargo update` のあとに depup が `Cargo.lock` を監査する） | 条件を満たさない crates.io のクレートを depup が差し戻す（[下記](#rust-の-cargolock-監査)） |
 | mise | `--minimum-release-age <日時>` と `MISE_MINIMUM_RELEASE_AGE` | 公開日時が分かる前方一致の版を制限する。推移的依存への適用は `npm:`・`pypi:` の未固定依存だけ。完全固定・lock 済みのトップレベルの版には native の制限が効かない |
-| npm、Yarn、Bun、pip、Poetry、Rye、Pipenv、Go、Bundler、Composer、Gradle、SwiftPM | なし | 適用されない（age フィルターが効くのは直接依存だけ） |
+| npm | なし | package-lock 形式 2/3 の実際の解決版を install 後に検証する |
+| Yarn、Bun | なし | lock の監査は未対応。age が有効なら終了コード 2 で通知する |
+| pip、Poetry、Rye、Pipenv、Go、Bundler、Composer、Gradle、SwiftPM | なし | 適用されない（age フィルターが効くのは直接依存だけ） |
 
-`--verbose` を付けると、今回使うパッケージマネージャーのうち、age フィルターが直接依存にしか効かないものを通知します。`--no-age` を指定し、プロジェクトと PM 自身のポリシーもない場合は、age の値をどこにも渡さず、Rust の監査も行いません。uv のパッケージ・index 単位の明示例外は uv 自身の仕様に従います。
+`--verbose` を付けると、今回使うパッケージマネージャーのうち、age フィルターが直接依存にしか効かないものを通知します。`--no-age` を指定し、プロジェクトと PM 自身のポリシーもない場合は、age の値をどこにも渡さず、Rust と Node の lock の監査も行いません。uv のパッケージ・index 単位の明示例外は uv 自身の仕様に従います。
+
+#### Node の lock の監査
+
+age が有効な `--install` では、直接依存・推移依存・開発依存の実際の解決版を検証します。更新がない再実行でも、ほかの install が失敗した場合でも既存 lock を検証します。lock がなく、install も不要な場合は監査しません。
+
+- pnpm: `pnpm list --depth Infinity --lockfile-only --json` で lock の依存グラフを読みます。共有 workspace はルートと全メンバーを含め、最も厳しい設定を使います。必須依存の欠落や CLI の警告があれば未確認扱いにします。
+- npm: 優先される `npm-shrinkwrap.json`、または `package-lock.json` の形式 2/3 の `packages` テーブルを読み、各パッケージと workspace の必須依存の解決先も確認します。
+- Yarn、Bun、npm の形式 1: 現在は未対応として、age が有効なら終了コード 2 で通知します。
+
+取得元が公開 npm レジストリだと確認できるパッケージだけを照会します。pnpm が生成した依存グラフの URL だけを根拠にせず、実際に有効なレジストリ設定も確認します。alias は実パッケージ名を使います。ローカル・workspace・Git 依存は公開日の監査対象外です。private や取得元が不明のレジストリ依存は、その名前を公開 npm へ送らず未確認として報告します。公開日不明、読み込み・照会の失敗、監査中の lock の変更、180 秒の時間切れも終了コード 2 になります。公開日は更新候補のフィルターと別に検証するため、deprecated や latest 以外のロックされた版も確認できます。
+
+Node の監査では lock を書き換えません。違反は実際のロック版・公開日・基準日時を、未確認の依存は理由を常に表示します。PM 自身の age フィルターで新規の解決を制限できる場合も、最後の検証を省略しません。
 
 #### Rust の `Cargo.lock` 監査
 
-Rust では、install の前後で `Cargo.lock` のバージョンが変わったクレートだけ、直接依存か推移的依存かを問わず公開日時を確認します。age フィルターの条件を満たさないものは差し戻します。
+Rust では、最終 `Cargo.lock` の crates.io の版を、無変更の直接依存・推移依存も含めて確認します。まず新しく解決されたクレートの age 違反を、元のマニフェストの制約と install 前の下限が許す範囲で差し戻します。その後、別の読み取り専用の検証で最終 lock の全件を確認します。
 
 ```text
 ⠙ Auditing hyper [██████████████████████▓░░░░░░░] 18/24 (6s)
@@ -389,7 +403,7 @@ Rust では、install の前後で `Cargo.lock` のバージョンが変わっ�
     hyper 1.11.1 → 1.11.0
 ```
 
-対象を「変わったもの」に限るのは、crates.io の利用ポリシーに従ってリクエストを 1 秒に 1 回までに抑えているためです。ロックファイル全体（多くは数百クレート）を調べると、それだけで数分かかります。監査には `Cargo.lock` ごとに 180 秒の上限があります。install 前に `Cargo.lock` がなかった場合はすべてのエントリが新規扱いになるため、この上限に達しやすくなります。crates.io 以外のレジストリのクレートは、crates.io で公開日時を調べられないので監査せず、ロックされた版のまま残します。
+crates.io API への照会は 1 秒に 1 回までに抑え、実行中の取得情報は再利用します。差し戻しと最終検証には、`Cargo.lock` ごとにそれぞれ独立した 180 秒の枠を設けます。最終検証では、[公式の sparse index](https://doc.rust-lang.org/cargo/reference/registry-index.html) の公開日を最大 8 件並列で取得します。日付がない場合や、若い版に公開者の例外を照合する場合は、レート制限付き API を使います。yank 済みのロック版も公開日を確認しますが、更新・差し戻し候補には使いません。未確認が残れば、無変更の再実行でも報告して終了コード 2 にします。既存 lock の読み込み失敗や、install が必要だったのに lock がない場合を成功扱いにしません。lock がない無変更のプロジェクトでは install も lock の監査も行いません。install 前の lock が読めない場合は、安全な下限を確定できないため自動差し戻しも行いません。crates.io 以外のレジストリのクレートは、crates.io で公開日時を調べられないので監査せず、ロックされた版のまま残します。
 
 差し戻し先のバージョンは次のとおりです。
 
@@ -398,7 +412,7 @@ Rust では、install の前後で `Cargo.lock` のバージョンが変わっ�
 
 どちらの場合も、install 前の `Cargo.lock` にあった同じ semver 系列の利用可能なバージョンより古くはしません。yank 済み・公開日不明などで crates.io の利用可能な版情報に含まれないバージョンは、この下限にも戻し先にも使いません。その場合は、互換性があり age フィルターを満たす古い版を選び、有効な候補がなければ未解消の違反として報告します。
 
-条件を満たすバージョンが利用可能な下限より古いものしかなければ、install 前のバージョンに戻します。install で入った変更だけを取り消すためです。戻した install 前のバージョンも age フィルターの条件を満たさない場合は、差し戻した一覧とは別の黄色い行で表示します。
+条件を満たすバージョンが利用可能な下限より古いものしかなければ、install 前のバージョンに戻します。install で入った変更だけを取り消すためです。戻した install 前のバージョンも age フィルターの条件を満たさない場合は、未解消の違反として終了コード 2 にし、差し戻した一覧とは別の黄色い行で表示します。下限にある無変更の違反も報告し、すでに lock にあったことを免除の理由にはしません。
 
 ```text
   . — 1 crate(s) returned to the version locked before the install, which is also newer than --age:
@@ -425,17 +439,20 @@ Rust では、install の前後で `Cargo.lock` のバージョンが変わっ�
 
 解決し直した結果 `Cargo.lock` から外れたクレートは `tokio 1.53.1 → removed` のように表示し、差し戻した件数に含めます。また、1 件ずつでもまとめてでも、差し戻すと別の新しいバージョンが `Cargo.lock` に入ることがあります。depup はそれも監査して差し戻し、これを決まった回数まで繰り返します。
 
-共有ワークスペースの lock には、対象メンバーの最も厳しい設定と、全メンバーに共通する公開者の例外だけを使います。lock の版がキャッシュ済みのレジストリ情報にない場合は、情報を 1 回取り直します。公開日不明、lock の読み込み・解析失敗、差し戻し失敗、監査未完了が残ると終了コードは `2` になります（install 失敗もある場合は `1` が優先）。install 前の版へ戻した場合は install による変更を取り消した扱いとし、それだけでは失敗にしません。
+共有ワークスペースの lock には、対象メンバーの最も厳しい設定と、全メンバーに共通する公開者の例外だけを使います。lock の版がキャッシュ済みのレジストリ情報にない場合は、情報を 1 回取り直します。公開日不明、lock の読み込み・解析失敗、差し戻し失敗、監査未完了が残ると終了コードは `2` になります（install 失敗もある場合は `1` が優先）。install 前の版へ戻しても、その版が age を満たさなければ未解消として扱います。
 
-差し戻したと数えるのは、`Cargo.lock` が実際に変わったときだけです。`cargo update` の終了コードを信じず、毎回ロックファイルを読み直して確かめます。最後の報告も、監査を終えた時点のロックファイルの状態から組み立てます。差し戻した結果は常に表示します。差し戻せなかったクレート、公開日時を取得できなかったクレート、時間の上限で確認できなかったクレートも、`--verbose` なしで件数を表示します。
+差し戻したと数えるのは、`Cargo.lock` が実際に変わったときだけです。`cargo update` の終了コードを信じず、毎回ロックファイルを読み直して確かめます。最後の報告も、監査を終えた時点のロックファイルの状態から組み立てます。差し戻した結果は常に表示します。差し戻せなかったクレート、公開日時を取得できなかったクレート、時間の上限で確認できなかったクレートも、`--verbose` なしで名前・試行時に要求した差し戻し先・理由を表示します。
 
 ```text
-  . — 2 crate(s) could not be rolled back to satisfy --age (use --verbose for details)
-  . — 1 crate(s) could not be checked against --age: release date unavailable (use --verbose for details)
+  . — 2 crate(s) could not be rolled back to satisfy --age:
+    foo (2.1.3; requested: 2.1.2): cargo update failed: <cargo のエラー>
+    bar (1.0.2): no older version satisfies --age
+  . — 1 crate(s) could not be checked against --age:
+    example (1.0.0): release date unavailable
   . — age audit stopped after 180s; 3 crate(s) left unchecked
 ```
 
-`--verbose` を付けると、監査の開始時に `Enforcing --age on crates changed in Cargo.lock...` と表示し、差し戻せなかったクレートと公開日時を取得できなかったクレートについて、1 件ずつ理由を示します。
+`--verbose` を付けると、監査の開始時に `Enforcing --age on registry crates in Cargo.lock...` と表示します。失敗の理由は通常出力でも表示します。
 
 ```text
   . — 2 crate(s) could not be rolled back to satisfy --age:
@@ -448,7 +465,7 @@ Rust では、install の前後で `Cargo.lock` のバージョンが変わっ�
 | `Cargo.toml requires ...` | バージョン指定が、age フィルターの条件を満たすバージョンをすべて除外している |
 | `no older version satisfies --age` | ロックされた版より古いバージョンに、条件を満たすものがない |
 | `cargo update failed: ...` | cargo が差し戻しを受け付けなかった（続けて cargo のエラーを表示する） |
-| `not attempted: ...` | 繰り返しの回数か時間の上限に達したため、差し戻しを試さなかった |
+| `not attempted: ...` | install 前の下限より古くする必要がある、または繰り返しの回数か時間の上限に達したため、差し戻しを試さなかった |
 | `release date unavailable` | 公開日時を取得できず、条件を満たすか確認できなかった |
 
 監査に未解決の問題が残る場合は終了コード `2` になります。

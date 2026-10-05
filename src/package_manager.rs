@@ -123,7 +123,9 @@ impl SystemPackageManager {
         if working_dir.join("bun.lock").exists() || working_dir.join("bun.lockb").exists() {
             return Some("bun");
         }
-        if working_dir.join("package-lock.json").exists() {
+        if working_dir.join("npm-shrinkwrap.json").exists()
+            || working_dir.join("package-lock.json").exists()
+        {
             return Some("npm");
         }
         // package.json があるがロックファイルがない場合は npm をデフォルトにする
@@ -213,11 +215,10 @@ impl SystemPackageManager {
 
     /// パッケージマネージャ実行時に追加する環境変数を決定する。
     ///
-    /// - **pnpm (v10.16+)**: `npm_config_minimum_release_age=<分>` で
-    ///   `minimumReleaseAge` 設定を注入する。pnpm は npm の config 規約に
-    ///   従うため、この env var は `.npmrc` の `minimum-release-age=<分>` と
-    ///   等価になる。pnpm v10.16 未満ではこの env var は未知の設定として
-    ///   無視される (graceful no-op)。
+    /// - **pnpm**: `npm_config_minimum_release_age=<分>` と
+    ///   `pnpm_config_minimum_release_age=<分>` の両方で設定を注入する。
+    ///   npm 互換の設定を読む版と pnpm 独自の設定を読む版の両方へ同じ値を渡す。
+    ///   未対応の版や既存 lock にも備え、install 後に実際の版を監査する。
     /// - **uv (preview)**: `UV_MALWARE_CHECK=1` を常に注入し、`uv sync`
     ///   実行時に OSV の MAL advisories と locked resolution を照合する
     ///   ライトウェイトなマルウェアチェックを有効化する (Astral の preview
@@ -238,6 +239,10 @@ impl SystemPackageManager {
                 + u64::from(age.subsec_nanos() != 0 && age.as_secs().is_multiple_of(60));
             env.push((
                 "npm_config_minimum_release_age".to_string(),
+                minutes.to_string(),
+            ));
+            env.push((
+                "pnpm_config_minimum_release_age".to_string(),
                 minutes.to_string(),
             ));
         }
@@ -676,10 +681,16 @@ mod tests {
         let env = pm.get_install_env("pnpm", Some(age));
         assert_eq!(
             env,
-            vec![(
-                "npm_config_minimum_release_age".to_string(),
-                "20160".to_string()
-            )]
+            vec![
+                (
+                    "npm_config_minimum_release_age".to_string(),
+                    "20160".to_string()
+                ),
+                (
+                    "pnpm_config_minimum_release_age".to_string(),
+                    "20160".to_string()
+                ),
+            ]
         );
     }
 
@@ -688,6 +699,15 @@ mod tests {
         let pm = SystemPackageManager::new();
         let env = pm.get_install_env("pnpm", None);
         assert!(env.is_empty());
+    }
+
+    #[test]
+    fn pnpm_age_supports_both_config_environments() {
+        let env = SystemPackageManager::new()
+            .get_install_env("pnpm", Some(Duration::from_secs(14 * 86400)));
+        for prefix in ["npm_config", "pnpm_config"] {
+            assert!(env.contains(&(format!("{prefix}_minimum_release_age"), "20160".into())));
+        }
     }
 
     #[test]
@@ -702,7 +722,10 @@ mod tests {
         ] {
             assert_eq!(
                 pm.get_install_env("pnpm", Some(age)),
-                vec![("npm_config_minimum_release_age".into(), minutes.into())]
+                vec![
+                    ("npm_config_minimum_release_age".into(), minutes.into()),
+                    ("pnpm_config_minimum_release_age".into(), minutes.into()),
+                ]
             );
         }
     }
@@ -867,6 +890,14 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         std::fs::write(temp_dir.path().join("package-lock.json"), "{}").unwrap();
 
+        let pm = SystemPackageManager::new();
+        assert_eq!(pm.detect_node_pm(temp_dir.path()), Some("npm"));
+    }
+
+    #[test]
+    fn test_detect_node_pm_npm_shrinkwrap() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(temp_dir.path().join("npm-shrinkwrap.json"), "{}").unwrap();
         let pm = SystemPackageManager::new();
         assert_eq!(pm.detect_node_pm(temp_dir.path()), Some("npm"));
     }

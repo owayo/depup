@@ -331,14 +331,14 @@ If the same dependency key is declared more than once in a manifest, or several 
 With `--install`, depup runs each project's package manager after writing the manifests, so lock files and installed packages follow the new versions.
 
 - An install runs only for manifests that received at least one update, and never with `--dry-run`.
-- Without [`.depup`](configuration.md#depup-configuration-file), every install runs in the target directory (the `PATH` argument, or the current directory), even when the updated manifest belongs to a workspace member. With `.depup`, each install runs in the deepest listed directory that contains the updated manifest, so nested apps install in their own directories.
+- Node installs run at the shared pnpm workspace root or the manifest directory. Other languages use the target directory (PATH) without [`.depup`](configuration.md#depup-configuration-file), or the deepest listed directory containing the updated manifest when `.depup` is present.
 - Installs run one at a time, in directory path order, and each language runs at most once per directory. The package manager's output is captured instead of streamed; its stderr is printed only when the install fails.
 
-If an install fails, depup still runs the remaining installs, prints the failed command with the package manager's stderr, and exits with code 1 at the end (`Error: Some package manager installs failed`). A package manager that is not installed counts as a failure. Manifests that were already rewritten are not rolled back, and the Rust age audit ([below](#auditing-cargolock-rust)) still runs even when another install fails.
+If an install fails, depup still runs the remaining installs, prints the failed command with the package manager's stderr, and exits with code 1 at the end (`Error: Some package manager installs failed`). A package manager that is not installed counts as a failure. Manifests that were already rewritten are not rolled back, and the Rust and Node lockfile age audits still run even when another install fails. An unchanged `--install` run also audits existing locks; it does not rerun package managers when there are no manifest updates.
 
 ### Commands per Package Manager
 
-The package manager is detected from files in the directory where the install runs; parent directories are not searched. Within each language, the first match wins:
+The package manager is detected from files in the directory where the install runs. Node members of a detected pnpm workspace share its root install and lock audit; other package managers do not search parent directories. Within each language, the first match wins:
 
 | Language | Detected by | Command |
 |----------|-------------|---------|
@@ -370,17 +370,31 @@ The age filter decides which versions depup writes into manifests. Whether it al
 
 | Package manager | What depup passes | Transitive dependencies |
 |-----------------|-------------------|-------------------------|
-| pnpm | `npm_config_minimum_release_age=<minutes>` (environment variable) | Filtered by pnpm v10.16 or later; older versions ignore the variable |
+| pnpm | Both `npm_config_minimum_release_age=<minutes>` and `pnpm_config_minimum_release_age=<minutes>` | Native filtering on supported pnpm versions, plus a post-install lock audit. The two prefixes cover pnpm 10 and pnpm 11 or later |
 | uv | `--exclude-newer <timestamp>` | Filtered when uv resolves them |
 | Cargo | Nothing; depup audits `Cargo.lock` after `cargo update` | crates.io crates that violate the age filter are rolled back ([below](#auditing-cargolock-rust)) |
 | mise | `--minimum-release-age <timestamp>` and `MISE_MINIMUM_RELEASE_AGE` | Fuzzy top-level versions are filtered when timestamps are available. Only the `npm:` and `pypi:` backends pass the cutoff to unpinned transitive dependencies; exact pins and locked top-level versions bypass native filtering |
-| npm, Yarn, Bun, pip, Poetry, Rye, Pipenv, Go, Bundler, Composer, Gradle, SwiftPM | Nothing | Not filtered; only direct dependencies follow the age filter |
+| npm | Nothing | Resolved versions are verified after install for package-lock v2/v3 |
+| Yarn, Bun | Nothing | Lock audit is currently unsupported; an active age policy produces exit 2 |
+| pip, Poetry, Rye, Pipenv, Go, Bundler, Composer, Gradle, SwiftPM | Nothing | Not filtered; only direct dependencies follow the age filter |
 
-With `--verbose`, depup prints a note naming the package managers used in the run for which the age filter covers direct dependencies only. With `--no-age` and no project or native policy, nothing age-related is passed and the Rust audit does not run. Native package/index exemptions configured in uv still follow uv's own semantics.
+With `--verbose`, depup prints a note naming the package managers used in the run for which the age filter covers direct dependencies only. With `--no-age` and no project or native policy, nothing age-related is passed and neither the Rust nor Node lock audit runs. Native package/index exemptions configured in uv still follow uv's own semantics.
+
+#### Auditing Node Lockfiles
+
+With an active age policy, `--install` checks the actual resolved versions of direct and transitive dependencies, including dev dependencies. It also checks unchanged locks on subsequent runs and after another install fails. If no lock exists and no install is needed, no lock audit runs.
+
+- pnpm: reads the lock graph using `pnpm list --depth Infinity --lockfile-only --json`. Shared workspaces include all projects and the root, with the strictest member policy. Missing required dependencies or CLI warnings make the graph unverified.
+- npm: reads the `packages` table of `npm-shrinkwrap.json` (preferred) or `package-lock.json`, format 2 or 3, and verifies required dependencies across packages and workspaces.
+- Yarn, Bun, and npm format 1: currently reported as unsupported, with exit code 2 when age is active.
+
+Only packages whose registry source can be confirmed as public npm are queried. For pnpm, generated graph URLs alone are not source evidence; the effective registry configuration is checked too. Aliases use the real package name. Local, workspace, and Git dependencies are outside this release-date audit. Private or unknown registry sources are reported as unverified without querying public npm for their names. Missing publication dates, read or lookup failures, changed lock contents during the audit, and the 180-second time limit also produce exit code 2. Publication dates are checked independently of the update-candidate filters, so deprecated or non-latest locked versions can be verified.
+
+Node auditing does not rewrite the lockfile. Violations always show the actual locked version, publication date, and cutoff; unverified entries always show their reason. Native age filtering helps prevent new resolutions, but does not replace this final verification.
 
 #### Auditing `Cargo.lock` (Rust)
 
-For Rust, depup checks the release dates of the crates whose version in `Cargo.lock` changed during the install, direct and transitive dependencies alike, and rolls back any that violate the age filter:
+For Rust, depup checks all crates.io versions in the final `Cargo.lock`, including unchanged direct and transitive dependencies. It first rolls back newly resolved violations where the original manifest constraints and the pre-install minimum permit it, then performs a separate read-only verification of every final locked version:
 
 ```text
 ⠙ Auditing hyper [██████████████████████▓░░░░░░░] 18/24 (6s)
@@ -388,7 +402,7 @@ For Rust, depup checks the release dates of the crates whose version in `Cargo.l
     hyper 1.11.1 → 1.11.0
 ```
 
-Only changed entries are audited because depup limits crates.io requests to one per second, following its crawler policy; auditing an entire lock file (often hundreds of crates) would take several minutes on its own. The audit is capped at 180 seconds per `Cargo.lock`. If `Cargo.lock` did not exist before the install, every entry counts as changed, so the cap is more likely to be reached. Crates from registries other than crates.io are not audited and keep their locked versions, because their release dates cannot be looked up on crates.io.
+depup limits crates.io API requests to one per second and reuses metadata fetched during the run. Rollback and final verification each have a separate 180-second budget per `Cargo.lock`. Final verification reads immutable publication dates from the [official sparse index](https://doc.rust-lang.org/cargo/reference/registry-index.html), with at most eight concurrent requests; missing dates or young versions needing publisher verification use the rate-limited API. This metadata includes yanked locked versions without allowing them as update or rollback candidates. Unchecked entries are reported and produce exit code 2, including on a no-change retry. An unreadable existing lock, or a missing lock after an install was needed, cannot pass. A lockless project with no updates does not run an install or lock audit. An unreadable pre-install lock also disables automatic rollback because its minimum cannot be established safely. Crates from registries other than crates.io are not audited and keep their locked versions, because their release dates cannot be looked up on crates.io.
 
 A crate is rolled back to the following version:
 
@@ -397,7 +411,7 @@ A crate is rolled back to the following version:
 
 In both cases, a rollback never goes below an available pre-install version from the same semver series. Pre-install versions absent from usable crates.io metadata, including yanked versions and versions with unreadable release dates, are excluded from both this minimum and restoration. In that case, depup chooses an older compatible version that satisfies the age filter, or reports an unresolved violation if none exists.
 
-If only versions below an available minimum satisfy the age filter, the crate goes back to that pre-install version, so depup undoes only the change the install made. When that pre-install version is itself newer than the age filter allows, it is reported on a separate yellow line instead of as rolled back:
+If only versions below an available minimum satisfy the age filter, the crate goes back to that pre-install version, so depup undoes only the change the install made. When that pre-install version is itself newer than the age filter allows, it remains an unresolved violation (exit code 2) and is reported on a separate yellow line instead of as rolled back. An unchanged violation at this minimum is also reported; it is never exempted merely because it was already locked:
 
 ```text
   . — 1 crate(s) returned to the version locked before the install, which is also newer than --age:
@@ -424,17 +438,20 @@ Crates rolled back together are reported with the others:
 
 A crate that drops out of `Cargo.lock` during the joint resolution is listed as `tokio 1.53.1 → removed` and counted as rolled back. Any rollback, one at a time or joint, can also bring other new versions into `Cargo.lock`; depup audits those as well and rolls them back in turn, up to a fixed number of rounds.
 
-A shared workspace lock uses the strictest member policy and only publisher exemptions common to every member. If a locked version is absent from cached registry metadata, depup refreshes that metadata once. Missing metadata, unreadable or invalid locks, failed rollbacks, and an unfinished audit cause exit code `2` (an install failure still takes priority as `1`). Restoring the pre-install version counts as undoing the install and does not by itself fail the run.
+A shared workspace lock uses the strictest member policy and only publisher exemptions common to every member. If a locked version is absent from cached registry metadata, depup refreshes that metadata once. Missing metadata, unreadable or invalid locks, failed rollbacks, and an unfinished audit cause exit code `2` (an install failure still takes priority as `1`). Restoring the pre-install version is still unresolved if it does not satisfy the age policy.
 
-A rollback counts only when `Cargo.lock` actually changed; depup rereads the lock file after each `cargo update` instead of trusting its exit status, and builds the final report from the lock file as it stands when the audit ends. Rollbacks are always reported. Crates that could not be rolled back, crates whose release date is unavailable, and crates left unchecked when the time cap is reached are counted even without `--verbose`:
+A rollback counts only when `Cargo.lock` actually changed; depup rereads the lock file after each `cargo update` instead of trusting its exit status, and builds the final report from the lock file as it stands when the audit ends. Rollbacks are always reported. Crates that could not be rolled back, crates whose release date is unavailable, and crates left unchecked when the time cap is reached always show names, requested rollback targets when attempted, and reasons, even without `--verbose`:
 
 ```text
-  . — 2 crate(s) could not be rolled back to satisfy --age (use --verbose for details)
-  . — 1 crate(s) could not be checked against --age: release date unavailable (use --verbose for details)
+  . — 2 crate(s) could not be rolled back to satisfy --age:
+    foo (2.1.3; requested: 2.1.2): cargo update failed: <cargo error>
+    bar (1.0.2): no older version satisfies --age
+  . — 1 crate(s) could not be checked against --age:
+    example (1.0.0): release date unavailable
   . — age audit stopped after 180s; 3 crate(s) left unchecked
 ```
 
-With `--verbose`, depup prints `Enforcing --age on crates changed in Cargo.lock...` when the audit starts, and gives the reason for each crate that could not be rolled back or whose release date is unavailable:
+With `--verbose`, depup prints `Enforcing --age on registry crates in Cargo.lock...` when the audit starts. Failure reasons are also shown in normal output:
 
 ```text
   . — 2 crate(s) could not be rolled back to satisfy --age:

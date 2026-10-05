@@ -50,6 +50,17 @@ pub trait RegistryAdapter: Send + Sync {
 
     /// パッケージの利用可能なバージョンを取得
     async fn fetch_versions(&self, package: &str) -> Result<Vec<VersionInfo>, RegistryError>;
+
+    /// lock に存在する版の公開日。候補と違い、yank 済みの版も検証できる必要がある。
+    /// publisher_cutoff より若い版だけ、レジストリが確認した公開者も取得する。
+    async fn fetch_locked_versions(
+        &self,
+        package: &str,
+        _locked: &[String],
+        _publisher_cutoff: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<VersionInfo>, RegistryError> {
+        self.fetch_versions(package).await
+    }
 }
 
 /// Maven 座標 (groupId / artifactId) と GitHub owner/repo セグメントの共通文字種検証。

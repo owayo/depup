@@ -149,7 +149,7 @@ depup --diff
 |------|---------|
 | `0` | No failures. This includes runs with no updates, dry runs, and runs whose only `Errors:` entries are OSV notices (fallbacks or failed lookups). |
 | `1` | A package manager install failed, `--cd` could not change the directory, or depup itself could not continue (for example, the HTTP client failed to initialize or the results could not be written). |
-| `2` | Part of the run failed: a manifest could not be read, parsed, or written (including a refused ambiguous write), a registry lookup failed, or a Cargo age audit left violations or unverified entries (including an unreadable lock or an exhausted time budget). Invalid command-line arguments also exit with `2`. |
+| `2` | Part of the run failed: a manifest could not be read, parsed, or written (including a refused ambiguous write), a registry lookup failed, or a Rust or Node lockfile age audit left violations or unverified entries (including an unreadable lock or an exhausted time budget). Invalid command-line arguments also exit with `2`. |
 
 A code-2 failure does not stop the run. A failed lookup skips that dependency, and a manifest that cannot be read or parsed is left out; everything else is still written and installed. A failed write leaves that file unchanged, but its dependencies are still listed as updated and `--install` still runs for it. When both `1` and `2` apply, `1` wins.
 
