@@ -14,8 +14,10 @@ use colored::Colorize;
 use depup::cargo_rollback::report::{lock_age_report_lines, lock_mismatch_lines};
 use depup::cli::CliArgs;
 use depup::config::DepupConfig;
+use depup::domain::Language;
 use depup::global_config::{GlobalConfig, resolve_max_change, resolve_osv};
 use depup::install::{InstallPlan, RustAuditPlan};
+use depup::node_lock::audit_node_lock;
 use depup::orchestrator::Orchestrator;
 use depup::output::{OutputConfig, create_formatter};
 use depup::package_manager::SystemPackageManager;
@@ -133,10 +135,11 @@ async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
     // dry-run でない場合、要求があればパッケージマネージャの install を実行
     if args.install && !args.dry_run {
         let plan = InstallPlan::new(&orchestrator, &result, &monorepo_dirs, &args.path);
-        // 他の言語の install が失敗しても、変更された Rust lock の監査は行う。
+        // 他の言語の install が失敗しても、Rust / Node lock の監査は行う。
         let install_result = run_package_installs(&args, &plan);
         let audit_plan = plan.rust_audit_plan(&orchestrator, &result);
         age_audit_failed = enforce_rust_lock_age(&args, &orchestrator, &audit_plan).await;
+        age_audit_failed |= enforce_node_lock_age(&args, &plan).await;
 
         // 画面に出した更新先と、実際に Cargo.lock へ入った版の食い違いを知らせる。
         // 結果の一覧は install 前に出しているので、ここで別に注記する
@@ -180,7 +183,9 @@ fn run_package_installs(args: &CliArgs, plan: &InstallPlan) -> anyhow::Result<()
                 .filter_map(|job| {
                     let (_, pm) =
                         pm_runner.resolve_package_manager(job.language, &job.directory)?;
-                    (!job.language.pm_has_native_transitive_age_support(pm)).then(|| pm.to_string())
+                    (job.language != depup::domain::Language::Node
+                        && !job.language.pm_has_native_transitive_age_support(pm))
+                    .then(|| pm.to_string())
                 })
                 .collect();
             unsupported.sort();
@@ -238,7 +243,7 @@ fn run_package_installs(args: &CliArgs, plan: &InstallPlan) -> anyhow::Result<()
     Ok(())
 }
 
-/// 計画された共有 lock ごとに、install で変わった crate の age を監査する。
+/// 計画された共有 lock ごとに、既存版も含め crate の age を監査する。
 async fn enforce_rust_lock_age(
     args: &CliArgs,
     orchestrator: &Orchestrator,
@@ -256,13 +261,23 @@ async fn enforce_rust_lock_age(
     }
     if args.verbose {
         eprintln!();
-        eprintln!("Enforcing --age on crates changed in Cargo.lock...");
+        eprintln!("Enforcing --age on registry crates in Cargo.lock...");
     }
     let mut progress = Progress::new(!args.quiet);
     progress.start(0, "Auditing Cargo.lock against --age");
     let bar = progress.bar();
     for lock in &plan.locks {
         if lock.policy.min_age.is_none() {
+            continue;
+        }
+        if let Some(problem) = &lock.baseline_problem {
+            has_unresolved = true;
+            progress.suspend(|| {
+                eprintln!(
+                    "  {} — cannot safely roll back --age violations: pre-install {problem}",
+                    lock.directory.display()
+                )
+            });
             continue;
         }
         let audit = orchestrator
@@ -290,6 +305,74 @@ async fn enforce_rust_lock_age(
     }
     progress.finish_and_clear();
     has_unresolved
+}
+
+/// Node は lock の実際の解決版を検査し、違反・未確認を必ず報告する。
+async fn enforce_node_lock_age(args: &CliArgs, plan: &InstallPlan) -> bool {
+    let pm_runner = SystemPackageManager::new();
+    let mut failed = false;
+    let mut progress = Progress::new(!args.quiet);
+    for job in &plan.node_audits {
+        let has_lock = [
+            "pnpm-lock.yaml",
+            "package-lock.json",
+            "npm-shrinkwrap.json",
+            "yarn.lock",
+            "bun.lock",
+            "bun.lockb",
+        ]
+        .iter()
+        .any(|filename| job.directory.join(filename).exists());
+        if !has_lock
+            && !plan.jobs.iter().any(|install| {
+                install.language == Language::Node && install.directory == job.directory
+            })
+        {
+            continue;
+        }
+        let policy = match &job.policy {
+            Ok(policy) if policy.min_age.is_some() => policy,
+            Ok(_) => continue,
+            Err(error) => {
+                eprintln!(
+                    "  {} — cannot audit --age: {error}",
+                    job.directory.display()
+                );
+                failed = true;
+                continue;
+            }
+        };
+        let Some((directory, pm)) = pm_runner.resolve_package_manager(job.language, &job.directory)
+        else {
+            eprintln!(
+                "  {} — cannot audit --age: Node package manager could not be determined",
+                job.directory.display()
+            );
+            failed = true;
+            continue;
+        };
+        progress.start(0, "Auditing Node lockfile against --age");
+        let bar = progress.bar();
+        let audit = audit_node_lock(&directory, pm, policy, bar.as_ref()).await;
+        failed |= audit.has_failures();
+        progress.suspend(|| {
+            for message in audit.failure_messages() {
+                eprintln!(
+                    "{}",
+                    format!("  {} — {message}", directory.display()).yellow()
+                );
+            }
+            if args.verbose && !audit.has_failures() {
+                eprintln!(
+                    "  {} — {} public npm package version(s) verified against --age",
+                    directory.display(),
+                    audit.checked
+                );
+            }
+        });
+        progress.finish_and_clear();
+    }
+    failed
 }
 
 /// 画面に出した更新先と、監査後の lock に入った版の相違を知らせる。

@@ -35,6 +35,25 @@ struct NpmPackageResponse {
     versions: HashMap<String, NpmVersionMetadata>,
 }
 
+/// lock の監査では latest や deprecated に関わらず、固定された版の公開日を読む。
+#[derive(Debug, Deserialize)]
+struct NpmPublicationResponse {
+    #[serde(default)]
+    time: HashMap<String, Value>,
+}
+
+impl NpmPublicationResponse {
+    fn into_publication_dates(self) -> HashMap<String, DateTime<Utc>> {
+        self.time
+            .into_iter()
+            .filter_map(|(version, value)| {
+                let released_at = value.as_str()?.parse().ok()?;
+                Some((version, released_at))
+            })
+            .collect()
+    }
+}
+
 /// npm の各版のメタデータ。未知フィールドは serde が読み捨てる。
 #[derive(Debug, Deserialize)]
 struct NpmVersionMetadata {
@@ -97,6 +116,19 @@ impl NpmAdapter {
     /// 新しい npm アダプタを作成
     pub fn new(client: HttpClient) -> Self {
         Self { client }
+    }
+
+    /// 更新候補の除外規則を通さず、インストール済みの版を照合する公開日を取得する。
+    pub async fn fetch_publication_dates(
+        &self,
+        package: &str,
+    ) -> Result<HashMap<String, DateTime<Utc>>, RegistryError> {
+        self.validate_package_name(package)?;
+        let response: NpmPublicationResponse = self
+            .client
+            .get_json(&self.build_url(package), package, self.registry_name())
+            .await?;
+        Ok(response.into_publication_dates())
     }
 
     /// パッケージ用の URL を構築
@@ -192,6 +224,32 @@ impl RegistryAdapter for NpmAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lock_audit_dates_include_deprecated_and_above_latest_versions() {
+        let response: NpmPublicationResponse = serde_json::from_value(serde_json::json!({
+            "dist-tags": {"latest": "1.0.0"},
+            "versions": {
+                "1.0.0": {},
+                "1.1.0": {"deprecated": "use another release"},
+                "2.0.0": {}
+            },
+            "time": {
+                "1.0.0": "2026-09-01T00:00:00Z",
+                "1.1.0": "2026-09-30T00:00:00Z",
+                "2.0.0": "2026-10-01T00:00:00Z",
+                "invalid": "not-a-date",
+                "wrong-type": 12
+            }
+        }))
+        .unwrap();
+        let dates = response.into_publication_dates();
+        assert_eq!(dates.len(), 3);
+        assert!(dates.contains_key("1.1.0"));
+        assert!(dates.contains_key("2.0.0"));
+        assert!(!dates.contains_key("invalid"));
+        assert!(!dates.contains_key("wrong-type"));
+    }
 
     #[test]
     fn test_npm_adapter_language() {

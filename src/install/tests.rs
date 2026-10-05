@@ -6,6 +6,81 @@ use crate::domain::{
 use clap::Parser;
 
 #[test]
+fn no_manifest_updates_still_plan_an_existing_rust_lock_audit() {
+    let temp = tempfile::tempdir().unwrap();
+    write_lock(temp.path(), "1.0.1");
+    let mut args = CliArgs::parse_from(["depup", "--age", "2w"]);
+    args.path = temp.path().to_path_buf();
+    let orchestrator = Orchestrator::new(args).unwrap();
+    let mut summary = UpdateSummary::new(false);
+    summary.add_manifest(ManifestUpdateResult::new(
+        temp.path().join("Cargo.toml"),
+        Language::Rust,
+    ));
+    let result = OrchestratorResult {
+        summary,
+        write_results: Vec::new(),
+        errors: Vec::new(),
+    };
+    let plan = InstallPlan::new(&orchestrator, &result, &None, temp.path());
+    let audit = plan.rust_audit_plan(&orchestrator, &result);
+    assert_eq!(audit.locks.len(), 1);
+    assert_eq!(audit.locks[0].baseline["pkg"], vec!["1.0.1"]);
+}
+
+#[test]
+fn invalid_baseline_is_not_treated_as_a_new_lock() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("Cargo.lock"), "broken {{").unwrap();
+    let mut args = CliArgs::parse_from(["depup", "--age", "2w"]);
+    args.path = temp.path().to_path_buf();
+    let orchestrator = Orchestrator::new(args).unwrap();
+    let result = result_with_update(temp.path().join("Cargo.toml"), Language::Rust);
+    let plan = InstallPlan::new(&orchestrator, &result, &None, temp.path());
+    write_lock(temp.path(), "1.0.1");
+    let audit = plan.rust_audit_plan(&orchestrator, &result);
+    assert!(audit.locks[0].baseline_problem.is_some());
+}
+
+#[test]
+fn unchanged_node_workspace_uses_all_members_strictest_age() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let member = root.join("apps/web");
+    let other = root.join("apps/worker");
+    for directory in [root, member.as_path(), other.as_path()] {
+        std::fs::create_dir_all(directory).unwrap();
+        std::fs::write(directory.join("package.json"), "{\"name\":\"example\"}").unwrap();
+    }
+    std::fs::write(
+        root.join("pnpm-workspace.yaml"),
+        "packages:\n  - 'apps/*'\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+    std::fs::write(other.join(".npmrc"), "minimum-release-age=30d\n").unwrap();
+    let mut args = CliArgs::parse_from(["depup", "--no-age"]);
+    args.path = member.clone();
+    let orchestrator = Orchestrator::new(args).unwrap();
+    let mut result = result_with_update(member.join("package.json"), Language::Node);
+    let plan = InstallPlan::new(&orchestrator, &result, &None, &member);
+    assert_eq!(plan.jobs.len(), 1);
+    assert_eq!(plan.jobs[0].directory, std::fs::canonicalize(root).unwrap());
+    assert_eq!(
+        plan.jobs[0].policy.as_ref().unwrap().min_age,
+        Some(std::time::Duration::from_secs(30 * 86400))
+    );
+    result.summary.manifests[0].results.clear();
+    let plan = InstallPlan::new(&orchestrator, &result, &None, &member);
+    assert!(plan.jobs.is_empty());
+    assert_eq!(plan.node_audits.len(), 1);
+    assert_eq!(
+        plan.node_audits[0].policy.as_ref().unwrap().min_age,
+        Some(std::time::Duration::from_secs(30 * 86400))
+    );
+}
+
+#[test]
 fn shared_install_includes_a_member_with_no_updates_and_does_not_mix_siblings() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("workspace");

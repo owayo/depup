@@ -323,6 +323,57 @@ mod json_output_tests {
 mod exit_code_tests {
     use super::*;
 
+    #[test]
+    fn unchanged_install_cannot_pass_with_an_unverified_lock() {
+        for (filename, content, lock) in [
+            (
+                "Cargo.toml",
+                "[package]\nname = 'example'\nversion = '1.0.0'\n",
+                "Cargo.lock",
+            ),
+            (
+                "package.json",
+                r#"{"name":"example","dependencies":{}}"#,
+                "package-lock.json",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join(filename), content).unwrap();
+            // lock のない無変更プロジェクトは install を起動せず正常終了する。
+            let no_lock = Command::new(get_binary_path())
+                .args(["--install", "--age", "2w", "--no-osv", "--quiet"])
+                .arg(dir.path())
+                .output()
+                .unwrap();
+            assert!(no_lock.status.success(), "{filename}: {no_lock:?}");
+            fs::write(dir.path().join(lock), "invalid lock").unwrap();
+            let output = Command::new(get_binary_path())
+                .args(["--install", "--age", "2w", "--no-osv", "--quiet"])
+                .arg(dir.path())
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(2), "{filename}: {output:?}");
+            assert!(String::from_utf8_lossy(&output.stderr).contains(lock));
+            assert_eq!(
+                fs::read_to_string(dir.path().join(filename)).unwrap(),
+                content
+            );
+            assert_eq!(
+                fs::read_to_string(dir.path().join(lock)).unwrap(),
+                "invalid lock"
+            );
+
+            for flag in ["--dry-run", "--no-age"] {
+                let output = Command::new(get_binary_path())
+                    .args(["--install", "--no-osv", "--quiet", flag])
+                    .arg(dir.path())
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{filename} {flag}: {output:?}");
+            }
+        }
+    }
+
     /// 更新なしの正常実行で終了コードを確認する
     #[test]
     fn test_exit_code_no_updates() {

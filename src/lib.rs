@@ -17,6 +17,7 @@ pub mod error;
 pub mod global_config;
 pub mod install;
 pub mod manifest;
+pub mod node_lock;
 pub mod orchestrator;
 pub mod osv;
 pub mod output;

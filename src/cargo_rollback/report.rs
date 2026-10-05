@@ -91,7 +91,7 @@ impl ReportLine {
 
 /// 1 つの Cargo.lock の監査結果を、stderr に出す行へ変換する。
 ///
-/// 差し戻せなかった crate の件数は `--verbose` が無くても必ず出す。`--age` は供給網
+/// 差し戻せなかった crate の名前・要求版・理由は `--verbose` が無くても必ず出す。`--age` は供給網
 /// 対策として使われるので、満たせなかったことを黙って捨てると、差し戻せた分だけが
 /// 表示されて `--age` が効いたように見えてしまう。
 pub fn lock_age_report_lines(
@@ -120,7 +120,7 @@ pub fn lock_age_report_lines(
         // (直前に未検証件数を警告済み)
         if verbose && audit.unchecked == 0 && audit.problems.is_empty() {
             lines.push(ReportLine::info(format!(
-                "  {dir} — all crates changed by install are within --age"
+                "  {dir} — all registry crates in Cargo.lock are within --age"
             )));
         }
         return lines;
@@ -182,45 +182,37 @@ pub fn lock_age_report_lines(
     }
 
     if !remaining.is_empty() {
-        if verbose {
+        lines.push(ReportLine::warning(format!(
+            "  {dir} — {} crate(s) could not be rolled back to satisfy --age:",
+            remaining.len()
+        )));
+        for adj in &remaining {
+            let requested = adj
+                .target
+                .as_ref()
+                .map(|version| format!("; requested: {version}"))
+                .unwrap_or_default();
             lines.push(ReportLine::warning(format!(
-                "  {dir} — {} crate(s) could not be rolled back to satisfy --age:",
-                remaining.len()
-            )));
-            for adj in &remaining {
-                lines.push(ReportLine::warning(format!(
-                    "    {} ({}): {}",
-                    adj.name,
-                    adj.from,
-                    lock_age_status_detail(&adj.status)
-                )));
-            }
-        } else {
-            lines.push(ReportLine::warning(format!(
-                "  {dir} — {} crate(s) could not be rolled back to satisfy --age (use --verbose for details)",
-                remaining.len()
+                "    {} ({}{}): {}",
+                adj.name,
+                adj.from,
+                requested,
+                lock_age_status_detail(&adj.status)
             )));
         }
     }
 
     if !unverified.is_empty() {
-        if verbose {
+        lines.push(ReportLine::warning(format!(
+            "  {dir} — {} crate(s) could not be checked against --age:",
+            unverified.len()
+        )));
+        for adj in &unverified {
             lines.push(ReportLine::warning(format!(
-                "  {dir} — {} crate(s) could not be checked against --age:",
-                unverified.len()
-            )));
-            for adj in &unverified {
-                lines.push(ReportLine::warning(format!(
-                    "    {} ({}): {}",
-                    adj.name,
-                    adj.from,
-                    lock_age_status_detail(&adj.status)
-                )));
-            }
-        } else {
-            lines.push(ReportLine::warning(format!(
-                "  {dir} — {} crate(s) could not be checked against --age: release date unavailable (use --verbose for details)",
-                unverified.len()
+                "    {} ({}): {}",
+                adj.name,
+                adj.from,
+                lock_age_status_detail(&adj.status)
             )));
         }
     }
@@ -365,7 +357,16 @@ mod tests {
         LockAgeAdjustment {
             name: name.to_string(),
             from: from.to_string(),
-            to: to.map(str::to_string),
+            to: if status.is_resolved() || status.is_restored() {
+                to.map(str::to_string)
+            } else {
+                None
+            },
+            target: if status.is_resolved() || status.is_restored() {
+                None
+            } else {
+                to.map(str::to_string)
+            },
             status,
         }
     }
@@ -374,7 +375,27 @@ mod tests {
         lines.iter().map(|line| line.text.as_str()).collect()
     }
 
-    /// 差し戻せなかった crate の件数は `--verbose` が無くても 1 行出す。
+    #[test]
+    fn failure_details_include_requested_version_without_verbose() {
+        let audit = LockAgeAuditResult {
+            adjustments: vec![adjustment(
+                "example-udp",
+                "0.5.16",
+                Some("0.5.15"),
+                LockAgeStatus::UpdateCommandFailed("resolver conflict".into()),
+            )],
+            ..Default::default()
+        };
+        let lines = lock_age_report_lines(Path::new("."), &audit, false);
+        assert!(lines.iter().any(|line| {
+            line.text.contains("example-udp")
+                && line.text.contains("0.5.16")
+                && line.text.contains("requested: 0.5.15")
+                && line.text.contains("resolver conflict")
+        }));
+    }
+
+    /// 差し戻せなかった crate の詳細は `--verbose` が無くても出す。
     /// 見出しは直接依存も含むので `transitive dep(s)` ではなく `crate(s)`
     #[test]
     fn test_lock_age_report_lines_counts_failures_without_verbose() {
@@ -400,7 +421,9 @@ mod tests {
             vec![
                 "  ./wasm — 1 crate(s) rolled back to satisfy --age:",
                 "    cc 1.5.1 → 1.4.6",
-                "  ./wasm — 2 crate(s) could not be rolled back to satisfy --age (use --verbose for details)",
+                "  ./wasm — 2 crate(s) could not be rolled back to satisfy --age:",
+                "    wasm-bindgen (0.2.129): cargo update failed: conflict",
+                "    web-sys (0.3.106): no older version satisfies --age",
             ]
         );
         assert!(!lines[0].warning);
@@ -481,7 +504,8 @@ mod tests {
             texts(&lines),
             vec![
                 "  . — age audit stopped after 180s; 3 crate(s) left unchecked",
-                "  . — 1 crate(s) could not be checked against --age: release date unavailable (use --verbose for details)",
+                "  . — 1 crate(s) could not be checked against --age:",
+                "    private-crate (0.1.0): release date unavailable",
             ]
         );
         assert!(lines.iter().all(|line| line.warning));
@@ -494,7 +518,7 @@ mod tests {
         assert!(lock_age_report_lines(Path::new("."), &audit, false).is_empty());
         assert_eq!(
             texts(&lock_age_report_lines(Path::new("."), &audit, true)),
-            vec!["  . — all crates changed by install are within --age"]
+            vec!["  . — all registry crates in Cargo.lock are within --age"]
         );
     }
 

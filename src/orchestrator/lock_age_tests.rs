@@ -6,6 +6,47 @@ use chrono::{DateTime, TimeZone, Utc};
 use clap::Parser;
 
 #[tokio::test]
+async fn unchanged_lock_detects_a_previously_incomplete_rollback() {
+    let registry = LocalRegistry::new();
+    for version in ["1.0.0", "1.0.1"] {
+        registry.publish("library", version, &[]);
+    }
+    let project = TestProject::new(&registry, &manifest("library = '1.0.0'\n"));
+    project.cargo_ok(&["generate-lockfile", "--offline"]);
+    let baseline = parse_registry_entries(&project.read("Cargo.lock"));
+    assert_eq!(project.locked_versions("library"), ["1.0.1"]);
+    let dates = FakeCratesIo::new()
+        .release("library", "1.0.0", old())
+        .release("library", "1.0.1", fresh());
+    let orchestrator = Orchestrator::new(CliArgs::parse_from(["depup"])).unwrap();
+    let cargo = cargo_for(&project);
+    let result = orchestrator
+        .audit_lock_age(
+            &LockAgeAudit {
+                project_dir: project.path(),
+                cutoff: cutoff(),
+                exemptions: &Default::default(),
+                baseline: &baseline,
+                preferred: &PreferredVersions::new(),
+                adapter: &dates,
+                cargo: &cargo,
+                budget: LOCK_AGE_AUDIT_BUDGET,
+            },
+            None,
+        )
+        .await;
+    assert_eq!(project.locked_versions("library"), ["1.0.1"]);
+    assert!(result.has_unresolved(), "{result:?}");
+    let failure = adjustment(&result, "library");
+    assert_eq!(failure.to, None);
+    assert_eq!(failure.target, None);
+    assert!(
+        matches!(&failure.status, LockAgeStatus::NotAttempted(reason) if reason.contains("rollback minimum"))
+    );
+    assert!(lock_is_accepted(&project));
+}
+
+#[tokio::test]
 async fn a_release_absent_from_the_check_cache_is_refetched_and_rolled_back() {
     let registry = LocalRegistry::new();
     for version in ["1.0.0", "1.0.1"] {
@@ -79,7 +120,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         LockAgeStatus::ReleaseDateUnavailable
     );
     assert!(result.has_unresolved());
-    assert_eq!(dates.fetch_count(), 2);
+    assert_eq!(dates.fetch_count(), 3);
 }
 
 #[tokio::test]
@@ -567,9 +608,15 @@ async fn test_crate_returns_to_young_version_locked_before_install() {
     let result = audit(&project, &baseline, &dates).await;
 
     assert_eq!(project.locked_versions("solo"), vec!["1.0.1"]);
-    let solo = adjustment(&result, "solo");
+    let solo = result
+        .adjustments
+        .iter()
+        .find(|item| item.name == "solo" && item.from == "1.0.2")
+        .unwrap();
     assert_eq!(solo.status, LockAgeStatus::Restored);
     assert_eq!(solo.to.as_deref(), Some("1.0.1"));
+    assert_eq!(result.adjustments.len(), 1, "{result:?}");
+    assert!(result.has_unresolved());
     assert!(lock_is_accepted(&project));
 }
 
@@ -850,7 +897,168 @@ async fn test_exhausted_budget_leaves_everything_unchecked() {
     .await;
 
     assert_eq!(result.unchecked, 3);
-    assert!(result.adjustments.is_empty());
+    assert_eq!(result.adjustments.len(), 3);
+    assert!(
+        result
+            .adjustments
+            .iter()
+            .all(|adjustment| adjustment.status.is_unverified())
+    );
     assert_eq!(project.read("Cargo.lock"), before);
     assert_eq!(dates.fetch_count(), 0);
+}
+
+/// 差し戻しの照会が予算切れになっても、全件検証には独立した枠がある。
+#[tokio::test]
+async fn final_verification_has_an_independent_time_budget() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct DelayedFirst(AtomicUsize);
+    #[async_trait::async_trait]
+    impl crate::registry::RegistryAdapter for DelayedFirst {
+        fn language(&self) -> Language {
+            Language::Rust
+        }
+        fn registry_name(&self) -> &'static str {
+            "delayed-first"
+        }
+        async fn fetch_versions(
+            &self,
+            _: &str,
+        ) -> Result<Vec<VersionInfo>, crate::error::RegistryError> {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Ok(vec![VersionInfo::new("1.0.0", old())])
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("Cargo.lock"), "version = 4\n[[package]]\nname = 'library'\nversion = '1.0.0'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\n").unwrap();
+    let dates = DelayedFirst(AtomicUsize::new(0));
+    let orchestrator = Orchestrator::new(CliArgs::parse_from(["depup"])).unwrap();
+    let result = orchestrator
+        .audit_lock_age(
+            &LockAgeAudit {
+                project_dir: dir.path(),
+                cutoff: cutoff(),
+                exemptions: &Default::default(),
+                baseline: &Default::default(),
+                preferred: &Default::default(),
+                adapter: &dates,
+                cargo: &CargoCommand::new(),
+                budget: Duration::from_millis(100),
+            },
+            None,
+        )
+        .await;
+    assert_eq!(dates.0.load(Ordering::SeqCst), 2);
+    assert!(!result.has_unresolved(), "{result:?}");
+}
+
+/// 候補から除外された lock 版を、公開日専用の取得経路で検証する。
+#[tokio::test]
+async fn candidate_filtered_locked_version_can_still_be_verified() {
+    struct LockedOnly;
+    #[async_trait::async_trait]
+    impl crate::registry::RegistryAdapter for LockedOnly {
+        fn language(&self) -> Language {
+            Language::Rust
+        }
+        fn registry_name(&self) -> &'static str {
+            "locked-only"
+        }
+        async fn fetch_versions(
+            &self,
+            _: &str,
+        ) -> Result<Vec<VersionInfo>, crate::error::RegistryError> {
+            Ok(vec![VersionInfo::new("1.0.0", old())])
+        }
+        async fn fetch_locked_versions(
+            &self,
+            _: &str,
+            _: &[String],
+            _: Option<DateTime<Utc>>,
+        ) -> Result<Vec<VersionInfo>, crate::error::RegistryError> {
+            Ok(vec![VersionInfo::new("1.0.1", old())])
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("Cargo.lock"), "version = 4\n[[package]]\nname = 'library'\nversion = '1.0.1'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\n").unwrap();
+    let orchestrator = Orchestrator::new(CliArgs::parse_from(["depup"])).unwrap();
+    let result = orchestrator
+        .audit_lock_age(
+            &LockAgeAudit {
+                project_dir: dir.path(),
+                cutoff: cutoff(),
+                exemptions: &Default::default(),
+                baseline: &Default::default(),
+                preferred: &Default::default(),
+                adapter: &LockedOnly,
+                cargo: &CargoCommand::new(),
+                budget: LOCK_AGE_AUDIT_BUDGET,
+            },
+            None,
+        )
+        .await;
+    assert!(!result.has_unresolved(), "{result:?}");
+}
+
+#[tokio::test]
+async fn full_lock_verification_fetches_in_bounded_parallel_batches() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct ConcurrentDates {
+        active: AtomicUsize,
+        peak: AtomicUsize,
+        count: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl crate::registry::RegistryAdapter for ConcurrentDates {
+        fn language(&self) -> Language {
+            Language::Rust
+        }
+        fn registry_name(&self) -> &'static str {
+            "concurrent-dates"
+        }
+        async fn fetch_versions(
+            &self,
+            _: &str,
+        ) -> Result<Vec<VersionInfo>, crate::error::RegistryError> {
+            self.count.fetch_add(1, Ordering::SeqCst);
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(vec![VersionInfo::new("1.0.0", old())])
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut content = "version = 4\n".to_string();
+    for n in 0..64 {
+        content.push_str(&format!("[[package]]\nname = 'library-{n}'\nversion = '1.0.0'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\n"));
+    }
+    std::fs::write(dir.path().join("Cargo.lock"), &content).unwrap();
+    let baseline = parse_registry_entries(&content);
+    let dates = ConcurrentDates {
+        active: AtomicUsize::new(0),
+        peak: AtomicUsize::new(0),
+        count: AtomicUsize::new(0),
+    };
+    let orchestrator = Orchestrator::new(CliArgs::parse_from(["depup"])).unwrap();
+    let result = orchestrator
+        .audit_lock_age(
+            &LockAgeAudit {
+                project_dir: dir.path(),
+                cutoff: cutoff(),
+                exemptions: &Default::default(),
+                baseline: &baseline,
+                preferred: &Default::default(),
+                adapter: &dates,
+                cargo: &CargoCommand::new(),
+                budget: LOCK_AGE_AUDIT_BUDGET,
+            },
+            None,
+        )
+        .await;
+    assert!(!result.has_unresolved(), "{result:?}");
+    assert_eq!(dates.count.load(Ordering::SeqCst), 64);
+    assert!((2..=8).contains(&dates.peak.load(Ordering::SeqCst)));
 }

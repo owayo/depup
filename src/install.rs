@@ -2,7 +2,7 @@
 //!
 //! install 前の lock を保存し、install 後に生成された lock も含めて監査を計画する。
 
-use crate::cargo_rollback::audit::PreferredVersions;
+use crate::cargo_rollback::audit::{PreferredVersions, read_audit_lock};
 use crate::cargo_rollback::report::{DisplayedUpdate, LockedVersionMismatch, lock_mismatches};
 use crate::domain::{Language, UpdateResult};
 use crate::manifest::{
@@ -24,7 +24,9 @@ pub struct InstallJob {
 /// install 前に確定する実行単位と、変更を判定するための lock の保存。
 pub struct InstallPlan {
     pub jobs: Vec<InstallJob>,
-    baselines: BTreeMap<PathBuf, RegistryLockEntries>,
+    /// Node lock の監査は、マニフェストの更新がない実行でも計画する。
+    pub node_audits: Vec<InstallJob>,
+    baselines: BTreeMap<PathBuf, Result<RegistryLockEntries, String>>,
 }
 
 impl InstallPlan {
@@ -34,11 +36,22 @@ impl InstallPlan {
         monorepo_dirs: &Option<Vec<PathBuf>>,
         default_path: &Path,
     ) -> Self {
+        let node_audits = node_audit_jobs(orchestrator, result);
+        let shared_node_policies = &node_audits;
         let jobs = build_install_map(result, monorepo_dirs, default_path)
             .into_iter()
             .flat_map(|(directory, languages)| {
                 languages.into_iter().map(move |language| InstallJob {
-                    policy: install_age_policy(orchestrator, result, &directory, language),
+                    policy: if language == Language::Node {
+                        shared_node_policies
+                            .iter()
+                            .find(|job| job.directory == directory)
+                            .expect("every Node install has an audit scope")
+                            .policy
+                            .clone()
+                    } else {
+                        install_age_policy(orchestrator, result, &directory, language)
+                    },
                     directory: directory.clone(),
                     language,
                 })
@@ -47,14 +60,18 @@ impl InstallPlan {
         let groups = RustLockGroups::collect(orchestrator, result);
         let baselines = groups
             .locks
-            .into_iter()
-            .filter(|(_, group)| !group.manifests.is_empty())
-            .map(|(directory, _)| {
-                let entries = read_registry_entries(&directory.join("Cargo.lock"));
+            .into_keys()
+            .map(|directory| {
+                let entries =
+                    read_audit_lock(&directory.join("Cargo.lock")).map(|(_, entries)| entries);
                 (directory, entries)
             })
             .collect();
-        Self { jobs, baselines }
+        Self {
+            jobs,
+            node_audits,
+            baselines,
+        }
     }
 
     /// install が新規作成した lock を再検出し、install 前の版を対応付ける。
@@ -67,9 +84,18 @@ impl InstallPlan {
         let locks = groups
             .locks
             .into_iter()
-            .filter(|(_, group)| !group.manifests.is_empty())
             .map(|(directory, group)| RustLockPlan {
-                baseline: self.baselines.get(&directory).cloned().unwrap_or_default(),
+                baseline: self
+                    .baselines
+                    .get(&directory)
+                    .and_then(|result| result.as_ref().ok())
+                    .cloned()
+                    .unwrap_or_default(),
+                baseline_problem: self
+                    .baselines
+                    .get(&directory)
+                    .and_then(|result| result.as_ref().err())
+                    .cloned(),
                 directory,
                 policy: group.policy,
                 preferred: group.preferred,
@@ -78,7 +104,15 @@ impl InstallPlan {
             .collect();
         RustAuditPlan {
             locks,
-            missing_lock_dirs: groups.missing_lock_dirs,
+            missing_lock_dirs: groups
+                .missing_lock_dirs
+                .into_iter()
+                .filter(|directory| {
+                    self.jobs.iter().any(|job| {
+                        job.language == Language::Rust && directory.starts_with(&job.directory)
+                    })
+                })
+                .collect(),
         }
     }
 }
@@ -88,6 +122,8 @@ pub struct RustLockPlan {
     pub directory: PathBuf,
     pub policy: AgePolicy,
     pub baseline: RegistryLockEntries,
+    /// 既存 lock を読めなかった場合、空の下限で自動差し戻ししない。
+    pub baseline_problem: Option<String>,
     pub preferred: PreferredVersions,
     manifests: Vec<ManifestLockUpdates>,
 }
@@ -177,7 +213,7 @@ impl RustLockGroups {
         }
         let mut missing_lock_dirs = BTreeSet::new();
         for (index, manifest) in result.summary.manifests.iter().enumerate() {
-            if manifest.language != Language::Rust || !manifest.has_updates() {
+            if manifest.language != Language::Rust {
                 continue;
             }
             let Some(parent) = manifest.path.parent() else {
@@ -193,6 +229,9 @@ impl RustLockGroups {
                 }
                 continue;
             };
+            if !manifest.has_updates() {
+                continue;
+            }
             let group = locks
                 .get_mut(&directory)
                 .expect("every detected lock has a policy");
@@ -270,6 +309,79 @@ fn nearest_monorepo_dir(
         .unwrap_or_else(|| fallback.to_path_buf())
 }
 
+/// pnpm の共有 lock は、実際に検出される workspace member だけを結び付ける。
+fn node_resolution_directory(manifest: &Path) -> PathBuf {
+    let parent = manifest.parent().unwrap_or(Path::new("."));
+    let parent = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    let manifest = parent.join("package.json");
+    for directory in parent.ancestors() {
+        if directory == parent {
+            if [
+                "pnpm-lock.yaml",
+                "package-lock.json",
+                "npm-shrinkwrap.json",
+                "yarn.lock",
+                "bun.lock",
+                "bun.lockb",
+            ]
+            .iter()
+            .any(|filename| directory.join(filename).exists())
+            {
+                return directory.to_path_buf();
+            }
+        } else if directory.join("pnpm-workspace.yaml").is_file()
+            && detect_manifests(directory).iter().any(|candidate| {
+                candidate.language == Language::Node
+                    && std::fs::canonicalize(&candidate.path).is_ok_and(|path| path == manifest)
+            })
+        {
+            return directory.to_path_buf();
+        }
+    }
+    parent
+}
+
+fn node_audit_jobs(orchestrator: &Orchestrator, result: &OrchestratorResult) -> Vec<InstallJob> {
+    let mut groups: BTreeMap<PathBuf, BTreeSet<PathBuf>> = BTreeMap::new();
+    for manifest in &result.summary.manifests {
+        if manifest.language == Language::Node {
+            groups
+                .entry(node_resolution_directory(&manifest.path))
+                .or_default()
+                .insert(manifest.path.clone());
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(directory, mut manifests)| {
+            manifests.extend(
+                detect_manifests(&directory)
+                    .into_iter()
+                    .filter(|manifest| manifest.language == Language::Node)
+                    .map(|manifest| manifest.path),
+            );
+            let policy = (|| {
+                let mut policy =
+                    orchestrator.resolved_age_policy_for_language(&directory, Language::Node)?;
+                for manifest in manifests {
+                    if let Some(parent) = manifest.parent() {
+                        policy.merge(
+                            &orchestrator
+                                .resolved_age_policy_for_language(parent, Language::Node)?,
+                        );
+                    }
+                }
+                Ok(policy)
+            })();
+            InstallJob {
+                directory,
+                language: Language::Node,
+                policy,
+            }
+        })
+        .collect()
+}
+
 fn build_install_map(
     result: &OrchestratorResult,
     monorepo_dirs: &Option<Vec<PathBuf>>,
@@ -280,9 +392,13 @@ fn build_install_map(
         if !manifest.has_updates() {
             continue;
         }
-        let directory = match monorepo_dirs {
-            Some(dirs) => nearest_monorepo_dir(&manifest.path, dirs, default_path),
-            None => default_path.to_path_buf(),
+        let directory = if manifest.language == Language::Node {
+            node_resolution_directory(&manifest.path)
+        } else {
+            match monorepo_dirs {
+                Some(dirs) => nearest_monorepo_dir(&manifest.path, dirs, default_path),
+                None => default_path.to_path_buf(),
+            }
         };
         let languages = dir_langs.entry(directory).or_default();
         if !languages.contains(&manifest.language) {

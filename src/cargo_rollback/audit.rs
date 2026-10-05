@@ -8,6 +8,7 @@ use crate::manifest::{RegistryLockEntries, parse_registry_entries};
 use crate::registry::RegistryAdapter;
 use crate::registry::versions::VersionFetcher;
 use crate::update::{VersionInfo, compare_versions};
+use futures::{StreamExt, stream};
 use indicatif::ProgressBar;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
@@ -52,13 +53,9 @@ pub(crate) fn read_audit_lock(path: &Path) -> Result<(String, RegistryLockEntrie
 /// 反復することで連鎖を解消するが、無限ループを避けるため上限を設ける。
 const MAX_ENFORCE_LOCK_AGE_PASSES: usize = 5;
 
-/// `enforce_lock_age_rust` がレジストリ照会に使える時間の上限。
-///
-/// crates.io は crawler policy により 1 リクエスト/秒へ直列化されるため、監査対象が
-/// 数百件に膨らむと数分間ネットワーク待ちで無音になり、利用者からはハングと区別が
-/// つかない。通常は差分監査 (`changed_entries`) で数件に収まるが、Cargo.lock を
-/// 新規生成した直後など対象が大量になるケースの安全弁として上限を設ける。
-/// 予算切れの場合は監査済みの分を適用したうえで、未検証件数を呼び出し側へ返す。
+/// lock ごとの差し戻しと最終全件検証に、それぞれ与える時間の上限。
+/// 候補取得 API の待機が全件検証やまとめ解きの枠を食い潰さないよう分ける。
+/// 全件検証は sparse index の公開日を並列取得し、未完了なら成功にしない。
 pub const LOCK_AGE_AUDIT_BUDGET: Duration = Duration::from_secs(180);
 
 /// age 監査の差し戻しで起動する `cargo update -p --precise` 1 回あたりの上限。
@@ -94,7 +91,7 @@ pub struct LockAgeAuditResult {
     /// 期間を満たさなかった `(crate 名, 元の版)` ごとの最終結果 (名前 → 版の順)。
     /// 1 件ずつの差し戻しで失敗し、後のまとめ解きで戻せた組は、戻せた結果だけが残る
     pub adjustments: Vec<LockAgeAdjustment>,
-    /// 監査を終えた時点の Cargo.lock に残る、install で変わった版のうち公開日を確かめられ
+    /// 監査を終えた時点の Cargo.lock に残る版のうち公開日を確かめられ
     /// なかった件数 (時間予算 `LOCK_AGE_AUDIT_BUDGET` 切れなど。0 なら全件を確かめた)
     pub unchecked: usize,
     /// 利用者に必ず知らせるべき問題 (まとめ解きの後に元の Cargo.lock を戻せなかった等)
@@ -102,26 +99,21 @@ pub struct LockAgeAuditResult {
 }
 
 impl LockAgeAuditResult {
-    /// install による age 違反や未確認の状態が残ったか。既存版への復元は変更の取り消し。
+    /// 最終 lock に age 違反や未確認の状態が残ったか。既存版も例外にしない。
     pub fn has_unresolved(&self) -> bool {
         self.unchecked > 0
             || !self.problems.is_empty()
-            || self.adjustments.iter().any(|adjustment| {
-                !adjustment.status.is_resolved() && !adjustment.status.is_restored()
-            })
+            || self
+                .adjustments
+                .iter()
+                .any(|adjustment| !adjustment.status.is_resolved())
     }
 }
 
 /// install 前の Cargo.lock (`baseline`) から見て、新規に入った / バージョンが変わった
 /// registry エントリだけを名前順で抽出する。
 ///
-/// post-install age 監査の対象を「depup の更新によって lock に入ったもの」へ限定する
-/// ための絞り込み。lock 全体を監査すると crates.io の 1 リクエスト/秒 制限により
-/// 数百件 = 数分の無音待ちになるうえ、depup が触っていない既存の解決結果まで
-/// 差し戻し対象にしてしまう。
-///
-/// `baseline` が空の場合 (install 前に Cargo.lock が無かった等) は全エントリが
-/// 「新規に入ったもの」なので、結果的に全件が対象になる。
+/// 全件監査の順序で、新しく解決された crate を優先するために使う。
 fn changed_entries(
     current: &RegistryLockEntries,
     baseline: &RegistryLockEntries,
@@ -143,6 +135,23 @@ fn changed_entries(
     targets
 }
 
+/// 変更版を先に確認するが、無変更の版も監査対象から外さない。
+fn audit_entries(
+    current: &RegistryLockEntries,
+    baseline: &RegistryLockEntries,
+) -> Vec<(String, Vec<String>)> {
+    let changed: HashSet<String> = changed_entries(current, baseline)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    let mut targets: Vec<_> = current
+        .iter()
+        .map(|(name, versions)| (name.clone(), versions.clone()))
+        .collect();
+    targets.sort_by(|a, b| (!changed.contains(&a.0), &a.0).cmp(&(!changed.contains(&b.0), &b.0)));
+    targets
+}
+
 /// `enforce_lock_age_rust` が 1 件の依存に対して実施した調整内容
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockAgeAdjustment {
@@ -150,8 +159,10 @@ pub struct LockAgeAdjustment {
     pub name: String,
     /// Cargo.lock 上で解決されていたバージョン
     pub from: String,
-    /// 差し戻したバージョン (`Downgraded` のみ)
+    /// 最終 lock 上で実際に移動した版。
     pub to: Option<String>,
+    /// 差し戻しで要求した版。実際の移動先とは分ける。
+    pub target: Option<String>,
     /// 差し戻しの結果
     pub status: LockAgeStatus,
 }
@@ -204,7 +215,7 @@ pub(crate) struct LockAgeAudit<'a> {
     /// これより後に公開された版を違反とする
     pub(crate) cutoff: chrono::DateTime<chrono::Utc>,
     pub(crate) exemptions: &'a crate::update::AgeExemptions,
-    /// install 前の Cargo.lock (これと同じ版は監査しない)
+    /// install 前の Cargo.lock (差し戻しの下限と確認順序に使う)
     pub(crate) baseline: &'a RegistryLockEntries,
     /// judge がこの実行で選んだ版
     pub(crate) preferred: &'a PreferredVersions,
@@ -228,12 +239,18 @@ struct AdjustmentLog {
 impl AdjustmentLog {
     /// 結果を記録する (既にあれば上書き)
     fn record(&mut self, name: &str, from: &str, to: Option<String>, status: LockAgeStatus) {
+        let (to, target) = if status.is_resolved() || status.is_restored() {
+            (to.clone(), to)
+        } else {
+            (None, to)
+        };
         self.entries.insert(
             (name.to_string(), from.to_string()),
             LockAgeAdjustment {
                 name: name.to_string(),
                 from: from.to_string(),
                 to,
+                target,
                 status,
             },
         );
@@ -247,14 +264,9 @@ impl AdjustmentLog {
         to: Option<String>,
         status: LockAgeStatus,
     ) {
-        self.entries
-            .entry((name.to_string(), from.to_string()))
-            .or_insert_with(|| LockAgeAdjustment {
-                name: name.to_string(),
-                from: from.to_string(),
-                to,
-                status,
-            });
+        if !self.contains(name, from) {
+            self.record(name, from, to, status);
+        }
     }
 
     /// その組の結果が既にあるか
@@ -361,7 +373,7 @@ pub(crate) fn rollback_target(
     }
 }
 
-/// install 前の lock (`before`) にあった、`current` と同じ semver 系列で `current` より古い版の
+/// install 前の lock (`before`) にあった、`current` と同じ semver 系列で `current` 以下の版の
 /// うち利用可能な最新。yank 済み・公開日不明などで取得一覧にない版は、下限にも戻し先にも使わない。
 fn version_floor(
     available: &[VersionInfo],
@@ -372,7 +384,7 @@ fn version_floor(
         .unwrap_or_default()
         .iter()
         .filter(|version| same_series(version, current))
-        .filter(|version| compare_versions(version, current) == std::cmp::Ordering::Less)
+        .filter(|version| compare_versions(version, current) != std::cmp::Ordering::Greater)
         .filter(|version| {
             available
                 .iter()
@@ -582,7 +594,7 @@ impl<'a> LockAgeAuditor<'a> {
                 break;
             }
         }
-        self.finalize(state).await
+        self.finalize(state, bar).await
     }
 
     /// 一巡分の公開日検査と、単独で差し戻せる候補の適用。
@@ -605,9 +617,6 @@ impl<'a> LockAgeAuditor<'a> {
         } = *self.input;
         let lock_path = project_dir.join("Cargo.lock");
         let (_, entries) = read_audit_lock(&lock_path)?;
-        // install 前と同じバージョンで lock されていた依存は depup の更新で入った
-        // ものではないため監査しない。crates.io は 1 リクエスト/秒に直列化される
-        // ので、lock 全体 (数百件) を舐めると監査だけで数分の無音待ちになる。
         let targets = changed_entries(&entries, baseline);
         if targets.is_empty() {
             return Ok(AuditPass::default());
@@ -624,7 +633,7 @@ impl<'a> LockAgeAuditor<'a> {
         }
         if pass_index == 0 && self.verbose {
             let message = format!(
-                "  {} — {} crate(s) changed by install; checking release dates",
+                "  {} — {} changed registry crate(s) in Cargo.lock; checking release dates",
                 project_dir.display(),
                 targets.len()
             );
@@ -722,6 +731,17 @@ impl<'a> LockAgeAuditor<'a> {
                         .record(name, current, None, LockAgeStatus::NoOlderCandidate);
                     continue;
                 };
+                if compare_versions(&target, current) != std::cmp::Ordering::Less {
+                    state.log.record_if_absent(
+                        name,
+                        current,
+                        pick_older_within_age(&all_versions, current, cutoff, exemptions),
+                        LockAgeStatus::NotAttempted(format!(
+                            "the pre-install locked version {target} is the rollback minimum and does not satisfy --age"
+                        )),
+                    );
+                    continue;
+                }
                 let candidate = RollbackCandidate {
                     name: name.clone(),
                     current: current.clone(),
@@ -739,7 +759,7 @@ impl<'a> LockAgeAuditor<'a> {
                     state.log.record_if_absent(
                         name,
                         current,
-                        None,
+                        Some(target),
                         LockAgeStatus::NotAttempted(format!(
                             "stopped after {MAX_ENFORCE_LOCK_AGE_PASSES} rounds of rollbacks"
                         )),
@@ -845,6 +865,7 @@ impl<'a> LockAgeAuditor<'a> {
                             LockAgeStatus::Removed
                         };
                         state.log.record(name, current, moved, status);
+                        state.log.entries.get_mut(&key).unwrap().target = Some(target.clone());
                         return Ok(());
                     }
                     None => LockAgeStatus::UpdateCommandFailed(format!(
@@ -861,11 +882,11 @@ impl<'a> LockAgeAuditor<'a> {
                 state.log.record(
                     name,
                     current,
-                    None,
+                    Some(target.clone()),
                     LockAgeStatus::UpdateCommandFailed(message),
                 );
             }
-            other => state.log.record(name, current, None, other),
+            other => state.log.record(name, current, Some(target.clone()), other),
         }
         Ok(())
     }
@@ -893,7 +914,7 @@ impl<'a> LockAgeAuditor<'a> {
                 state.log.record_if_absent(
                     &candidate.name,
                     &candidate.current,
-                    None,
+                    Some(candidate.target.clone()),
                     LockAgeStatus::NotAttempted(
                         "audit time budget ran out before resolving together".to_string(),
                     ),
@@ -929,6 +950,8 @@ impl<'a> LockAgeAuditor<'a> {
                             Some(version),
                             LockAgeStatus::Downgraded,
                         );
+                        state.log.entries.get_mut(&key).unwrap().target =
+                            Some(candidate.target.clone());
                     }
                     TogetherOutcome::Removed => {
                         resolved_any = true;
@@ -945,7 +968,7 @@ impl<'a> LockAgeAuditor<'a> {
                         state.log.record(
                             &candidate.name,
                             &candidate.current,
-                            None,
+                            Some(candidate.target.clone()),
                             LockAgeStatus::BlockedByManifest(requirement),
                         );
                     }
@@ -959,7 +982,7 @@ impl<'a> LockAgeAuditor<'a> {
                         state.log.record(
                             &candidate.name,
                             &candidate.current,
-                            None,
+                            Some(candidate.target.clone()),
                             LockAgeStatus::UpdateCommandFailed(message),
                         );
                     }
@@ -972,9 +995,12 @@ impl<'a> LockAgeAuditor<'a> {
                             )),
                             None => LockAgeStatus::NotAttempted(reason),
                         };
-                        state
-                            .log
-                            .record(&candidate.name, &candidate.current, None, status);
+                        state.log.record(
+                            &candidate.name,
+                            &candidate.current,
+                            Some(candidate.target.clone()),
+                            status,
+                        );
                     }
                 }
             }
@@ -990,7 +1016,7 @@ impl<'a> LockAgeAuditor<'a> {
                 state.log.record_if_absent(
                     &candidate.name,
                     &candidate.current,
-                    None,
+                    Some(candidate.target.clone()),
                     LockAgeStatus::NotAttempted(
                         "resolving together already failed for the same Cargo.lock".to_string(),
                     ),
@@ -1000,14 +1026,15 @@ impl<'a> LockAgeAuditor<'a> {
         Ok(())
     }
 
-    /// 通信せず、取得済みの公開日と最終 lock を突き合わせる。
-    async fn finalize(&self, state: AuditState) -> LockAgeAuditResult {
+    /// 差し戻しとは別の時間予算で、最終 lock の全件を検証する。
+    async fn finalize(&self, state: AuditState, bar: Option<&ProgressBar>) -> LockAgeAuditResult {
         let LockAgeAudit {
             project_dir,
             cutoff,
             exemptions,
             baseline,
             adapter,
+            budget,
             ..
         } = *self.input;
         let lock_path = project_dir.join("Cargo.lock");
@@ -1016,11 +1043,8 @@ impl<'a> LockAgeAuditor<'a> {
             mut problems,
             ..
         } = state;
-        // 報告は最終的な Cargo.lock の状態から組み立て直す。途中の記録だけで「差し戻した」と
-        // 言うと、後の差し戻しで版が動いた・まとめ解きの結果を確かめる前に予算が尽きた等の
-        // 場合に、lock の実態と食い違う
-        let final_entries = match read_audit_lock(&lock_path) {
-            Ok((_, entries)) => entries,
+        let (content, final_entries) = match read_audit_lock(&lock_path) {
+            Ok(entries) => entries,
             Err(error) => {
                 if !problems.contains(&error) {
                     problems.push(error);
@@ -1032,79 +1056,110 @@ impl<'a> LockAgeAuditor<'a> {
             }
         };
         log.reconcile_with_lock(&final_entries);
-        // 途中で記録した移動先ではなく、最終 lock の公開日を確認する。
-        let moved: Vec<(String, String, String)> = log
-            .entries
-            .values()
-            .filter(|adjustment| adjustment.status == LockAgeStatus::Downgraded)
-            .filter_map(|adjustment| {
-                Some((
-                    adjustment.name.clone(),
-                    adjustment.from.clone(),
-                    adjustment.to.clone()?,
-                ))
-            })
-            .collect();
-        for (name, from, to) in moved {
-            let known = self.versions.cached(adapter, &name).await;
-            let info = known.as_ref().and_then(|all| {
-                all.iter()
-                    .find(|info| compare_versions(&info.version, &to) == std::cmp::Ordering::Equal)
-            });
-            let status = match info {
-                None => Some(LockAgeStatus::ReleaseDateUnavailable),
-                Some(info) if exemptions.admits(Language::Rust, &name, info, cutoff) => None,
+        let targets = audit_entries(&final_entries, baseline);
+        let deadline = tokio::time::Instant::now() + budget;
+        if let Some(bar) = bar {
+            bar.set_position(0);
+            bar.set_length(targets.len() as u64);
+            bar.set_message("Verifying all registry crates in final Cargo.lock");
+        }
+        let mut metadata = HashMap::new();
+        // 実行内の候補キャッシュは使えるが、候補から落ちた yank 済みの版は別途取得する。
+        {
+            let requests = stream::iter(targets.iter().map(|(name, locked)| async move {
+                let cached = self.versions.cached(adapter, name).await;
+                if let Some(cached) = cached
+                    && locked
+                        .iter()
+                        .all(|locked| cached.iter().any(|info| info.version == *locked))
+                {
+                    return (name.clone(), Some(cached));
+                }
+                let fetched = adapter
+                    .fetch_locked_versions(name, locked, (!exemptions.is_empty()).then_some(cutoff))
+                    .await
+                    .ok();
+                (name.clone(), fetched)
+            }))
+            .buffer_unordered(8);
+            tokio::pin!(requests);
+            while tokio::time::Instant::now() < deadline {
+                let Ok(Some((name, known))) =
+                    tokio::time::timeout_at(deadline, requests.next()).await
+                else {
+                    break;
+                };
+                metadata.insert(name.clone(), known);
+                if let Some(bar) = bar {
+                    bar.set_position(metadata.len() as u64);
+                    bar.set_message(format!("Verifying {name}"));
+                }
+            }
+        }
+        // 実際の移動先を最終状態で判定する。既存の若い版へ戻しても成功にはしない。
+        for adjustment in log.entries.values_mut() {
+            if adjustment.status != LockAgeStatus::Downgraded {
+                continue;
+            }
+            let Some(to) = &adjustment.to else {
+                continue;
+            };
+            let info = metadata
+                .get(&adjustment.name)
+                .and_then(Option::as_ref)
+                .and_then(|known| known.iter().find(|info| info.version == *to));
+            adjustment.status = match info {
+                Some(info) if exemptions.admits(Language::Rust, &adjustment.name, info, cutoff) => {
+                    LockAgeStatus::Downgraded
+                }
                 Some(_)
                     if baseline
-                        .get(&name)
-                        .is_some_and(|versions| versions.contains(&to)) =>
+                        .get(&adjustment.name)
+                        .is_some_and(|versions| versions.contains(to)) =>
                 {
-                    Some(LockAgeStatus::Restored)
+                    LockAgeStatus::Restored
                 }
-                Some(_) => Some(LockAgeStatus::NotAttempted(format!(
+                Some(_) => LockAgeStatus::NotAttempted(format!(
                     "final locked version {to} does not satisfy --age"
-                ))),
+                )),
+                None => LockAgeStatus::ReleaseDateUnavailable,
             };
-            if let Some(status) = status {
-                log.record(&name, &from, Some(to), status);
-            }
         }
-        let mut unchecked = 0usize;
-        for (name, versions) in changed_entries(&final_entries, baseline) {
-            // ここではレジストリへ問い合わせない (予算を使い切っていることがある)。
-            // 監査中に取得した公開日だけで判定し、取得していないものは未検証として数える
-            let known = self.versions.cached(adapter, &name).await;
+        let mut unchecked = 0;
+        for (name, versions) in targets {
+            let known = metadata.get(&name).and_then(Option::as_ref);
             for version in versions {
-                if log.contains(&name, &version) {
+                let info =
+                    known.and_then(|known| known.iter().find(|info| info.version == version));
+                if info.is_some_and(|info| exemptions.admits(Language::Rust, &name, info, cutoff)) {
+                    // 最終状態を確認できれば途中の取得失敗は残さない。
+                    log.entries.remove(&(name.clone(), version.clone()));
                     continue;
                 }
-                let info = known.as_ref().and_then(|all| {
-                    all.iter().find(|info| {
-                        compare_versions(&info.version, &version) == std::cmp::Ordering::Equal
-                    })
-                });
-                match (known.as_ref(), info) {
-                    (Some(_), Some(info))
-                        if !exemptions.admits(Language::Rust, &name, info, cutoff) =>
-                    {
-                        log.record(
-                            &name,
-                            &version,
-                            None,
-                            LockAgeStatus::NotAttempted(
-                                "the audit ended before rolling it back".to_string(),
-                            ),
-                        )
-                    }
-                    (Some(_), Some(_)) => {}
-                    (Some(_), None) => {
-                        log.record(&name, &version, None, LockAgeStatus::ReleaseDateUnavailable)
-                    }
-                    (None, _) => unchecked += 1,
+                // 差し戻し先の若い版を別件で重複報告しない。
+                if log.entries.values().any(|adjustment| {
+                    adjustment.name == name && adjustment.to.as_ref() == Some(&version)
+                }) {
+                    continue;
                 }
+                if !metadata.contains_key(&name) {
+                    unchecked += 1;
+                }
+                let status = match info {
+                    None => LockAgeStatus::ReleaseDateUnavailable,
+                    Some(_) if baseline.get(&name).is_some_and(|versions| versions.contains(&version)) => LockAgeStatus::NotAttempted(
+                        "the pre-install locked version is the rollback minimum and does not satisfy --age".into()
+                    ),
+                    Some(_) => LockAgeStatus::NotAttempted("the audit ended before rolling it back".into()),
+                };
+                log.record_if_absent(&name, &version, None, status);
             }
         }
-
+        if std::fs::read_to_string(&lock_path)
+            .map_or(true, |final_content| final_content != content)
+        {
+            problems.push("Cargo.lock changed during final age verification; rerun --install to verify the new state".into());
+        }
         LockAgeAuditResult {
             adjustments: log.into_adjustments(),
             unchecked,

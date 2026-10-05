@@ -66,6 +66,60 @@ struct CratesIoResponse {
     versions: Vec<CrateVersion>,
 }
 
+impl CratesIoResponse {
+    fn into_versions(self, include_yanked: bool) -> Vec<VersionInfo> {
+        let mut versions = Vec::new();
+        for version in self.versions {
+            if version.yanked && !include_yanked {
+                continue;
+            }
+            if let Ok(released_at) = version.created_at.parse::<DateTime<Utc>>() {
+                let mut info = VersionInfo::new(&version.num, released_at);
+                info.publisher = version.publisher();
+                versions.push(info);
+            }
+        }
+        versions.sort();
+        versions
+    }
+}
+
+/// Sparse index の公開日は yank によって変わらない。
+#[derive(Deserialize)]
+struct IndexRelease {
+    name: String,
+    vers: String,
+    #[serde(default)]
+    pubtime: Option<String>,
+}
+
+fn index_path(name: &str) -> String {
+    let name = name.to_ascii_lowercase();
+    match name.len() {
+        1 => format!("1/{name}"),
+        2 => format!("2/{name}"),
+        3 => format!("3/{}/{name}", &name[..1]),
+        _ => format!("{}/{}/{name}", &name[..2], &name[2..4]),
+    }
+}
+
+fn index_release_dates(content: &str, package: &str) -> Option<Vec<VersionInfo>> {
+    let mut versions = Vec::new();
+    for line in content.lines() {
+        let release: IndexRelease = serde_json::from_str(line).ok()?;
+        if !release.name.eq_ignore_ascii_case(package) {
+            return None;
+        }
+        if let Some(date) = release
+            .pubtime
+            .and_then(|date| date.parse::<DateTime<Utc>>().ok())
+        {
+            versions.push(VersionInfo::new(release.vers, date));
+        }
+    }
+    Some(versions)
+}
+
 /// クレートバージョン情報
 #[derive(Debug, Deserialize)]
 struct CrateVersion {
@@ -173,6 +227,24 @@ impl CratesIoAdapter {
 
         permit
     }
+
+    async fn api_versions(
+        &self,
+        crate_name: &str,
+        include_yanked: bool,
+    ) -> Result<Vec<VersionInfo>, RegistryError> {
+        self.validate_crate_name(crate_name)?;
+        let _permit = self.apply_rate_limit().await;
+        let response: CratesIoResponse = self
+            .client
+            .get_json(
+                &self.build_url(crate_name),
+                crate_name,
+                self.registry_name(),
+            )
+            .await?;
+        Ok(response.into_versions(include_yanked))
+    }
 }
 
 #[async_trait]
@@ -186,43 +258,82 @@ impl RegistryAdapter for CratesIoAdapter {
     }
 
     async fn fetch_versions(&self, crate_name: &str) -> Result<Vec<VersionInfo>, RegistryError> {
-        // 名前の検証はレート制限を取る前に行う (不正名で 1 秒の枠を消費しない)
+        self.api_versions(crate_name, false).await
+    }
+
+    async fn fetch_locked_versions(
+        &self,
+        crate_name: &str,
+        locked: &[String],
+        publisher_cutoff: Option<DateTime<Utc>>,
+    ) -> Result<Vec<VersionInfo>, RegistryError> {
         self.validate_crate_name(crate_name)?;
-
-        // レート制限を適用（HTTP リクエスト完了まで許可を保持する）
-        let _permit = self.apply_rate_limit().await;
-
-        let url = self.build_url(crate_name);
-        let response: CratesIoResponse = self
+        let url = format!("https://index.crates.io/{}", index_path(crate_name));
+        if let Ok(content) = self
             .client
-            .get_json(&url, crate_name, self.registry_name())
-            .await?;
-
-        let mut versions = Vec::new();
-
-        for version in response.versions {
-            // yank されたバージョンをスキップ
-            if version.yanked {
-                continue;
-            }
-
-            if let Ok(released_at) = version.created_at.parse::<DateTime<Utc>>() {
-                let mut info = VersionInfo::new(&version.num, released_at);
-                info.publisher = version.publisher();
-                versions.push(info);
-            }
+            .get_text(&url, crate_name, self.registry_name())
+            .await
+            && let Some(versions) = index_release_dates(&content, crate_name)
+            && locked
+                .iter()
+                .all(|locked| versions.iter().any(|info| info.version == *locked))
+            && publisher_cutoff.is_none_or(|cutoff| {
+                locked.iter().all(|locked| {
+                    versions
+                        .iter()
+                        .any(|info| info.version == *locked && info.released_at <= cutoff)
+                })
+            })
+        {
+            return Ok(versions);
         }
-
-        // バージョンでソート
-        versions.sort();
-
-        Ok(versions)
+        // 古い index や若い版の公開者免除では API を使う。yank 済みの lock 版も含む。
+        self.api_versions(crate_name, true).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn locked_metadata_includes_yanked_dates_without_making_them_candidates() {
+        let response = || {
+            serde_json::from_value::<CratesIoResponse>(serde_json::json!({"versions":[
+                {"num":"1.0.0","created_at":"2026-01-01T00:00:00Z","yanked":false},
+                {"num":"1.0.1","created_at":"2026-01-02T00:00:00Z","yanked":true}
+            ]}))
+            .unwrap()
+        };
+        assert_eq!(response().into_versions(false).len(), 1);
+        let locked = response().into_versions(true);
+        assert_eq!(locked.len(), 2);
+        assert_eq!(locked[1].version, "1.0.1");
+        assert_eq!(
+            locked[1].released_at,
+            "2026-01-02T00:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+    }
+
+    #[test]
+    fn sparse_publication_dates_include_yanked_and_skip_missing_dates() {
+        let content = r#"{"name":"library","vers":"1.0.0","pubtime":"2026-01-01T00:00:00Z","yanked":true}
+{"name":"library","vers":"1.0.1","pubtime":null}
+{"name":"library","vers":"1.0.2","pubtime":"invalid"}"#;
+        let dates = index_release_dates(content, "library").unwrap();
+        assert_eq!(dates.len(), 1);
+        assert_eq!(dates[0].version, "1.0.0");
+        assert!(index_release_dates(content, "other").is_none());
+        assert!(index_release_dates("invalid", "library").is_none());
+        for (name, path) in [
+            ("X", "1/x"),
+            ("ab", "2/ab"),
+            ("ABC", "3/a/abc"),
+            ("serde", "se/rd/serde"),
+        ] {
+            assert_eq!(index_path(name), path);
+        }
+    }
 
     #[test]
     fn publisher_requires_registry_verified_identity() {
