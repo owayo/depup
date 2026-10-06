@@ -352,7 +352,7 @@ The package manager is detected from files in the directory where the install ru
 | | `Pipfile.lock` | `pipenv install` |
 | | `pyproject.toml` / `requirements.txt` | `pip install -e .` |
 | Rust | `Cargo.toml`, or `src-tauri/Cargo.toml` in a Tauri project (`cargo update` then runs in `src-tauri/`) | `cargo update` |
-| Go | `go.mod` | `go mod download` |
+| Go | `go.mod` | `go mod tidy` |
 | Ruby | `Gemfile` | `bundle install` |
 | PHP | `composer.json` | `composer update` |
 | Java | `gradlew` | `./gradlew dependencies` |
@@ -363,6 +363,8 @@ The package manager is detected from files in the directory where the install ru
 If none of the listed files is present, no install runs for that language, and nothing is printed. When the age filter is active, pnpm, uv, and mise also receive the age setting ([below](#transitive-dependencies-and-the-age-filter)), and `uv sync` always runs with `UV_MALWARE_CHECK=1` ([uv Malware Check](#uv-malware-check-preview)).
 
 When `--install` processes a PHP project, depup runs `composer update` rather than `composer install`. `composer install` reuses the existing lock file and cannot reflect constraints that depup has just changed in `composer.json`; `composer update` resolves those constraints and refreshes `composer.lock`.
+
+For Go, `go mod tidy` synchronizes `go.mod` and `go.sum` with the source code, including tests and platform-specific imports. It records module content checksums as well as `go.mod` checksums so that subsequent builds have the required sums. Unlike argumentless `go mod download`, it also adds missing indirect requirements and removes unused requirements and sums. This may change `// indirect` comments and, when dependencies require a newer Go release, the `go` or `toolchain` directives. Projects that commit `vendor/` must run `go mod vendor` afterwards to refresh it. A tidy failure is reported as an install failure.
 
 ### Transitive Dependencies and the Age Filter
 

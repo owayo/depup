@@ -277,8 +277,9 @@ impl SystemPackageManager {
             "pipenv" => vec!["pipenv", "install"],
             // Rust の処理
             "cargo" => vec!["cargo", "update"],
-            // Go 言語
-            "go" => vec!["go", "mod", "download"],
+            // Go 1.17 以降の引数なし download は本体のハッシュを go.sum に保存しない。
+            // tidy でハッシュと、新版が必要とする間接依存の require を揃える。
+            "go" => vec!["go", "mod", "tidy"],
             // Ruby の処理
             "bundle" => vec!["bundle", "install"],
             // PHP の処理。
@@ -617,7 +618,123 @@ mod tests {
     fn test_get_install_command_go() {
         let pm = SystemPackageManager::new();
         let cmd = pm.get_install_command("go");
-        assert_eq!(cmd, vec!["go", "mod", "download"]);
+        assert_eq!(cmd, vec!["go", "mod", "tidy"]);
+    }
+
+    #[test]
+    fn go_install_completes_checksums_and_indirect_requirements() {
+        use std::fs;
+
+        if which::which("go").is_err() {
+            eprintln!("Skipping Go install regression: go is not installed");
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let proxy = temp.path().join("proxy");
+        fs::create_dir_all(&project).unwrap();
+        for (name, version, archive, manifest) in [
+            (
+                "direct",
+                "v1.0.0",
+                include_bytes!("../tests/fixtures/go-install/direct-v1.0.0.zip").as_slice(),
+                "module example.com/direct\n\ngo 1.17\n",
+            ),
+            (
+                "direct",
+                "v1.1.0",
+                include_bytes!("../tests/fixtures/go-install/direct-v1.1.0.zip").as_slice(),
+                "module example.com/direct\n\ngo 1.17\n\nrequire example.com/indirect v1.0.0\n",
+            ),
+            (
+                "indirect",
+                "v1.0.0",
+                include_bytes!("../tests/fixtures/go-install/indirect-v1.0.0.zip").as_slice(),
+                "module example.com/indirect\n\ngo 1.17\n",
+            ),
+        ] {
+            let versions = proxy.join(format!("example.com/{name}/@v"));
+            fs::create_dir_all(&versions).unwrap();
+            fs::write(versions.join(format!("{version}.zip")), archive).unwrap();
+            fs::write(versions.join(format!("{version}.mod")), manifest).unwrap();
+            fs::write(
+                versions.join(format!("{version}.info")),
+                format!(r#"{{"Version":"{version}","Time":"2020-01-01T00:00:00Z"}}"#),
+            )
+            .unwrap();
+        }
+
+        let env = vec![
+            (
+                "GOPROXY".into(),
+                reqwest::Url::from_directory_path(&proxy)
+                    .unwrap()
+                    .to_string(),
+            ),
+            ("GOSUMDB".into(), "off".into()),
+            ("GOPRIVATE".into(), String::new()),
+            ("GONOPROXY".into(), "none".into()),
+            ("GOENV".into(), "off".into()),
+            ("GOFLAGS".into(), String::new()),
+            ("GO111MODULE".into(), "on".into()),
+            ("GOWORK".into(), "off".into()),
+            ("GOTOOLCHAIN".into(), "local".into()),
+            (
+                "GOMODCACHE".into(),
+                temp.path().join("modcache").to_str().unwrap().into(),
+            ),
+            (
+                "GOCACHE".into(),
+                temp.path().join("buildcache").to_str().unwrap().into(),
+            ),
+        ];
+        let pm = SystemPackageManager::new();
+        let run = |args: &[&str]| pm.run_command(args, &project, &env).unwrap();
+        let assert_success = |output: Output| {
+            assert!(
+                output.status.success(),
+                "Go command failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        fs::write(
+            project.join("go.mod"),
+            "module example.com/app\n\ngo 1.17\n\nrequire example.com/direct v1.0.0\n",
+        )
+        .unwrap();
+        fs::write(
+            project.join("main.go"),
+            "package main\nimport \"example.com/direct\"\nfunc main() { println(direct.Message()) }\n",
+        )
+        .unwrap();
+        assert_success(run(&["go", "mod", "tidy"]));
+        let manifest_path = project.join("go.mod");
+        let manifest = fs::read_to_string(&manifest_path).unwrap();
+        fs::write(&manifest_path, manifest.replace("v1.0.0", "v1.1.0")).unwrap();
+
+        // 旧コマンドは成功しても本体のハッシュを保存せず、readonly build は失敗する。
+        assert_success(run(&["go", "mod", "download"]));
+        let sums = fs::read_to_string(project.join("go.sum")).unwrap();
+        assert!(sums.contains("example.com/direct v1.1.0/go.mod h1:"));
+        assert!(!sums.contains("example.com/direct v1.1.0 h1:"));
+        assert!(
+            !run(&["go", "build", "-mod=readonly", "./..."])
+                .status
+                .success()
+        );
+
+        assert_success(run(&pm.get_install_command("go")));
+        let sums = fs::read_to_string(project.join("go.sum")).unwrap();
+        assert!(sums.contains("example.com/direct v1.1.0 h1:"));
+        assert!(sums.contains("example.com/indirect v1.0.0 h1:"));
+        assert!(
+            fs::read_to_string(&manifest_path)
+                .unwrap()
+                .contains("example.com/indirect v1.0.0 // indirect")
+        );
+        assert_success(run(&["go", "build", "-mod=readonly", "./..."]));
+        assert_success(run(&["go", "test", "-mod=readonly", "./..."]));
     }
 
     #[test]

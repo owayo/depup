@@ -353,7 +353,7 @@ install が失敗しても、残りの install は続けます。失敗したコ
 | | `Pipfile.lock` | `pipenv install` |
 | | `pyproject.toml` / `requirements.txt` | `pip install -e .` |
 | Rust | `Cargo.toml`、または Tauri プロジェクトの `src-tauri/Cargo.toml`（このときは `src-tauri/` で実行） | `cargo update` |
-| Go | `go.mod` | `go mod download` |
+| Go | `go.mod` | `go mod tidy` |
 | Ruby | `Gemfile` | `bundle install` |
 | PHP | `composer.json` | `composer update` |
 | Java | `gradlew` | `./gradlew dependencies` |
@@ -364,6 +364,8 @@ install が失敗しても、残りの install は続けます。失敗したコ
 表のファイルがどれもなければ、その言語の install は実行せず、何も表示しません。age フィルターが有効なときは、pnpm・uv・mise に age の値も渡します（[推移的依存と age フィルター](#推移的依存と-age-フィルター)）。`uv sync` には常に `UV_MALWARE_CHECK=1` を付けます（[uv のマルウェアチェック](#uv-のマルウェアチェックpreview)）。
 
 PHP プロジェクトを `--install` で処理するとき、depup は `composer install` ではなく `composer update` を実行します。`composer install` は既存のロックファイルを再利用するため、depup が直前に `composer.json` へ書いた制約を反映できません。`composer update` で制約を解決し直し、`composer.lock` を更新します。
+
+Go では `go mod tidy` で、テストやプラットフォーム固有の import も含めて、ソースコードと `go.mod`・`go.sum` を揃えます。`go.mod` のハッシュに加えてモジュール本体のハッシュも記録し、後続のビルドに必要なチェックサムを揃えます。引数なしの `go mod download` と異なり、不足する間接依存を追加し、使われなくなった依存やハッシュを削除します。`// indirect` コメントが変わるほか、依存先が新しい Go を要求すると `go`・`toolchain` ディレクティブが変わる場合もあります。`vendor/` をコミットするプロジェクトでは、その後に `go mod vendor` で更新してください。tidy が失敗した場合は install 失敗として報告します。
 
 ### 推移的依存と age フィルター
 
