@@ -165,6 +165,11 @@ pub fn detect_manifests(dir: &Path) -> Vec<ManifestInfo> {
         push_unique_manifest(&mut manifests, catalog_path, Language::Java);
     }
 
+    let wrapper_properties = dir.join("gradle/wrapper/gradle-wrapper.properties");
+    if wrapper_properties.is_file() {
+        push_unique_manifest(&mut manifests, wrapper_properties, Language::Java);
+    }
+
     // mise の設定ファイルを検出する。`mise.toml` は Language::all() のループで
     // 拾えるが、mise は同じディレクトリの複数ファイルを読むので残りも足す。
     for mise_path in detect_mise_manifests(dir) {
@@ -725,7 +730,7 @@ fn gradle_project_path_to_dir(project_path: &str) -> Option<String> {
 ///
 /// 文字列リテラル内の `//` (`url 'https://...'`) はコメント扱いしない。
 /// 行数がずれないよう、除いた部分の改行は残す。
-fn strip_gradle_comments(content: &str) -> String {
+pub(crate) fn strip_gradle_comments(content: &str) -> String {
     let mut out = String::with_capacity(content.len());
     let mut chars = content.chars().peekable();
     let mut quote: Option<char> = None;
@@ -1418,6 +1423,21 @@ members = ["crates/nonexistent"]
         assert_eq!(manifests.len(), 1);
         assert_eq!(manifests[0].language, Language::Java);
         assert!(manifests[0].path.ends_with("gradle/libs.versions.toml"));
+    }
+
+    #[test]
+    fn test_detect_gradle_wrapper_properties() {
+        let dir = create_temp_dir();
+        fs::create_dir_all(dir.path().join("gradle/wrapper")).unwrap();
+        fs::write(
+            dir.path().join("gradle/wrapper/gradle-wrapper.properties"),
+            "distributionUrl=https\\://services.gradle.org/distributions/gradle-9.7-bin.zip\n",
+        )
+        .unwrap();
+        let manifests = detect_manifests(dir.path());
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(manifests[0].language, Language::Java);
+        assert!(manifests[0].path.ends_with("gradle-wrapper.properties"));
     }
 
     #[test]

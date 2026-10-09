@@ -292,6 +292,7 @@ impl SystemPackageManager {
             // Java/Gradle の処理
             "gradle" => vec!["gradle", "dependencies"],
             "./gradlew" => vec!["./gradlew", "dependencies"],
+            "./gradlew.bat" => vec!["./gradlew.bat", "dependencies"],
             // Swift の処理
             "swift" => vec!["swift", "package", "resolve"],
             // mise の処理。`mise install` は設定ファイルに書かれたバージョンを
@@ -331,6 +332,41 @@ impl SystemPackageManager {
 }
 
 impl SystemPackageManager {
+    /// Run the Wrapper task twice so the distribution, scripts, and JAR agree.
+    pub fn update_gradle_wrapper(&self, project_dir: &Path, version: &str) -> Result<(), String> {
+        if version.is_empty()
+            || !version
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
+        {
+            return Err("invalid Gradle Wrapper version".to_string());
+        }
+        let script = if cfg!(windows) {
+            "./gradlew.bat"
+        } else {
+            "./gradlew"
+        };
+        if !project_dir.join(script).is_file() {
+            return Err(format!("Gradle Wrapper script is missing: {script}"));
+        }
+        for pass in 1..=2 {
+            let output = self
+                .run_command(
+                    &[script, "wrapper", "--gradle-version", version],
+                    project_dir,
+                    &[],
+                )
+                .map_err(|error| format!("Gradle Wrapper pass {pass} failed: {error}"))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "Gradle Wrapper pass {pass} failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// 言語に対応するパッケージマネージャと、その実行ディレクトリを決める。
     ///
     /// 実行ディレクトリは通常 `working_dir` と同じだが、Tauri プロジェクトの Rust だけは
@@ -370,7 +406,12 @@ impl SystemPackageManager {
             Language::Php => pm_if_any_exists(working_dir, &["composer.json"], "composer"),
             // gradlew が利用可能ならそちらを優先し、なければ gradle にフォールバック
             Language::Java => {
-                pm_if_any_exists(working_dir, &["gradlew"], "./gradlew").or_else(|| {
+                let (script, command) = if cfg!(windows) {
+                    ("gradlew.bat", "./gradlew.bat")
+                } else {
+                    ("gradlew", "./gradlew")
+                };
+                pm_if_any_exists(working_dir, &[script], command).or_else(|| {
                     pm_if_any_exists(working_dir, &["build.gradle", "build.gradle.kts"], "gradle")
                 })
             }
@@ -472,6 +513,35 @@ pub fn run_installs<R: PackageManagerRunner>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn gradle_wrapper_update_runs_both_passes_in_project() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let project = tempfile::TempDir::new().unwrap();
+        let script = project.path().join("gradlew");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> wrapper-invocations\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        SystemPackageManager::new()
+            .update_gradle_wrapper(project.path(), "9.8.0")
+            .unwrap();
+        let calls = std::fs::read_to_string(project.path().join("wrapper-invocations")).unwrap();
+        assert_eq!(
+            calls.lines().collect::<Vec<_>>(),
+            [
+                "wrapper --gradle-version 9.8.0",
+                "wrapper --gradle-version 9.8.0"
+            ]
+        );
+    }
 
     #[test]
     fn uv_and_mise_receive_the_original_absolute_cutoff() {
@@ -763,6 +833,10 @@ mod tests {
         let pm = SystemPackageManager::new();
         let cmd = pm.get_install_command("./gradlew");
         assert_eq!(cmd, vec!["./gradlew", "dependencies"]);
+        assert_eq!(
+            pm.get_install_command("./gradlew.bat"),
+            vec!["./gradlew.bat", "dependencies"]
+        );
     }
 
     #[test]
@@ -1152,6 +1226,11 @@ mod tests {
     #[test]
     fn test_resolve_package_manager_detects_per_language() {
         let pm = SystemPackageManager::new();
+        let (wrapper_manifest, wrapper_command) = if cfg!(windows) {
+            ("gradlew.bat", "./gradlew.bat")
+        } else {
+            ("gradlew", "./gradlew")
+        };
 
         for (manifest, language, expected) in [
             ("Cargo.toml", Language::Rust, "cargo"),
@@ -1161,7 +1240,7 @@ mod tests {
             ("Package.swift", Language::Swift, "swift"),
             ("build.gradle", Language::Java, "gradle"),
             ("build.gradle.kts", Language::Java, "gradle"),
-            ("gradlew", Language::Java, "./gradlew"),
+            (wrapper_manifest, Language::Java, wrapper_command),
         ] {
             let temp_dir = tempfile::tempdir().unwrap();
             std::fs::write(temp_dir.path().join(manifest), "").unwrap();
@@ -1205,10 +1284,18 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         std::fs::write(temp_dir.path().join("build.gradle"), "").unwrap();
         std::fs::write(temp_dir.path().join("gradlew"), "").unwrap();
+        std::fs::write(temp_dir.path().join("gradlew.bat"), "").unwrap();
         let (_, resolved) = pm
             .resolve_package_manager(Language::Java, temp_dir.path())
             .unwrap();
-        assert_eq!(resolved, "./gradlew");
+        assert_eq!(
+            resolved,
+            if cfg!(windows) {
+                "./gradlew.bat"
+            } else {
+                "./gradlew"
+            }
+        );
     }
 
     /// Tauri プロジェクトの Rust は src-tauri を実行ディレクトリにする。

@@ -456,7 +456,7 @@ spotless = { id = "com.diffplug.spotless", version = "6.25.0" }
             .expect("version catalog が検出されるべき");
         assert_eq!(catalog_manifest.language, depup::domain::Language::Java);
 
-        // パース: libraries は Maven 座標で抽出し、plugins は除外する
+        // パース: libraries は Maven 座標、plugins は marker 座標で抽出する
         let parser = depup::manifest::get_parser(depup::domain::Language::Java);
         let deps = parser.parse(catalog).unwrap();
 
@@ -474,13 +474,10 @@ spotless = { id = "com.diffplug.spotless", version = "6.25.0" }
                 .any(|d| d.name == "org.apache.commons:commons-lang3"
                     && d.version_spec.version == "3.14.0")
         );
-        // plugins は Maven 座標と一致しないため更新対象から除外される
-        assert!(
-            !deps
-                .iter()
-                .any(|d| d.name.contains("spotless") || d.name.contains("com.diffplug"))
-        );
-        assert_eq!(deps.len(), 3, "libraries 3 件のみ (plugins は除外)");
+        assert!(deps.iter().any(|d| d.name
+            == "com.diffplug.spotless:com.diffplug.spotless.gradle.plugin"
+            && d.version_spec.version == "6.25.0"));
+        assert_eq!(deps.len(), 4);
     }
 
     /// Package.swift ファイルの検出テスト

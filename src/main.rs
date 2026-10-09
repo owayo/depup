@@ -22,6 +22,7 @@ use depup::orchestrator::Orchestrator;
 use depup::output::{OutputConfig, create_formatter};
 use depup::package_manager::SystemPackageManager;
 use depup::progress::Progress;
+use std::collections::HashSet;
 use std::io::{self, Write};
 use std::process::ExitCode;
 
@@ -165,7 +166,7 @@ async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
 
 /// 計画されたパッケージマネージャの install を実行する。
 fn run_package_installs(args: &CliArgs, plan: &InstallPlan) -> anyhow::Result<()> {
-    if plan.jobs.is_empty() {
+    if plan.jobs.is_empty() && plan.wrapper_updates.is_empty() {
         return Ok(());
     }
     let pm_runner = SystemPackageManager::new();
@@ -199,9 +200,33 @@ fn run_package_installs(args: &CliArgs, plan: &InstallPlan) -> anyhow::Result<()
         }
     }
     let mut any_install_failed = false;
+    let mut failed_wrapper_roots = HashSet::new();
+    for (directory, version) in &plan.wrapper_updates {
+        if args.verbose {
+            eprintln!(
+                "Updating Gradle Wrapper to {version} ({})...",
+                directory.display()
+            );
+        }
+        if let Err(error) = pm_runner.update_gradle_wrapper(directory, version) {
+            eprintln!(
+                "  Gradle Wrapper update failed ({}): {error}",
+                directory.display()
+            );
+            failed_wrapper_roots.insert(directory);
+            any_install_failed = true;
+        }
+    }
     // install の出力をキャプチャしている間も、実行中の言語をスピナーで示す。
     let mut progress = Progress::new(!args.quiet);
     for job in &plan.jobs {
+        if job.language == Language::Java
+            && failed_wrapper_roots
+                .iter()
+                .any(|root| job.directory.starts_with(root) || root.starts_with(&job.directory))
+        {
+            continue;
+        }
         progress.spinner(&format!(
             "Running {} install...",
             job.language.display_name()

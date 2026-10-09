@@ -13,6 +13,7 @@ mod crates_io;
 mod git_remote;
 mod github_tags;
 mod go_proxy;
+mod gradle_versions;
 mod maven_central;
 mod mise_registry;
 mod npm;
@@ -47,6 +48,11 @@ pub trait RegistryAdapter: Send + Sync {
 
     /// レジストリ名を取得
     fn registry_name(&self) -> &'static str;
+
+    /// Separate cached versions when a project resolves the same coordinate from other repositories.
+    fn cache_scope(&self) -> String {
+        String::new()
+    }
 
     /// パッケージの利用可能なバージョンを取得
     async fn fetch_versions(&self, package: &str) -> Result<Vec<VersionInfo>, RegistryError>;
