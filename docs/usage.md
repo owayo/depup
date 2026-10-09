@@ -330,7 +330,7 @@ If the same dependency key is declared more than once in a manifest, or several 
 
 With `--install`, depup runs each project's package manager after writing the manifests, so lock files and installed packages follow the new versions.
 
-- An install runs only for manifests that received at least one update, and never with `--dry-run`.
+- An install runs only for manifests that received at least one update, and never with `--dry-run`. An update that could not be written to the manifest does not count.
 - Node installs run at the shared pnpm workspace root or the manifest directory. Other languages use the target directory (PATH) without [`.depup`](configuration.md#depup-configuration-file), or the deepest listed directory containing the updated manifest when `.depup` is present.
 - Installs run one at a time, in directory path order, and each language runs at most once per directory. The package manager's output is captured instead of streamed; its stderr is printed only when the install fails.
 
@@ -504,5 +504,7 @@ By default, the text output only counts skipped dependencies. Run with `--verbos
 | `fetch failed: ...` | The version lookup failed, for example because of a registry error or a failed `git ls-remote`. Whether the exit code changes depends on the cause. | [Exit Codes](cli-reference.md#exit-codes) |
 
 These are the labels in the text output. In `--json` output with `--verbose`, the same reasons appear as `already_latest`, `pinned`, `change_level_limited: <LEVEL>`, `excluded`, `not_in_only_list`, `no_suitable_version`, `parse_error: ...`, and `fetch_failed: ...`.
+
+An update row that ends with `✗ failed` (`[failed]` without color) is an update depup found but could not write to the manifest, for example because the write was refused as ambiguous (see [Writing Rules](#writing-rules)). It is counted as failed instead of updated, its reason is listed in the `Errors:` section, and the exit code is `2`.
 
 If a dependency does not appear in the output at all, depup did not process the declaration; check in [Ecosystem Details](ecosystems.md#ecosystem-details) that its file, section, and declaration form are supported. Manifests of languages left out by a language flag such as `--node` are not parsed (project age settings in pnpm, Bun, and mise files are still read). If the manifest was updated but the install failed, see [Running the Package Manager](#running-the-package-manager---install).
