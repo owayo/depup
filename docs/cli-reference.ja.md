@@ -98,6 +98,7 @@ depup --cd ./projects/myapp -n
 - 変更の種類は `[major]` / `[minor]` / `[patch]` で示します。
 - `✓ OSV` は、脆弱性チェックを通過したバージョンに付きます。更新行の下の `↳ OSV skipped:` 行には、脆弱性があるため候補から外したバージョンを表示します。ラベルは skipped ですが、依存のスキップではありません（依存そのものは更新されています）。
 - スキップした依存の件数は、マニフェストの見出し（`— N updates, M skips`）と Summary に表示します。更新が 0 件のマニフェストでは、理由ごとの件数も表示します。
+- マニフェストへ書き込めなかった更新（書き込み先が曖昧なための拒否など）は、行末に `✗ failed` が付き、更新の件数に入りません。見出しは `— N updates, K failed, M skips` になり、Summary に `K package(s) failed to update` の行が加わります。理由は `Errors:` 欄に表示します。
 - `--verbose` を付けると、スキップした依存を理由ごとに一覧し、Summary にも理由別・言語別の内訳を付けます。
 - エラーは、OSV の通知も含めて `Errors:` 欄に表示します。
 
@@ -109,25 +110,44 @@ depup --json
 
 ```json
 {
+  "dry_run": false,
+  "summary": {
+    "updates": 1,
+    "failed": 1,
+    "skips": 1
+  },
   "manifests": [
     {
-      "path": "package.json",
-      "language": "node",
+      "path": "./package.json",
+      "language": "Node.js",
       "updates": [
         {
-          "type": "update",
-          "dependency": {
-            "name": "lodash",
-            "version_spec": "^4.17.20"
-          },
-          "new_version": "4.17.21",
-          "released_at": "2024-12-15T10:30:00Z"
+          "name": "lodash",
+          "kind": "registry",
+          "from": "4.17.20",
+          "to": "4.17.21",
+          "dev": false
+        }
+      ],
+      "failed": [
+        {
+          "name": "react",
+          "kind": "registry",
+          "from": "18.0.0",
+          "to": "19.2.0",
+          "dev": false,
+          "error": "Refusing to update ambiguous dependency 'react' because it has multiple declarations or a shared version target"
         }
       ]
     }
+  ],
+  "errors": [
+    "Failed to write ./package.json: Refusing to update ambiguous dependency 'react' because it has multiple declarations or a shared version target"
   ]
 }
 ```
+
+`summary.updates` と各マニフェストの `updates` に入るのは、書き込めた更新（`--dry-run` では書き込める見込みの更新）だけです。書き込めなかった更新は `summary.failed` に数え、マニフェストの `failed` 配列に入れて、理由を `error` に入れます。git 依存は `"kind": "git"` になり、`source`（認証情報を伏せたリポジトリの URL）と `reference` が加わります。`--verbose` を付けると、各マニフェストに `skips` が、`summary` に `by_language` が加わります。
 
 ### diff 出力
 
@@ -136,12 +156,16 @@ depup --diff
 ```
 
 ```diff
---- package.json
-+++ package.json
-@@ dependencies @@
+--- a/./package.json
++++ b/./package.json
+@@ lodash @@
 -  "lodash": "^4.17.20"
 +  "lodash": "^4.17.21"
+
+# 1 package(s) would be updated, 1 failed
 ```
+
+書き込めなかった更新の hunk は出しません。最後の行の件数はテキスト・JSON の出力と同じ数え方で、書き込めなかった更新があるときだけ `, K failed` を付けます。
 
 ### 終了コード
 
@@ -151,7 +175,7 @@ depup --diff
 | `1` | パッケージマネージャーの install が失敗した、`--cd` でディレクトリを移動できなかった、または depup 自体が動作を続けられなかった（HTTP クライアントの初期化や、結果の出力に失敗した場合など） |
 | `2` | 処理の一部が失敗した。マニフェストの読み込み・解析・書き込みの失敗（書き込み先が曖昧なための拒否を含む）、レジストリからの取得の失敗、Rust または Node の lock の age 監査で違反・未確認が残る場合（lock の読み込み失敗や時間切れを含む）が該当する。コマンドライン引数の誤りも `2` になる |
 
-終了コード 2 になる失敗が起きても、処理は止まりません。取得に失敗した依存はスキップし、読み込みや解析に失敗したマニフェストは処理から外して、それ以外の書き込みや install は続けます。書き込みに失敗したファイルは元のまま残りますが、その依存は更新として表示され、`--install` も実行されます。`1` と `2` の両方に当てはまる場合は `1` になります。
+終了コード 2 になる失敗が起きても、処理は止まりません。取得に失敗した依存はスキップし、読み込みや解析に失敗したマニフェストは処理から外して、それ以外の書き込みや install は続けます。ファイルの保存に失敗した場合は、元の内容のまま残ります。マニフェストの一部の更新だけを書き込めなかった場合（書き込み先が曖昧なための拒否など）は、残りの更新を保存します。どちらの場合も、書き込めなかった更新は失敗として表示し、`--install` を実行する理由にもしません。`1` と `2` の両方に当てはまる場合は `1` になります。
 
 取得の問題のうち、次の 3 つは終了コードを変えません。
 

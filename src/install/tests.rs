@@ -221,6 +221,42 @@ fn audit_keeps_the_pre_install_baseline_and_displayed_target() {
     assert_eq!(reports[0].1[0].locked, "2.0.1");
 }
 
+/// `result_with_update` の更新を、マニフェストへ書き込めなかったことにした結果
+fn result_with_failed_update(path: PathBuf, language: Language) -> OrchestratorResult {
+    let mut result = result_with_update(path, language);
+    result.summary.manifests[0].record_write_error(0, "Failed to update pkg");
+    result
+}
+
+#[test]
+fn build_install_map_skips_manifest_whose_updates_all_failed() {
+    // 回帰 (#21): 書き込めなかった更新しかないマニフェストは何も書き換えていないので、
+    // install の理由にしない (Rust の install は lock 全体を上げる `cargo update`)
+    let root = PathBuf::from("/repo");
+    let result = result_with_failed_update(root.join("Cargo.toml"), Language::Rust);
+
+    assert!(build_install_map(&result, &None, &root).is_empty());
+}
+
+#[test]
+fn audit_does_not_treat_an_unwritten_update_as_displayed() {
+    // 書き込めなかった更新先は、差し戻し先の候補にも「表示した更新先と lock の食い違い」の
+    // 注記にも使わない。lock の監査そのものは今までどおり計画する
+    let temp = tempfile::tempdir().unwrap();
+    let mut args = CliArgs::parse_from(["depup", "--age", "2w"]);
+    args.path = temp.path().to_path_buf();
+    let orchestrator = Orchestrator::new(args).unwrap();
+    let result = result_with_failed_update(temp.path().join("Cargo.toml"), Language::Rust);
+    write_lock(temp.path(), "1.0.0");
+    let plan = InstallPlan::new(&orchestrator, &result, &None, temp.path());
+    write_lock(temp.path(), "2.0.1");
+    let audit = plan.rust_audit_plan(&orchestrator, &result);
+    assert_eq!(audit.locks.len(), 1);
+    assert_eq!(audit.locks[0].baseline["pkg"], vec!["1.0.0"]);
+    assert!(!audit.locks[0].preferred.contains_key("pkg"));
+    assert!(audit.mismatch_reports().is_empty());
+}
+
 #[test]
 fn a_lock_created_by_install_has_an_empty_baseline() {
     let temp = tempfile::tempdir().unwrap();

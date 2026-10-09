@@ -173,6 +173,17 @@ impl TextFormatter {
             .unwrap_or(0)
     }
 
+    /// 書き込めなかった更新の行の末尾に付ける印
+    fn write_failed_marker(&self, write_failed: bool) -> String {
+        if !write_failed {
+            String::new()
+        } else if self.color {
+            format!(" {}", "✗ failed".red())
+        } else {
+            " [failed]".to_string()
+        }
+    }
+
     /// 単一の更新行をフォーマット
     #[allow(clippy::too_many_arguments)]
     fn format_update_line(
@@ -185,11 +196,13 @@ impl TextFormatter {
         variable_name: Option<&str>,
         osv_skipped: &[String],
         osv_checked: bool,
+        write_failed: bool,
         max_name_len: usize,
         writer: &mut dyn Write,
     ) -> std::io::Result<()> {
         let change_type = VersionChangeType::from_versions(old_version, new_version);
         let dev_marker = if is_dev { " 🔧" } else { "" };
+        let failed_marker = self.write_failed_marker(write_failed);
 
         // リリース日をフォーマット
         let date_display = released_at
@@ -231,7 +244,7 @@ impl TextFormatter {
 
             writeln!(
                 writer,
-                "  {} {} {} {} [{}]{}{}{}{}",
+                "  {} {} {} {} [{}]{}{}{}{}{}",
                 name_display,
                 old_version.dimmed(),
                 arrow,
@@ -240,12 +253,13 @@ impl TextFormatter {
                 date_colored,
                 var_colored,
                 osv_colored,
-                dev_display
+                dev_display,
+                failed_marker
             )?;
         } else {
             writeln!(
                 writer,
-                "  {:width$} {} -> {} [{}]{}{}{}{}",
+                "  {:width$} {} -> {} [{}]{}{}{}{}{}",
                 name,
                 old_version,
                 new_version,
@@ -254,6 +268,7 @@ impl TextFormatter {
                 var_display,
                 osv_marker_plain,
                 dev_marker,
+                failed_marker,
                 width = max_name_len
             )?;
         }
@@ -273,15 +288,18 @@ impl TextFormatter {
 
     /// git 依存の更新行をフォーマットする
     /// 例: `  tree-sitter-xojo  branch=main  f41817b3 → 045c52a6  [git]`
+    #[allow(clippy::too_many_arguments)]
     fn format_git_update_line(
         &self,
         name: &str,
         git: &GitSource,
         new_version: &str,
         is_dev: bool,
+        write_failed: bool,
         max_name_len: usize,
         writer: &mut dyn Write,
     ) -> std::io::Result<()> {
+        let failed_marker = self.write_failed_marker(write_failed);
         let ref_label = git.reference.display_name();
         let (old_display, new_display) = match &git.reference {
             GitReference::Tag(current) => (current.clone(), new_version.to_string()),
@@ -298,24 +316,26 @@ impl TextFormatter {
             let name_display = format!("{:width$}", name, width = max_name_len);
             writeln!(
                 writer,
-                "  {} {} {} {} {} {}{}",
+                "  {} {} {} {} {} {}{}{}",
                 name_display,
                 ref_label.cyan(),
                 old_display.dimmed(),
                 "→".dimmed(),
                 new_display.bright_white().bold(),
                 "[git]".dimmed(),
-                dev_marker.dimmed()
+                dev_marker.dimmed(),
+                failed_marker
             )
         } else {
             writeln!(
                 writer,
-                "  {:width$} {} {} -> {} [git]{}",
+                "  {:width$} {} {} -> {} [git]{}{}",
                 name,
                 ref_label,
                 old_display,
                 new_display,
                 dev_marker,
+                failed_marker,
                 width = max_name_len
             )
         }
@@ -337,8 +357,10 @@ impl TextFormatter {
                 osv_skipped,
                 osv_checked,
                 age_exemption,
+                write_error,
             } = result
             {
+                let write_failed = write_error.is_some();
                 // git 依存は専用フォーマットで表示
                 if let Some(git) = &dependency.git_source {
                     self.format_git_update_line(
@@ -346,6 +368,7 @@ impl TextFormatter {
                         git,
                         new_version,
                         is_dev,
+                        write_failed,
                         max_name_len,
                         writer,
                     )?;
@@ -369,6 +392,7 @@ impl TextFormatter {
                     dependency.variable_name.as_deref(),
                     osv_skipped,
                     *osv_checked,
+                    write_failed,
                     max_name_len,
                     writer,
                 )?;
@@ -392,8 +416,8 @@ impl TextFormatter {
     ) -> std::io::Result<()> {
         let prefix = self.dry_run_prefix();
 
-        // 更新とスキップを収集
-        let updates: Vec<_> = manifest.updates().collect();
+        // 更新とスキップを収集。行には書き込めなかった更新も印を付けて並べる
+        let updates: Vec<_> = manifest.judged_updates().collect();
         let skips: Vec<_> = manifest.skips().collect();
 
         // 更新もスキップもない完全に空のマニフェストを除外
@@ -401,8 +425,9 @@ impl TextFormatter {
             return Ok(());
         }
 
-        // 更新数とスキップ数をカウント
-        let update_count = updates.len();
+        // 更新数とスキップ数をカウント。更新数には書き込めなかった更新を含めず、別に数える
+        let update_count = manifest.update_count();
+        let failed_count = manifest.failed_count();
         let skip_count = skips.len();
 
         // 更新なしでスキップありの場合、スキップサマリを表示 (非 verbose モードでも)
@@ -439,12 +464,21 @@ impl TextFormatter {
                 }
             });
 
-        // カウント付きマニフェストヘッダを書き出す
+        // カウント付きマニフェストヘッダを書き出す。書き込めなかった更新があるときだけ
+        // その件数も出す
         let path_display = manifest.path.display().to_string();
         let lang_display = format!("({})", manifest.language);
+        let failed_display = if failed_count > 0 {
+            format!(
+                ", {} failed",
+                self.apply_color(&failed_count.to_string(), Color::Red)
+            )
+        } else {
+            String::new()
+        };
         writeln!(
             writer,
-            "{}{} {} — {} {}, {} {}",
+            "{}{} {} — {} {}{}, {} {}",
             prefix,
             self.maybe_bold(&path_display),
             self.maybe_dimmed(&lang_display),
@@ -454,6 +488,7 @@ impl TextFormatter {
             } else {
                 "updates"
             },
+            failed_display,
             self.maybe_dimmed(&skip_count.to_string()),
             if skip_count == 1 { "skip" } else { "skips" }
         )?;
@@ -703,17 +738,28 @@ impl OutputFormatter for TextFormatter {
         writer: &mut dyn Write,
     ) -> std::io::Result<()> {
         let prefix = self.dry_run_prefix();
+        // 更新数には書き込めなかった更新を含めず、別に数える
         let updates = summary.total_updates();
+        let failed = summary.total_failed();
         let skips = summary.total_skips();
 
         if self.verbosity == Verbosity::Quiet {
             // 最小限の出力
-            if updates > 0 {
+            if updates > 0 || failed > 0 {
+                let failed_display = if failed > 0 {
+                    format!(
+                        ", {} failed",
+                        self.apply_color(&failed.to_string(), Color::Red)
+                    )
+                } else {
+                    String::new()
+                };
                 writeln!(
                     writer,
-                    "{}{} updated",
+                    "{}{} updated{}",
                     prefix,
-                    self.apply_color(&updates.to_string(), Color::Green)
+                    self.apply_color(&updates.to_string(), Color::Green),
+                    failed_display
                 )?;
             } else {
                 writeln!(writer, "{}{}", prefix, self.maybe_dimmed("No updates"))?;
@@ -756,6 +802,15 @@ impl OutputFormatter for TextFormatter {
             writeln!(writer, "  {}", self.maybe_dimmed("No packages updated"))?;
         }
 
+        // 書き込めなかった更新 (理由は Errors 欄に出る)
+        if failed > 0 {
+            writeln!(
+                writer,
+                "  {} package(s) failed to update",
+                self.apply_color(&failed.to_string(), Color::Red)
+            )?;
+        }
+
         // スキップサマリ
         if skips > 0 {
             write!(
@@ -780,18 +835,27 @@ impl OutputFormatter for TextFormatter {
         if self.verbosity == Verbosity::Verbose {
             writeln!(writer)?;
             writeln!(writer, "{}:", self.maybe_dimmed("By language"))?;
-            for (language, lang_updates, lang_skips) in summary.language_breakdown() {
+            for counts in summary.language_breakdown() {
                 let lang_name = if self.color {
-                    language.to_string().cyan().to_string()
+                    counts.language.to_string().cyan().to_string()
                 } else {
-                    language.to_string()
+                    counts.language.to_string()
+                };
+                let failed_display = if counts.failed > 0 {
+                    format!(
+                        ", {} failed",
+                        self.apply_color(&counts.failed.to_string(), Color::Red)
+                    )
+                } else {
+                    String::new()
                 };
                 writeln!(
                     writer,
-                    "  {}: {} updated, {} skipped",
+                    "  {}: {} updated{}, {} skipped",
                     lang_name,
-                    self.apply_color(&lang_updates.to_string(), Color::Green),
-                    self.maybe_dimmed(&lang_skips.to_string())
+                    self.apply_color(&counts.updates.to_string(), Color::Green),
+                    failed_display,
+                    self.maybe_dimmed(&counts.skips.to_string())
                 )?;
             }
         }
@@ -1027,6 +1091,114 @@ mod tests {
         let output_str = String::from_utf8(output).unwrap();
 
         assert!(output_str.contains("No updates"));
+    }
+
+    /// 書き込めなかった更新を含む結果。`failed` に挙げた名前の更新を書き込めなかったことにする
+    fn create_result_with_write_failures(failed: &[&str]) -> OrchestratorResult {
+        let mut summary = UpdateSummary::new(false);
+        let mut manifest = ManifestUpdateResult::new(PathBuf::from("package.json"), Language::Node);
+        // 本番依存 - マイナー更新
+        manifest.add_result(UpdateResult::update(
+            sample_dependency("lodash", "4.17.21", false),
+            "4.18.0",
+        ));
+        // 本番依存 - メジャー更新
+        manifest.add_result(UpdateResult::update(
+            sample_dependency("react", "18.0.0", false),
+            "19.0.0",
+        ));
+        // 開発依存 - パッチ更新
+        manifest.add_result(UpdateResult::update(
+            sample_dependency("typescript", "5.0.0", true),
+            "5.0.1",
+        ));
+        manifest.add_result(UpdateResult::skip(
+            sample_dependency("express", "4.18.0", false),
+            SkipReason::AlreadyLatest,
+        ));
+        for index in 0..manifest.results.len() {
+            if failed.contains(&manifest.results[index].package_name()) {
+                let reason = format!(
+                    "Failed to update {}",
+                    manifest.results[index].package_name()
+                );
+                manifest.record_write_error(index, reason);
+            }
+        }
+        summary.add_manifest(manifest);
+
+        OrchestratorResult {
+            summary,
+            write_results: Vec::new(),
+            errors: Vec::new(),
+        }
+    }
+
+    fn format_text(result: &OrchestratorResult, verbosity: Verbosity) -> String {
+        let formatter = TextFormatter::with_color(verbosity, false, false);
+        let mut output = Vec::new();
+        formatter.format(result, &mut output).unwrap();
+        String::from_utf8(output).unwrap()
+    }
+
+    #[test]
+    fn test_format_counts_write_failures_apart_from_updates() {
+        // 回帰 (#21): 書き込めなかった更新は見出しと Summary の更新数に入れず、
+        // 別に数える。一覧の行には印を付けて残す
+        let result = create_result_with_write_failures(&["react", "typescript"]);
+
+        let output = format_text(&result, Verbosity::Normal);
+        assert!(output.contains("— 1 update, 2 failed, 1 skip"), "{output}");
+        let line = |name: &str| {
+            output
+                .lines()
+                .find(|line| line.trim_start().starts_with(name))
+                .unwrap_or_else(|| panic!("{name} の行が無い: {output}"))
+                .to_string()
+        };
+        assert!(!line("lodash").contains("[failed]"));
+        assert!(line("react").ends_with("[major] [failed]"), "{output}");
+        assert!(line("typescript").ends_with("🔧 [failed]"), "{output}");
+        assert!(
+            output.contains("1 package(s) updated (1 minor)"),
+            "{output}"
+        );
+        assert!(output.contains("2 package(s) failed to update"), "{output}");
+
+        let quiet = format_text(&result, Verbosity::Quiet);
+        assert_eq!(quiet.trim(), "1 updated, 2 failed");
+
+        let verbose = format_text(&result, Verbosity::Verbose);
+        assert!(
+            verbose.contains(": 1 updated, 2 failed, 1 skipped"),
+            "{verbose}"
+        );
+    }
+
+    #[test]
+    fn test_format_shows_manifest_whose_updates_all_failed() {
+        // 全更新を書き込めなかったマニフェストも、スキップの要約にせず更新の行を出す
+        let result = create_result_with_write_failures(&["lodash", "react", "typescript"]);
+
+        let output = format_text(&result, Verbosity::Normal);
+        assert!(output.contains("— 0 updates, 3 failed, 1 skip"), "{output}");
+        assert_eq!(output.matches("[failed]").count(), 3, "{output}");
+        assert!(output.contains("No packages updated"), "{output}");
+        assert!(output.contains("3 package(s) failed to update"), "{output}");
+
+        let quiet = format_text(&result, Verbosity::Quiet);
+        assert_eq!(quiet.trim(), "0 updated, 3 failed");
+    }
+
+    #[test]
+    fn test_format_without_write_failures_keeps_counts_unchanged() {
+        // 書き込めなかった更新が無いときは、件数の表示を変えない
+        let result = create_result_with_write_failures(&[]);
+
+        let output = format_text(&result, Verbosity::Normal);
+        assert!(output.contains("— 3 updates, 1 skip"), "{output}");
+        assert!(!output.contains("failed"), "{output}");
+        assert_eq!(format_text(&result, Verbosity::Quiet).trim(), "3 updated");
     }
 
     #[test]

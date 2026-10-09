@@ -98,6 +98,7 @@ depup --cd ./projects/myapp -n
 - Change type: `[major]`, `[minor]`, `[patch]`
 - `✓ OSV` marks versions that passed the vulnerability check. A `↳ OSV skipped:` line below an update lists the vulnerable versions that were removed from the candidates; the dependency itself was still updated
 - Skipped dependencies are counted in each manifest heading (`— N updates, M skips`) and in the summary; a manifest with no updates also shows the count per reason
+- An update that could not be written to the manifest (for example, a write refused as ambiguous) ends with `✗ failed` and is not counted as an update: the heading becomes `— N updates, K failed, M skips`, and the summary adds `K package(s) failed to update`. The reason is listed in the `Errors:` section
 - With `--verbose`, every skipped dependency is listed under its reason, and the summary is broken down by reason and language
 - Errors, including OSV notices, are listed in the `Errors:` section
 
@@ -109,25 +110,44 @@ depup --json
 
 ```json
 {
+  "dry_run": false,
+  "summary": {
+    "updates": 1,
+    "failed": 1,
+    "skips": 1
+  },
   "manifests": [
     {
-      "path": "package.json",
-      "language": "node",
+      "path": "./package.json",
+      "language": "Node.js",
       "updates": [
         {
-          "type": "update",
-          "dependency": {
-            "name": "lodash",
-            "version_spec": "^4.17.20"
-          },
-          "new_version": "4.17.21",
-          "released_at": "2024-12-15T10:30:00Z"
+          "name": "lodash",
+          "kind": "registry",
+          "from": "4.17.20",
+          "to": "4.17.21",
+          "dev": false
+        }
+      ],
+      "failed": [
+        {
+          "name": "react",
+          "kind": "registry",
+          "from": "18.0.0",
+          "to": "19.2.0",
+          "dev": false,
+          "error": "Refusing to update ambiguous dependency 'react' because it has multiple declarations or a shared version target"
         }
       ]
     }
+  ],
+  "errors": [
+    "Failed to write ./package.json: Refusing to update ambiguous dependency 'react' because it has multiple declarations or a shared version target"
   ]
 }
 ```
+
+`summary.updates` and each manifest's `updates` cover only the updates that were written (with `--dry-run`, the updates that would be written). Updates that could not be written are counted in `summary.failed` and listed in the manifest's `failed` array, with the reason in `error`. Git dependencies use `"kind": "git"` and add `source` (the repository URL with any credentials masked) and `reference`. With `--verbose`, each manifest also lists its `skips`, and the summary adds `by_language`.
 
 ### Diff Output
 
@@ -136,12 +156,16 @@ depup --diff
 ```
 
 ```diff
---- package.json
-+++ package.json
-@@ dependencies @@
+--- a/./package.json
++++ b/./package.json
+@@ lodash @@
 -  "lodash": "^4.17.20"
 +  "lodash": "^4.17.21"
+
+# 1 package(s) would be updated, 1 failed
 ```
+
+Updates that could not be written get no hunk. The last line counts updates the same way as the text and JSON output, and adds `, K failed` only when some updates could not be written.
 
 ### Exit Codes
 
@@ -151,7 +175,7 @@ depup --diff
 | `1` | A package manager install failed, `--cd` could not change the directory, or depup itself could not continue (for example, the HTTP client failed to initialize or the results could not be written). |
 | `2` | Part of the run failed: a manifest could not be read, parsed, or written (including a refused ambiguous write), a registry lookup failed, or a Rust or Node lockfile age audit left violations or unverified entries (including an unreadable lock or an exhausted time budget). Invalid command-line arguments also exit with `2`. |
 
-A code-2 failure does not stop the run. A failed lookup skips that dependency, and a manifest that cannot be read or parsed is left out; everything else is still written and installed. A failed write leaves that file unchanged, but its dependencies are still listed as updated and `--install` still runs for it. When both `1` and `2` apply, `1` wins.
+A code-2 failure does not stop the run. A failed lookup skips that dependency, and a manifest that cannot be read or parsed is left out; everything else is still written and installed. If a file cannot be saved, it keeps its original content. If only some updates in a manifest cannot be written (for example, one refused as ambiguous), the rest are still saved. Either way, the updates that could not be written are reported as failed instead of updated, and they do not make `--install` run. When both `1` and `2` apply, `1` wins.
 
 These lookup problems leave the exit code unchanged:
 

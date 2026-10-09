@@ -30,7 +30,8 @@ impl DiffFormatter {
     ///
     /// 実際にマニフェストへ書き込まれる更新だけを対象にする。git 依存の
     /// branch / default / rev はマニフェストを書き換えない (Cargo.lock 側の
-    /// 更新のみ) ため、偽の差分として表示しない。表示対象がなければ何も書かない。
+    /// 更新のみ) ため、偽の差分として表示しない。書き込めなかった更新も
+    /// (`updates` が含めないので) 表示しない。表示対象がなければ何も書かない。
     fn write_manifest_diff(
         &self,
         manifest: &ManifestUpdateResult,
@@ -91,6 +92,14 @@ impl DiffFormatter {
     }
 }
 
+/// 書き込めなかった更新があるときだけ、件数の後ろに付ける `, N failed`
+fn failed_suffix(summary: &UpdateSummary) -> String {
+    match summary.total_failed() {
+        0 => String::new(),
+        failed => format!(", {} failed", failed),
+    }
+}
+
 impl OutputFormatter for DiffFormatter {
     fn format(&self, result: &OrchestratorResult, writer: &mut dyn Write) -> std::io::Result<()> {
         let prefix = self.dry_run_prefix();
@@ -101,12 +110,15 @@ impl OutputFormatter for DiffFormatter {
             }
         }
 
-        // 最後にサマリを書く
+        // 最後にサマリを書く。件数はテキスト・JSON の出力と同じく、書き込めなかった更新を
+        // 含めずに別に数える (hunk の無い更新、たとえば Cargo.lock だけが変わる git 依存も数える)
         let updates = result.summary.total_updates();
         writeln!(
             writer,
-            "{}# {} package(s) would be updated",
-            prefix, updates
+            "{}# {} package(s) would be updated{}",
+            prefix,
+            updates,
+            failed_suffix(&result.summary)
         )?;
 
         Ok(())
@@ -123,8 +135,11 @@ impl OutputFormatter for DiffFormatter {
 
         writeln!(
             writer,
-            "{}# {} package(s) updated, {} skipped",
-            prefix, updates, skips
+            "{}# {} package(s) updated{}, {} skipped",
+            prefix,
+            updates,
+            failed_suffix(summary),
+            skips
         )?;
 
         Ok(())
@@ -432,6 +447,39 @@ mod tests {
 
         assert!(output_str.contains("0 package(s) updated"));
         assert!(output_str.contains("1 skipped"));
+    }
+
+    #[test]
+    fn test_format_diff_excludes_write_failures() {
+        // 回帰 (#21): 書き込めなかった更新は hunk に出さず、件数にも入れずに別に数える
+        let mut result = create_test_result();
+        let manifest = &mut result.summary.manifests[0];
+        manifest.add_result(UpdateResult::update(
+            sample_dependency("react", "18.0.0"),
+            "19.0.0",
+        ));
+        manifest.record_write_error(1, "Failed to update react");
+
+        let formatter = DiffFormatter::new(false);
+        let mut output = Vec::new();
+        formatter.format(&result, &mut output).unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("@@ lodash @@"), "{text}");
+        assert!(!text.contains("react"), "{text}");
+        assert!(
+            text.contains("# 1 package(s) would be updated, 1 failed"),
+            "{text}"
+        );
+
+        let mut output = Vec::new();
+        formatter
+            .format_summary(&result.summary, &mut output)
+            .unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(
+            text.contains("# 1 package(s) updated, 1 failed, 0 skipped"),
+            "{text}"
+        );
     }
 
     #[test]
