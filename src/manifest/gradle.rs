@@ -10,7 +10,9 @@
 
 use crate::domain::{Dependency, Language, VersionSpec, VersionSpecKind};
 use crate::error::ManifestError;
-use crate::manifest::{ManifestParser, gradle_version_catalog, line_utils::split_line_ending};
+use crate::manifest::{
+    ManifestParser, gradle_version_catalog, gradle_wrapper, line_utils::split_line_ending,
+};
 use crate::parser::get_parser;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
@@ -879,6 +881,9 @@ impl ManifestParser for GradleParser {
         if let Some(dependencies) = gradle_version_catalog::parse(content)? {
             return Ok(dependencies);
         }
+        if let Some(dependencies) = gradle_wrapper::parse(content)? {
+            return Ok(dependencies);
+        }
 
         let mut dependencies = Vec::new();
         // 同一座標を複数の configuration へ書く Gradle の正式な作法を 1 依存へ畳むための集合
@@ -966,6 +971,9 @@ impl ManifestParser for GradleParser {
     ) -> Result<String, ManifestError> {
         if let Some(result) = gradle_version_catalog::update_version(content, package, new_version)?
         {
+            return Ok(result);
+        }
+        if let Some(result) = gradle_wrapper::update_version(content, package, new_version)? {
             return Ok(result);
         }
 
@@ -2159,13 +2167,17 @@ spring-core = { module = "org.springframework:spring-core", version.ref = "sprin
     }
 
     #[test]
-    fn test_parse_version_catalog_skips_plugins() {
+    fn test_parse_version_catalog_includes_plugin_markers() {
         let content = r#"
 [plugins]
 versions = { id = "com.github.ben-manes.versions", version = "0.45.0" }
 "#;
         let deps = parse(content).unwrap();
-        assert!(deps.is_empty());
+        assert_eq!(deps.len(), 1);
+        assert_eq!(
+            deps[0].name,
+            "com.github.ben-manes.versions:com.github.ben-manes.versions.gradle.plugin"
+        );
     }
 
     #[test]

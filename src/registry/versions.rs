@@ -22,6 +22,18 @@ pub(crate) struct VersionFetcher {
 }
 
 impl VersionFetcher {
+    fn cache_key(
+        adapter: &(dyn RegistryAdapter + Send + Sync),
+        package: &str,
+    ) -> (Language, String) {
+        let scope = adapter.cache_scope();
+        if scope.is_empty() {
+            (adapter.language(), package.to_string())
+        } else {
+            (adapter.language(), format!("{scope}\0{package}"))
+        }
+    }
+
     pub(crate) fn new(general_concurrency: usize, crates_io_concurrency: usize) -> Self {
         Self {
             cache: Arc::new(Mutex::new(HashMap::new())),
@@ -47,7 +59,7 @@ impl VersionFetcher {
                 .await
                 .map_err(|error| error.to_string());
         }
-        let cache_key = (adapter.language(), package.to_string());
+        let cache_key = Self::cache_key(adapter, package);
 
         // まずキャッシュを確認
         {
@@ -106,11 +118,11 @@ impl VersionFetcher {
         package: &str,
         version: &str,
     ) -> Result<Option<DateTime<Utc>>, String> {
-        let key = (adapter.language(), package.to_string(), version.to_string());
+        let package_key = Self::cache_key(adapter, package);
+        let key = (package_key.0, package_key.1.clone(), version.to_string());
         if let Some(date) = self.release_dates.lock().await.get(&key) {
             return Ok(Some(*date));
         }
-        let package_key = (adapter.language(), package.to_string());
         let fetch_lock = {
             let mut locks = self.fetch_locks.lock().await;
             Arc::clone(
@@ -151,7 +163,7 @@ impl VersionFetcher {
         self.cache
             .lock()
             .await
-            .insert((adapter.language(), package.to_string()), versions.clone());
+            .insert(Self::cache_key(adapter, package), versions.clone());
         Ok(versions)
     }
 
@@ -162,8 +174,6 @@ impl VersionFetcher {
         package: &str,
     ) -> Option<Vec<VersionInfo>> {
         let cache = self.cache.lock().await;
-        cache
-            .get(&(adapter.language(), package.to_string()))
-            .cloned()
+        cache.get(&Self::cache_key(adapter, package)).cloned()
     }
 }

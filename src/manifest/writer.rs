@@ -108,9 +108,37 @@ impl ManifestWriter {
             .into_iter()
             .filter_map(|(name, count)| (count > 1).then_some(name))
             .collect();
+        let is_version_catalog = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".versions.toml"));
         let ambiguous_variables: HashSet<String> = variable_counts
             .into_iter()
-            .filter_map(|(name, count)| (count > 1).then_some(name))
+            .filter_map(|(name, count)| {
+                if count <= 1 {
+                    return None;
+                }
+                // Every alias sharing this catalog version must select the same target.
+                // A skipped alias or different target keeps the write ambiguous.
+                let targets: Vec<&str> = manifest_result
+                    .results
+                    .iter()
+                    .filter_map(|result| match result {
+                        UpdateResult::Update {
+                            dependency,
+                            new_version,
+                            ..
+                        } if dependency.variable_name.as_deref() == Some(&name) => {
+                            Some(new_version.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let shared_target_is_safe = is_version_catalog
+                    && targets.len() == count
+                    && targets.iter().all(|target| *target == targets[0]);
+                (!shared_target_is_safe).then_some(name)
+            })
             .collect();
 
         // 更新は順番に適用する
@@ -671,6 +699,35 @@ beta = { module = "com.example:beta", version.ref = "shared" }
         assert_eq!(result.updates_failed, 1);
         assert!(!result.file_modified);
         assert_eq!(fs::read_to_string(&path).unwrap(), original_content);
+    }
+
+    #[test]
+    fn test_apply_updates_shared_plugin_reference_when_all_targets_agree() {
+        let temp_dir = TempDir::new().unwrap();
+        let content = r#"[versions]
+agp = "9.3.1"
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+android-library = { id = "com.android.library", version.ref = "agp" }
+"#;
+        let path = temp_dir.path().join("libs.versions.toml");
+        fs::write(&path, content).unwrap();
+
+        let parser = crate::manifest::GradleParser;
+        let mut manifest_result = ManifestUpdateResult::new(&path, Language::Java);
+        for dependency in parser.parse(content).unwrap() {
+            manifest_result.add_result(UpdateResult::update(dependency, "9.4.1"));
+        }
+        let result = ManifestWriter::new(false)
+            .apply_updates(&manifest_result, &parser)
+            .unwrap();
+        assert_eq!(result.updates_applied, 1);
+        assert_eq!(result.updates_failed, 0);
+        assert!(result.file_modified);
+        let updated = fs::read_to_string(path).unwrap();
+        assert!(updated.contains("agp = \"9.4.1\""));
+        assert!(updated.contains("version.ref = \"agp\""));
     }
 
     #[test]

@@ -150,7 +150,7 @@ Composer は `~>` 演算子を受け付けない（`Invalid operator "~>"`）た
 
 ### Java（Gradle）
 
-Maven Central の依存では、リポジトリのアーティファクト単位の `maven-metadata.xml` から版一覧を取得します。更新候補として選んだ版の POM の `Last-Modified` を確認してから age フィルタを適用します。完全一致の現在版が版一覧に無い場合は「最新」とせず取得失敗を報告します。公開日が無い、または不正な場合も age フィルタを黙って迂回せず取得失敗にします。
+Gradle の依存では、Maven Central・Google Maven・Gradle Plugin Portal のアーティファクト単位の `maven-metadata.xml` から版一覧を取得します。最も近い `settings.gradle` / `settings.gradle.kts` の組み込みリポジトリ宣言を使い、ライブラリには `dependencyResolutionManagement`、プラグインには `pluginManagement` の順序を適用します。設定がなければ Maven Central、Google Maven、Plugin Portal の順に試します。選んだ版の POM の `Last-Modified` を確認してから age フィルタを適用します。完全一致の現在版が版一覧に無い場合や、公開日が無い・不正な場合は取得失敗を報告します。
 
 `strictly` / `require` / `prefer` / `reject` を使う Gradle の rich version 宣言は、`implementation("org.slf4j:slf4j-api") { version { ... } }` のような依存ブロック内でも解析します。文字列記法の短縮形でも、完全一致（`group:name:1.2.3!!`）、動的プレフィックス（`group:name:5.3.+!!`）、範囲（`group:name:[1.7, 1.8[!!`）、prefer 付きの strict 範囲（`group:name:[1.7, 1.8[!!1.7.25`）を解析できます。`strictly` または `require` で範囲を、`prefer` で優先するバージョンを指定している場合、depup は範囲を上限制約として維持したまま `prefer` の値を更新します。`reject` に列挙されたバージョンは候補から外し、`2.+` のような動的な reject や `[1.5,1.9)` のような範囲の reject も考慮します。
 
@@ -158,7 +158,9 @@ Gradle の宣言ラッパー `platform(...)` / `enforcedPlatform(...)` / `testFi
 
 `ext.<name> = '...'` / `project.ext.<name> = "..."` のドット代入も `ext { ... }` ブロックと同じく変数として解決し、`${Versions.retrofit}` のような修飾付きの参照は最後のセグメントで解決します。同じ変数名が異なる値で複数定義されている場合は変数を解決せず、その変数を参照する依存は対象外になります。別オブジェクトの値を拾う誤更新を避けるためです。
 
-`gradle/*.versions.toml` にある Gradle version catalog は、Java のマニフェストとして検出します。depup は `[libraries]` の `alias = "group:name:version"`、`module = "group:name"`、`group` / `name` / `version`、`version.ref` を解析し、参照先の `[versions]` もその場で更新します。`strictly` / `require` / `prefer` / `reject` / `rejectAll` を含む rich version table は、Gradle のビルドファイルと同じ規則で候補を選びます。`[plugins]` に並ぶのは Gradle のプラグイン ID で、Maven Central の座標とは一致しないため、対象外です。
+`gradle/*.versions.toml` にある Gradle version catalog は、Java のマニフェストとして検出します。depup は `[libraries]` の `alias = "group:name:version"`、`module = "group:name"`、`group` / `name` / `version`、`version.ref` を解析し、参照先の `[versions]` もその場で更新します。`strictly` / `require` / `prefer` / `reject` / `rejectAll` を含む rich version table は、Gradle のビルドファイルと同じ規則で候補を選びます。`[plugins]` は plugin marker artifact（`<id>:<id>.gradle.plugin`）から版を取得し、インライン版または `version.ref` の形を保って更新します。同じ `version.ref` を使うすべての依存が同じ更新先を選んだときだけ参照先を 1 回書き換え、候補が食い違う場合は書き込みを拒否します。
+
+`gradle/wrapper/gradle-wrapper.properties` の配布 URL は、Gradle の公式版一覧にある正式リリースを使って更新します。`-bin` / `-all` と改行形式を保持します。Wrapper を更新して `--install` を実行する場合、依存の処理より前に `./gradlew wrapper --gradle-version <version>` を 2 回実行し、スクリプトと JAR を揃えます（Windows では `gradlew.bat`）。独自の配布 URL または `distributionSha256Sum` があるファイルは、対応するチェックサムを維持できないため書き換えません。Android Gradle Plugin を更新する場合は、[公式の対応表](https://developer.android.com/build/releases/about-agp)で選んだ Gradle Wrapper が必要最小版を満たすことを確認してください。
 
 Gradle の文字列記法では、`:resources@zip` や `@aar` のような classifier / extension の接尾辞を保持します。`//` の行コメントや `/* ... */` のブロックコメントの中だけにある依存宣言は無視します。Gradle version catalog では、バージョンが宣言されている TOML の文字列形式またはテーブル形式を保ったまま更新します。
 

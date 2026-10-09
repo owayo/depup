@@ -24,6 +24,8 @@ pub struct InstallJob {
 /// install 前に確定する実行単位と、変更を判定するための lock の保存。
 pub struct InstallPlan {
     pub jobs: Vec<InstallJob>,
+    /// Wrapper distributions whose properties file was actually written.
+    pub wrapper_updates: Vec<(PathBuf, String)>,
     /// Node lock の監査は、マニフェストの更新がない実行でも計画する。
     pub node_audits: Vec<InstallJob>,
     baselines: BTreeMap<PathBuf, Result<RegistryLockEntries, String>>,
@@ -37,6 +39,33 @@ impl InstallPlan {
         default_path: &Path,
     ) -> Self {
         let node_audits = node_audit_jobs(orchestrator, result);
+        let wrapper_updates = result
+            .summary
+            .manifests
+            .iter()
+            .filter(|manifest| {
+                manifest
+                    .path
+                    .ends_with("gradle/wrapper/gradle-wrapper.properties")
+                    && result.write_results.iter().any(|write| {
+                        write.path == manifest.path && write.file_modified && !write.has_errors()
+                    })
+            })
+            .filter_map(|manifest| {
+                let version = manifest.results.iter().find_map(|item| match item {
+                    UpdateResult::Update {
+                        dependency,
+                        new_version,
+                        ..
+                    } if dependency.name == crate::manifest::GRADLE_WRAPPER_PACKAGE => {
+                        Some(new_version.clone())
+                    }
+                    _ => None,
+                })?;
+                let project = manifest.path.parent()?.parent()?.parent()?.to_path_buf();
+                Some((project, version))
+            })
+            .collect();
         let shared_node_policies = &node_audits;
         let jobs = build_install_map(result, monorepo_dirs, default_path)
             .into_iter()
@@ -69,6 +98,7 @@ impl InstallPlan {
             .collect();
         Self {
             jobs,
+            wrapper_updates,
             node_audits,
             baselines,
         }

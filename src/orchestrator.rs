@@ -594,6 +594,11 @@ impl Orchestrator {
             let adapter: Arc<dyn RegistryAdapter + Send + Sync> = if info.language == Language::Mise
             {
                 Arc::new(MiseAdapter::for_project(dir, policy.cutoff()))
+            } else if info.language == Language::Java {
+                Arc::new(MavenCentralAdapter::for_manifest(
+                    self.client.clone(),
+                    &info.path,
+                ))
             } else {
                 Arc::from(self.get_adapter(info.language))
             };

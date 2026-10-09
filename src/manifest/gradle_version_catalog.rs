@@ -18,6 +18,7 @@ struct VersionCatalogVersion {
 struct VersionCatalogEntry {
     alias: String,
     name: String,
+    section: &'static str,
     version: VersionCatalogVersion,
     version_ref: Option<String>,
 }
@@ -245,6 +246,7 @@ fn parse_version_catalog_library(
             Some(VersionCatalogEntry {
                 alias: alias.to_string(),
                 name: package_name(group, artifact),
+                section: "libraries",
                 version: VersionCatalogVersion {
                     spec,
                     update_value: version.to_string(),
@@ -270,6 +272,7 @@ fn parse_version_catalog_library(
                 return Some(VersionCatalogEntry {
                     alias: alias.to_string(),
                     name: package_name(group, artifact),
+                    section: "libraries",
                     version,
                     version_ref: Some(version_ref.to_string()),
                 });
@@ -282,12 +285,45 @@ fn parse_version_catalog_library(
             Some(VersionCatalogEntry {
                 alias: alias.to_string(),
                 name: package_name(group, artifact),
+                section: "libraries",
                 version,
                 version_ref: None,
             })
         }
         _ => None,
     }
+}
+
+fn parse_version_catalog_plugin(
+    alias: &str,
+    value: &toml::Value,
+    versions: Option<&toml::Table>,
+    parser: &dyn crate::parser::VersionParser,
+) -> Option<VersionCatalogEntry> {
+    let table = value.as_table()?;
+    let id = table.get("id").and_then(catalog_string)?;
+    let (version, version_ref) = if let Some(reference) = version_catalog_ref(table) {
+        (
+            versions?
+                .get(reference)
+                .and_then(|value| parse_version_catalog_version_value(value, parser))?,
+            Some(reference.to_string()),
+        )
+    } else {
+        (
+            table
+                .get("version")
+                .and_then(|value| parse_version_catalog_version_value(value, parser))?,
+            None,
+        )
+    };
+    Some(VersionCatalogEntry {
+        alias: alias.to_string(),
+        name: package_name(id, &format!("{id}.gradle.plugin")),
+        section: "plugins",
+        version,
+        version_ref,
+    })
 }
 
 fn looks_like_version_catalog(content: &str) -> bool {
@@ -317,20 +353,20 @@ fn parse_version_catalog_entries(
     let catalog: toml::Value = toml::from_str(content).map_err(|err| {
         ManifestError::toml_parse_error(version_catalog_error_path(), err.to_string())
     })?;
-    let Some(libraries) = catalog.get("libraries").and_then(toml::Value::as_table) else {
-        return Ok(Some(Vec::new()));
-    };
     let versions = catalog.get("versions").and_then(toml::Value::as_table);
     let parser = get_parser(Language::Java);
-
-    Ok(Some(
-        libraries
-            .iter()
-            .filter_map(|(alias, value)| {
-                parse_version_catalog_library(alias, value, versions, parser.as_ref())
-            })
-            .collect(),
-    ))
+    let mut entries = Vec::new();
+    if let Some(libraries) = catalog.get("libraries").and_then(toml::Value::as_table) {
+        entries.extend(libraries.iter().filter_map(|(alias, value)| {
+            parse_version_catalog_library(alias, value, versions, parser.as_ref())
+        }));
+    }
+    if let Some(plugins) = catalog.get("plugins").and_then(toml::Value::as_table) {
+        entries.extend(plugins.iter().filter_map(|(alias, value)| {
+            parse_version_catalog_plugin(alias, value, versions, parser.as_ref())
+        }));
+    }
+    Ok(Some(entries))
 }
 
 fn formatted_catalog_update(
@@ -527,10 +563,10 @@ fn update_version_catalog_library_alias(
     formatted_version: &str,
 ) -> Option<String> {
     let (group, artifact) = entry.name.split_once(':')?;
-    let alias_section = format!("libraries.{}", entry.alias);
+    let alias_section = format!("{}.{}", entry.section, entry.alias);
     rewrite_catalog_lines(
         content,
-        "libraries",
+        entry.section,
         &alias_section,
         |line, in_target_block| {
             replace_library_dotted_line(line, entry, formatted_version).or_else(|| {
@@ -714,12 +750,50 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_plugins_are_excluded() {
-        // plugin ID は Maven 座標と一致しないため対象外
+    fn test_parse_plugins_use_marker_artifacts() {
         let content = "[libraries]\njunit = \"junit:junit:4.13.2\"\n\n[plugins]\nspotless = { id = \"com.diffplug.spotless\", version = \"6.25.0\" }\n";
         let d = deps(content);
-        assert_eq!(d.len(), 1);
+        assert_eq!(d.len(), 2);
         assert_eq!(d[0].name, "junit:junit");
+        assert_eq!(
+            d[1].name,
+            "com.diffplug.spotless:com.diffplug.spotless.gradle.plugin"
+        );
+        assert_eq!(d[1].version_spec.version, "6.25.0");
+    }
+
+    #[test]
+    fn test_plugin_only_catalog_with_version_ref() {
+        let content = "[versions]\nagp = '9.3.1'\n\n[plugins]\nandroid-application = { id = 'com.android.application', version.ref = 'agp' }\n";
+        let dep = find(
+            content,
+            "com.android.application:com.android.application.gradle.plugin",
+        );
+        assert_eq!(dep.version_spec.version, "9.3.1");
+        assert_eq!(dep.variable_name.as_deref(), Some("agp"));
+        let updated = update_version(
+            content,
+            "com.android.application:com.android.application.gradle.plugin",
+            "9.4.1",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(updated.contains("agp = '9.4.1'"));
+        assert!(updated.contains("version.ref = 'agp'"));
+    }
+
+    #[test]
+    fn test_update_plugin_inline_version_preserves_other_sections() {
+        let content = "[libraries]\njunit = 'junit:junit:4.13.2'\n\n[plugins]\nkotlin-compose = { id = 'org.jetbrains.kotlin.plugin.compose', version = '2.4.10' }\n";
+        let updated = update_version(
+            content,
+            "org.jetbrains.kotlin.plugin.compose:org.jetbrains.kotlin.plugin.compose.gradle.plugin",
+            "2.4.20",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(updated.contains("version = '2.4.20'"));
+        assert!(updated.contains("junit:junit:4.13.2"));
     }
 
     #[test]
