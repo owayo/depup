@@ -3,6 +3,7 @@
 use super::RegistryAdapter;
 use crate::domain::Language;
 use crate::update::VersionInfo;
+use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
@@ -15,6 +16,7 @@ type VersionFetchLocks = Arc<Mutex<HashMap<(Language, String), Arc<Mutex<()>>>>>
 pub(crate) struct VersionFetcher {
     pub(crate) cache: VersionCache,
     fetch_locks: VersionFetchLocks,
+    release_dates: Mutex<HashMap<(Language, String, String), DateTime<Utc>>>,
     general_semaphore: Semaphore,
     crates_io_semaphore: Semaphore,
 }
@@ -24,6 +26,7 @@ impl VersionFetcher {
         Self {
             cache: Arc::new(Mutex::new(HashMap::new())),
             fetch_locks: Arc::new(Mutex::new(HashMap::new())),
+            release_dates: Mutex::new(HashMap::new()),
             general_semaphore: Semaphore::new(general_concurrency),
             crates_io_semaphore: Semaphore::new(crates_io_concurrency),
         }
@@ -94,6 +97,40 @@ impl VersionFetcher {
         }
 
         Ok(result)
+    }
+
+    /// Share resolved publication dates across manifests in the same run.
+    pub(crate) async fn release_date(
+        &self,
+        adapter: &(dyn RegistryAdapter + Send + Sync),
+        package: &str,
+        version: &str,
+    ) -> Result<Option<DateTime<Utc>>, String> {
+        let key = (adapter.language(), package.to_string(), version.to_string());
+        if let Some(date) = self.release_dates.lock().await.get(&key) {
+            return Ok(Some(*date));
+        }
+        let package_key = (adapter.language(), package.to_string());
+        let fetch_lock = {
+            let mut locks = self.fetch_locks.lock().await;
+            Arc::clone(
+                locks
+                    .entry(package_key)
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+        let _guard = fetch_lock.lock().await;
+        if let Some(date) = self.release_dates.lock().await.get(&key) {
+            return Ok(Some(*date));
+        }
+        let date = adapter
+            .fetch_release_date(package, version)
+            .await
+            .map_err(|error| error.to_string())?;
+        if let Some(date) = date {
+            self.release_dates.lock().await.insert(key, date);
+        }
+        Ok(date)
     }
 
     /// install がキャッシュにない版を選んだ場合に、共有レート制限付きで一覧を更新する。

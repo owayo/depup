@@ -285,6 +285,20 @@ impl Orchestrator {
         // registry 経由のフェッチ
         match self.fetch_versions(adapter, &dep.name).await {
             Ok(versions) => {
+                let versions = match self
+                    .resolve_java_release_dates(&dep, adapter, judge, versions)
+                    .await
+                {
+                    Ok(versions) => versions,
+                    Err(error) => {
+                        return OnePassResult {
+                            name: dep.name.clone(),
+                            outcome: UpdateResult::skip_fetch_failed(dep, error.clone()),
+                            fetch_error: Some(error),
+                            osv_warnings: Vec::new(),
+                        };
+                    }
+                };
                 // OSV チェック: judge で採用しようとした候補だけを問い合わせる。
                 // 脆弱なら、その候補を除外して再 judge するループで安全な候補に
                 // 自然にフォールバックする (1 依存あたり通常 1〜2 API call で済む)。
@@ -292,10 +306,36 @@ impl Orchestrator {
                 let mut osv_warnings = Vec::new();
                 let result = match (self.osv_checker.as_ref(), dep.language.osv_ecosystem()) {
                     (Some(checker), Some(eco)) => {
-                        judge_with_osv(judge, &dep, versions, checker, eco, bar, &mut osv_warnings)
-                            .await
+                        let mut context = OsvJudgeContext {
+                            checker,
+                            ecosystem: eco,
+                            bar,
+                            warnings: &mut osv_warnings,
+                        };
+                        judge_with_osv(self, adapter, judge, &dep, versions, &mut context).await
                     }
-                    _ => judge.judge(&dep, &versions),
+                    _ => Ok(judge.judge(&dep, &versions)),
+                };
+                let result = match result {
+                    Ok(result) => result,
+                    Err(error) => {
+                        return OnePassResult {
+                            name: dep.name.clone(),
+                            outcome: UpdateResult::skip_fetch_failed(dep, error.clone()),
+                            fetch_error: Some(error),
+                            osv_warnings,
+                        };
+                    }
+                };
+                let result = match result {
+                    UpdateResult::Skip {
+                        reason: SkipReason::AlreadyLatest,
+                        released_at: Some(date),
+                        ..
+                    } if adapter.release_dates_deferred() && date.timestamp() == 0 => {
+                        UpdateResult::skip_already_latest(dep.clone())
+                    }
+                    other => other,
                 };
                 OnePassResult {
                     name: dep.name.clone(),
@@ -842,6 +882,100 @@ impl Orchestrator {
         self.versions.fetch(adapter, package).await
     }
 
+    /// Maven metadata has no per-version date. Resolve only versions the judge would
+    /// actually select, then re-run the age filter with the POM's Last-Modified date.
+    async fn resolve_java_release_dates(
+        &self,
+        dep: &Dependency,
+        adapter: &(dyn RegistryAdapter + Send + Sync),
+        judge: &UpdateJudge,
+        mut versions: Vec<VersionInfo>,
+    ) -> Result<Vec<VersionInfo>, String> {
+        if !adapter.release_dates_deferred() || versions.is_empty() {
+            return Ok(versions);
+        }
+        if dep.version_spec.kind == crate::domain::VersionSpecKind::Exact
+            && !versions.iter().any(|candidate| {
+                compare_dependency_versions(dep, &candidate.version, dep.version())
+                    == std::cmp::Ordering::Equal
+            })
+        {
+            return Err(format!(
+                "current version {} is absent from Maven metadata",
+                dep.version()
+            ));
+        }
+
+        // Each pass resolves one new candidate. A candidate too young for min_age is
+        // excluded by the next pass; older candidates remain available as fallbacks.
+        let mut confirmed_limited = false;
+        for _ in 0..=versions.len() {
+            let (selected, checking_limit) = match judge.judge(dep, &versions) {
+                UpdateResult::Update { new_version, .. } => (Some(new_version), false),
+                UpdateResult::Skip {
+                    reason: SkipReason::AlreadyLatest,
+                    ..
+                } if self.args.verbose
+                    && dep.version_spec.kind == crate::domain::VersionSpecKind::Exact =>
+                {
+                    (
+                        versions
+                            .iter()
+                            .find(|candidate| {
+                                compare_dependency_versions(dep, &candidate.version, dep.version())
+                                    == std::cmp::Ordering::Equal
+                            })
+                            .map(|candidate| candidate.version.clone()),
+                        false,
+                    )
+                }
+                UpdateResult::Skip {
+                    reason: SkipReason::ChangeLevelLimited(max),
+                    ..
+                } if !confirmed_limited => {
+                    let candidate = judge
+                        .candidates_before_age(dep, &versions)
+                        .into_iter()
+                        .filter(|info| {
+                            info.released_at.timestamp() == 0
+                                && compare_dependency_versions(dep, &info.version, dep.version())
+                                    == std::cmp::Ordering::Greater
+                                && crate::domain::ChangeLevel::from_versions(
+                                    dep.version(),
+                                    &info.version,
+                                )
+                                .is_some_and(|level| level > max)
+                        })
+                        .max_by(|a, b| compare_dependency_versions(dep, &a.version, &b.version))
+                        .map(|info| info.version.clone());
+                    (candidate, true)
+                }
+                _ => (None, false),
+            };
+            let Some(selected) = selected else {
+                return Ok(versions);
+            };
+            let Some(info) = versions.iter_mut().find(|info| info.version == selected) else {
+                return Err(format!(
+                    "selected Maven version {selected} is absent from metadata"
+                ));
+            };
+            if info.released_at.timestamp() != 0 {
+                return Ok(versions);
+            }
+            let date = self
+                .versions
+                .release_date(adapter, &dep.name, &selected)
+                .await?
+                .ok_or_else(|| format!("release date unavailable for {selected}"))?;
+            info.released_at = date;
+            if checking_limit && judge.admits_age(dep, info) {
+                confirmed_limited = true;
+            }
+        }
+        Err("could not resolve Maven release dates".to_string())
+    }
+
     /// Tauriパッケージバージョンを同期する (@tauri-apps/api, @tauri-apps/cli, tauri crate)
     ///
     /// Tauriビルドエラーを防ぐため、全パッケージのメジャー.マイナーバージョンを
@@ -1118,18 +1252,35 @@ struct OnePassResult {
 /// 通常 1 依存あたり 1〜2 API call で済む。
 /// 全 candidate を網羅的にチェックする旧実装と違い、`@angular/*` のように
 /// 1000+ バージョンを持つパッケージでも実用的な速度で完了する。
+struct OsvJudgeContext<'a> {
+    checker: &'a OsvChecker,
+    ecosystem: &'a str,
+    bar: Option<&'a ProgressBar>,
+    warnings: &'a mut Vec<String>,
+}
+
 async fn judge_with_osv(
+    orchestrator: &Orchestrator,
+    adapter: &(dyn RegistryAdapter + Send + Sync),
     judge: &UpdateJudge,
     dep: &Dependency,
     versions: Vec<VersionInfo>,
-    checker: &OsvChecker,
-    ecosystem: &str,
-    bar: Option<&ProgressBar>,
-    warnings: &mut Vec<String>,
-) -> UpdateResult {
+    context: &mut OsvJudgeContext<'_>,
+) -> Result<UpdateResult, String> {
+    let bar = context.bar;
+    let warnings = &mut context.warnings;
+    let checker = context.checker;
+    let ecosystem = context.ecosystem;
     let mut allowed = versions;
     let mut fallback_chain: Vec<String> = Vec::new();
     loop {
+        allowed = match orchestrator
+            .resolve_java_release_dates(dep, adapter, judge, allowed)
+            .await
+        {
+            Ok(versions) => versions,
+            Err(error) => return Err(error),
+        };
         let result = judge.judge(dep, &allowed);
         let UpdateResult::Update {
             new_version: target,
@@ -1137,7 +1288,7 @@ async fn judge_with_osv(
         } = &result
         else {
             // Skip 結果は OSV と無関係に確定
-            return result;
+            return Ok(result);
         };
         let target = target.clone();
 
@@ -1155,12 +1306,12 @@ async fn judge_with_osv(
                         target
                     );
                     osv_println(bar, &line);
-                    return result
+                    return Ok(result
                         .with_osv_skipped(fallback_chain)
-                        .with_osv_checked(true);
+                        .with_osv_checked(true));
                 }
                 // チェック完了・脆弱性なし
-                return result.with_osv_checked(true);
+                return Ok(result.with_osv_checked(true));
             }
             Ok(OsvCheck::Vulnerable(ids)) => {
                 let detail = if ids.is_empty() {
@@ -1192,7 +1343,7 @@ async fn judge_with_osv(
                         "could not exclude {} from candidates, stopping OSV check",
                         target
                     ));
-                    return result.with_osv_skipped(fallback_chain);
+                    return Ok(result.with_osv_skipped(fallback_chain));
                 }
                 // ループ継続 → 次の候補で再判定
             }
@@ -1200,11 +1351,11 @@ async fn judge_with_osv(
                 let line = format!("  ⚠ OSV check failed for {} {}: {}", dep.name, target, e);
                 osv_println(bar, &line);
                 warnings.push(format!("OSV check failed for {}: {}", target, e));
-                return if fallback_chain.is_empty() {
+                return Ok(if fallback_chain.is_empty() {
                     result
                 } else {
                     result.with_osv_skipped(fallback_chain)
-                };
+                });
             }
         }
     }
@@ -1928,6 +2079,147 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             Ok(vec![VersionInfo::now("1.0.0")])
         }
+    }
+
+    struct DatedMavenAdapter {
+        calls: AtomicUsize,
+        now: chrono::DateTime<chrono::Utc>,
+    }
+
+    #[async_trait]
+    impl RegistryAdapter for DatedMavenAdapter {
+        fn language(&self) -> Language {
+            Language::Java
+        }
+
+        fn registry_name(&self) -> &'static str {
+            "Maven Central"
+        }
+
+        fn release_dates_deferred(&self) -> bool {
+            true
+        }
+
+        async fn fetch_versions(
+            &self,
+            _package: &str,
+        ) -> Result<Vec<VersionInfo>, crate::error::RegistryError> {
+            Ok(Vec::new())
+        }
+
+        async fn fetch_release_date(
+            &self,
+            _package: &str,
+            version: &str,
+        ) -> Result<Option<chrono::DateTime<chrono::Utc>>, crate::error::RegistryError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let days = if matches!(version, "3.0.0" | "4.0.0") {
+                1
+            } else {
+                30
+            };
+            Ok(Some(self.now - chrono::Duration::days(days)))
+        }
+    }
+
+    #[tokio::test]
+    async fn maven_dates_are_fetched_only_for_selected_candidates() {
+        let dir = TempDir::new().unwrap();
+        let orchestrator = Orchestrator::new(make_args_with_path(dir.path(), &["--java"])).unwrap();
+        let now = chrono::Utc::now();
+        let adapter = DatedMavenAdapter {
+            calls: AtomicUsize::new(0),
+            now,
+        };
+        let judge = UpdateJudge::with_time(
+            UpdateFilter::new()
+                .with_include_pinned(true)
+                .with_min_age(Duration::from_secs(14 * 86400)),
+            now,
+        );
+        let dep = Dependency::new(
+            "example:library",
+            crate::domain::VersionSpec::new(
+                crate::domain::VersionSpecKind::Exact,
+                "1.0.0",
+                "1.0.0",
+            ),
+            false,
+            Language::Java,
+        );
+        let unknown = chrono::DateTime::from_timestamp(0, 0).unwrap();
+        let versions = ["1.0.0", "2.0.0", "3.0.0"]
+            .map(|version| VersionInfo::new(version, unknown))
+            .to_vec();
+        let resolved = orchestrator
+            .resolve_java_release_dates(&dep, &adapter, &judge, versions.clone())
+            .await
+            .unwrap();
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(resolved[1].released_at, now - chrono::Duration::days(30));
+        assert_eq!(resolved[2].released_at, now - chrono::Duration::days(1));
+        assert!(matches!(
+            judge.judge(&dep, &resolved),
+            UpdateResult::Update { new_version, .. } if new_version == "2.0.0"
+        ));
+        orchestrator
+            .resolve_java_release_dates(&dep, &adapter, &judge, versions)
+            .await
+            .unwrap();
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 2);
+
+        let missing = vec![VersionInfo::new("2.0.0", unknown)];
+        assert!(
+            orchestrator
+                .resolve_java_release_dates(&dep, &adapter, &judge, missing)
+                .await
+                .unwrap_err()
+                .contains("absent from Maven metadata")
+        );
+    }
+
+    #[tokio::test]
+    async fn young_maven_major_does_not_trigger_max_change_warning() {
+        let dir = TempDir::new().unwrap();
+        let orchestrator = Orchestrator::new(make_args_with_path(dir.path(), &["--java"])).unwrap();
+        let now = chrono::Utc::now();
+        let adapter = DatedMavenAdapter {
+            calls: AtomicUsize::new(0),
+            now,
+        };
+        let judge = UpdateJudge::with_time(
+            UpdateFilter::new()
+                .with_include_pinned(true)
+                .with_min_age(Duration::from_secs(14 * 86400))
+                .with_max_change(crate::domain::ChangeLevel::Minor),
+            now,
+        );
+        let dep = Dependency::new(
+            "example:library",
+            crate::domain::VersionSpec::new(
+                crate::domain::VersionSpecKind::Exact,
+                "3.0.0",
+                "3.0.0",
+            ),
+            false,
+            Language::Java,
+        );
+        let unknown = chrono::DateTime::from_timestamp(0, 0).unwrap();
+        let versions = ["3.0.0", "4.0.0"]
+            .map(|version| VersionInfo::new(version, unknown))
+            .to_vec();
+        let resolved = orchestrator
+            .resolve_java_release_dates(&dep, &adapter, &judge, versions)
+            .await
+            .unwrap();
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            judge.judge(&dep, &resolved),
+            UpdateResult::Skip {
+                reason: SkipReason::AlreadyLatest,
+                ..
+            }
+        ));
     }
 
     fn make_args(args: &[&str]) -> CliArgs {

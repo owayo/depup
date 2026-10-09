@@ -540,6 +540,23 @@ impl UpdateJudge {
         }
     }
 
+    /// Candidates that satisfy version constraints before the release-age check.
+    /// Used by registries that resolve publication dates lazily.
+    pub(crate) fn candidates_before_age<'a>(
+        &self,
+        dependency: &Dependency,
+        available_versions: &'a [VersionInfo],
+    ) -> Vec<&'a VersionInfo> {
+        let stable = self.stable_candidates(dependency, available_versions);
+        let flavored = apply_java_flavor_filter(dependency, stable);
+        let ranged = apply_range_upper_bound(dependency, flavored);
+        apply_rejected_versions(dependency, ranged)
+    }
+
+    pub(crate) fn admits_age(&self, dependency: &Dependency, version: &VersionInfo) -> bool {
+        !self.apply_age_filter(dependency, vec![version]).is_empty()
+    }
+
     /// `min_age` が設定されていれば、現在時刻から逆算したリリース時刻以前のものだけを残す。
     fn apply_age_filter<'a>(
         &self,

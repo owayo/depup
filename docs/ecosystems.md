@@ -154,6 +154,8 @@ Composer rejects the `~>` operator (`Invalid operator "~>"`), so for PHP a `~>` 
 
 ### Java (Gradle)
 
+For Maven Central dependencies, depup reads artifact-level `maven-metadata.xml` from the repository to discover versions. It checks the POM's `Last-Modified` header for each version selected as an update candidate, then applies the age filter. If an exact current version is absent from the repository metadata, depup reports a fetch failure instead of claiming it is already latest. A missing or invalid release date also fails the fetch rather than silently bypassing the age filter.
+
 Gradle rich version declarations using `strictly`, `require`, `prefer`, and `reject` are parsed in dependency blocks such as `implementation("org.slf4j:slf4j-api") { version { ... } }`. String notation shorthand supports exact, dynamic-prefix, and range constraints, including `group:name:1.2.3!!`, `group:name:5.3.+!!`, `group:name:[1.7, 1.8[!!`, and a strict range with a preferred version such as `group:name:[1.7, 1.8[!!1.7.25`. When `strictly` or `require` declares a range and `prefer` declares the selected version, depup keeps the range as the upper-bound constraint and updates the `prefer` value. Versions listed with `reject` are removed from the candidates, including dynamic rejects such as `2.+` and ranges such as `[1.5,1.9)`.
 
 Gradle declaration wrappers are supported: `platform(...)`, `enforcedPlatform(...)`, and `testFixtures(...)`. BOM declarations such as `implementation platform('com.google.cloud:libraries-bom:26.1.0')` and `testImplementation(platform("org.junit:junit-bom:5.10.0"))` are parsed and updated, and the surrounding configuration name is still used for the dev/production classification.
