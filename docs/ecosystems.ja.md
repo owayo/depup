@@ -150,6 +150,8 @@ Composer は `~>` 演算子を受け付けない（`Invalid operator "~>"`）た
 
 ### Java（Gradle）
 
+Maven Central の依存では、リポジトリのアーティファクト単位の `maven-metadata.xml` から版一覧を取得します。更新候補として選んだ版の POM の `Last-Modified` を確認してから age フィルタを適用します。完全一致の現在版が版一覧に無い場合は「最新」とせず取得失敗を報告します。公開日が無い、または不正な場合も age フィルタを黙って迂回せず取得失敗にします。
+
 `strictly` / `require` / `prefer` / `reject` を使う Gradle の rich version 宣言は、`implementation("org.slf4j:slf4j-api") { version { ... } }` のような依存ブロック内でも解析します。文字列記法の短縮形でも、完全一致（`group:name:1.2.3!!`）、動的プレフィックス（`group:name:5.3.+!!`）、範囲（`group:name:[1.7, 1.8[!!`）、prefer 付きの strict 範囲（`group:name:[1.7, 1.8[!!1.7.25`）を解析できます。`strictly` または `require` で範囲を、`prefer` で優先するバージョンを指定している場合、depup は範囲を上限制約として維持したまま `prefer` の値を更新します。`reject` に列挙されたバージョンは候補から外し、`2.+` のような動的な reject や `[1.5,1.9)` のような範囲の reject も考慮します。
 
 Gradle の宣言ラッパー `platform(...)` / `enforcedPlatform(...)` / `testFixtures(...)` にも対応しています。`implementation platform('com.google.cloud:libraries-bom:26.1.0')` や `testImplementation(platform("org.junit:junit-bom:5.10.0"))` のような BOM 宣言も解析・更新でき、開発依存かどうかはラッパーの外側にある configuration 名（`implementation` / `testImplementation` など）で判定します。

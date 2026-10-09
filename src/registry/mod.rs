@@ -51,6 +51,22 @@ pub trait RegistryAdapter: Send + Sync {
     /// パッケージの利用可能なバージョンを取得
     async fn fetch_versions(&self, package: &str) -> Result<Vec<VersionInfo>, RegistryError>;
 
+    /// Whether `fetch_versions` returned placeholder dates that must be resolved
+    /// before an update can be reported.
+    fn release_dates_deferred(&self) -> bool {
+        false
+    }
+
+    /// A release date that must be checked before selecting a version. Registries that
+    /// return dates with their version listing can use the default implementation.
+    async fn fetch_release_date(
+        &self,
+        _package: &str,
+        _version: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, RegistryError> {
+        Ok(None)
+    }
+
     /// lock に存在する版の公開日。候補と違い、yank 済みの版も検証できる必要がある。
     /// publisher_cutoff より若い版だけ、レジストリが確認した公開者も取得する。
     async fn fetch_locked_versions(
