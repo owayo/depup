@@ -94,6 +94,8 @@ In `Cargo.toml`, dependency updates are limited to dependency tables such as `[d
 
 Cargo renamed dependencies such as `alias = { package = "actual-crate", version = "1" }` are fetched by the real package name and written back through the manifest key. `--only` and `--exclude` accept either name.
 
+A dependency is often declared in `[dependencies]` and again in `[dev-dependencies]` to add `features` for tests. When such declarations point to the same source — the same crates.io version requirement written the same way, or the same git URL and reference — depup treats them as one dependency: it looks the dependency up once, shows one update, and rewrites every declaration. The version requirement is compared as written, so `"1.0"` and `"^1.0"` count as different. Declarations that differ in version requirement, git URL or reference, the `version` written beside `git`, or the `package` they point to are not combined, and an update to them is refused as ambiguous.
+
 Path dependencies (`{ path = "../common" }`) are not processed, even when they also declare a `version` for publishing, because they resolve to the local crate. Dependencies that point at a registry other than crates.io — a non-`crates-io` `registry = "..."` or any `registry-index = "..."` — are not processed either, because depup only queries crates.io.
 
 Git dependencies are checked with `git ls-remote` instead of a registry:

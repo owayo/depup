@@ -143,6 +143,9 @@ impl ManifestWriter {
 
         // 更新は順番に適用する
         let mut current_content = content.clone();
+        // 曖昧として拒否した依存キー。版や取得元の食い違う宣言が別々の更新になっても、
+        // 同じ依存のエラーは 1 行だけ出す
+        let mut refused_ambiguous: HashSet<&str> = HashSet::new();
 
         for update in manifest_result.results.iter() {
             if let UpdateResult::Update {
@@ -151,6 +154,17 @@ impl ManifestWriter {
                 ..
             } = update
             {
+                // git 依存の branch/default/rev はマニフェストを書き換えない
+                // (Cargo.lock 側で commit hash が更新されるのを待つ)。何も書き換えないので
+                // 同名の宣言が他にあっても巻き添えは起きず、曖昧判定を当てない
+                if dependency
+                    .git_source
+                    .as_ref()
+                    .is_some_and(|git| !matches!(git.reference, GitReference::Tag(_)))
+                {
+                    continue;
+                }
+
                 let ambiguous_variable = dependency
                     .variable_name
                     .as_ref()
@@ -158,37 +172,34 @@ impl ManifestWriter {
                 if ambiguous_declarations.contains(dependency.manifest_name()) || ambiguous_variable
                 {
                     result.updates_failed += 1;
-                    result.errors.push(format!(
-                        "Refusing to update ambiguous dependency '{}' because it has multiple declarations or a shared version target",
-                        dependency.manifest_name()
-                    ));
+                    if refused_ambiguous.insert(dependency.manifest_name()) {
+                        result.errors.push(format!(
+                            "Refusing to update ambiguous dependency '{}' because it has multiple declarations or a shared version target",
+                            dependency.manifest_name()
+                        ));
+                    }
                     continue;
                 }
 
-                // git 依存の場合は参照種別で挙動が変わる。
-                //   - tag: マニフェストの tag 文字列を書き換える
-                //   - branch/default/rev: マニフェストを書き換えない
-                //     (Cargo.lock 側で commit hash が更新されるのを待つ)
-                if let Some(git) = &dependency.git_source {
-                    if let GitReference::Tag(_) = &git.reference {
-                        match parser.update_git_tag(
-                            &current_content,
-                            dependency.manifest_name(),
-                            new_version,
-                        ) {
-                            Ok(updated_content) => {
-                                if updated_content != current_content {
-                                    current_content = updated_content;
-                                    result.updates_applied += 1;
-                                }
+                // git 依存の tag はマニフェストの tag 文字列を書き換える
+                if dependency.git_source.is_some() {
+                    match parser.update_git_tag(
+                        &current_content,
+                        dependency.manifest_name(),
+                        new_version,
+                    ) {
+                        Ok(updated_content) => {
+                            if updated_content != current_content {
+                                current_content = updated_content;
+                                result.updates_applied += 1;
                             }
-                            Err(e) => {
-                                result.updates_failed += 1;
-                                result.errors.push(format!(
-                                    "Failed to update git tag for {}: {}",
-                                    dependency.name, e
-                                ));
-                            }
+                        }
+                        Err(e) => {
+                            result.updates_failed += 1;
+                            result.errors.push(format!(
+                                "Failed to update git tag for {}: {}",
+                                dependency.name, e
+                            ));
                         }
                     }
                     continue;
@@ -1071,6 +1082,164 @@ my-crate = { git = "https://github.com/example/my-crate.git", branch = "main" }
         // ファイル内容が元のままであることを確認
         let content = fs::read_to_string(&path).unwrap();
         assert_eq!(content, original_content);
+    }
+
+    /// Cargo.toml を parse し、`(依存名, git 依存か, 更新先)` ごとに該当する依存を
+    /// 更新として書き込む。parse から書き込みまでを通すための補助で、
+    /// 書き込みの結果と書き込み後のファイル内容を返す
+    fn apply_cargo_updates(content: &str, updates: &[(&str, bool, &str)]) -> (WriteResult, String) {
+        let temp_dir = TempDir::new().unwrap();
+        let path = create_temp_cargo_toml(&temp_dir, content);
+        let parser = crate::manifest::CargoTomlParser;
+        let dependencies = parser.parse(content).unwrap();
+
+        let mut manifest_result = ManifestUpdateResult::new(&path, Language::Rust);
+        for (name, is_git, new_version) in updates {
+            let dependency = dependencies
+                .iter()
+                .find(|dependency| dependency.name == *name && dependency.is_git() == *is_git)
+                .unwrap_or_else(|| panic!("{name} が parse されない: {dependencies:?}"))
+                .clone();
+            manifest_result.add_result(UpdateResult::update(dependency, *new_version));
+        }
+
+        let result = ManifestWriter::new(false)
+            .apply_updates(&manifest_result, &parser)
+            .unwrap();
+        let written = fs::read_to_string(&path).unwrap();
+        (result, written)
+    }
+
+    #[test]
+    fn test_apply_updates_rust_same_git_tag_in_dependencies_and_dev_dependencies() {
+        // 回帰 (#20): 同じ git の tag 依存を [dependencies] と [dev-dependencies] に書いた
+        // 構成は曖昧として拒否せず、1 回の更新で両方の tag を書き換える
+        let content = r#"[dependencies]
+serde_json = { git = "https://github.com/example/json", tag = "v1.0.100" }
+
+[dev-dependencies]
+serde_json = { git = "https://github.com/example/json", tag = "v1.0.100", features = ["preserve_order"] }
+"#;
+        let (result, written) = apply_cargo_updates(content, &[("serde_json", true, "v1.0.151")]);
+
+        assert_eq!(result.updates_applied, 1);
+        assert_eq!(result.updates_failed, 0);
+        assert!(!result.has_errors(), "errors: {:?}", result.errors);
+        assert!(result.file_modified);
+        assert_eq!(
+            written.matches(r#"tag = "v1.0.151""#).count(),
+            2,
+            "{written}"
+        );
+        assert!(written.contains(r#"features = ["preserve_order"]"#));
+    }
+
+    #[test]
+    fn test_apply_updates_rust_same_registry_version_in_dependencies_and_dev_dependencies() {
+        // 回帰 (#20): crates.io の依存でも、同じ版の指定の宣言は 1 回の更新で全部書き換える
+        let content = r#"[dependencies]
+anyhow = "1.0.0"
+
+[dev-dependencies]
+anyhow = { version = "1.0.0", features = ["backtrace"] }
+"#;
+        let (result, written) = apply_cargo_updates(content, &[("anyhow", false, "1.0.100")]);
+
+        assert_eq!(result.updates_applied, 1);
+        assert_eq!(result.updates_failed, 0);
+        assert!(!result.has_errors(), "errors: {:?}", result.errors);
+        assert!(written.contains(r#"anyhow = "1.0.100""#), "{written}");
+        assert!(
+            written.contains(r#"anyhow = { version = "1.0.100", features = ["backtrace"] }"#),
+            "{written}"
+        );
+    }
+
+    #[test]
+    fn test_apply_updates_rust_same_git_branch_in_dependencies_and_dev_dependencies() {
+        // 回帰 (#20): branch の git 依存は Cargo.toml を書き換えない更新なので、
+        // 宣言が複数あってもエラーにしない
+        let content = r#"[dependencies]
+serde_json = { git = "https://github.com/example/json", branch = "master" }
+
+[dev-dependencies]
+serde_json = { git = "https://github.com/example/json", branch = "master", features = ["preserve_order"] }
+"#;
+        let (result, written) = apply_cargo_updates(content, &[("serde_json", true, "def5678")]);
+
+        assert_eq!(result.updates_applied, 0);
+        assert_eq!(result.updates_failed, 0);
+        assert!(!result.has_errors(), "errors: {:?}", result.errors);
+        assert!(!result.file_modified);
+        assert_eq!(written, content);
+    }
+
+    #[test]
+    fn test_apply_updates_rust_unwritten_git_update_is_not_refused_beside_registry_declaration() {
+        // branch / rev / 既定ブランチの git 依存と同名の crates.io の宣言が並ぶとき、
+        // Cargo.toml を書き換えない git の更新は通し、書き換える crates.io の更新だけを
+        // 曖昧として拒否する
+        for git_reference in [r#", branch = "main""#, r#", rev = "abc1234""#, ""] {
+            let content = format!(
+                r#"[dependencies]
+tracked = {{ git = "https://github.com/example/tracked"{git_reference} }}
+
+[dev-dependencies]
+tracked = "1.0.0"
+"#
+            );
+
+            let (result, written) = apply_cargo_updates(&content, &[("tracked", true, "def5678")]);
+            assert_eq!(result.updates_failed, 0, "{git_reference}");
+            assert!(!result.has_errors(), "{git_reference}: {:?}", result.errors);
+            assert_eq!(written, content);
+
+            let (result, written) = apply_cargo_updates(
+                &content,
+                &[("tracked", true, "def5678"), ("tracked", false, "1.1.0")],
+            );
+            assert_eq!(result.updates_applied, 0, "{git_reference}");
+            assert_eq!(result.updates_failed, 1, "{git_reference}");
+            assert_eq!(
+                result.errors.len(),
+                1,
+                "{git_reference}: {:?}",
+                result.errors
+            );
+            assert!(result.errors[0].contains("ambiguous dependency 'tracked'"));
+            assert_eq!(written, content);
+        }
+    }
+
+    #[test]
+    fn test_apply_updates_rust_mismatched_declarations_report_one_error() {
+        // 版の指定が食い違う宣言は今のとおり拒否する。どちらの宣言も更新になっても、
+        // 同じ依存のエラーは 1 行にまとめる
+        let content = r#"[dependencies]
+shared = "^1.0.0"
+
+[dev-dependencies]
+shared = "=2.0.0"
+"#;
+        let temp_dir = TempDir::new().unwrap();
+        let path = create_temp_cargo_toml(&temp_dir, content);
+        let parser = crate::manifest::CargoTomlParser;
+        let dependencies = parser.parse(content).unwrap();
+        assert_eq!(dependencies.len(), 2, "{dependencies:?}");
+
+        let mut manifest_result = ManifestUpdateResult::new(&path, Language::Rust);
+        for dependency in dependencies {
+            manifest_result.add_result(UpdateResult::update(dependency, "3.0.0"));
+        }
+        let result = ManifestWriter::new(false)
+            .apply_updates(&manifest_result, &parser)
+            .unwrap();
+
+        assert_eq!(result.updates_applied, 0);
+        assert_eq!(result.updates_failed, 2);
+        assert_eq!(result.errors.len(), 1, "errors: {:?}", result.errors);
+        assert!(result.errors[0].contains("ambiguous dependency 'shared'"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), content);
     }
 
     #[test]
