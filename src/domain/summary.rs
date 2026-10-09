@@ -4,7 +4,7 @@
 
 use super::{Language, UpdateResult};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// 単一マニフェストファイルの更新結果
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -38,9 +38,27 @@ impl ManifestUpdateResult {
         self.results.push(result);
     }
 
-    /// 更新件数を返す
+    /// judge が更新すると決めた結果を、書き込みの成否を問わずに返す。
+    ///
+    /// 書き込みの段階 (と、それより前の段階) はこちらを使う。書き込んだ後の
+    /// 件数・出力・install は、失敗を除いた `updates` を使う
+    pub fn judged_updates(&self) -> impl Iterator<Item = &UpdateResult> {
+        self.results.iter().filter(|r| r.is_update())
+    }
+
+    /// judge が更新すると決めた結果があるかどうかを返す
+    pub fn has_judged_updates(&self) -> bool {
+        self.judged_updates().next().is_some()
+    }
+
+    /// 更新件数を返す (書き込めなかった更新は数えない)
     pub fn update_count(&self) -> usize {
-        self.results.iter().filter(|r| r.is_update()).count()
+        self.updates().count()
+    }
+
+    /// 書き込めなかった更新の件数を返す
+    pub fn failed_count(&self) -> usize {
+        self.failed_updates().count()
     }
 
     /// スキップ件数を返す
@@ -48,9 +66,19 @@ impl ManifestUpdateResult {
         self.results.iter().filter(|r| r.is_skip()).count()
     }
 
-    /// 全更新を返す
+    /// 更新を返す (書き込めなかった更新は含めない)。
+    ///
+    /// Cargo.toml を書き換えない更新 (git の branch 依存のように Cargo.lock だけが変わるもの) と、
+    /// 書き換えても内容が同じだった更新は、書き込みに失敗していないので含める
     pub fn updates(&self) -> impl Iterator<Item = &UpdateResult> {
-        self.results.iter().filter(|r| r.is_update())
+        self.results
+            .iter()
+            .filter(|r| r.is_update() && r.write_error().is_none())
+    }
+
+    /// 書き込めなかった更新を返す
+    pub fn failed_updates(&self) -> impl Iterator<Item = &UpdateResult> {
+        self.results.iter().filter(|r| r.write_error().is_some())
     }
 
     /// 全スキップを返す
@@ -58,10 +86,30 @@ impl ManifestUpdateResult {
         self.results.iter().filter(|r| r.is_skip())
     }
 
-    /// 依存関係が更新されたかどうかを返す
+    /// 依存関係が更新されたかどうかを返す (書き込めなかった更新は数えない)
     pub fn has_updates(&self) -> bool {
         self.update_count() > 0
     }
+
+    /// `results` の `index` 番目の更新を、書き込めなかったものとして記録する
+    pub fn record_write_error(&mut self, index: usize, reason: impl Into<String>) {
+        if let Some(result) = self.results.get_mut(index) {
+            result.record_write_error(reason);
+        }
+    }
+}
+
+/// 言語ごとの件数
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LanguageCounts {
+    /// 言語
+    pub language: Language,
+    /// 更新の数 (書き込めなかった更新は数えない)
+    pub updates: usize,
+    /// 書き込めなかった更新の数
+    pub failed: usize,
+    /// スキップの数
+    pub skips: usize,
 }
 
 /// 全更新操作の総合サマリ
@@ -97,9 +145,14 @@ impl UpdateSummary {
         self.manifests.iter().filter(|m| m.modified).count()
     }
 
-    /// 更新された依存関係の合計数を返す
+    /// 更新された依存関係の合計数を返す (書き込めなかった更新は数えない)
     pub fn total_updates(&self) -> usize {
         self.manifests.iter().map(|m| m.update_count()).sum()
+    }
+
+    /// 書き込めなかった更新の合計数を返す
+    pub fn total_failed(&self) -> usize {
+        self.manifests.iter().map(|m| m.failed_count()).sum()
     }
 
     /// スキップされた依存関係の合計数を返す
@@ -124,8 +177,8 @@ impl UpdateSummary {
             .filter(move |m| m.language == language)
     }
 
-    /// 非空の言語ごとに (言語, 更新数, スキップ数) を `Language::all()` 順で返す
-    pub fn language_breakdown(&self) -> Vec<(Language, usize, usize)> {
+    /// 非空の言語ごとの件数を `Language::all()` 順で返す
+    pub fn language_breakdown(&self) -> Vec<LanguageCounts> {
         Language::all()
             .iter()
             .filter_map(|language| {
@@ -133,15 +186,26 @@ impl UpdateSummary {
                 if manifests.is_empty() {
                     None
                 } else {
-                    let updates: usize = manifests.iter().map(|m| m.update_count()).sum();
-                    let skips: usize = manifests.iter().map(|m| m.skip_count()).sum();
-                    Some((*language, updates, skips))
+                    Some(LanguageCounts {
+                        language: *language,
+                        updates: manifests.iter().map(|m| m.update_count()).sum(),
+                        failed: manifests.iter().map(|m| m.failed_count()).sum(),
+                        skips: manifests.iter().map(|m| m.skip_count()).sum(),
+                    })
                 }
             })
             .collect()
     }
 
-    /// 全マニフェストの全更新を返す
+    /// `path` のマニフェストの `results` の `index` 番目の更新を、書き込めなかったものとして
+    /// 記録する。マニフェストのパスは検出の段階で重複を除いてあるので、パスで 1 件に決まる
+    pub fn record_write_error(&mut self, path: &Path, index: usize, reason: impl Into<String>) {
+        if let Some(manifest) = self.manifests.iter_mut().find(|m| m.path == path) {
+            manifest.record_write_error(index, reason);
+        }
+    }
+
+    /// 全マニフェストの全更新を返す (書き込めなかった更新は含めない)
     pub fn all_updates(&self) -> impl Iterator<Item = &UpdateResult> {
         self.manifests.iter().flat_map(|m| m.updates())
     }
@@ -380,5 +444,65 @@ mod tests {
         assert!(json.contains("\"dry_run\":true"));
         let parsed: UpdateSummary = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, summary);
+    }
+
+    #[test]
+    fn test_write_errors_are_counted_apart_from_updates() {
+        // 回帰 (#21): 書き込めなかった更新は更新として数えず、別に数える。
+        // judge が決めた更新 (judged_updates) には残る
+        let mut summary = UpdateSummary::new(false);
+        let mut node = ManifestUpdateResult::new("/package.json", Language::Node);
+        node.add_result(sample_update("lodash"));
+        node.add_result(sample_update("express"));
+        node.add_result(sample_skip("react"));
+        summary.add_manifest(node);
+        let mut rust = ManifestUpdateResult::new("/Cargo.toml", Language::Rust);
+        rust.add_result(sample_update("serde"));
+        summary.add_manifest(rust);
+
+        summary.record_write_error(Path::new("/package.json"), 1, "Failed to update express");
+        summary.record_write_error(Path::new("/Cargo.toml"), 0, "Refusing to update serde");
+        // Skip とマニフェストの外の位置には何もしない
+        summary.record_write_error(Path::new("/package.json"), 2, "ignored");
+        summary.record_write_error(Path::new("/package.json"), 9, "ignored");
+
+        let node = &summary.manifests[0];
+        assert_eq!(node.judged_updates().count(), 2);
+        assert_eq!(node.update_count(), 1);
+        assert_eq!(node.updates().next().unwrap().package_name(), "lodash");
+        assert_eq!(node.failed_count(), 1);
+        assert_eq!(
+            node.failed_updates().next().unwrap().write_error(),
+            Some("Failed to update express")
+        );
+        assert_eq!(node.skip_count(), 1);
+        assert!(node.has_updates());
+
+        // 全更新を書き込めなかったマニフェストは、更新が無いものとして扱う
+        let rust = &summary.manifests[1];
+        assert!(rust.has_judged_updates());
+        assert!(!rust.has_updates());
+        assert_eq!(rust.failed_count(), 1);
+
+        assert_eq!(summary.total_updates(), 1);
+        assert_eq!(summary.total_failed(), 2);
+        assert_eq!(summary.all_updates().count(), 1);
+        assert_eq!(
+            summary.language_breakdown(),
+            vec![
+                LanguageCounts {
+                    language: Language::Node,
+                    updates: 1,
+                    failed: 1,
+                    skips: 1,
+                },
+                LanguageCounts {
+                    language: Language::Rust,
+                    updates: 0,
+                    failed: 1,
+                    skips: 0,
+                },
+            ]
+        );
     }
 }

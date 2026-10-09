@@ -22,6 +22,6 @@ pub use change_level::ChangeLevel;
 pub use dependency::Dependency;
 pub use git_source::{GitReference, GitSource};
 pub use language::Language;
-pub use summary::{ManifestUpdateResult, UpdateSummary};
+pub use summary::{LanguageCounts, ManifestUpdateResult, UpdateSummary};
 pub use update_result::{SkipReason, UpdateResult};
 pub use version_spec::{VersionSpec, VersionSpecKind, range_lower_bound_version};

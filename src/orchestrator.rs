@@ -496,7 +496,7 @@ impl Orchestrator {
             .await;
         self.sync_tauri_if_needed(manifests, progress, &mut summary, &mut errors)
             .await;
-        let write_results = self.write_phase(&summary, progress, &mut errors);
+        let write_results = self.write_phase(&mut summary, progress, &mut errors);
 
         OrchestratorResult {
             summary,
@@ -675,9 +675,12 @@ impl Orchestrator {
     }
 
     /// 書き込み phase: 更新を適用 (`dry_run` ならプレビューのみ) し、書き込みエラーを集約する。
+    ///
+    /// 書き込めなかった更新は `summary` に記録する。以後の出力・install・lock の監査は、
+    /// 書き込めた (dry-run では書き込める見込みの) 更新だけを更新として扱う
     fn write_phase(
         &self,
-        summary: &UpdateSummary,
+        summary: &mut UpdateSummary,
         progress: &mut Progress,
         errors: &mut Vec<OrchestratorError>,
     ) -> Vec<WriteResult> {
@@ -689,6 +692,9 @@ impl Orchestrator {
         progress.finish_and_clear();
 
         for result in &write_results {
+            for failure in &result.failed_updates {
+                summary.record_write_error(&result.path, failure.index, failure.reason.clone());
+            }
             for error in &result.errors {
                 errors.push(OrchestratorError::WriteError {
                     path: result.path.display().to_string(),
@@ -1886,6 +1892,58 @@ mod tests {
             .unwrap();
         assert_eq!(root_result.updates().count(), 1);
         assert_eq!(app_result.updates().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn write_failures_are_recorded_in_summary() {
+        // 回帰 (#21): 書き込めなかった更新 (ここでは曖昧として拒否した更新) は summary に
+        // 記録し、更新の件数に入れない。dry-run でも書き込める見込みかどうかで数える
+        let root = TempDir::new().unwrap();
+        fs::write(
+            root.path().join("package.json"),
+            r#"{"dependencies":{"shared":"^1.0.0","library":"^1.0.0"},"devDependencies":{"shared":"~1.0.0"}}"#,
+        )
+        .unwrap();
+        let orchestrator = Orchestrator::new(make_args_with_path(
+            root.path(),
+            &["--no-age", "--no-osv", "--dry-run", "--quiet"],
+        ))
+        .unwrap();
+        let now = chrono::Utc::now();
+        {
+            let mut cache = orchestrator.versions.cache.lock().await;
+            for name in ["shared", "library"] {
+                cache.insert(
+                    (Language::Node, name.into()),
+                    vec![
+                        VersionInfo::new("1.0.0", now - chrono::Duration::days(60)),
+                        VersionInfo::new("1.5.0", now - chrono::Duration::days(30)),
+                    ],
+                );
+            }
+        }
+
+        let result = orchestrator.run().await;
+
+        let manifest = &result.summary.manifests[0];
+        assert_eq!(manifest.judged_updates().count(), 3);
+        let updated: Vec<_> = manifest.updates().map(|u| u.package_name()).collect();
+        assert_eq!(updated, vec!["library"]);
+        let failed: Vec<_> = manifest
+            .failed_updates()
+            .map(|u| (u.package_name(), u.dependency().is_dev))
+            .collect();
+        assert_eq!(failed, vec![("shared", false), ("shared", true)]);
+        assert!(manifest.failed_updates().all(|u| {
+            u.write_error()
+                .unwrap()
+                .contains("ambiguous dependency 'shared'")
+        }));
+        assert_eq!(result.summary.total_updates(), 1);
+        assert_eq!(result.summary.total_failed(), 2);
+        // エラーの行は依存ごとに 1 行
+        assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+        assert_eq!(result.write_results[0].updates_failed(), 2);
     }
 
     #[tokio::test]

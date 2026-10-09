@@ -6,7 +6,7 @@
 //! - 更新時の書式保持
 //! - 失敗時も継続できるエラーハンドリング
 
-use crate::domain::{GitReference, Language, ManifestUpdateResult, UpdateResult};
+use crate::domain::{Dependency, GitReference, Language, ManifestUpdateResult, UpdateResult};
 use crate::error::ManifestError;
 use crate::manifest::ManifestParser;
 use std::collections::{HashMap, HashSet};
@@ -26,14 +26,24 @@ pub struct ManifestWriter {
 pub struct WriteResult {
     /// 対象マニフェストのパス
     pub path: std::path::PathBuf,
-    /// 実際に反映された更新数
+    /// 実際に反映された更新数 (書き換えても内容が同じだった更新と、
+    /// マニフェストを書き換えない git の更新は数えない)
     pub updates_applied: usize,
-    /// 失敗した更新数
-    pub updates_failed: usize,
+    /// 書き込めなかった更新 (`ManifestUpdateResult::results` 上の位置の順)
+    pub failed_updates: Vec<WriteFailure>,
     /// 実ファイルが変更されたかどうか
     pub file_modified: bool,
     /// 更新中に発生したエラー
     pub errors: Vec<String>,
+}
+
+/// 書き込めなかった更新 1 件
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteFailure {
+    /// `ManifestUpdateResult::results` 上の位置
+    pub index: usize,
+    /// 書き込めなかった理由
+    pub reason: String,
 }
 
 impl WriteResult {
@@ -42,7 +52,7 @@ impl WriteResult {
         Self {
             path: path.into(),
             updates_applied: 0,
-            updates_failed: 0,
+            failed_updates: Vec::new(),
             file_modified: false,
             errors: Vec::new(),
         }
@@ -53,9 +63,56 @@ impl WriteResult {
         self.updates_applied > 0
     }
 
+    /// 書き込めなかった更新の数
+    pub fn updates_failed(&self) -> usize {
+        self.failed_updates.len()
+    }
+
     /// エラーがあるかどうか
     pub fn has_errors(&self) -> bool {
         !self.errors.is_empty()
+    }
+
+    /// `index` の更新を書き込めなかったものとして記録する
+    fn record_failure(&mut self, index: usize, reason: impl Into<String>) {
+        self.failed_updates.push(WriteFailure {
+            index,
+            reason: reason.into(),
+        });
+    }
+
+    /// マニフェスト全体の失敗 (読み込み・解析・保存の失敗) を記録する。
+    ///
+    /// マニフェストを書き換える更新はどれも反映されていないので、まだ個別の理由が
+    /// 記録されていない更新を `reason` で書き込めなかったものにする。個別の理由
+    /// (曖昧として拒否した、など) がある更新は、その理由を残す
+    fn record_manifest_failure(&mut self, manifest_result: &ManifestUpdateResult, reason: String) {
+        for (index, update) in manifest_result.results.iter().enumerate() {
+            if let UpdateResult::Update { dependency, .. } = update
+                && rewrites_manifest(dependency)
+                && !self
+                    .failed_updates
+                    .iter()
+                    .any(|failure| failure.index == index)
+            {
+                self.record_failure(index, reason.clone());
+            }
+        }
+        self.failed_updates.sort_by_key(|failure| failure.index);
+        self.updates_applied = 0;
+        self.file_modified = false;
+        self.errors.push(reason);
+    }
+}
+
+/// 更新がマニフェストを書き換えるかどうかを返す。
+///
+/// git 依存の branch / rev / 既定ブランチはマニフェストを書き換えない
+/// (Cargo.lock 側で commit hash が更新されるのを待つ)
+fn rewrites_manifest(dependency: &Dependency) -> bool {
+    match &dependency.git_source {
+        Some(git) => matches!(git.reference, GitReference::Tag(_)),
+        None => true,
     }
 }
 
@@ -75,7 +132,11 @@ impl ManifestWriter {
         self.dry_run
     }
 
-    /// `ManifestUpdateResult` の更新をファイルへ適用する
+    /// `ManifestUpdateResult` の更新をファイルへ適用する。
+    ///
+    /// 書き込めなかった更新は `WriteResult::failed_updates` に記録する。保存 (I/O) に失敗した
+    /// ときも `Ok` を返し、書き換えた更新をすべて書き込めなかったものとして記録する。
+    /// `Err` を返すのは、マニフェストを読み込めず、どの更新も試せなかったときだけ
     pub fn apply_updates(
         &self,
         manifest_result: &ManifestUpdateResult,
@@ -147,21 +208,16 @@ impl ManifestWriter {
         // 同じ依存のエラーは 1 行だけ出す
         let mut refused_ambiguous: HashSet<&str> = HashSet::new();
 
-        for update in manifest_result.results.iter() {
+        for (index, update) in manifest_result.results.iter().enumerate() {
             if let UpdateResult::Update {
                 dependency,
                 new_version,
                 ..
             } = update
             {
-                // git 依存の branch/default/rev はマニフェストを書き換えない
-                // (Cargo.lock 側で commit hash が更新されるのを待つ)。何も書き換えないので
-                // 同名の宣言が他にあっても巻き添えは起きず、曖昧判定を当てない
-                if dependency
-                    .git_source
-                    .as_ref()
-                    .is_some_and(|git| !matches!(git.reference, GitReference::Tag(_)))
-                {
+                // マニフェストを書き換えない更新 (git 依存の branch/default/rev) は、
+                // 同名の宣言が他にあっても巻き添えは起きないので、曖昧判定を当てない
+                if !rewrites_manifest(dependency) {
                     continue;
                 }
 
@@ -171,13 +227,14 @@ impl ManifestWriter {
                     .is_some_and(|name| ambiguous_variables.contains(name));
                 if ambiguous_declarations.contains(dependency.manifest_name()) || ambiguous_variable
                 {
-                    result.updates_failed += 1;
+                    let reason = format!(
+                        "Refusing to update ambiguous dependency '{}' because it has multiple declarations or a shared version target",
+                        dependency.manifest_name()
+                    );
                     if refused_ambiguous.insert(dependency.manifest_name()) {
-                        result.errors.push(format!(
-                            "Refusing to update ambiguous dependency '{}' because it has multiple declarations or a shared version target",
-                            dependency.manifest_name()
-                        ));
+                        result.errors.push(reason.clone());
                     }
+                    result.record_failure(index, reason);
                     continue;
                 }
 
@@ -195,11 +252,10 @@ impl ManifestWriter {
                             }
                         }
                         Err(e) => {
-                            result.updates_failed += 1;
-                            result.errors.push(format!(
-                                "Failed to update git tag for {}: {}",
-                                dependency.name, e
-                            ));
+                            let reason =
+                                format!("Failed to update git tag for {}: {}", dependency.name, e);
+                            result.errors.push(reason.clone());
+                            result.record_failure(index, reason);
                         }
                     }
                     continue;
@@ -217,10 +273,9 @@ impl ManifestWriter {
                         }
                     }
                     Err(e) => {
-                        result.updates_failed += 1;
-                        result
-                            .errors
-                            .push(format!("Failed to update {}: {}", dependency.name, e));
+                        let reason = format!("Failed to update {}: {}", dependency.name, e);
+                        result.errors.push(reason.clone());
+                        result.record_failure(index, reason);
                     }
                 }
             }
@@ -228,10 +283,17 @@ impl ManifestWriter {
 
         // dry-run でなく、実際に変更がある場合のみ書き戻す
         if result.updates_applied > 0 && !self.dry_run {
-            write_atomically(path, &current_content).map_err(|e| ManifestError::WriteError {
-                path: path.clone(),
-                source: e,
-            })?;
+            if let Err(source) = write_atomically(path, &current_content) {
+                let error = ManifestError::WriteError {
+                    path: path.clone(),
+                    source,
+                };
+                result.record_manifest_failure(
+                    manifest_result,
+                    format!("Failed to process manifest: {}", error),
+                );
+                return Ok(result);
+            }
             result.file_modified = true;
         }
 
@@ -246,23 +308,20 @@ impl ManifestWriter {
     ) -> Vec<WriteResult> {
         manifests
             .iter()
-            .filter_map(|manifest| {
-                // 更新対象があるマニフェストだけ処理する
-                if !manifest.has_updates() {
-                    return None;
-                }
-
+            // 更新対象があるマニフェストだけ処理する
+            .filter(|manifest| manifest.has_judged_updates())
+            .map(|manifest| {
                 let parser = get_parser(manifest.language);
-                match self.apply_updates(manifest, parser.as_ref()) {
-                    Ok(result) => Some(result),
-                    Err(e) => {
+                self.apply_updates(manifest, parser.as_ref())
+                    .unwrap_or_else(|e| {
+                        // 読み込み・解析に失敗したので、どの更新も試せていない
                         let mut result = WriteResult::new(&manifest.path);
+                        result.record_manifest_failure(
+                            manifest,
+                            format!("Failed to process manifest: {}", e),
+                        );
                         result
-                            .errors
-                            .push(format!("Failed to process manifest: {}", e));
-                        Some(result)
-                    }
-                }
+                    })
             })
             .collect()
     }
@@ -509,7 +568,7 @@ mod tests {
         let result = WriteResult::new("/path/to/file");
         assert_eq!(result.path, std::path::PathBuf::from("/path/to/file"));
         assert_eq!(result.updates_applied, 0);
-        assert_eq!(result.updates_failed, 0);
+        assert_eq!(result.updates_failed(), 0);
         assert!(!result.file_modified);
         assert!(result.errors.is_empty());
     }
@@ -673,7 +732,7 @@ tokio_v1 = { package = "tokio", version = "1.0", features = ["rt"] }
             .unwrap();
 
         assert_eq!(result.updates_applied, 0);
-        assert_eq!(result.updates_failed, 1);
+        assert_eq!(result.updates_failed(), 1);
         assert!(!result.file_modified);
         assert!(result.errors[0].contains("ambiguous dependency"));
         assert_eq!(fs::read_to_string(path).unwrap(), original_content);
@@ -707,7 +766,7 @@ beta = { module = "com.example:beta", version.ref = "shared" }
             .unwrap();
 
         assert_eq!(result.updates_applied, 0);
-        assert_eq!(result.updates_failed, 1);
+        assert_eq!(result.updates_failed(), 1);
         assert!(!result.file_modified);
         assert_eq!(fs::read_to_string(&path).unwrap(), original_content);
     }
@@ -734,7 +793,7 @@ android-library = { id = "com.android.library", version.ref = "agp" }
             .apply_updates(&manifest_result, &parser)
             .unwrap();
         assert_eq!(result.updates_applied, 1);
-        assert_eq!(result.updates_failed, 0);
+        assert_eq!(result.updates_failed(), 0);
         assert!(result.file_modified);
         let updated = fs::read_to_string(path).unwrap();
         assert!(updated.contains("agp = \"9.4.1\""));
@@ -774,7 +833,7 @@ android-library = { id = "com.android.library", version.ref = "agp" }
             .unwrap();
 
         assert_eq!(result.updates_applied, 1);
-        assert_eq!(result.updates_failed, 0);
+        assert_eq!(result.updates_failed(), 0);
         assert!(!result.has_errors(), "errors: {:?}", result.errors);
         assert!(result.file_modified);
 
@@ -820,7 +879,7 @@ dependencies {
             .unwrap();
 
         assert_eq!(result.updates_applied, 0);
-        assert_eq!(result.updates_failed, 1);
+        assert_eq!(result.updates_failed(), 1);
         assert!(!result.file_modified);
         assert!(result.errors[0].contains("ambiguous dependency"));
         assert_eq!(fs::read_to_string(&path).unwrap(), original_content);
@@ -851,7 +910,7 @@ dependencies {
             .unwrap();
 
         assert_eq!(result.updates_applied, 0);
-        assert_eq!(result.updates_failed, 1);
+        assert_eq!(result.updates_failed(), 1);
         assert!(!result.file_modified);
         assert!(result.errors[0].contains("ambiguous dependency"));
         assert_eq!(fs::read_to_string(&path).unwrap(), original_content);
@@ -882,7 +941,7 @@ dependencies {
         let result = writer.apply_updates(&manifest_result, &parser).unwrap();
 
         assert_eq!(result.updates_applied, 1);
-        assert_eq!(result.updates_failed, 1);
+        assert_eq!(result.updates_failed(), 1);
         assert!(result.has_errors());
         assert!(result.file_modified); // 成功分は書き戻される
     }
@@ -941,7 +1000,7 @@ dependencies {
         let result = writer.apply_updates(&manifest_result, &NoOpParser).unwrap();
 
         assert_eq!(result.updates_applied, 0);
-        assert_eq!(result.updates_failed, 0);
+        assert_eq!(result.updates_failed(), 0);
         assert!(!result.file_modified);
         assert!(!result.has_errors());
 
@@ -998,6 +1057,9 @@ dependencies {
         let mut manifest_result = ManifestUpdateResult::new(&path, Language::Node);
         let dep = sample_dependency("lodash", "4.17.21", Language::Node);
         manifest_result.add_result(UpdateResult::update(dep, "4.18.0"));
+        // 保存の前に個別の理由で失敗する更新
+        let missing = sample_dependency("nonexistent", "1.0.0", Language::Node);
+        manifest_result.add_result(UpdateResult::update(missing, "2.0.0"));
 
         let writer = ManifestWriter::new(false);
         let parser = crate::manifest::PackageJsonParser;
@@ -1008,11 +1070,36 @@ dependencies {
         perms.set_mode(0o644);
         fs::set_permissions(&path, perms).unwrap();
 
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            ManifestError::WriteError { .. } => {}
-            e => panic!("Expected WriteError, got: {:?}", e),
-        }
+        // 保存に失敗しても Err にせず、書き換えた更新を書き込めなかったものとして記録する。
+        // 保存の前に個別の理由で失敗した更新は、その理由を残す
+        let result = result.unwrap();
+        assert_eq!(result.updates_applied, 0);
+        assert!(!result.file_modified);
+        assert_eq!(result.updates_failed(), 2);
+        assert_eq!(result.failed_updates[0].index, 0);
+        assert!(
+            result.failed_updates[0]
+                .reason
+                .contains("failed to write manifest file"),
+            "{:?}",
+            result.failed_updates
+        );
+        assert_eq!(result.failed_updates[1].index, 1);
+        assert!(
+            result.failed_updates[1]
+                .reason
+                .starts_with("Failed to update nonexistent"),
+            "{:?}",
+            result.failed_updates
+        );
+        assert_eq!(result.errors.len(), 2, "{:?}", result.errors);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|error| error.starts_with("Failed to process manifest"))
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), original_content);
     }
 
     #[test]
@@ -1123,7 +1210,7 @@ serde_json = { git = "https://github.com/example/json", tag = "v1.0.100", featur
         let (result, written) = apply_cargo_updates(content, &[("serde_json", true, "v1.0.151")]);
 
         assert_eq!(result.updates_applied, 1);
-        assert_eq!(result.updates_failed, 0);
+        assert_eq!(result.updates_failed(), 0);
         assert!(!result.has_errors(), "errors: {:?}", result.errors);
         assert!(result.file_modified);
         assert_eq!(
@@ -1146,7 +1233,7 @@ anyhow = { version = "1.0.0", features = ["backtrace"] }
         let (result, written) = apply_cargo_updates(content, &[("anyhow", false, "1.0.100")]);
 
         assert_eq!(result.updates_applied, 1);
-        assert_eq!(result.updates_failed, 0);
+        assert_eq!(result.updates_failed(), 0);
         assert!(!result.has_errors(), "errors: {:?}", result.errors);
         assert!(written.contains(r#"anyhow = "1.0.100""#), "{written}");
         assert!(
@@ -1168,7 +1255,7 @@ serde_json = { git = "https://github.com/example/json", branch = "master", featu
         let (result, written) = apply_cargo_updates(content, &[("serde_json", true, "def5678")]);
 
         assert_eq!(result.updates_applied, 0);
-        assert_eq!(result.updates_failed, 0);
+        assert_eq!(result.updates_failed(), 0);
         assert!(!result.has_errors(), "errors: {:?}", result.errors);
         assert!(!result.file_modified);
         assert_eq!(written, content);
@@ -1190,7 +1277,7 @@ tracked = "1.0.0"
             );
 
             let (result, written) = apply_cargo_updates(&content, &[("tracked", true, "def5678")]);
-            assert_eq!(result.updates_failed, 0, "{git_reference}");
+            assert_eq!(result.updates_failed(), 0, "{git_reference}");
             assert!(!result.has_errors(), "{git_reference}: {:?}", result.errors);
             assert_eq!(written, content);
 
@@ -1199,7 +1286,7 @@ tracked = "1.0.0"
                 &[("tracked", true, "def5678"), ("tracked", false, "1.1.0")],
             );
             assert_eq!(result.updates_applied, 0, "{git_reference}");
-            assert_eq!(result.updates_failed, 1, "{git_reference}");
+            assert_eq!(result.updates_failed(), 1, "{git_reference}");
             assert_eq!(
                 result.errors.len(),
                 1,
@@ -1236,7 +1323,7 @@ shared = "=2.0.0"
             .unwrap();
 
         assert_eq!(result.updates_applied, 0);
-        assert_eq!(result.updates_failed, 2);
+        assert_eq!(result.updates_failed(), 2);
         assert_eq!(result.errors.len(), 1, "errors: {:?}", result.errors);
         assert!(result.errors[0].contains("ambiguous dependency 'shared'"));
         assert_eq!(fs::read_to_string(&path).unwrap(), content);
@@ -1281,5 +1368,132 @@ shared = "=2.0.0"
 
         assert_eq!(results.len(), 1);
         assert!(results[0].has_errors());
+        // 読み込めないマニフェストの更新は、どれも書き込めなかったものとして記録する
+        assert_eq!(results[0].updates_failed(), 1);
+        assert_eq!(results[0].failed_updates[0].index, 0);
+        assert!(
+            results[0].failed_updates[0]
+                .reason
+                .starts_with("Failed to process manifest")
+        );
+    }
+
+    #[test]
+    fn test_apply_updates_records_failed_update_positions() {
+        // 回帰 (#21): 書き込めなかった更新は、`results` 上の位置と理由で記録する。
+        // 出力はこれを使って、書き込めた更新と書き込めなかった更新を分けて数える
+        let temp_dir = TempDir::new().unwrap();
+        let path = create_temp_package_json(
+            &temp_dir,
+            r#"{
+  "dependencies": {
+    "lodash": "^4.17.21"
+  }
+}"#,
+        );
+
+        let mut manifest_result = ManifestUpdateResult::new(&path, Language::Node);
+        let express = sample_dependency("express", "4.18.0", Language::Node);
+        manifest_result.add_result(UpdateResult::skip_already_latest(express));
+        let lodash = sample_dependency("lodash", "4.17.21", Language::Node);
+        manifest_result.add_result(UpdateResult::update(lodash, "4.18.0"));
+        let missing = sample_dependency("nonexistent", "1.0.0", Language::Node);
+        manifest_result.add_result(UpdateResult::update(missing, "2.0.0"));
+
+        let result = ManifestWriter::new(false)
+            .apply_updates(&manifest_result, &crate::manifest::PackageJsonParser)
+            .unwrap();
+
+        assert_eq!(result.updates_applied, 1);
+        assert_eq!(result.updates_failed(), 1);
+        assert_eq!(result.failed_updates[0].index, 2);
+        assert!(
+            result.failed_updates[0]
+                .reason
+                .starts_with("Failed to update nonexistent"),
+            "{:?}",
+            result.failed_updates
+        );
+        assert_eq!(result.errors, vec![result.failed_updates[0].reason.clone()]);
+    }
+
+    #[test]
+    fn test_apply_updates_dry_run_records_refused_updates() {
+        // dry-run でも、書き込めない見込みの更新を記録する (ファイルは変えない)
+        let temp_dir = TempDir::new().unwrap();
+        let original_content = r#"{
+  "dependencies": {
+    "shared": "^1.0.0"
+  },
+  "devDependencies": {
+    "shared": "~1.0.0"
+  }
+}"#;
+        let path = create_temp_package_json(&temp_dir, original_content);
+        let parser = crate::manifest::PackageJsonParser;
+        let mut manifest_result = ManifestUpdateResult::new(&path, Language::Node);
+        for dependency in parser.parse(original_content).unwrap() {
+            manifest_result.add_result(UpdateResult::update(dependency, "1.5.0"));
+        }
+
+        let result = ManifestWriter::dry_run()
+            .apply_updates(&manifest_result, &parser)
+            .unwrap();
+
+        assert_eq!(result.updates_failed(), 2);
+        assert_eq!(
+            result
+                .failed_updates
+                .iter()
+                .map(|failure| failure.index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original_content);
+    }
+
+    #[test]
+    fn test_apply_all_updates_unreadable_manifest_keeps_unwritten_git_updates() {
+        // マニフェストを読み込めなくても、マニフェストを書き換えない git の更新
+        // (Cargo.lock 側で上がる branch の依存) は書き込めなかったものにしない
+        let mut manifest_result =
+            ManifestUpdateResult::new("/nonexistent/path/Cargo.toml", Language::Rust);
+        let branch = Dependency::new(
+            "tracked",
+            VersionSpec::new(VersionSpecKind::Exact, "main", "main"),
+            false,
+            Language::Rust,
+        )
+        .with_git_source(GitSource::new(
+            "https://github.com/example/tracked",
+            GitReference::Branch("main".to_string()),
+        ));
+        manifest_result.add_result(UpdateResult::update(branch, "def5678"));
+        let tagged = Dependency::new(
+            "tagged",
+            VersionSpec::new(VersionSpecKind::Exact, "v1.0.0", "v1.0.0"),
+            false,
+            Language::Rust,
+        )
+        .with_git_source(GitSource::new(
+            "https://github.com/example/tagged",
+            GitReference::Tag("v1.0.0".to_string()),
+        ));
+        manifest_result.add_result(UpdateResult::update(tagged, "v1.1.0"));
+
+        let results = ManifestWriter::new(false).apply_all_updates(&[manifest_result], |_| {
+            Box::new(crate::manifest::CargoTomlParser)
+        });
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0]
+                .failed_updates
+                .iter()
+                .map(|failure| failure.index)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
     }
 }

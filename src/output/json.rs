@@ -42,8 +42,10 @@ struct JsonOutput {
 /// サマリ統計の JSON 表現
 #[derive(Serialize)]
 struct JsonSummary {
-    /// 更新の総数
+    /// 更新の総数 (書き込めなかった更新は数えない)
     updates: usize,
+    /// 書き込めなかった更新の総数
+    failed: usize,
     /// スキップの総数
     skips: usize,
     /// 言語別の内訳
@@ -56,8 +58,10 @@ struct JsonSummary {
 struct JsonLanguageSummary {
     /// 言語名
     language: String,
-    /// 更新数
+    /// 更新数 (書き込めなかった更新は数えない)
     updates: usize,
+    /// 書き込めなかった更新の数
+    failed: usize,
     /// スキップ数
     skips: usize,
 }
@@ -69,8 +73,10 @@ struct JsonManifest {
     path: String,
     /// マニフェストの言語
     language: String,
-    /// 更新のリスト
+    /// 更新のリスト (書き込めなかった更新は含めない)
     updates: Vec<JsonUpdate>,
+    /// 書き込めなかった更新のリスト。各要素の `error` に理由が入る
+    failed: Vec<JsonUpdate>,
     /// スキップのリスト (verbose モードのみ)
     #[serde(skip_serializing_if = "Vec::is_empty")]
     skips: Vec<JsonSkip>,
@@ -97,6 +103,9 @@ struct JsonUpdate {
     /// git 依存の場合の参照情報 (type/value)
     #[serde(skip_serializing_if = "Option::is_none")]
     reference: Option<JsonGitReference>,
+    /// マニフェストへ書き込めなかった理由 (`failed` の要素だけ)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 /// git 参照の JSON 表現 (branch/tag/rev/default_branch)
@@ -161,55 +170,64 @@ impl JsonFormatter {
         }
     }
 
+    /// 更新 1 件を JSON 表現に変換する (`Skip` 結果は `None`)
+    fn update_to_json(result: &UpdateResult) -> Option<JsonUpdate> {
+        let UpdateResult::Update {
+            dependency,
+            new_version,
+            age_exemption,
+            write_error,
+            ..
+        } = result
+        else {
+            return None;
+        };
+        if let Some(git) = &dependency.git_source {
+            let from = match &git.reference {
+                GitReference::Tag(t) => t.clone(),
+                _ => git.current_commit.clone().unwrap_or_default(),
+            };
+            Some(JsonUpdate {
+                age_exemption: age_exemption.clone(),
+                name: dependency.name.clone(),
+                kind: "git",
+                from,
+                to: new_version.clone(),
+                dev: dependency.is_dev,
+                // URL に埋め込まれたアクセストークンを伏せる。
+                // fetch 成功時の Update は GitRemoteError を経由しないため、
+                // エラー側の伏せ字が効かず、ここが唯一の未伏せ出力経路だった
+                // (CI の JSON 成果物・ログにトークンが残る)。
+                source: Some(crate::registry::redact_url(&git.url)),
+                reference: Some(JsonGitReference::from_reference(&git.reference)),
+                error: write_error.clone(),
+            })
+        } else {
+            Some(JsonUpdate {
+                age_exemption: age_exemption.clone(),
+                name: dependency.name.clone(),
+                kind: "registry",
+                // `to` はレジストリが返す生の値なので、`from` も同じ書式
+                // (Go なら `v` 付き) に揃える
+                from: dependency.version_spec.display_version(),
+                to: new_version.clone(),
+                dev: dependency.is_dev,
+                source: None,
+                reference: None,
+                error: write_error.clone(),
+            })
+        }
+    }
+
     /// マニフェスト結果を JSON 表現に変換
     fn manifest_to_json(&self, manifest: &ManifestUpdateResult) -> JsonManifest {
         let updates: Vec<JsonUpdate> = manifest
             .updates()
-            .filter_map(|result| {
-                if let UpdateResult::Update {
-                    dependency,
-                    new_version,
-                    age_exemption,
-                    ..
-                } = result
-                {
-                    if let Some(git) = &dependency.git_source {
-                        let from = match &git.reference {
-                            GitReference::Tag(t) => t.clone(),
-                            _ => git.current_commit.clone().unwrap_or_default(),
-                        };
-                        Some(JsonUpdate {
-                            age_exemption: age_exemption.clone(),
-                            name: dependency.name.clone(),
-                            kind: "git",
-                            from,
-                            to: new_version.clone(),
-                            dev: dependency.is_dev,
-                            // URL に埋め込まれたアクセストークンを伏せる。
-                            // fetch 成功時の Update は GitRemoteError を経由しないため、
-                            // エラー側の伏せ字が効かず、ここが唯一の未伏せ出力経路だった
-                            // (CI の JSON 成果物・ログにトークンが残る)。
-                            source: Some(crate::registry::redact_url(&git.url)),
-                            reference: Some(JsonGitReference::from_reference(&git.reference)),
-                        })
-                    } else {
-                        Some(JsonUpdate {
-                            age_exemption: age_exemption.clone(),
-                            name: dependency.name.clone(),
-                            kind: "registry",
-                            // `to` はレジストリが返す生の値なので、`from` も同じ書式
-                            // (Go なら `v` 付き) に揃える
-                            from: dependency.version_spec.display_version(),
-                            to: new_version.clone(),
-                            dev: dependency.is_dev,
-                            source: None,
-                            reference: None,
-                        })
-                    }
-                } else {
-                    None
-                }
-            })
+            .filter_map(Self::update_to_json)
+            .collect();
+        let failed: Vec<JsonUpdate> = manifest
+            .failed_updates()
+            .filter_map(Self::update_to_json)
             .collect();
 
         let skips: Vec<JsonSkip> = if self.verbosity == Verbosity::Verbose {
@@ -241,6 +259,7 @@ impl JsonFormatter {
             path: manifest.path.display().to_string(),
             language: manifest.language.display_name().to_string(),
             updates,
+            failed,
             skips,
         }
     }
@@ -249,6 +268,7 @@ impl JsonFormatter {
 impl OutputFormatter for JsonFormatter {
     fn format(&self, result: &OrchestratorResult, writer: &mut dyn Write) -> std::io::Result<()> {
         let updates = result.summary.total_updates();
+        let failed = result.summary.total_failed();
         let skips = result.summary.total_skips();
 
         let by_language: Vec<JsonLanguageSummary> = if self.verbosity == Verbosity::Verbose {
@@ -256,10 +276,11 @@ impl OutputFormatter for JsonFormatter {
                 .summary
                 .language_breakdown()
                 .into_iter()
-                .map(|(language, updates, skips)| JsonLanguageSummary {
-                    language: language.display_name().to_string(),
-                    updates,
-                    skips,
+                .map(|counts| JsonLanguageSummary {
+                    language: counts.language.display_name().to_string(),
+                    updates: counts.updates,
+                    failed: counts.failed,
+                    skips: counts.skips,
                 })
                 .collect()
         } else {
@@ -270,6 +291,7 @@ impl OutputFormatter for JsonFormatter {
             dry_run: result.summary.dry_run,
             summary: JsonSummary {
                 updates,
+                failed,
                 skips,
                 by_language,
             },
@@ -294,12 +316,10 @@ impl OutputFormatter for JsonFormatter {
         summary: &UpdateSummary,
         writer: &mut dyn Write,
     ) -> std::io::Result<()> {
-        let updates = summary.total_updates();
-        let skips = summary.total_skips();
-
         let output = JsonSummary {
-            updates,
-            skips,
+            updates: summary.total_updates(),
+            failed: summary.total_failed(),
+            skips: summary.total_skips(),
             by_language: Vec::new(),
         };
 
@@ -618,9 +638,78 @@ mod tests {
 
         let parsed: serde_json::Value = serde_json::from_str(&output_str).unwrap();
         assert_eq!(parsed["summary"]["updates"], 0);
+        assert_eq!(parsed["summary"]["failed"], 0);
         assert_eq!(parsed["summary"]["skips"], 0);
         assert!(parsed["manifests"].as_array().unwrap().is_empty());
         // エラーがない場合はerrorsフィールドが省略される
         assert!(parsed.get("errors").is_none() || parsed["errors"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_format_json_separates_write_failures() {
+        // 回帰 (#21): 書き込めなかった更新は `updates` と `summary.updates` に入れず、
+        // `failed` に理由付きで入れる。`summary` の件数は各配列の長さの和と一致する
+        let mut result = create_test_result();
+        let manifest = &mut result.summary.manifests[0];
+        manifest.add_result(UpdateResult::update(
+            sample_dependency("react", "18.0.0"),
+            "19.0.0",
+        ));
+        manifest.record_write_error(2, "Failed to update react: package not found");
+
+        for verbosity in [Verbosity::Normal, Verbosity::Verbose] {
+            let mut output = Vec::new();
+            JsonFormatter::new(verbosity)
+                .format(&result, &mut output)
+                .unwrap();
+            let parsed: serde_json::Value = serde_json::from_slice(&output).unwrap();
+
+            assert_eq!(parsed["summary"]["updates"], 1);
+            assert_eq!(parsed["summary"]["failed"], 1);
+            assert_eq!(parsed["summary"]["skips"], 1);
+            let manifest = &parsed["manifests"][0];
+            let updates = manifest["updates"].as_array().unwrap();
+            assert_eq!(updates.len(), 1);
+            assert_eq!(updates[0]["name"], "lodash");
+            assert!(updates[0].get("error").is_none());
+            let failed = manifest["failed"].as_array().unwrap();
+            assert_eq!(failed.len(), 1);
+            assert_eq!(failed[0]["name"], "react");
+            assert_eq!(failed[0]["from"], "18.0.0");
+            assert_eq!(failed[0]["to"], "19.0.0");
+            assert_eq!(
+                failed[0]["error"],
+                "Failed to update react: package not found"
+            );
+            if verbosity == Verbosity::Verbose {
+                assert_eq!(parsed["summary"]["by_language"][0]["updates"], 1);
+                assert_eq!(parsed["summary"]["by_language"][0]["failed"], 1);
+            }
+        }
+
+        let mut output = Vec::new();
+        JsonFormatter::new(Verbosity::Normal)
+            .format_summary(&result.summary, &mut output)
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(parsed["updates"], 1);
+        assert_eq!(parsed["failed"], 1);
+    }
+
+    #[test]
+    fn test_format_json_always_lists_failed() {
+        // 書き込めなかった更新が無くても `failed` は空の配列で出す
+        let mut output = Vec::new();
+        JsonFormatter::new(Verbosity::Normal)
+            .format(&create_test_result(), &mut output)
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(parsed["summary"]["failed"], 0);
+        assert!(
+            parsed["manifests"][0]["failed"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
     }
 }

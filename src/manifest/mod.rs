@@ -51,7 +51,7 @@ pub use package_swift::PackageSwiftParser;
 pub use pnpm_settings::{PnpmSettings, has_pnpm_workspace};
 pub use pyproject_toml::PyprojectTomlParser;
 pub use tool_versions::TOOL_VERSIONS_FILENAME;
-pub use writer::{ManifestWriter, WriteResult, read_manifest, write_manifest};
+pub use writer::{ManifestWriter, WriteFailure, WriteResult, read_manifest, write_manifest};
 
 use crate::domain::{Dependency, Language};
 use crate::error::ManifestError;

@@ -73,6 +73,10 @@ pub enum UpdateResult {
         /// age を免除した身元と、レジストリが確認した根拠。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         age_exemption: Option<crate::update::AgeExemption>,
+        /// マニフェストへ書き込めなかったときの理由 (dry-run では書き込めない見込みの理由)。
+        /// 書き込みの段階より前は常に `None`
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        write_error: Option<String>,
     },
     /// 依存関係の更新がスキップされた
     Skip {
@@ -103,6 +107,7 @@ impl UpdateResult {
             osv_skipped: Vec::new(),
             osv_checked: false,
             age_exemption: None,
+            write_error: None,
         }
     }
 
@@ -119,6 +124,7 @@ impl UpdateResult {
             osv_skipped: Vec::new(),
             osv_checked: false,
             age_exemption: None,
+            write_error: None,
         }
     }
 
@@ -194,9 +200,27 @@ impl UpdateResult {
         Self::skip(dependency, SkipReason::FetchFailed(message.into()))
     }
 
-    /// Update結果かどうかを返す
+    /// Update結果かどうかを返す。
+    ///
+    /// judge が更新すると決めたかどうかで、書き込みの成否は見ない。書き込めた更新だけを
+    /// 数えるときは `write_error` も見る (`ManifestUpdateResult::updates` を参照)
     pub fn is_update(&self) -> bool {
         matches!(self, UpdateResult::Update { .. })
+    }
+
+    /// マニフェストへ書き込めなかった更新の理由を返す
+    pub fn write_error(&self) -> Option<&str> {
+        match self {
+            UpdateResult::Update { write_error, .. } => write_error.as_deref(),
+            UpdateResult::Skip { .. } => None,
+        }
+    }
+
+    /// マニフェストへ書き込めなかったことを記録する。`Skip` 結果に対しては no-op
+    pub fn record_write_error(&mut self, reason: impl Into<String>) {
+        if let UpdateResult::Update { write_error, .. } = self {
+            *write_error = Some(reason.into());
+        }
     }
 
     /// Skip結果かどうかを返す
@@ -571,5 +595,35 @@ mod tests {
         assert!(json.contains("\"type\":\"skip\""));
         let parsed: UpdateResult = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, result);
+    }
+
+    #[test]
+    fn test_record_write_error() {
+        // 書き込めなかった理由は Update にだけ記録し、Skip では何もしない
+        let mut update = UpdateResult::update(sample_dependency(), "2.0.0");
+        assert_eq!(update.write_error(), None);
+        update.record_write_error("Failed to update lodash");
+        assert_eq!(update.write_error(), Some("Failed to update lodash"));
+        assert!(update.is_update());
+
+        let mut skip = UpdateResult::skip(sample_dependency(), SkipReason::Excluded);
+        skip.record_write_error("ignored");
+        assert_eq!(skip.write_error(), None);
+    }
+
+    #[test]
+    fn test_serde_update_result_write_error() {
+        // 書き込めなかった理由が無いときは出力せず、無いデータも読み込める
+        let result = UpdateResult::update(sample_dependency(), "2.0.0");
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(!json.contains("write_error"));
+        let parsed: UpdateResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.write_error(), None);
+
+        let mut failed = result;
+        failed.record_write_error("Failed to update lodash");
+        let json = serde_json::to_string(&failed).unwrap();
+        let parsed: UpdateResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, failed);
     }
 }
