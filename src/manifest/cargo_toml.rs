@@ -210,7 +210,7 @@ impl ManifestParser for CargoTomlParser {
             }
         })?;
 
-        let mut dependencies = Vec::new();
+        let mut dependencies = CargoDeclarations::default();
         let parser = get_parser(Language::Rust);
 
         // 通常の依存関係を読む
@@ -256,7 +256,7 @@ impl ManifestParser for CargoTomlParser {
             parse_cargo_dependencies(deps, parser.as_ref(), false, &mut dependencies);
         }
 
-        Ok(dependencies)
+        Ok(dependencies.dependencies)
     }
 
     fn language(&self) -> Language {
@@ -522,14 +522,14 @@ fn parse_cargo_dependencies(
     deps: &toml::map::Map<String, Value>,
     parser: &dyn VersionParser,
     is_dev: bool,
-    output: &mut Vec<Dependency>,
+    output: &mut CargoDeclarations,
 ) {
     for (name, value) in deps {
         match value {
             // 単純な文字列: `package = "1.0.0"`
             Value::String(s) => {
                 if let Some(spec) = parser.parse(s) {
-                    push_dependency(output, name, spec, is_dev, None, None);
+                    output.push(new_dependency(name, spec, is_dev, None, None), None);
                 }
             }
             // inline table 形式: `package = { version = "1.0.0", features = [...] }`
@@ -540,13 +540,12 @@ fn parse_cargo_dependencies(
                 // git 依存の検出を先に試みる
                 if let Some(git_source) = try_parse_git_source(t) {
                     let spec = git_reference_spec(&git_source.reference);
-                    push_dependency(
-                        output,
-                        package_name,
-                        spec,
-                        is_dev,
-                        manifest_name,
-                        Some(git_source),
+                    // 公開用に併記した `version` は git 依存の Dependency には残らないが、
+                    // 宣言をまとめてよいかの判定には要る
+                    let published_version = t.get("version").and_then(|v| v.as_str());
+                    output.push(
+                        new_dependency(package_name, spec, is_dev, manifest_name, Some(git_source)),
+                        published_version,
                     );
                     continue;
                 }
@@ -571,7 +570,10 @@ fn parse_cargo_dependencies(
                 if let Some(version_str) = t.get("version").and_then(|v| v.as_str())
                     && let Some(spec) = parser.parse(version_str)
                 {
-                    push_dependency(output, package_name, spec, is_dev, manifest_name, None);
+                    output.push(
+                        new_dependency(package_name, spec, is_dev, manifest_name, None),
+                        None,
+                    );
                 }
             }
             _ => {}
@@ -579,14 +581,13 @@ fn parse_cargo_dependencies(
     }
 }
 
-fn push_dependency(
-    output: &mut Vec<Dependency>,
+fn new_dependency(
     name: &str,
     spec: VersionSpec,
     is_dev: bool,
     manifest_name: Option<&str>,
     git_source: Option<GitSource>,
-) {
+) -> Dependency {
     let mut dep = if is_dev {
         Dependency::development(name.to_string(), spec, Language::Rust)
     } else {
@@ -598,7 +599,63 @@ fn push_dependency(
     if let Some(gs) = git_source {
         dep = dep.with_git_source(gs);
     }
-    output.push(dep);
+    dep
+}
+
+/// 宣言をまとめるときのキー: (実パッケージ名, マニフェスト上の依存キー, 版の指定の生表記,
+/// git の取得元 (URL, 参照, 公開用に併記した `version` の生表記))
+type DeclarationKey = (
+    String,
+    String,
+    String,
+    Option<(String, GitReference, Option<String>)>,
+);
+
+/// parse した依存の一覧。同じ取得元・同じ版を指す宣言は 1 依存にまとめる。
+///
+/// `[dependencies]` と `[dev-dependencies]` に同じ依存を同じ版で書き、dev 側にだけ
+/// `features` を足すのは Rust でよくある書き方。宣言ごとに 1 依存を返すと writer の
+/// 曖昧性ガード (同じ依存キーの宣言が 2 件以上あれば更新を拒否) に必ず掛かり、
+/// 「2 updates」と表示しながら 1 バイトも書けずに exit code 2 になっていた。
+/// `update_version` / `update_git_tag` は全依存セクションの同名の宣言をすべて書き換えるので、
+/// 取得元と版の指定が一致する宣言は「1 依存 = 1 書き換え」として扱ってよい。
+/// まとめればレジストリや `git ls-remote` への問い合わせも 1 回で済む。
+///
+/// キー ([`DeclarationKey`]) が 1 つでも食い違う宣言はまとめない。マニフェストを書き換える
+/// 更新は、従来どおり writer が曖昧として拒否する (git の branch / rev / 既定ブランチの更新は
+/// マニフェストを書き換えないので、曖昧判定の対象外)。版の指定は生表記で比べるので、
+/// Cargo では同じ意味の `"1.0"` と `"^1.0"` もまとめない。`features` などの付帯指定と
+/// `is_dev` はキーに含めない。
+/// 残すのは最初の宣言だが、`is_dev` はどれか 1 つでも本番の宣言があれば本番にする
+/// (`[dev-dependencies]` とターゲット固有の `[dependencies]` の組では dev 側が先に読まれる)。
+#[derive(Default)]
+struct CargoDeclarations {
+    dependencies: Vec<Dependency>,
+    positions: std::collections::HashMap<DeclarationKey, usize>,
+}
+
+impl CargoDeclarations {
+    /// 依存を足す。git 依存では、公開用に併記した `version` も `published_version` で渡す
+    fn push(&mut self, dependency: Dependency, published_version: Option<&str>) {
+        let key = (
+            dependency.name.clone(),
+            dependency.manifest_name().to_string(),
+            dependency.version_spec.raw.clone(),
+            dependency.git_source.as_ref().map(|git| {
+                (
+                    git.url.clone(),
+                    git.reference.clone(),
+                    published_version.map(str::to_string),
+                )
+            }),
+        );
+        if let Some(&position) = self.positions.get(&key) {
+            self.dependencies[position].is_dev &= dependency.is_dev;
+        } else {
+            self.positions.insert(key, self.dependencies.len());
+            self.dependencies.push(dependency);
+        }
+    }
 }
 
 /// inline table から git 依存を検出して `GitSource` を組み立てる
@@ -2207,5 +2264,113 @@ toml = { version = "0.8.0", features = ["derive"] }
             table_content.matches("\r\n").count()
         );
         assert!(!table.replace("\r\n", "").contains('\n'));
+    }
+
+    #[test]
+    fn test_parse_merges_declarations_with_same_source_and_version() {
+        // 回帰 (#20): 同じ依存を [dependencies] と [dev-dependencies] に同じ取得元・
+        // 同じ版で書き、dev 側にだけ features を足す構成は 1 依存にまとめる。
+        // 宣言ごとに返すと writer の曖昧性ガードで更新を拒否していた
+        let content = r#"
+[dependencies]
+tagged = { git = "https://github.com/example/tagged", tag = "v1.0.100" }
+anyhow = "1.0.0"
+tracked = { git = "https://github.com/example/tracked", branch = "master" }
+quoted = "2.0.0"
+
+[dev-dependencies]
+tagged = { git = "https://github.com/example/tagged", tag = "v1.0.100", features = ["preserve_order"] }
+anyhow = { version = "1.0.0", features = ["backtrace"] }
+tracked = { git = "https://github.com/example/tracked", branch = "master", features = ["preserve_order"] }
+quoted = '2.0.0'
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 4, "{deps:?}");
+
+        let tagged = deps.iter().find(|d| d.name == "tagged").unwrap();
+        assert!(!tagged.is_dev);
+        assert_eq!(
+            tagged.git_source.as_ref().unwrap().reference,
+            GitReference::Tag("v1.0.100".to_string())
+        );
+
+        let anyhow = deps.iter().find(|d| d.name == "anyhow").unwrap();
+        assert!(!anyhow.is_dev);
+        assert_eq!(anyhow.version_spec.raw, "1.0.0");
+
+        let tracked = deps.iter().find(|d| d.name == "tracked").unwrap();
+        assert!(!tracked.is_dev);
+        assert_eq!(
+            tracked.git_source.as_ref().unwrap().reference,
+            GitReference::Branch("master".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_keeps_declarations_with_different_source_or_version() {
+        // 版の指定・タグ・URL・取得元の種類・git に併記した version のどれかが食い違う宣言は
+        // まとめない (writer が従来どおり曖昧として拒否する)。版の指定は生表記で比べるので、
+        // Cargo では同じ意味の "1.0" と "^1.0" もまとめない
+        let content = r#"
+[dependencies]
+ranged = "^1.0.0"
+caret = "1.0"
+tagged = { git = "https://github.com/example/tagged", tag = "v1.0.0" }
+forked = { git = "https://github.com/example/forked", tag = "v1.0.0" }
+mixed = { git = "https://github.com/example/mixed", branch = "main" }
+published = { git = "https://github.com/example/published", tag = "v1.0.0", version = "1.0" }
+
+[dev-dependencies]
+ranged = "=2.0.0"
+caret = "^1.0"
+tagged = { git = "https://github.com/example/tagged", tag = "v2.0.0" }
+forked = { git = "https://github.com/someone/forked", tag = "v1.0.0" }
+mixed = "1.0.0"
+published = { git = "https://github.com/example/published", tag = "v1.0.0", version = "2.0" }
+"#;
+        let deps = parse(content).unwrap();
+        for name in ["ranged", "caret", "tagged", "forked", "mixed", "published"] {
+            assert_eq!(
+                deps.iter().filter(|d| d.name == name).count(),
+                2,
+                "{name} の宣言はまとめない: {deps:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_keeps_same_key_renamed_to_different_packages() {
+        // 依存キーが同じでも `package` で指す実パッケージが違う宣言はまとめない
+        let content = r#"
+[dependencies]
+http = { package = "http", version = "1.0.0" }
+
+[dev-dependencies]
+http = { package = "http-legacy", version = "1.0.0" }
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 2, "{deps:?}");
+        assert!(deps.iter().all(|d| d.manifest_name() == "http"));
+    }
+
+    #[test]
+    fn test_parse_merged_declaration_is_production_when_any_declaration_is() {
+        // [dev-dependencies] が target 固有の [dependencies] より先に読まれても、
+        // 本番の宣言が 1 つでもあれば本番の依存として扱う
+        let content = r#"
+[dev-dependencies]
+libc = "0.2.150"
+cc = "1.0.83"
+
+[build-dependencies]
+cc = "1.0.83"
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2.150", features = ["extra_traits"] }
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 2, "{deps:?}");
+        assert!(!deps.iter().find(|d| d.name == "libc").unwrap().is_dev);
+        assert!(deps.iter().find(|d| d.name == "cc").unwrap().is_dev);
     }
 }
