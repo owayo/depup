@@ -532,6 +532,29 @@ jobs:
               ;;
           esac
 
+      # upstream の workflow 変更を含む fork 同期には Workflows の書き込み権限が要る。
+      # PR 提出用の classic PAT は public_repo のままにし、同期だけ専用 App で行う
+      - name: Create a token for the winget fork
+        id: sync-token
+        if: steps.registration.outputs.registered == 'true'
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.WINGET_SYNC_APP_CLIENT_ID }}
+          private-key: ${{ secrets.WINGET_SYNC_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: winget-pkgs
+          permission-contents: write
+          permission-workflows: write
+
+      - name: Sync the winget-pkgs fork
+        if: steps.registration.outputs.registered == 'true'
+        env:
+          GH_TOKEN: ${{ steps.sync-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          gh api -X POST "repos/${GITHUB_REPOSITORY_OWNER}/winget-pkgs/merge-upstream" \
+            -f branch=master --jq .message
+
       - name: Submit the manifest to winget-pkgs
         id: submit
         if: steps.registration.outputs.registered == 'true'
