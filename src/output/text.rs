@@ -156,6 +156,9 @@ impl TextFormatter {
             SkipReason::FetchFailed(msg) => format!("fetch failed: {}", msg),
             SkipReason::LanguageFiltered => "filtered".to_string(),
             SkipReason::NoSuitableVersion => "no suitable version".to_string(),
+            SkipReason::ReleaseDateUnknown(version) => {
+                format!("release date unavailable for {version}")
+            }
             SkipReason::ParseError(msg) => format!("parse error: {}", msg),
             SkipReason::ChangeLevelLimited(level) => format!("max-change={}", level),
         }
@@ -207,7 +210,7 @@ impl TextFormatter {
         // リリース日をフォーマット
         let date_display = released_at
             .map(|d| format!(" ({})", d.format("%Y/%m/%d %H:%M")))
-            .unwrap_or_default();
+            .unwrap_or_else(|| " (release date unknown)".to_string());
 
         // 変数インジケータをフォーマット
         let var_display = variable_name
@@ -232,7 +235,7 @@ impl TextFormatter {
                         .dimmed()
                         .to_string()
                 })
-                .unwrap_or_default();
+                .unwrap_or_else(|| " (release date unknown)".dimmed().to_string());
             let var_colored = variable_name
                 .map(|v| format!(" via ${}", v).cyan().to_string())
                 .unwrap_or_default();
@@ -974,6 +977,30 @@ mod tests {
     }
 
     #[test]
+    fn unknown_release_date_is_not_displayed_as_epoch() {
+        let formatter = TextFormatter::with_color(Verbosity::Normal, true, false);
+        let mut output = Vec::new();
+        formatter
+            .format_update_line(
+                "python",
+                "3.14.7",
+                "3.15.0",
+                false,
+                None,
+                None,
+                &[],
+                false,
+                false,
+                6,
+                &mut output,
+            )
+            .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("release date unknown"));
+        assert!(!output.contains("1970"));
+    }
+
+    #[test]
     fn test_dry_run_prefix() {
         let formatter = TextFormatter::with_color(Verbosity::Normal, true, false);
         assert_eq!(formatter.dry_run_prefix(), "(dry-run) ");
@@ -1157,7 +1184,10 @@ mod tests {
                 .to_string()
         };
         assert!(!line("lodash").contains("[failed]"));
-        assert!(line("react").ends_with("[major] [failed]"), "{output}");
+        assert!(
+            line("react").ends_with("[major] (release date unknown) [failed]"),
+            "{output}"
+        );
         assert!(line("typescript").ends_with("🔧 [failed]"), "{output}");
         assert!(
             output.contains("1 package(s) updated (1 minor)"),

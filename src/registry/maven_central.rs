@@ -8,7 +8,7 @@ use crate::error::RegistryError;
 use crate::registry::{HttpClient, RegistryAdapter, is_valid_registry_id_segment};
 use crate::update::VersionInfo;
 use async_trait::async_trait;
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use reqwest::header::LAST_MODIFIED;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -292,15 +292,14 @@ impl RegistryAdapter for MavenCentralAdapter {
             });
         }
 
-        // The listing has no per-version timestamps. A conservative placeholder is
-        // replaced for each candidate before the judge makes a final decision.
-        let unknown_date = Utc.timestamp_opt(0, 0).single().expect("Unix epoch");
+        // The listing has no per-version timestamps. Resolve selected candidates
+        // from their POMs before the judge makes a final decision.
         let mut versions = metadata
             .versioning
             .versions
             .version
             .into_iter()
-            .map(|version| VersionInfo::new(version, unknown_date))
+            .map(VersionInfo::undated)
             .collect::<Vec<_>>();
         versions.sort();
         self.package_sources

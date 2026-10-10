@@ -948,7 +948,7 @@ impl Orchestrator {
                         .candidates_before_age(dep, &versions)
                         .into_iter()
                         .filter(|info| {
-                            info.released_at.timestamp() == 0
+                            info.released_at.is_none()
                                 && compare_dependency_versions(dep, &info.version, dep.version())
                                     == std::cmp::Ordering::Greater
                                 && crate::domain::ChangeLevel::from_versions(
@@ -971,7 +971,7 @@ impl Orchestrator {
                     "selected Maven version {selected} is absent from metadata"
                 ));
             };
-            if info.released_at.timestamp() != 0 {
+            if info.released_at.is_some() {
                 return Ok(versions);
             }
             let date = self
@@ -979,7 +979,7 @@ impl Orchestrator {
                 .release_date(adapter, &dep.name, &selected)
                 .await?
                 .ok_or_else(|| format!("release date unavailable for {selected}"))?;
-            info.released_at = date;
+            info.released_at = Some(date);
             if checking_limit && judge.admits_age(dep, info) {
                 confirmed_limited = true;
             }
@@ -1093,7 +1093,7 @@ impl Orchestrator {
                         crate_versions
                             .iter()
                             .find(|info| &info.version == target)
-                            .filter(|info| info.released_at > cutoff)
+                            .filter(|info| info.released_at.is_none_or(|date| date > cutoff))
                     })
                     .and_then(|info| {
                         self.resolved_age_policy_for(&project_dir.join("src-tauri"))
@@ -2210,17 +2210,22 @@ mod tests {
             false,
             Language::Java,
         );
-        let unknown = chrono::DateTime::from_timestamp(0, 0).unwrap();
         let versions = ["1.0.0", "2.0.0", "3.0.0"]
-            .map(|version| VersionInfo::new(version, unknown))
+            .map(VersionInfo::undated)
             .to_vec();
         let resolved = orchestrator
             .resolve_java_release_dates(&dep, &adapter, &judge, versions.clone())
             .await
             .unwrap();
         assert_eq!(adapter.calls.load(Ordering::SeqCst), 2);
-        assert_eq!(resolved[1].released_at, now - chrono::Duration::days(30));
-        assert_eq!(resolved[2].released_at, now - chrono::Duration::days(1));
+        assert_eq!(
+            resolved[1].released_at,
+            Some(now - chrono::Duration::days(30))
+        );
+        assert_eq!(
+            resolved[2].released_at,
+            Some(now - chrono::Duration::days(1))
+        );
         assert!(matches!(
             judge.judge(&dep, &resolved),
             UpdateResult::Update { new_version, .. } if new_version == "2.0.0"
@@ -2231,7 +2236,7 @@ mod tests {
             .unwrap();
         assert_eq!(adapter.calls.load(Ordering::SeqCst), 2);
 
-        let missing = vec![VersionInfo::new("2.0.0", unknown)];
+        let missing = vec![VersionInfo::undated("2.0.0")];
         assert!(
             orchestrator
                 .resolve_java_release_dates(&dep, &adapter, &judge, missing)
@@ -2267,10 +2272,7 @@ mod tests {
             false,
             Language::Java,
         );
-        let unknown = chrono::DateTime::from_timestamp(0, 0).unwrap();
-        let versions = ["3.0.0", "4.0.0"]
-            .map(|version| VersionInfo::new(version, unknown))
-            .to_vec();
+        let versions = ["3.0.0", "4.0.0"].map(VersionInfo::undated).to_vec();
         let resolved = orchestrator
             .resolve_java_release_dates(&dep, &adapter, &judge, versions)
             .await
@@ -2716,7 +2718,7 @@ mod tests {
                 cache_key,
                 vec![VersionInfo {
                     version: "4.17.21".to_string(),
-                    released_at: chrono::Utc::now(),
+                    released_at: Some(chrono::Utc::now()),
                     publisher: Default::default(),
                 }],
             );

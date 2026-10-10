@@ -68,7 +68,7 @@ mod tests {
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0].version, "9.8.0");
         assert_eq!(
-            versions[0].released_at.to_rfc3339(),
+            versions[0].released_at.unwrap().to_rfc3339(),
             "2026-09-20T12:34:56+00:00"
         );
     }

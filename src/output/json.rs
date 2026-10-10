@@ -165,6 +165,9 @@ impl JsonFormatter {
             SkipReason::FetchFailed(msg) => format!("fetch_failed: {}", msg),
             SkipReason::LanguageFiltered => "language_filtered".to_string(),
             SkipReason::NoSuitableVersion => "no_suitable_version".to_string(),
+            SkipReason::ReleaseDateUnknown(version) => {
+                format!("release_date_unknown: {version}")
+            }
             SkipReason::ParseError(msg) => format!("parse_error: {}", msg),
             SkipReason::ChangeLevelLimited(level) => format!("change_level_limited: {}", level),
         }

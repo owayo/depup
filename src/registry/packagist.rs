@@ -94,13 +94,9 @@ impl PackagistAdapter {
 
     /// `time` フィールドからリリース日時を解決する
     ///
-    /// `time` が欠損またはパース不能な場合は UNIX_EPOCH (= 「十分古い」) へフォールバックする。
-    /// `Utc::now()` をフォールバックに使うと、デフォルト有効の age フィルタ (1w) が
-    /// 該当バージョンを「リリース直後」とみなして永久に候補から除外してしまうため。
-    /// github_tags.rs で確立した「日付不明 = UNIX_EPOCH = 十分古い」の設計判断に合わせる。
-    fn resolve_released_at(time: Option<&str>) -> DateTime<Utc> {
+    /// `time` が欠損またはパース不能な場合は日時不明として保持する。
+    fn resolve_released_at(time: Option<&str>) -> Option<DateTime<Utc>> {
         time.and_then(|t| t.parse::<DateTime<Utc>>().ok())
-            .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
     }
 }
 
@@ -147,10 +143,10 @@ impl RegistryAdapter for PackagistAdapter {
                 }
 
                 // リリースタイムスタンプをパース
-                // (time 欠損時は UNIX_EPOCH = 「十分古い」扱い。Utc::now() だと age フィルタで永久除外される)
+                // time が欠けても版自体は残し、age 判定に日付不明を伝える。
                 let released_at = Self::resolve_released_at(version_info.time.as_deref());
                 let normalized = Self::normalize_version(&version_info.version);
-                versions.push(VersionInfo::new(&normalized, released_at));
+                versions.push(VersionInfo::with_released_at(&normalized, released_at));
             }
         }
 
@@ -303,22 +299,16 @@ mod tests {
         assert!(info.time.is_none());
     }
 
-    /// バグ回帰テスト: `time` 欠損時の released_at は UNIX_EPOCH (= 十分古い) になる。
-    /// 以前は `Utc::now()` をフォールバックにしていたため、デフォルト有効の age フィルタ (1w)
-    /// で該当バージョンが「リリース直後」とみなされ永久に候補除外されていた。
     #[test]
-    fn test_resolve_released_at_missing_time_falls_back_to_epoch() {
-        assert_eq!(
-            PackagistAdapter::resolve_released_at(None),
-            DateTime::<Utc>::UNIX_EPOCH
-        );
+    fn test_resolve_released_at_missing_time_is_unknown() {
+        assert_eq!(PackagistAdapter::resolve_released_at(None), None);
     }
 
     #[test]
-    fn test_resolve_released_at_invalid_time_falls_back_to_epoch() {
+    fn test_resolve_released_at_invalid_time_is_unknown() {
         assert_eq!(
             PackagistAdapter::resolve_released_at(Some("not-a-timestamp")),
-            DateTime::<Utc>::UNIX_EPOCH
+            None
         );
     }
 
@@ -327,18 +317,11 @@ mod tests {
         let resolved = PackagistAdapter::resolve_released_at(Some("2023-02-14T15:00:00+00:00"));
         assert_eq!(
             resolved,
-            "2023-02-14T15:00:00+00:00"
-                .parse::<DateTime<Utc>>()
-                .unwrap()
+            Some(
+                "2023-02-14T15:00:00+00:00"
+                    .parse::<DateTime<Utc>>()
+                    .unwrap()
+            )
         );
-    }
-
-    /// epoch フォールバックされたバージョンが age フィルタを通過できることを確認
-    /// (cutoff = now - N days は常に 1970 年より新しいため `released_at <= cutoff` が成立する)
-    #[test]
-    fn test_epoch_fallback_passes_age_filter() {
-        let released_at = PackagistAdapter::resolve_released_at(None);
-        let cutoff_1w = Utc::now() - chrono::Duration::weeks(1);
-        assert!(released_at <= cutoff_1w);
     }
 }

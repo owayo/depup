@@ -220,4 +220,6 @@ mise の `[settings] minimum_release_age` が**明示的に書かれている**�
 
 `mise ls-remote` は各マニフェストのスコープで実行し、解決済みの cutoff を `--minimum-release-age <日時>` で渡します。グローバル・ローカル・ツール単位の明示 age と環境変数も読み、depup の値より厳しい制約を維持します。ツール単位の値はスコープ全体の最も厳しい値にまとめます。age が無効で明示制約もない場合だけ `0` を渡します。age で絞られた候補はスコープごとに異なるため、depup の共有キャッシュには入れず、mise 自身のキャッシュを使います。`minimum_release_age_excludes` は depup では適用せず、設定されている場合は警告を表示します。
 
+mise のバックエンドによっては、一部の版に `created_at` がありません。同じツール・同じベンダーのほかの版に日時があれば、日時不明の版は有効な age フィルターを通せず、公開日不明の理由でスキップします。そのツールの全版に日時がなければ更新は可能ですが、出力には日時不明と表示し、age は検証できません。欠けた日時を別の API へ問い合わせて補完することはしません。
+
 公開日時を返さないバックエンドの age 制御は mise に委譲します。ただし、mise 自身も日時不明の版を許可します。トップレベルの完全固定・lock 済みの版も native の age 制限から外れます。推移的依存に cutoff を渡すのは `npm:`・`pypi:` の未固定依存だけです（[mise の仕様](https://mise.jdx.dev/configuration/settings.html#minimum_release_age)）。

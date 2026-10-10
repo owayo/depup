@@ -279,9 +279,10 @@ impl RegistryAdapter for CratesIoAdapter {
                 .all(|locked| versions.iter().any(|info| info.version == *locked))
             && publisher_cutoff.is_none_or(|cutoff| {
                 locked.iter().all(|locked| {
-                    versions
-                        .iter()
-                        .any(|info| info.version == *locked && info.released_at <= cutoff)
+                    versions.iter().any(|info| {
+                        info.version == *locked
+                            && info.released_at.is_some_and(|date| date <= cutoff)
+                    })
                 })
             })
         {
@@ -311,7 +312,7 @@ mod tests {
         assert_eq!(locked[1].version, "1.0.1");
         assert_eq!(
             locked[1].released_at,
-            "2026-01-02T00:00:00Z".parse::<DateTime<Utc>>().unwrap()
+            Some("2026-01-02T00:00:00Z".parse::<DateTime<Utc>>().unwrap())
         );
     }
 

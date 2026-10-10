@@ -100,7 +100,8 @@ impl AgeExemptions {
         version: &VersionInfo,
         cutoff: DateTime<Utc>,
     ) -> bool {
-        version.released_at <= cutoff || self.exemption(language, package, version).is_some()
+        version.released_at.is_some_and(|date| date <= cutoff)
+            || self.exemption(language, package, version).is_some()
     }
 
     pub(crate) fn exemption(

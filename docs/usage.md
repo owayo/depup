@@ -47,6 +47,8 @@ depup --no-age
 
 The age filter applies to the versions depup writes into manifests; for transitive dependencies during `--install`, see [Transitive Dependencies and the Age Filter](#transitive-dependencies-and-the-age-filter). The GitHub Tags API does not return per-tag release timestamps, so the filter has no practical effect on Swift packages: every tag passes regardless of the cutoff. Cargo git dependencies are not subject to the age filter either.
 
+An unavailable release date is never treated as an old date. With an active age filter, depup excludes undated versions from registries that normally provide dates and reports `release date unavailable for <version>` when this prevents an update. Without an age filter, the version remains eligible. Backends that provide no dates at all, including GitHub Tags and some mise tools, remain eligible with age enabled; their update lines say `release date unknown`, so their age cannot be verified.
+
 #### Resolution Priority
 
 A minimum release age declared in the project (pnpm's or Bun's `minimumReleaseAge`, or mise's `minimum_release_age`) is treated as the **project policy** and takes precedence over the CLI `--age` and the global configuration file. The age for each manifest is resolved in this order (highest first):

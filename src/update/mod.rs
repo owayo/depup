@@ -457,14 +457,51 @@ impl UpdateJudge {
             available_versions
         };
 
+        // mise はバックエンドによって公開日を一切返さない。同じツール・同じ
+        // flavor に日付付きの版が一つでもあれば、日付欠落を age の対象にする。
+        // Swift の tag と Java の Maven metadata は一覧に日付がない。
+        // Java は選択後に POM の日時を取得して判定し直す。
+        let allow_undated = match dependency.language {
+            Language::Mise => available_versions.iter().all(|v| v.released_at.is_none()),
+            Language::Swift | Language::Java => true,
+            _ => false,
+        };
         let stable = self.stable_candidates(dependency, available_versions);
         let flavored = apply_java_flavor_filter(dependency, stable);
-        let age_filtered = self.apply_age_filter(dependency, flavored);
-        let range_filtered = apply_range_upper_bound(dependency, age_filtered);
-        let eligible = apply_rejected_versions(dependency, range_filtered);
+        let ranged = apply_range_upper_bound(dependency, flavored);
+        let before_age = apply_rejected_versions(dependency, ranged);
+        let age_enabled = self
+            .filter
+            .min_age
+            .and_then(|age| crate::domain::cutoff_from(self.now, age))
+            .is_some();
+        let unknown_newer = if age_enabled && !allow_undated {
+            apply_max_change_filter(dependency, &before_age, self.filter.max_change)
+                .into_iter()
+                .filter(|v| {
+                    v.released_at.is_none()
+                        && self
+                            .filter
+                            .age_exempt
+                            .exemption(dependency.language, &dependency.name, v)
+                            .is_none()
+                        && compare_dependency_versions(dependency, &v.version, dependency.version())
+                            == std::cmp::Ordering::Greater
+                })
+                .max_by(|a, b| compare_dependency_versions(dependency, &a.version, &b.version))
+                .map(|v| v.version.clone())
+        } else {
+            None
+        };
+        let eligible = self.apply_age_filter(dependency, before_age, allow_undated);
 
         if eligible.is_empty() {
-            return UpdateResult::skip(dependency.clone(), SkipReason::NoSuitableVersion);
+            return UpdateResult::skip(
+                dependency.clone(),
+                unknown_newer
+                    .map(SkipReason::ReleaseDateUnknown)
+                    .unwrap_or(SkipReason::NoSuitableVersion),
+            );
         }
 
         let allowed = apply_max_change_filter(dependency, &eligible, self.filter.max_change);
@@ -485,7 +522,7 @@ impl UpdateJudge {
                 .iter()
                 .max_by(|a, b| compare_dependency_versions(dependency, &a.version, &b.version))
                 .unwrap();
-            return UpdateResult::skip_already_latest_with_date(
+            return UpdateResult::skip_already_latest_with_optional_date(
                 dependency.clone(),
                 latest.released_at,
             );
@@ -502,7 +539,7 @@ impl UpdateJudge {
                     allowed
                         .iter()
                         .find(|info| &info.version == new_version)
-                        .filter(|info| info.released_at > cutoff)
+                        .filter(|info| info.released_at.is_none_or(|date| date > cutoff))
                 })
                 .and_then(|info| {
                     self.filter
@@ -511,6 +548,16 @@ impl UpdateJudge {
                 }),
             _ => None,
         };
+        if matches!(
+            &result,
+            UpdateResult::Skip {
+                reason: SkipReason::AlreadyLatest,
+                ..
+            }
+        ) && let Some(version) = unknown_newer
+        {
+            return UpdateResult::skip(dependency.clone(), SkipReason::ReleaseDateUnknown(version));
+        }
         result.with_age_exemption(exemption)
     }
 
@@ -554,7 +601,13 @@ impl UpdateJudge {
     }
 
     pub(crate) fn admits_age(&self, dependency: &Dependency, version: &VersionInfo) -> bool {
-        !self.apply_age_filter(dependency, vec![version]).is_empty()
+        !self
+            .apply_age_filter(
+                dependency,
+                vec![version],
+                dependency.language == Language::Java,
+            )
+            .is_empty()
     }
 
     /// `min_age` が設定されていれば、現在時刻から逆算したリリース時刻以前のものだけを残す。
@@ -562,6 +615,7 @@ impl UpdateJudge {
         &self,
         dependency: &Dependency,
         candidates: Vec<&'a VersionInfo>,
+        allow_undated: bool,
     ) -> Vec<&'a VersionInfo> {
         let Some(min_age) = self.filter.min_age else {
             return candidates;
@@ -575,12 +629,13 @@ impl UpdateJudge {
         candidates
             .into_iter()
             .filter(|v| {
-                self.filter.age_exempt.admits(
-                    dependency.language,
-                    &dependency.name,
-                    v,
-                    min_release_time,
-                )
+                (allow_undated && v.released_at.is_none())
+                    || self.filter.age_exempt.admits(
+                        dependency.language,
+                        &dependency.name,
+                        v,
+                        min_release_time,
+                    )
             })
             .collect()
     }
@@ -763,7 +818,8 @@ fn mise_flavor_candidates(dependency: &Dependency, versions: &[VersionInfo]) -> 
         .iter()
         .filter_map(|info| {
             let (candidate_flavor, core) = crate::parser::split_mise_flavor(&info.version)?;
-            (candidate_flavor == flavor).then(|| VersionInfo::new(core, info.released_at))
+            (candidate_flavor == flavor)
+                .then(|| VersionInfo::with_released_at(core, info.released_at))
         })
         .collect()
 }
@@ -819,7 +875,10 @@ fn select_latest_candidate(
                 return UpdateResult::skip(dependency.clone(), SkipReason::ChangeLevelLimited(max));
             }
         }
-        return UpdateResult::skip_already_latest_with_date(dependency.clone(), latest.released_at);
+        return UpdateResult::skip_already_latest_with_optional_date(
+            dependency.clone(),
+            latest.released_at,
+        );
     }
 
     // 更新先の文字列表現を安全に組み立てられない制約は更新対象にしない
@@ -834,10 +893,13 @@ fn select_latest_candidate(
     // phantom update (例: Wildcard `1.x` の範囲内に最新版がある場合)。
     // writer が no-op なのに毎回「更新あり」と報告し続けないよう AlreadyLatest にする。
     if formatted == dependency.version_spec.raw {
-        return UpdateResult::skip_already_latest_with_date(dependency.clone(), latest.released_at);
+        return UpdateResult::skip_already_latest_with_optional_date(
+            dependency.clone(),
+            latest.released_at,
+        );
     }
 
-    UpdateResult::update_with_date(dependency.clone(), &latest.version, latest.released_at)
+    UpdateResult::update_with_optional_date(dependency.clone(), &latest.version, latest.released_at)
 }
 
 #[cfg(test)]
@@ -3090,6 +3152,115 @@ mod tests {
             .parse(raw)
             .expect("parsable mise version");
         Dependency::new(name, spec, false, Language::Mise)
+    }
+
+    #[test]
+    fn mise_unknown_newer_date_is_reported_when_other_versions_are_dated() {
+        let now = fixed_time();
+        let dep = make_mise_dependency("python", "3.14.7");
+        let versions = vec![
+            VersionInfo::new("3.14.7", now - chrono::Duration::days(60)),
+            VersionInfo::undated("3.15.0"),
+        ];
+        let judge = UpdateJudge::with_time(
+            UpdateFilter::new().with_min_age(std::time::Duration::from_secs(14 * 86400)),
+            now,
+        );
+
+        assert!(matches!(
+            judge.judge(&dep, &versions),
+            UpdateResult::Skip {
+                reason: SkipReason::ReleaseDateUnknown(version),
+                ..
+            } if version == "3.15.0"
+        ));
+        assert!(matches!(
+            UpdateJudge::with_time(UpdateFilter::new(), now).judge(&dep, &versions),
+            UpdateResult::Update {
+                new_version,
+                released_at: None,
+                ..
+            } if new_version == "3.15.0"
+        ));
+    }
+
+    #[test]
+    fn mise_all_unknown_dates_keep_backend_without_dates_updatable() {
+        let now = fixed_time();
+        let dep = make_mise_dependency("tool", "1.0.0");
+        let versions = vec![VersionInfo::undated("1.0.0"), VersionInfo::undated("1.1.0")];
+        let judge = UpdateJudge::with_time(
+            UpdateFilter::new().with_min_age(std::time::Duration::from_secs(14 * 86400)),
+            now,
+        );
+        assert!(matches!(
+            judge.judge(&dep, &versions),
+            UpdateResult::Update {
+                new_version,
+                released_at: None,
+                ..
+            } if new_version == "1.1.0"
+        ));
+    }
+
+    #[test]
+    fn mise_date_coverage_is_scoped_to_selected_vendor() {
+        let now = fixed_time();
+        let dep = make_mise_dependency("java", "temurin-21.0.5");
+        let versions = vec![
+            VersionInfo::undated("temurin-21.0.5"),
+            VersionInfo::undated("temurin-21.0.9"),
+            VersionInfo::new("zulu-27.0.0", now - chrono::Duration::days(30)),
+        ];
+        let judge = UpdateJudge::with_time(
+            UpdateFilter::new().with_min_age(std::time::Duration::from_secs(14 * 86400)),
+            now,
+        );
+        assert!(matches!(
+            judge.judge(&dep, &versions),
+            UpdateResult::Update {
+                new_version,
+                released_at: None,
+                ..
+            } if new_version == "21.0.9"
+        ));
+    }
+
+    #[test]
+    fn mise_prefers_older_dated_update_over_unknown_newer_version() {
+        let now = fixed_time();
+        let dep = make_mise_dependency("python", "3.14.0");
+        let versions = vec![
+            VersionInfo::new("3.14.0", now - chrono::Duration::days(90)),
+            VersionInfo::new("3.14.7", now - chrono::Duration::days(30)),
+            VersionInfo::undated("3.15.0"),
+        ];
+        let judge = UpdateJudge::with_time(
+            UpdateFilter::new().with_min_age(std::time::Duration::from_secs(14 * 86400)),
+            now,
+        );
+        assert!(matches!(
+            judge.judge(&dep, &versions),
+            UpdateResult::Update { new_version, .. } if new_version == "3.14.7"
+        ));
+    }
+
+    #[test]
+    fn registries_with_release_dates_do_not_accept_unknown_dates_with_age() {
+        let now = fixed_time();
+        let dep = make_dependency("package", "1.0.0", Language::Php, false);
+        let versions = vec![VersionInfo::undated("2.0.0")];
+        let judge = UpdateJudge::with_time(
+            UpdateFilter::new().with_min_age(std::time::Duration::from_secs(14 * 86400)),
+            now,
+        );
+        assert!(matches!(
+            judge.judge(&dep, &versions),
+            UpdateResult::Skip {
+                reason: SkipReason::ReleaseDateUnknown(version),
+                ..
+            } if version == "2.0.0"
+        ));
     }
 
     /// `temurin-21.0.5` の利用者が別ベンダー (`zulu-`) や接頭辞なしの版へ
