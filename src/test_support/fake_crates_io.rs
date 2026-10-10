@@ -118,13 +118,17 @@ mod tests {
 
         let versions = fake.fetch_versions("solo").await.unwrap();
 
-        let pairs: Vec<(&str, DateTime<Utc>)> = versions
+        let pairs: Vec<(&str, Option<DateTime<Utc>>)> = versions
             .iter()
             .map(|v| (v.version.as_str(), v.released_at))
             .collect();
         assert_eq!(
             pairs,
-            vec![("0.9.0", day(1)), ("1.0.2", day(2)), ("1.0.10", day(3))]
+            vec![
+                ("0.9.0", Some(day(1))),
+                ("1.0.2", Some(day(2))),
+                ("1.0.10", Some(day(3)))
+            ]
         );
     }
 

@@ -159,27 +159,22 @@ fn is_valid_tool_name(name: &str) -> bool {
 /// - `2026-08-26T13:05:28.0Z` (RFC 3339)
 /// - `2025-03-28T22:04:28.484345` (タイムゾーンなし。UTC とみなす)
 ///
-/// どちらでも読めない場合や欠落時は `UNIX_EPOCH` を返す。「十分に古い」扱いに
-/// なるため、公開日を取得できないバックエンドの版が age フィルタで
-/// 永久に除外されることはない (GitHub Tags アダプタと同じ方針)。
-fn parse_created_at(raw: Option<&str>) -> DateTime<Utc> {
-    let epoch = Utc.timestamp_opt(0, 0).single().unwrap_or_default();
-    let Some(text) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
-        return epoch;
-    };
+/// 欠落・不正な日付は実在する日時に置き換えず、公開日不明として返す。
+fn parse_created_at(raw: Option<&str>) -> Option<DateTime<Utc>> {
+    let text = raw.map(str::trim).filter(|s| !s.is_empty())?;
 
     if let Ok(parsed) = DateTime::parse_from_rfc3339(text) {
-        return parsed.with_timezone(&Utc);
+        return Some(parsed.with_timezone(&Utc));
     }
     for format in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%d"] {
         if let Ok(naive) = NaiveDateTime::parse_from_str(text, format) {
-            return Utc.from_utc_datetime(&naive);
+            return Some(Utc.from_utc_datetime(&naive));
         }
     }
     if let Ok(date) = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d") {
-        return Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).unwrap_or_default());
+        return Some(Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0)?));
     }
-    epoch
+    None
 }
 
 /// `mise ls-remote --json` の出力を `VersionInfo` に変換する
@@ -200,7 +195,7 @@ fn parse_ls_remote_json(package: &str, stdout: &str) -> Result<Vec<VersionInfo>,
         .into_iter()
         .filter(|entry| !entry.version.trim().is_empty())
         .map(|entry| {
-            VersionInfo::new(
+            VersionInfo::with_released_at(
                 entry.version.trim().to_string(),
                 parse_created_at(entry.created_at.as_deref()),
             )
@@ -432,7 +427,7 @@ mod tests {
     #[test]
     fn test_parse_created_at_rfc3339() {
         let parsed = parse_created_at(Some("2026-08-26T13:05:28.0Z"));
-        assert_eq!(parsed.to_rfc3339(), "2026-08-26T13:05:28+00:00");
+        assert_eq!(parsed.unwrap().to_rfc3339(), "2026-08-26T13:05:28+00:00");
     }
 
     /// タイムゾーンなしの表記 (asdf 系プラグインが返す) も UTC として読む
@@ -440,16 +435,16 @@ mod tests {
     fn test_parse_created_at_naive() {
         let parsed = parse_created_at(Some("2025-03-28T22:04:28.484345"));
         assert_eq!(
-            parsed.format("%Y-%m-%d %H:%M:%S").to_string(),
+            parsed.unwrap().format("%Y-%m-%d %H:%M:%S").to_string(),
             "2025-03-28 22:04:28"
         );
     }
 
     #[test]
-    fn test_parse_created_at_missing_falls_back_to_epoch() {
-        assert_eq!(parse_created_at(None).timestamp(), 0);
-        assert_eq!(parse_created_at(Some("")).timestamp(), 0);
-        assert_eq!(parse_created_at(Some("not a date")).timestamp(), 0);
+    fn test_parse_created_at_missing_is_unknown() {
+        assert_eq!(parse_created_at(None), None);
+        assert_eq!(parse_created_at(Some("")), None);
+        assert_eq!(parse_created_at(Some("not a date")), None);
     }
 
     #[test]
@@ -470,7 +465,7 @@ mod tests {
         let json = r#"[{"version":"1.2.3"},{"version":"1.2.4","prerelease":false}]"#;
         let versions = parse_ls_remote_json("ubi:owner/repo", json).unwrap();
         assert_eq!(versions.len(), 2);
-        assert_eq!(versions[0].released_at.timestamp(), 0);
+        assert_eq!(versions[0].released_at, None);
     }
 
     #[test]

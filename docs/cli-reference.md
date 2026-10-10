@@ -94,7 +94,7 @@ depup --cd ./projects/myapp -n
 ### Text Output (Default)
 
 - `🔧` indicates development dependencies (such as devDependencies)
-- Release date shown in `(yyyy/mm/dd HH:MM)` format
+- Known release dates are shown in `(yyyy/mm/dd HH:MM)` format; unavailable dates appear as `(release date unknown)`
 - Change type: `[major]`, `[minor]`, `[patch]`
 - `✓ OSV` marks versions that passed the vulnerability check. A `↳ OSV skipped:` line below an update lists the vulnerable versions that were removed from the candidates; the dependency itself was still updated
 - Skipped dependencies are counted in each manifest heading (`— N updates, M skips`) and in the summary; a manifest with no updates also shows the count per reason

@@ -21,6 +21,8 @@ pub enum SkipReason {
     FetchFailed(String),
     /// 適切なバージョンが見つからない (例: 経過日数フィルタで全バージョンが除外)
     NoSuitableVersion,
+    /// 更新候補の公開日が不明で、age 制約を確認できない
+    ReleaseDateUnknown(String),
     /// バージョンのパースに失敗
     ParseError(String),
     /// 言語フィルタで除外された
@@ -39,6 +41,9 @@ impl fmt::Display for SkipReason {
             SkipReason::NotInOnlyList => write!(f, "not in --only list"),
             SkipReason::FetchFailed(msg) => write!(f, "fetch failed: {}", msg),
             SkipReason::NoSuitableVersion => write!(f, "no suitable version"),
+            SkipReason::ReleaseDateUnknown(version) => {
+                write!(f, "release date unavailable for {version}")
+            }
             SkipReason::ParseError(msg) => write!(f, "parse error: {}", msg),
             SkipReason::LanguageFiltered => write!(f, "language filtered"),
             SkipReason::ChangeLevelLimited(level) => {
@@ -117,10 +122,19 @@ impl UpdateResult {
         new_version: impl Into<String>,
         released_at: DateTime<Utc>,
     ) -> Self {
+        Self::update_with_optional_date(dependency, new_version, Some(released_at))
+    }
+
+    /// 公開日の有無を保った Update 結果を作成する
+    pub fn update_with_optional_date(
+        dependency: Dependency,
+        new_version: impl Into<String>,
+        released_at: Option<DateTime<Utc>>,
+    ) -> Self {
         UpdateResult::Update {
             dependency,
             new_version: new_version.into(),
-            released_at: Some(released_at),
+            released_at,
             osv_skipped: Vec::new(),
             osv_checked: false,
             age_exemption: None,
@@ -178,10 +192,18 @@ impl UpdateResult {
         dependency: Dependency,
         released_at: DateTime<Utc>,
     ) -> Self {
+        Self::skip_already_latest_with_optional_date(dependency, Some(released_at))
+    }
+
+    /// 公開日の有無を保った AlreadyLatest 結果を作成する
+    pub fn skip_already_latest_with_optional_date(
+        dependency: Dependency,
+        released_at: Option<DateTime<Utc>>,
+    ) -> Self {
         UpdateResult::Skip {
             dependency,
             reason: SkipReason::AlreadyLatest,
-            released_at: Some(released_at),
+            released_at,
         }
     }
 

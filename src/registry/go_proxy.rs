@@ -397,15 +397,13 @@ fn is_retracted(version: &str, retractions: &[Retraction]) -> bool {
 
 /// Go Proxy の `.info` 応答を共通のバージョン情報へ変換する。
 ///
-/// `Time` はプロキシ仕様上省略可能なため、欠落または不正値なら UNIX epoch を使い、
-/// `--age` によって日付不明の正当なバージョンが除外されないようにする。
+/// `Time` はプロキシ仕様上省略可能。欠落または不正値なら日時不明として保持する。
 fn into_version_info(info: VersionInfoResponse) -> VersionInfo {
     let released_at = info
         .time
         .as_deref()
-        .and_then(|time| time.parse::<DateTime<Utc>>().ok())
-        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
-    VersionInfo::new(info.version, released_at)
+        .and_then(|time| time.parse::<DateTime<Utc>>().ok());
+    VersionInfo::with_released_at(info.version, released_at)
 }
 
 #[async_trait]
@@ -654,24 +652,24 @@ mod tests {
     }
 
     #[test]
-    fn test_info_without_time_uses_unix_epoch() {
+    fn test_info_without_time_has_unknown_release_date() {
         let response: VersionInfoResponse =
             serde_json::from_str(r#"{"Version":"v0.0.0-20240101000000-abcdef123456"}"#).unwrap();
         let info = into_version_info(response);
 
         assert_eq!(info.version, "v0.0.0-20240101000000-abcdef123456");
-        assert_eq!(info.released_at, DateTime::<Utc>::UNIX_EPOCH);
+        assert_eq!(info.released_at, None);
     }
 
     #[test]
-    fn test_info_with_invalid_time_uses_unix_epoch() {
+    fn test_info_with_invalid_time_has_unknown_release_date() {
         let response = VersionInfoResponse {
             version: "v1.0.0".to_string(),
             time: Some("not-a-date".to_string()),
         };
         let info = into_version_info(response);
 
-        assert_eq!(info.released_at, DateTime::<Utc>::UNIX_EPOCH);
+        assert_eq!(info.released_at, None);
     }
 
     #[test]

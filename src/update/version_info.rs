@@ -17,8 +17,8 @@ use std::sync::LazyLock;
 pub struct VersionInfo {
     /// バージョン文字列 (例: "1.2.3")
     pub version: String,
-    /// このバージョンがリリースされた日時
-    pub released_at: DateTime<Utc>,
+    /// このバージョンがリリースされた日時。取得できない場合は None。
+    pub released_at: Option<DateTime<Utc>>,
     /// レジストリが確認した公開者。自己申告の repository URL は使わない。
     #[serde(default, skip_serializing_if = "super::PublisherEvidence::is_unknown")]
     pub publisher: super::PublisherEvidence,
@@ -27,6 +27,19 @@ pub struct VersionInfo {
 impl VersionInfo {
     /// 新しいVersionInfoを作成する
     pub fn new(version: impl Into<String>, released_at: DateTime<Utc>) -> Self {
+        Self::with_released_at(version, Some(released_at))
+    }
+
+    /// 公開日が不明なバージョンを作成する
+    pub fn undated(version: impl Into<String>) -> Self {
+        Self::with_released_at(version, None)
+    }
+
+    /// レジストリが返した公開日の有無を保って作成する
+    pub fn with_released_at(
+        version: impl Into<String>,
+        released_at: Option<DateTime<Utc>>,
+    ) -> Self {
         Self {
             version: version.into(),
             released_at,
@@ -36,11 +49,7 @@ impl VersionInfo {
 
     /// リリース日として現在時刻を使用してVersionInfoを作成する
     pub fn now(version: impl Into<String>) -> Self {
-        Self {
-            version: version.into(),
-            released_at: Utc::now(),
-            publisher: super::PublisherEvidence::Unknown,
-        }
+        Self::new(version, Utc::now())
     }
 
     /// このバージョンがプレリリース (alpha, beta, rc, canary, dev 等) かチェックする
@@ -1028,7 +1037,7 @@ mod tests {
         let date = Utc.with_ymd_and_hms(2024, 1, 15, 10, 0, 0).unwrap();
         let info = VersionInfo::new("1.2.3", date);
         assert_eq!(info.version, "1.2.3");
-        assert_eq!(info.released_at, date);
+        assert_eq!(info.released_at, Some(date));
     }
 
     #[test]
@@ -1038,8 +1047,8 @@ mod tests {
         let after = Utc::now();
 
         assert_eq!(info.version, "1.0.0");
-        assert!(info.released_at >= before);
-        assert!(info.released_at <= after);
+        assert!(info.released_at >= Some(before));
+        assert!(info.released_at <= Some(after));
     }
 
     #[test]
@@ -1228,7 +1237,7 @@ mod tests {
         let parsed: VersionInfo = serde_json::from_str(&json).unwrap();
 
         assert_eq!(parsed.version, "1.2.3");
-        assert_eq!(parsed.released_at, date);
+        assert_eq!(parsed.released_at, Some(date));
     }
 
     #[test]

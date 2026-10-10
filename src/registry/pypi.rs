@@ -137,12 +137,9 @@ impl RegistryAdapter for PyPIAdapter {
             }
 
             // リリースファイルの中から最も早いアップロード時刻を取得
-            // (全ファイルが upload_time_iso_8601 を欠く/壊れている場合は
-            //  UNIX_EPOCH = 「十分古い」扱い。リリースごと捨てると公開日不明の
-            //  バージョンが無言で候補から消え、有効な更新を取りこぼす)
-            let released_at =
-                Self::earliest_upload_time(&release_files).unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
-            versions.push(VersionInfo::new(&version, released_at));
+            // 欠落・不正な場合は日時不明として保持する。
+            let released_at = Self::earliest_upload_time(&release_files);
+            versions.push(VersionInfo::with_released_at(&version, released_at));
         }
 
         // バージョンでソート
@@ -258,19 +255,13 @@ mod tests {
         assert!(!PyPIAdapter::is_release_installable(yanked_release));
     }
 
-    /// バグ回帰テスト: `upload_time_iso_8601` を読めるファイルが 1 件も無いリリースは
-    /// UNIX_EPOCH (= 十分古い) にフォールバックし、候補から無言で消えないようにする。
-    /// 以前は `if let Some(...)` に else が無く、日付不明のリリースを丸ごと捨てていた。
+    /// 公開日を読めないリリースは日時不明として保持し、候補からは捨てない。
     #[test]
-    fn test_earliest_upload_time_missing_falls_back_to_epoch() {
+    fn test_earliest_upload_time_missing_is_unknown() {
         // upload_time_iso_8601 が欠損
         let json = r#"[{"yanked": false}]"#;
         let files: Vec<ReleaseInfo> = serde_json::from_str(json).unwrap();
         assert_eq!(PyPIAdapter::earliest_upload_time(&files), None);
-        assert_eq!(
-            PyPIAdapter::earliest_upload_time(&files).unwrap_or(DateTime::<Utc>::UNIX_EPOCH),
-            DateTime::<Utc>::UNIX_EPOCH
-        );
 
         // 日付として解釈できない値
         let json = r#"[{"upload_time_iso_8601": "not-a-date", "yanked": false}]"#;

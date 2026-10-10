@@ -13,7 +13,6 @@ use crate::registry::client::map_status_error;
 use crate::registry::{HttpClient, RegistryAdapter, is_valid_registry_id_segment};
 use crate::update::VersionInfo;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::collections::HashSet;
 
@@ -131,9 +130,8 @@ fn collect_tag_versions<I>(
             continue;
         }
         // GitHub Tags API はリリース日を返さない。
-        // `Utc::now()` を使うと `--age` フィルタが全 Swift 更新を抑制してしまうため、
-        // age フィルタを通過させるための「十分古い」値として UNIX_EPOCH を採用する。
-        versions.push(VersionInfo::new(version, DateTime::<Utc>::UNIX_EPOCH));
+        // 日付不明を実在する公開日時として表示しない。
+        versions.push(VersionInfo::undated(version));
     }
 }
 
@@ -734,20 +732,10 @@ mod tests {
         assert!(message.contains("1000 tags"));
     }
 
-    /// バグ回帰テスト: GitHub Tags API はリリース日を返さないため、
-    /// `--age` フィルタが Swift 更新を全スキップしないように
-    /// `released_at` には UNIX_EPOCH (= 古いとして扱う) を使う。
-    /// 以前は `Utc::now()` を使っていたため、`--age 1d` 等で全 Swift 更新が抑制されていた。
+    /// GitHub Tags API が返さない公開日を実在する日時として扱わない。
     #[test]
-    fn test_version_info_uses_epoch_for_age_filter_compatibility() {
-        let epoch = DateTime::<Utc>::UNIX_EPOCH;
-        let info = VersionInfo::new("1.2.3", epoch);
-        assert_eq!(info.released_at, epoch);
-        // 通常の age 指定 (例: 1日前) のカットオフは UNIX_EPOCH (1970年) より新しいので、
-        // epoch をリリース日とするバージョンは age フィルタを通過する。
-        let cutoff_1d = Utc::now() - chrono::Duration::days(1);
-        assert!(info.released_at <= cutoff_1d);
-        let cutoff_1y = Utc::now() - chrono::Duration::days(365);
-        assert!(info.released_at <= cutoff_1y);
+    fn test_version_info_has_unknown_release_date() {
+        let info = VersionInfo::undated("1.2.3");
+        assert_eq!(info.released_at, None);
     }
 }

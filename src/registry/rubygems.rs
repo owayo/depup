@@ -75,15 +75,9 @@ impl RubyGemsAdapter {
 
     /// `created_at` からリリース日時を解決する
     ///
-    /// 欠損またはパース不能な場合は UNIX_EPOCH (= 「十分古い」) へフォールバックする。
-    /// 以前は候補ごと捨てていたため、日付が読めないバージョンが無言で候補から消え、
-    /// 有効な更新を取りこぼしていた。`Utc::now()` をフォールバックに使うと、デフォルト
-    /// 有効の age フィルタ (1w) が「リリース直後」とみなして永久に除外してしまう。
-    /// packagist / go_proxy / github_tags と同じ「日付不明 = UNIX_EPOCH」方針に揃える。
-    fn resolve_released_at(created_at: Option<&str>) -> DateTime<Utc> {
-        created_at
-            .and_then(|t| t.parse::<DateTime<Utc>>().ok())
-            .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
+    /// 欠損またはパース不能な場合は日時不明として保持する。
+    fn resolve_released_at(created_at: Option<&str>) -> Option<DateTime<Utc>> {
+        created_at.and_then(|t| t.parse::<DateTime<Utc>>().ok())
     }
 }
 
@@ -121,10 +115,12 @@ impl RegistryAdapter for RubyGemsAdapter {
             }
 
             // 作成日時タイムスタンプをパース
-            // (欠損・不正時は UNIX_EPOCH = 「十分古い」扱い。候補ごと捨てると
-            //  公開日不明のバージョンが無言で消え、有効な更新を取りこぼす)
+            // 公開日が欠けても版自体は残し、age 判定に日付不明を伝える。
             let released_at = Self::resolve_released_at(version_info.created_at.as_deref());
-            versions.push(VersionInfo::new(&version_info.number, released_at));
+            versions.push(VersionInfo::with_released_at(
+                &version_info.number,
+                released_at,
+            ));
         }
 
         // バージョンでソート
@@ -257,23 +253,15 @@ mod tests {
         assert_eq!(kept[1].number, "1.6.0");
     }
 
-    /// バグ回帰テスト: `created_at` が欠損・不正な場合も UNIX_EPOCH (= 十分古い) として
-    /// 候補に残す。以前は `if let Ok(...)` に else が無く、日付を読めないバージョンを
-    /// 丸ごと捨てていたため、有効な更新が無言で取りこぼされていた。
+    /// 欠損・不正な公開日は日時不明として保持する。
     #[test]
-    fn test_resolve_released_at_missing_falls_back_to_epoch() {
-        assert_eq!(
-            RubyGemsAdapter::resolve_released_at(None),
-            DateTime::<Utc>::UNIX_EPOCH
-        );
+    fn test_resolve_released_at_missing_is_unknown() {
+        assert_eq!(RubyGemsAdapter::resolve_released_at(None), None);
         assert_eq!(
             RubyGemsAdapter::resolve_released_at(Some("not-a-date")),
-            DateTime::<Utc>::UNIX_EPOCH
+            None
         );
-        assert_eq!(
-            RubyGemsAdapter::resolve_released_at(Some("")),
-            DateTime::<Utc>::UNIX_EPOCH
-        );
+        assert_eq!(RubyGemsAdapter::resolve_released_at(Some("")), None);
     }
 
     #[test]
@@ -282,19 +270,19 @@ mod tests {
         let expected = "2023-10-05T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
         assert_eq!(
             RubyGemsAdapter::resolve_released_at(Some("2023-10-05T12:00:00Z")),
-            expected
+            Some(expected)
         );
     }
 
     #[test]
     fn test_deserialize_version_info_without_created_at() {
-        // created_at が無いレスポンスでもデシリアライズは成功し、日付は epoch 扱いになる
+        // created_at が無いレスポンスでもデシリアライズは成功する
         let json = r#"{"number": "1.0.0"}"#;
         let info: RubyGemsVersionInfo = serde_json::from_str(json).unwrap();
         assert_eq!(info.number, "1.0.0");
         assert_eq!(
             RubyGemsAdapter::resolve_released_at(info.created_at.as_deref()),
-            DateTime::<Utc>::UNIX_EPOCH
+            None
         );
     }
 
