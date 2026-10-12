@@ -462,6 +462,11 @@ jobs:
 
   # ---- winget のブロック (外し方は冒頭) ----------------------------------------------------
   # winget-pkgs へ更新の PR を出す。トークンは classic PAT (public_repo) を Secrets の WINGET_TOKEN に置く。
+  # PR を出す前に、fork (<owner>/winget-pkgs) を microsoft/winget-pkgs に同期する。upstream が .github/workflows/ を
+  # 変えた後の同期には Workflows の書き込み権限が要り、public_repo の PAT では winget-releaser の同期が UpdateRef の
+  # 権限不足で落ちる。同期だけを、fork にだけ入れた GitHub App のトークンで先に行う (App の Client ID は Variables の
+  # WINGET_SYNC_APP_CLIENT_ID、秘密鍵は Secrets の WINGET_SYNC_APP_PRIVATE_KEY。作り方は distribution.md)。PAT に
+  # workflow の scope は足さない (漏れたときに、持ち主の全 public リポジトリの workflow を書き換えられる)。
   # winget-releaser は「既に winget-pkgs にある版の更新」しかできないので、初版は手で出す (distribution.md)
   publish-winget:
     name: Publish to winget
@@ -472,21 +477,28 @@ jobs:
       WINGET_IDENTIFIER: owayo.depup
     outputs:
       submitted: ${{ steps.submit.outcome == 'success' }}
-      # no-token / not-registered / registered / unknown (提出しなかった理由を release-summary に渡す)
+      # no-token / no-sync-app / not-registered / registered / unknown (提出しなかった理由を release-summary に渡す)
       state: ${{ steps.registration.outputs.state || steps.token.outputs.state }}
     steps:
-      # トークンが無ければリリース全体を落とさずに飛ばす (jobs.<id>.if では secrets を読めない)
+      # トークンか、fork を同期する App の設定が無ければ、リリース全体を落とさずに飛ばす (jobs.<id>.if では secrets を
+      # 読めない)。値そのものは渡さず、有無だけを式で渡す
       - name: Check the winget token
         id: token
         env:
           HAS_TOKEN: ${{ secrets.WINGET_TOKEN != '' }}
+          HAS_SYNC_CLIENT_ID: ${{ vars.WINGET_SYNC_APP_CLIENT_ID != '' }}
+          HAS_SYNC_PRIVATE_KEY: ${{ secrets.WINGET_SYNC_APP_PRIVATE_KEY != '' }}
         run: |
-          if [ "${HAS_TOKEN}" = "true" ]; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          else
+          if [ "${HAS_TOKEN}" != "true" ]; then
             echo "::warning::The secret WINGET_TOKEN is not set; skipped the winget-pkgs submission"
             echo "available=false" >> "$GITHUB_OUTPUT"
             echo "state=no-token" >> "$GITHUB_OUTPUT"
+          elif [ "${HAS_SYNC_CLIENT_ID}" != "true" ] || [ "${HAS_SYNC_PRIVATE_KEY}" != "true" ]; then
+            echo "::warning::The GitHub App for the winget fork is not configured (variable WINGET_SYNC_APP_CLIENT_ID and secret WINGET_SYNC_APP_PRIVATE_KEY); skipped the winget-pkgs submission"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "state=no-sync-app" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
           fi
 
       # 初版のマニフェストはモデレータの承認待ちで数日かかることがあり、その間 winget-releaser は
@@ -532,8 +544,8 @@ jobs:
               ;;
           esac
 
-      # upstream の workflow 変更を含む fork 同期には Workflows の書き込み権限が要る。
-      # PR 提出用の classic PAT は public_repo のままにし、同期だけ専用 App で行う
+      # App のトークンは同期の直前に作る (トークンに手が届く時間を短くする)。対象は fork だけ、権限は contents と
+      # workflows の write だけ (upstream の workflow の変更を fork に取り込むのに workflows: write が要る)
       - name: Create a token for the winget fork
         id: sync-token
         if: steps.registration.outputs.registered == 'true'
@@ -546,6 +558,8 @@ jobs:
           permission-contents: write
           permission-workflows: write
 
+      # fork の master を upstream の master に追いつかせる (追いついていれば何も書かない)。先に同期しておけば、
+      # winget-releaser が提出の前に行う同期は書くものが無く、PAT の権限のままで通る
       - name: Sync the winget-pkgs fork
         if: steps.registration.outputs.registered == 'true'
         env:
@@ -620,6 +634,7 @@ jobs:
               case "${WINGET_SUBMITTED:-}/${WINGET_STATE:-}" in
                 true/*) note="submitted a pull request to microsoft/winget-pkgs" ;;
                 */no-token) note="skipped: the secret WINGET_TOKEN is not set" ;;
+                */no-sync-app) note="skipped: the GitHub App for the winget fork is not configured" ;;
                 */not-registered) note="skipped: the first manifest is not merged into winget-pkgs yet" ;;
                 *) note="not submitted" ;;
               esac
