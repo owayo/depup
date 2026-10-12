@@ -14,6 +14,8 @@ use std::time::Duration;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallScope {
     Full,
+    /// Full Cargo update at a root already confirmed by the planner.
+    CargoFull,
     Packages(Vec<String>),
     /// Reconcile changed requirements without unlocking unrelated Cargo packages.
     CargoWorkspace,
@@ -222,7 +224,7 @@ impl SystemPackageManager {
         out
     }
 
-    fn scoped_install_args(
+    pub(crate) fn scoped_install_args(
         &self,
         pm: &str,
         policy: &crate::update::AgePolicy,
@@ -230,6 +232,7 @@ impl SystemPackageManager {
     ) -> Result<Vec<String>, String> {
         let mut args = self.get_install_command_args_for_policy(pm, policy);
         match (pm, scope) {
+            ("cargo", InstallScope::CargoFull) => {}
             ("cargo", InstallScope::CargoWorkspace) => args.push("--workspace".into()),
             ("cargo", InstallScope::Packages(packages)) if !packages.is_empty() => {
                 for package in packages {
@@ -278,8 +281,7 @@ impl SystemPackageManager {
             && pm == "pnpm"
         {
             // 分への切り捨てでプロジェクトの秒単位の制約を弱めない。
-            let minutes = age.as_secs().div_ceil(60)
-                + u64::from(age.subsec_nanos() != 0 && age.as_secs().is_multiple_of(60));
+            let minutes = pnpm_age_minutes(age);
             env.push((
                 "npm_config_minimum_release_age".to_string(),
                 minutes.to_string(),
@@ -372,6 +374,12 @@ impl SystemPackageManager {
         }
         cmd.output()
     }
+}
+
+/// pnpm の分単位設定へ変換し、端数秒・ナノ秒も切り上げる。
+pub(crate) fn pnpm_age_minutes(age: Duration) -> u64 {
+    age.as_secs().div_ceil(60)
+        + u64::from(age.subsec_nanos() != 0 && age.as_secs().is_multiple_of(60))
 }
 
 impl SystemPackageManager {
@@ -557,7 +565,7 @@ impl SystemPackageManager {
         }
     }
 
-    fn resolve_scoped_package_manager(
+    pub(crate) fn resolve_scoped_package_manager(
         &self,
         language: Language,
         working_dir: &Path,
@@ -1049,6 +1057,38 @@ mod tests {
                 .unwrap()
                 .0,
             temp.path().join("src-tauri")
+        );
+    }
+
+    #[test]
+    fn cargo_full_scope_uses_no_selectors_and_rejects_missing_manifest() {
+        let pm = SystemPackageManager::new();
+        let policy = crate::update::AgePolicy {
+            min_age: None,
+            evaluated_at: chrono::Utc::now(),
+            exemptions: Default::default(),
+        };
+        assert_eq!(
+            pm.scoped_install_args("cargo", &policy, &InstallScope::CargoFull)
+                .unwrap(),
+            ["cargo", "update"]
+        );
+        assert!(
+            pm.scoped_install_args("composer", &policy, &InstallScope::CargoFull)
+                .is_err()
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let result = pm.run_install_scoped(
+            Language::Rust,
+            temp.path(),
+            &policy,
+            &InstallScope::CargoFull,
+        );
+        assert!(!result.success);
+        assert!(
+            result
+                .stderr
+                .contains("planned Cargo manifest is no longer available")
         );
     }
 

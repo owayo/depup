@@ -8,6 +8,7 @@ use crate::domain::{Language, UpdateResult};
 use crate::manifest::{
     RegistryLockEntries, detect_manifests, find_cargo_lock_upward, read_registry_entries,
 };
+use crate::node_scope::{node_resolution_directory, node_scopes};
 use crate::orchestrator::{Orchestrator, OrchestratorResult};
 use crate::package_manager::InstallScope;
 use crate::update::AgePolicy;
@@ -102,6 +103,13 @@ impl InstallPlan {
             .collect();
         if only_mode {
             scoped::replace_scoped_jobs(&mut jobs, orchestrator, result);
+        } else if result.errors.iter().any(|error| {
+            matches!(
+                error,
+                crate::orchestrator::OrchestratorError::NodePreflightError { .. }
+            )
+        }) {
+            scoped::replace_full_rust_jobs(&mut jobs, orchestrator, result);
         }
         let groups = RustLockGroups::collect(orchestrator, result);
         let baselines = groups
@@ -156,7 +164,18 @@ impl InstallPlan {
                 .into_iter()
                 .filter(|directory| {
                     self.jobs.iter().any(|job| {
-                        job.language == Language::Rust && directory.starts_with(&job.directory)
+                        if job.language != Language::Rust {
+                            return false;
+                        }
+                        match &job.scope {
+                            Ok(InstallScope::Full) => directory.starts_with(&job.directory),
+                            Ok(_) => crate::cargo_scope::rust_resolution_directory(
+                                &directory.join("Cargo.toml"),
+                                &orchestrator.rust_lock_boundary(),
+                            )
+                            .is_ok_and(|root| root == job.directory),
+                            Err(_) => false,
+                        }
                     })
                 })
                 .collect(),
@@ -223,29 +242,46 @@ struct RustLockGroups {
 impl RustLockGroups {
     fn collect(orchestrator: &Orchestrator, result: &OrchestratorResult) -> Self {
         let boundary = orchestrator.rust_lock_boundary();
+        let stopped_paths = stopped_cargo_paths(result);
+        let stopped_roots = stopped_cargo_roots(result);
+        let stopped = |path: &Path| {
+            stopped_paths.contains(&std::fs::canonicalize(path).unwrap_or_else(|_| path.into()))
+        };
+        let directory_for = |path: &Path| {
+            if stopped(path) {
+                return None;
+            }
+            lock_directory(path, &boundary).filter(|directory| {
+                !stopped_roots.contains(
+                    &std::fs::canonicalize(directory).unwrap_or_else(|_| directory.clone()),
+                )
+            })
+        };
         let mut paths: BTreeSet<PathBuf> = result
             .summary
             .manifests
             .iter()
-            .filter(|manifest| manifest.language == Language::Rust)
+            .filter(|manifest| manifest.language == Language::Rust && !stopped(&manifest.path))
             .map(|manifest| manifest.path.clone())
             .collect();
         let roots: BTreeSet<PathBuf> = paths
             .iter()
-            .filter_map(|path| lock_directory(path, &boundary))
+            .filter_map(|path| directory_for(path))
             .collect();
         // 起動場所や更新対象に含まれないメンバーの制約も、同じ lock へ統合する。
         for root in roots {
             paths.extend(
                 detect_manifests(&root)
                     .into_iter()
-                    .filter(|manifest| manifest.language == Language::Rust)
+                    .filter(|manifest| {
+                        manifest.language == Language::Rust && !stopped(&manifest.path)
+                    })
                     .map(|manifest| manifest.path),
             );
         }
         let mut locks: BTreeMap<PathBuf, RustLockGroup> = BTreeMap::new();
         for path in paths {
-            let Some(directory) = lock_directory(&path, &boundary) else {
+            let Some(directory) = directory_for(&path) else {
                 continue;
             };
             let policy = orchestrator.resolved_age_policy_for(path.parent().unwrap());
@@ -260,13 +296,16 @@ impl RustLockGroups {
         }
         let mut missing_lock_dirs = BTreeSet::new();
         for (index, manifest) in result.summary.manifests.iter().enumerate() {
-            if manifest.language != Language::Rust {
+            if manifest.language != Language::Rust || stopped(&manifest.path) {
                 continue;
             }
             let Some(parent) = manifest.path.parent() else {
                 continue;
             };
-            let Some(directory) = lock_directory(&manifest.path, &boundary) else {
+            let Some(directory) = directory_for(&manifest.path) else {
+                if lock_directory(&manifest.path, &boundary).is_some() {
+                    continue;
+                }
                 if orchestrator
                     .resolved_age_policy_for(parent)
                     .min_age
@@ -317,6 +356,33 @@ impl RustLockGroups {
     }
 }
 
+fn stopped_cargo_paths(result: &OrchestratorResult) -> BTreeSet<PathBuf> {
+    result
+        .errors
+        .iter()
+        .filter_map(|error| match error {
+            crate::orchestrator::OrchestratorError::CargoPreflightError { manifest, .. } => {
+                Some(manifest.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn stopped_cargo_roots(result: &OrchestratorResult) -> BTreeSet<PathBuf> {
+    result
+        .errors
+        .iter()
+        .filter_map(|error| match error {
+            crate::orchestrator::OrchestratorError::CargoPreflightError {
+                root: Some(root),
+                ..
+            } => Some(root.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Cargo.lock の探索と共有単位への変換はここだけで行う。
 fn lock_directory(manifest: &Path, boundary: &Path) -> Option<PathBuf> {
     let parent = manifest.parent()?;
@@ -356,78 +422,21 @@ fn nearest_monorepo_dir(
         .unwrap_or_else(|| fallback.to_path_buf())
 }
 
-/// pnpm の共有 lock は、実際に検出される workspace member だけを結び付ける。
-fn node_resolution_directory(manifest: &Path) -> PathBuf {
-    let parent = manifest.parent().unwrap_or(Path::new("."));
-    let parent = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
-    let manifest = parent.join("package.json");
-    for directory in parent.ancestors() {
-        if directory == parent {
-            if [
-                "pnpm-lock.yaml",
-                "package-lock.json",
-                "npm-shrinkwrap.json",
-                "yarn.lock",
-                "bun.lock",
-                "bun.lockb",
-            ]
-            .iter()
-            .any(|filename| directory.join(filename).exists())
-            {
-                return directory.to_path_buf();
-            }
-        } else if directory.join("pnpm-workspace.yaml").is_file()
-            && detect_manifests(directory).iter().any(|candidate| {
-                candidate.language == Language::Node
-                    && std::fs::canonicalize(&candidate.path).is_ok_and(|path| path == manifest)
-            })
-        {
-            return directory.to_path_buf();
-        }
-    }
-    parent
-}
-
 fn node_audit_jobs(orchestrator: &Orchestrator, result: &OrchestratorResult) -> Vec<InstallJob> {
-    let mut groups: BTreeMap<PathBuf, BTreeSet<PathBuf>> = BTreeMap::new();
-    for manifest in &result.summary.manifests {
-        if manifest.language == Language::Node {
-            groups
-                .entry(node_resolution_directory(&manifest.path))
-                .or_default()
-                .insert(manifest.path.clone());
-        }
-    }
-    groups
-        .into_iter()
-        .map(|(directory, mut manifests)| {
-            manifests.extend(
-                detect_manifests(&directory)
-                    .into_iter()
-                    .filter(|manifest| manifest.language == Language::Node)
-                    .map(|manifest| manifest.path),
-            );
-            let policy = (|| {
-                let mut policy =
-                    orchestrator.resolved_age_policy_for_language(&directory, Language::Node)?;
-                for manifest in manifests {
-                    if let Some(parent) = manifest.parent() {
-                        policy.merge(
-                            &orchestrator
-                                .resolved_age_policy_for_language(parent, Language::Node)?,
-                        );
-                    }
-                }
-                Ok(policy)
-            })();
-            InstallJob {
-                directory,
-                language: Language::Node,
-                policy,
-                scope: Ok(InstallScope::Full),
-            }
-        })
-        .collect()
+    node_scopes(&result.summary.manifests, |directory| {
+        orchestrator.resolved_age_policy_for_language(directory, Language::Node)
+    })
+    .into_iter()
+    .filter(|scope| !result.errors.iter().any(|error| {
+        matches!(error, crate::orchestrator::OrchestratorError::NodePreflightError { directory, .. } if directory == &scope.directory)
+    }))
+    .map(|scope| InstallJob {
+        directory: scope.directory,
+        language: Language::Node,
+        policy: scope.policy,
+        scope: Ok(InstallScope::Full),
+    })
+    .collect()
 }
 
 fn build_install_map(

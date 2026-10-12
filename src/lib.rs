@@ -10,6 +10,7 @@
 //! - Java（build.gradle / build.gradle.kts）対応
 
 pub mod cargo_rollback;
+mod cargo_scope;
 pub mod cli;
 pub mod config;
 pub mod domain;
@@ -18,6 +19,7 @@ pub mod global_config;
 pub mod install;
 pub mod manifest;
 pub mod node_lock;
+mod node_scope;
 pub mod orchestrator;
 pub mod osv;
 pub mod output;

@@ -1,8 +1,62 @@
 //! Plan selective updates from the applied dependencies and the old lockfile.
 
 use super::*;
+use crate::cargo_scope::rust_resolution_directory;
 use crate::domain::{Dependency, GitReference, ManifestUpdateResult};
 use crate::manifest::{LockPackage, is_crates_io_source, parse_lock_packages};
+
+/// Keep full refresh semantics while preventing detection from reviving a stopped root.
+pub(super) fn replace_full_rust_jobs(
+    jobs: &mut Vec<InstallJob>,
+    orchestrator: &Orchestrator,
+    result: &OrchestratorResult,
+) {
+    jobs.retain(|job| job.language != Language::Rust);
+    let boundary = orchestrator.rust_lock_boundary();
+    let stopped_paths = stopped_cargo_paths(result);
+    let stopped_roots = stopped_cargo_roots(result);
+    let mut locations = BTreeMap::new();
+    let mut roots = BTreeSet::new();
+    for manifest in result
+        .summary
+        .manifests
+        .iter()
+        .filter(|manifest| manifest.language == Language::Rust && manifest.has_updates())
+    {
+        let key = std::fs::canonicalize(&manifest.path).unwrap_or_else(|_| manifest.path.clone());
+        let location = locations
+            .entry(key.clone())
+            .or_insert_with(|| rust_resolution_directory(&manifest.path, &boundary));
+        let (directory, scope) = match location {
+            Ok(root) => (
+                root.clone(),
+                if stopped_roots.contains(root) || stopped_paths.contains(&key) {
+                    Err("Cargo root was stopped by the pnpm preflight".into())
+                } else {
+                    Ok(InstallScope::CargoFull)
+                },
+            ),
+            Err(error) => (
+                manifest.path.parent().unwrap_or(Path::new(".")).into(),
+                Err(error.clone()),
+            ),
+        };
+        if !roots.insert(directory.clone()) {
+            continue;
+        }
+        jobs.push(InstallJob {
+            policy: install_age_policy(orchestrator, result, &directory, Language::Rust),
+            directory,
+            language: Language::Rust,
+            scope,
+        });
+    }
+    jobs.sort_by(|left, right| {
+        left.directory
+            .cmp(&right.directory)
+            .then_with(|| left.language.to_string().cmp(&right.language.to_string()))
+    });
+}
 
 pub(super) fn replace_scoped_jobs(
     jobs: &mut Vec<InstallJob>,
@@ -63,63 +117,6 @@ pub(super) fn replace_scoped_jobs(
             .cmp(&right.directory)
             .then_with(|| left.language.to_string().cmp(&right.language.to_string()))
     });
-}
-
-fn rust_resolution_directory(manifest: &Path, boundary: &Path) -> Result<PathBuf, String> {
-    let manifest = std::fs::canonicalize(manifest)
-        .map_err(|error| format!("Cannot locate Cargo workspace: {error}"))?;
-    let parent = manifest
-        .parent()
-        .ok_or("Cargo manifest has no parent directory")?;
-    let program = which::which_in("cargo", std::env::var_os("PATH"), parent)
-        .map_err(|error| format!("Cannot locate Cargo executable: {error}"))?;
-    // Cargo accounts for exclusions, implicit path members and package.workspace.
-    // locate-project only reads manifests; it never resolves or writes a lock.
-    let output = std::process::Command::new(program)
-        .args([
-            "locate-project",
-            "--workspace",
-            "--message-format",
-            "json",
-            "--manifest-path",
-        ])
-        // Canonical Windows paths use an extended-length prefix that Cargo's
-        // workspace member matching does not consistently accept in argv.
-        // The resolved parent cwd keeps this relative filename unambiguous.
-        .arg(
-            manifest
-                .file_name()
-                .ok_or("Cargo manifest has no filename")?,
-        )
-        .current_dir(parent)
-        .env("CARGO_NET_OFFLINE", "true")
-        .env("RUSTUP_AUTO_INSTALL", "0")
-        .output()
-        .map_err(|error| format!("Cannot run cargo locate-project: {error}"))?;
-    if !output.status.success() {
-        let message = crate::package_manager::redact_install_output(
-            &String::from_utf8_lossy(&output.stderr),
-            &[],
-        );
-        return Err(format!("Cannot locate Cargo workspace: {}", message.trim()));
-    }
-    let location: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|_| "Cannot parse cargo locate-project output")?;
-    let root = location
-        .get("root")
-        .and_then(serde_json::Value::as_str)
-        .ok_or("cargo locate-project returned no root")?;
-    let root = std::fs::canonicalize(root)
-        .map_err(|error| format!("Cannot read located Cargo root: {error}"))?;
-    let directory = root
-        .parent()
-        .ok_or("Located Cargo root has no parent directory")?;
-    let boundary = std::fs::canonicalize(boundary)
-        .map_err(|error| format!("Cannot read Cargo execution boundary: {error}"))?;
-    if !directory.starts_with(boundary) {
-        return Err("Cargo resolved a workspace outside the execution boundary".into());
-    }
-    Ok(directory.to_path_buf())
 }
 
 fn composer_scope(

@@ -19,6 +19,7 @@ use crate::domain::{
 use crate::global_config::GlobalConfig;
 
 mod age;
+mod node_preflight;
 use crate::manifest::{
     ManifestInfo, ManifestWriter, MiseSettings, RegistryLockEntries, WriteResult, detect_manifests,
     find_cargo_lock_upward, get_parser, has_mise_config, read_git_entries,
@@ -37,6 +38,7 @@ use crate::update::{
 };
 use futures::stream::{self, StreamExt};
 use indicatif::ProgressBar;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -111,6 +113,14 @@ pub enum OrchestratorError {
     RegistryError { package: String, message: String },
     /// マニフェストの書き込みに失敗
     WriteError { path: String, message: String },
+    /// 書き込み前に停止した共有 pnpm scope。事後に同じ lock を再監査しない。
+    NodePreflightError { directory: PathBuf, message: String },
+    /// Stop a Cargo manifest and its confirmed install/audit root, if known.
+    CargoPreflightError {
+        manifest: PathBuf,
+        root: Option<PathBuf>,
+        message: String,
+    },
     /// OSV 脆弱性チェックに失敗または脆弱性を検出
     OsvWarning { package: String, message: String },
 }
@@ -130,6 +140,24 @@ impl std::fmt::Display for OrchestratorError {
             }
             OrchestratorError::WriteError { path, message } => {
                 write!(f, "Failed to write {}: {}", path, message)
+            }
+            OrchestratorError::NodePreflightError { directory, message } => {
+                write!(
+                    f,
+                    "pnpm preflight failed in {}: {}",
+                    directory.display(),
+                    message
+                )
+            }
+            OrchestratorError::CargoPreflightError {
+                manifest, message, ..
+            } => {
+                write!(
+                    f,
+                    "Cargo preflight stopped {}: {}",
+                    manifest.display(),
+                    message
+                )
             }
             OrchestratorError::OsvWarning { package, message } => {
                 write!(f, "OSV check for {}: {}", package, message)
@@ -475,6 +503,22 @@ impl Orchestrator {
         manifests: &[ManifestInfo],
         progress: &mut Progress,
     ) -> OrchestratorResult {
+        self.process_manifests_with_auditor(
+            manifests,
+            progress,
+            &node_preflight::PnpmLockAuditor,
+            &crate::cargo_scope::SystemCargoScopeResolver,
+        )
+        .await
+    }
+
+    async fn process_manifests_with_auditor(
+        &self,
+        manifests: &[ManifestInfo],
+        progress: &mut Progress,
+        auditor: &impl node_preflight::ExistingLockAuditor,
+        resolver: &impl crate::cargo_scope::CargoScopeResolver,
+    ) -> OrchestratorResult {
         let mut summary = UpdateSummary::new(self.args.dry_run);
         let mut errors = Vec::new();
 
@@ -496,7 +540,44 @@ impl Orchestrator {
             .await;
         self.sync_tauri_if_needed(manifests, progress, &mut summary, &mut errors)
             .await;
-        let write_results = self.write_phase(&mut summary, progress, &mut errors);
+        let skip = if self.args.install && !self.args.dry_run {
+            let cargo_boundary = self.rust_lock_boundary();
+            let cargo_membership = crate::cargo_scope::CargoMembership::new(
+                manifests
+                    .iter()
+                    .filter(|info| info.language == Language::Rust)
+                    .map(|info| info.path.clone())
+                    .chain(
+                        summary
+                            .manifests
+                            .iter()
+                            .filter(|result| result.language == Language::Rust)
+                            .map(|result| result.path.clone()),
+                    ),
+                &cargo_boundary,
+                resolver,
+            );
+            let scopes = node_preflight::ScopeContext {
+                manifests,
+                cargo: &cargo_membership,
+            };
+            progress.start(0, "Auditing existing pnpm-lock.yaml against --age");
+            let bar = progress.bar();
+            let blocked = node_preflight::preflight(
+                &summary,
+                &scopes,
+                &errors,
+                |dir| self.resolved_age_policy_for_language(dir, Language::Node),
+                auditor,
+                bar.as_ref(),
+            )
+            .await;
+            progress.finish_and_clear();
+            node_preflight::block(&mut summary, &mut errors, &scopes, &blocked)
+        } else {
+            BTreeSet::new()
+        };
+        let write_results = self.write_phase(&mut summary, progress, &mut errors, &skip);
 
         OrchestratorResult {
             summary,
@@ -660,14 +741,15 @@ impl Orchestrator {
         summary: &mut UpdateSummary,
         errors: &mut Vec<OrchestratorError>,
     ) {
-        if !manifests.iter().any(|m| m.is_tauri_rust) {
+        let projects: BTreeSet<_> = manifests
+            .iter()
+            .filter_map(|manifest| tauri_project_directory(manifest, manifests))
+            .collect();
+        if projects.is_empty() {
             return;
         }
         progress.spinner("Synchronizing Tauri versions...");
-        for manifest in manifests.iter().filter(|manifest| manifest.is_tauri_rust) {
-            let Some(project_dir) = manifest.path.parent().and_then(Path::parent) else {
-                continue;
-            };
+        for project_dir in projects {
             self.synchronize_tauri_versions(summary, errors, project_dir)
                 .await;
         }
@@ -683,12 +765,19 @@ impl Orchestrator {
         summary: &mut UpdateSummary,
         progress: &mut Progress,
         errors: &mut Vec<OrchestratorError>,
+        skip: &BTreeSet<PathBuf>,
     ) -> Vec<WriteResult> {
         if !self.args.dry_run {
             progress.spinner("Writing updates...");
         }
         let writer = ManifestWriter::new(self.args.dry_run);
-        let write_results = writer.apply_all_updates(&summary.manifests, get_parser);
+        let writable: Vec<_> = summary
+            .manifests
+            .iter()
+            .filter(|manifest| !skip.contains(&manifest.path))
+            .cloned()
+            .collect();
+        let write_results = writer.apply_all_updates(&writable, get_parser);
         progress.finish_and_clear();
 
         for result in &write_results {
@@ -771,6 +860,18 @@ impl Orchestrator {
         language: Language,
     ) -> Result<AgePolicy, String> {
         let mut policy = self.resolved_age_policy_for(dir);
+        if language == Language::Node {
+            let root = age::project_scope_root(&self.args.path);
+            let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+            for scope in dir.ancestors().take_while(|scope| scope.starts_with(&root)) {
+                if let Some((age, _)) =
+                    crate::manifest::PnpmSettings::checked_minimum_release_age_with_source(scope)?
+                {
+                    policy.min_age = policy.min_age.max(Some(age));
+                    policy.exemptions = crate::update::AgeExemptions::default();
+                }
+            }
+        }
         if let Some(age) =
             crate::manifest::native_age::native_min_age(language, dir, self.evaluated_at)?
         {
@@ -1236,6 +1337,24 @@ impl Orchestrator {
                 message: format!("Failed to fetch for Tauri sync: {}", e),
             })
     }
+}
+
+/// Cargo workspace 経由の検出では flag が付かないため、対応する Node manifest も照合する。
+fn tauri_project_directory<'a>(
+    manifest: &'a ManifestInfo,
+    inventory: &[ManifestInfo],
+) -> Option<&'a Path> {
+    if manifest.language != Language::Rust {
+        return None;
+    }
+    let project = manifest.path.parent()?.parent()?;
+    (manifest.is_tauri_rust
+        || (manifest.path.ends_with("src-tauri/Cargo.toml")
+            && inventory.iter().any(|candidate| {
+                candidate.language == Language::Node
+                    && candidate.path == project.join("package.json")
+            })))
+    .then_some(project)
 }
 
 /// バージョンチェック並列処理で 1 件の依存から得られた結果
