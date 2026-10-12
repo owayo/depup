@@ -92,6 +92,54 @@ impl LockGraph {
             .unwrap_or_default()
     }
 
+    /// Dependencies reachable through any lock node, including nodes outside a selected group.
+    pub(crate) fn reachable(&self, key: &PackageKey) -> BTreeSet<PackageKey> {
+        let mut seen = BTreeSet::new();
+        let mut pending = vec![key.clone()];
+        while let Some(node) = pending.pop() {
+            for next in self.dependencies.get(&node).into_iter().flatten() {
+                if next != key && seen.insert(next.clone()) {
+                    pending.push(next.clone());
+                }
+            }
+        }
+        seen
+    }
+
+    /// Order package IDs with dependents first. Unrelated IDs are deterministic;
+    /// malformed cycles are broken at the first remaining ID.
+    pub(crate) fn dependents_first(&self, keys: &[PackageKey]) -> Vec<PackageKey> {
+        let mut remaining: BTreeSet<_> = keys.iter().cloned().collect();
+        let below: BTreeMap<_, _> = remaining
+            .iter()
+            .map(|key| {
+                (
+                    key.clone(),
+                    self.reachable(key)
+                        .intersection(&remaining)
+                        .cloned()
+                        .collect::<BTreeSet<_>>(),
+                )
+            })
+            .collect();
+        let mut order = Vec::with_capacity(remaining.len());
+        while !remaining.is_empty() {
+            let next = remaining
+                .iter()
+                .find(|key| {
+                    !remaining
+                        .iter()
+                        .any(|other| other != *key && below[other].contains(*key))
+                })
+                .or_else(|| remaining.first())
+                .unwrap()
+                .clone();
+            remaining.remove(&next);
+            order.push(next);
+        }
+        order
+    }
+
     /// `group` の中で、group 内の他のパッケージから依存されていないもの (一族の「頂点」)。入力順を保つ。
     /// group 内に lock に無いキーがあれば、それは依存元を持たないものとして頂点に含める。
     /// 重複したキーは最初の 1 つだけを返す
@@ -210,6 +258,66 @@ mod tests {
 
     fn key(name: &str, version: &str) -> PackageKey {
         (name.to_string(), version.to_string())
+    }
+
+    #[test]
+    fn dependent_order_crosses_unselected_nodes_and_separates_versions() {
+        let graph = LockGraph::from_lock_content(
+            r#"
+version = 4
+[[package]]
+name = "z-top"
+version = "1.0.0"
+dependencies = ["middle"]
+[[package]]
+name = "middle"
+version = "1.0.0"
+dependencies = ["a-dep 2.0.0"]
+[[package]]
+name = "a-dep"
+version = "1.0.0"
+[[package]]
+name = "a-dep"
+version = "2.0.0"
+"#,
+        );
+        assert_eq!(
+            graph.dependents_first(&[
+                key("a-dep", "2.0.0"),
+                key("z-top", "1.0.0"),
+                key("a-dep", "1.0.0")
+            ]),
+            [
+                key("a-dep", "1.0.0"),
+                key("z-top", "1.0.0"),
+                key("a-dep", "2.0.0")
+            ]
+        );
+    }
+
+    #[test]
+    fn dependent_order_handles_cycles_and_duplicate_keys_deterministically() {
+        let graph = LockGraph::from_lock_content(
+            r#"
+version = 4
+[[package]]
+name = "a"
+version = "1.0.0"
+dependencies = ["b"]
+[[package]]
+name = "b"
+version = "1.0.0"
+dependencies = ["a"]
+"#,
+        );
+        assert_eq!(
+            graph.reachable(&key("a", "1.0.0")),
+            BTreeSet::from([key("b", "1.0.0")])
+        );
+        assert_eq!(
+            graph.dependents_first(&[key("b", "1.0.0"), key("a", "1.0.0"), key("b", "1.0.0")]),
+            [key("a", "1.0.0"), key("b", "1.0.0")]
+        );
     }
 
     /// wasm-bindgen 一族を模した lock。

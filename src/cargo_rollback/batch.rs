@@ -18,10 +18,257 @@ use super::series::same_series;
 use crate::manifest::{RegistryLockEntries, parse_registry_entries, write_manifest};
 use crate::update::compare_versions;
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::time::{Duration, Instant};
+
+/// One audited change to return to its install-time version.
+#[derive(Debug, Clone)]
+pub(crate) struct RestoreCandidate {
+    pub name: String,
+    pub current: Option<String>,
+    pub installed: String,
+}
+
+pub(crate) struct RestorationScope<'a> {
+    pub members: &'a [RestoreCandidate],
+    pub discarded: &'a [PackageKey],
+    pub installed: &'a str,
+    pub expected_lock: &'a str,
+}
+
+/// Re-resolve the current lock, preserving every package outside the restoration scope.
+pub(crate) async fn restore_installed(
+    root: &Path,
+    scope: RestorationScope<'_>,
+    cargo: &CargoCommand,
+    deadline: Instant,
+    per_command: Duration,
+) -> Result<String, String> {
+    let timeout =
+        command_timeout(deadline, per_command).ok_or("restoration time budget ran out")?;
+    let mut scratch = ScratchWorkspace::create(root, cargo, timeout).await?;
+    if scratch.original_lock() != scope.expected_lock {
+        return Err("Cargo.lock changed after planning the restoration".into());
+    }
+    let pins: Vec<_> = scope
+        .members
+        .iter()
+        .map(|member| AgePin {
+            name: member.name.clone(),
+            requirement: format!("={}", member.installed),
+        })
+        .collect();
+    let specs: Vec<_> = scope
+        .members
+        .iter()
+        .filter_map(|member| {
+            member
+                .current
+                .as_ref()
+                .map(|current| format!("{}@{current}", member.name))
+        })
+        .collect();
+    let resolved = re_resolve(
+        &mut scratch,
+        root,
+        cargo,
+        &specs,
+        &pins,
+        deadline,
+        per_command,
+    )
+    .await
+    .map_err(attempt_message)?;
+    check_restoration(
+        scratch.original_lock(),
+        &resolved,
+        scope.members,
+        scope.discarded,
+        scope.installed,
+    )?;
+    let committed = resolved.clone();
+    commit_resolution(&mut scratch, root, cargo, resolved, deadline, per_command)
+        .await
+        .map_err(attempt_message)?;
+    Ok(committed)
+}
+
+fn attempt_message(error: AttemptError) -> String {
+    match error {
+        AttemptError::Unresolved(message)
+        | AttemptError::Abort(message)
+        | AttemptError::OutOfTime(message)
+        | AttemptError::Broken(message) => message,
+    }
+}
+
+fn check_restoration(
+    before: &str,
+    after: &str,
+    members: &[RestoreCandidate],
+    discarded: &[PackageKey],
+    installed: &str,
+) -> Result<(), String> {
+    use crate::manifest::{is_crates_io_source, parse_lock_packages};
+    let tables = |content: &str| {
+        let document: toml::Value =
+            toml::from_str(content).unwrap_or(toml::Value::Table(Default::default()));
+        document
+            .get("package")
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|package| {
+                Some((
+                    (
+                        package.get("name")?.as_str()?.to_string(),
+                        package.get("version")?.as_str()?.to_string(),
+                        package
+                            .get("source")
+                            .and_then(toml::Value::as_str)
+                            .map(str::to_string),
+                    ),
+                    package.clone(),
+                ))
+            })
+            .collect::<HashMap<_, _>>()
+    };
+    let before_tables = tables(before);
+    let after_tables = tables(after);
+    let before_graph = LockGraph::from_lock_content(before);
+    let after_graph = LockGraph::from_lock_content(after);
+    let allowed: HashSet<_> = members
+        .iter()
+        .flat_map(|member| {
+            member
+                .current
+                .iter()
+                .chain(std::iter::once(&member.installed))
+                .map(|version| (member.name.clone(), version.clone()))
+        })
+        .chain(discarded.iter().cloned())
+        .collect();
+    let ids = |content: &str| {
+        parse_lock_packages(content)
+            .into_iter()
+            .map(|package| (package.name, package.version, package.source))
+            .collect::<HashSet<_>>()
+    };
+    let before = ids(before);
+    let after = ids(after);
+    let installed = ids(installed);
+    for member in members {
+        if !after.iter().any(|(name, version, source)| {
+            name == &member.name
+                && version == &member.installed
+                && source.as_deref().is_some_and(is_crates_io_source)
+        }) {
+            return Err(format!(
+                "{} did not return to install-time version {}",
+                member.name, member.installed
+            ));
+        }
+        if let Some(current) = &member.current
+            && *current != member.installed
+            && after.iter().any(|(name, version, source)| {
+                name == &member.name
+                    && version == current
+                    && source.as_deref().is_some_and(is_crates_io_source)
+            })
+        {
+            return Err(format!(
+                "{} {current} remained alongside its install-time version",
+                member.name
+            ));
+        }
+    }
+    for (name, version, source) in &before {
+        let selected = source.as_deref().is_some_and(is_crates_io_source)
+            && (discarded.contains(&(name.clone(), version.clone()))
+                || members.iter().any(|member| {
+                    member.name == *name && member.current.as_ref() == Some(version)
+                }));
+        if !selected && !after.contains(&(name.clone(), version.clone(), source.clone())) {
+            return Err(format!(
+                "restoration would change an unrelated package {name} {version}"
+            ));
+        }
+        if !selected {
+            let key = (name.clone(), version.clone(), source.clone());
+            let mut previous = before_tables[&key].clone();
+            let mut restored = after_tables[&key].clone();
+            let previous_dependencies = previous
+                .as_table_mut()
+                .and_then(|table| table.remove("dependencies"));
+            let restored_dependencies = restored
+                .as_table_mut()
+                .and_then(|table| table.remove("dependencies"));
+            if previous != restored {
+                return Err(format!(
+                    "restoration would change an unrelated package table {name} {version}"
+                ));
+            }
+            if previous_dependencies != restored_dependencies {
+                let key = (name.clone(), version.clone());
+                let left = before_graph.dependencies(&key);
+                let right = after_graph.dependencies(&key);
+                let count = |value: &Option<toml::Value>| {
+                    value
+                        .as_ref()
+                        .and_then(toml::Value::as_array)
+                        .map_or(0, Vec::len)
+                };
+                let ambiguous = left.iter().chain(&right).any(|key| {
+                    [&before, &after].iter().any(|ids| {
+                        ids.iter()
+                            .filter(|id| id.0 == key.0 && id.1 == key.1)
+                            .count()
+                            > 1
+                    })
+                });
+                let same_edges = left.len() == right.len()
+                    && left.iter().all(|dependency| {
+                        right.contains(dependency)
+                            || (allowed.contains(dependency)
+                                && right.iter().any(|target| {
+                                    allowed.contains(target)
+                                        && dependency.0 == target.0
+                                        && same_series(&dependency.1, &target.1)
+                                }))
+                    });
+                if ambiguous
+                    || left.len() != count(&previous_dependencies)
+                    || right.len() != count(&restored_dependencies)
+                    || !same_edges
+                {
+                    return Err(format!(
+                        "restoration would change unrelated dependency edges of {name} {version}"
+                    ));
+                }
+            }
+        }
+    }
+    for (name, version, source) in after.difference(&before) {
+        if !installed.contains(&(name.clone(), version.clone(), source.clone())) {
+            return Err(
+                "restoration introduced a version absent from the install-time lock".into(),
+            );
+        }
+        if !source.as_deref().is_some_and(is_crates_io_source)
+            || !members
+                .iter()
+                .any(|member| member.name == *name && member.installed == *version)
+        {
+            return Err(format!(
+                "restoration would add an unrelated package {name} {version}"
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// cargo を 1 回起動するごとに、最低限残っていてほしい時間。これより短いなら起動しない。
 ///
@@ -110,6 +357,8 @@ enum RunError {
 ///
 /// 反映した lock は元の manifest が受け入れることを確かめてから確定する。時間予算が
 /// 尽きたら残りの組は `NotAttempted` にする。戻り値は `candidates` と同じ順に並ぶ。
+// Retained public entry point; the auditor uses the tracked variant internally.
+// astro-sight:allow-dead
 pub async fn resolve_together(
     root: &Path,
     candidates: &[RollbackCandidate],
@@ -117,6 +366,25 @@ pub async fn resolve_together(
     deadline: Instant,
     per_command: Duration,
 ) -> TogetherReport {
+    resolve_together_tracked(root, candidates, cargo, deadline, per_command)
+        .await
+        .0
+}
+
+/// Exact snapshots around a verified commit, for audit ownership tracking.
+pub(crate) struct ResolutionChange {
+    pub before: String,
+    pub after: String,
+    pub selected: Vec<PackageKey>,
+}
+
+pub(crate) async fn resolve_together_tracked(
+    root: &Path,
+    candidates: &[RollbackCandidate],
+    cargo: &CargoCommand,
+    deadline: Instant,
+    per_command: Duration,
+) -> (TogetherReport, Vec<ResolutionChange>) {
     let mut outcomes: HashMap<PackageKey, TogetherOutcome> = HashMap::new();
     let mut problems: Vec<String> = Vec::new();
     let mut eligible: Vec<RollbackCandidate> = Vec::new();
@@ -140,13 +408,13 @@ pub async fn resolve_together(
         }
     }
     if eligible.is_empty() {
-        return finish(candidates, outcomes, problems);
+        return (finish(candidates, outcomes, problems), Vec::new());
     }
 
     let Some(timeout) = command_timeout(deadline, per_command) else {
         let outcome = TogetherOutcome::NotAttempted(BUDGET_EXHAUSTED.to_string());
         set_all(&mut outcomes, &eligible, &outcome);
-        return finish(candidates, outcomes, problems);
+        return (finish(candidates, outcomes, problems), Vec::new());
     };
     let mut scratch = match ScratchWorkspace::create(root, cargo, timeout).await {
         Ok(scratch) => scratch,
@@ -155,7 +423,7 @@ pub async fn resolve_together(
                 "could not copy the workspace to re-resolve it: {e}"
             ));
             set_all(&mut outcomes, &eligible, &outcome);
-            return finish(candidates, outcomes, problems);
+            return (finish(candidates, outcomes, problems), Vec::new());
         }
     };
 
@@ -192,6 +460,7 @@ pub async fn resolve_together(
     groups.sort_by_key(|group| std::cmp::Reverse(group.len()));
 
     let mut queue: VecDeque<Vec<RollbackCandidate>> = groups.into();
+    let mut changes = Vec::new();
     while let Some(group) = queue.pop_front() {
         // 前の組を反映した結果、既に今の版から動いた crate は、その結果で確定させる
         // (`-p name@今の版` が lock に無い版を指して cargo が失敗するのを避ける)
@@ -213,6 +482,7 @@ pub async fn resolve_together(
         // 前の組を反映した後は lock が変わっているので、グラフも取り直す
         let graph = LockGraph::from_lock_content(scratch.original_lock());
         let keys: Vec<PackageKey> = group.iter().map(RollbackCandidate::key).collect();
+        let before = scratch.original_lock().to_string();
 
         let mut result = Err(AttemptError::Unresolved(String::new()));
         let mut first_reason: Option<String> = None;
@@ -242,7 +512,14 @@ pub async fn resolve_together(
         }
 
         match result {
-            Ok(resolved) => outcomes.extend(resolved),
+            Ok(resolved) => {
+                changes.push(ResolutionChange {
+                    before,
+                    after: scratch.original_lock().to_string(),
+                    selected: keys,
+                });
+                outcomes.extend(resolved);
+            }
             Err(AttemptError::Unresolved(reason)) => {
                 set_all(&mut outcomes, &group, &TogetherOutcome::Failed(reason));
             }
@@ -274,7 +551,7 @@ pub async fn resolve_together(
         }
     }
 
-    finish(candidates, outcomes, problems)
+    (finish(candidates, outcomes, problems), changes)
 }
 
 /// 時間切れで着手できなかったときの理由
@@ -381,19 +658,45 @@ async fn attempt(
     deadline: Instant,
     per_command: Duration,
 ) -> Result<Vec<(PackageKey, TogetherOutcome)>, AttemptError> {
+    let specs: Vec<_> = group.iter().map(RollbackCandidate::spec).collect();
+    let resolved_lock = re_resolve(
+        scratch,
+        root,
+        cargo,
+        &specs,
+        &plan.pins,
+        deadline,
+        per_command,
+    )
+    .await?;
+    let resolved =
+        check_resolution(group, &plan.exact, &resolved_lock).map_err(AttemptError::Unresolved)?;
+    commit_resolution(scratch, root, cargo, resolved_lock, deadline, per_command).await?;
+    Ok(resolved)
+}
+
+async fn re_resolve(
+    scratch: &mut ScratchWorkspace,
+    root: &Path,
+    cargo: &CargoCommand,
+    specs: &[String],
+    pins: &[AgePin],
+    deadline: Instant,
+    per_command: Duration,
+) -> Result<String, AttemptError> {
     scratch
         .reset_lock()
         .map_err(|e| AttemptError::Abort(format!("could not reset the copied Cargo.lock: {e}")))?;
     scratch
-        .set_pins(&plan.pins)
+        .set_pins(pins)
         .map_err(|e| AttemptError::Abort(format!("could not write the temporary pins: {e}")))?;
 
     let manifest = scratch.manifest_path().into_os_string();
     let mut update: Vec<OsString> =
         vec!["update".into(), "--manifest-path".into(), manifest.clone()];
-    for candidate in group {
+    for spec in specs {
         update.push("-p".into());
-        update.push(candidate.spec().into());
+        update.push(spec.into());
     }
     run_cargo(cargo, root, &update, deadline, per_command)
         .await
@@ -425,9 +728,17 @@ async fn attempt(
     let resolved_lock = std::fs::read_to_string(scratch.lock_path()).map_err(|e| {
         AttemptError::Abort(format!("could not read the re-resolved Cargo.lock: {e}"))
     })?;
-    let resolved =
-        check_resolution(group, &plan.exact, &resolved_lock).map_err(AttemptError::Unresolved)?;
+    Ok(resolved_lock)
+}
 
+async fn commit_resolution(
+    scratch: &mut ScratchWorkspace,
+    root: &Path,
+    cargo: &CargoCommand,
+    resolved_lock: String,
+    deadline: Instant,
+    per_command: Duration,
+) -> Result<(), AttemptError> {
     // 作業中に利用者やエディタが元の Cargo.toml / Cargo.lock を書き換えていたら、
     // そちらを優先して手を引く
     if !scratch.originals_unchanged() {
@@ -472,7 +783,7 @@ async fn attempt(
         return Err(failure);
     }
     scratch.accept_lock(resolved_lock);
-    Ok(resolved)
+    Ok(())
 }
 
 /// 元へ戻せなかった Cargo.lock の内容を OS の一時ディレクトリへ退避し、その説明を返す。
@@ -689,6 +1000,64 @@ mod tests {
             ));
         }
         content
+    }
+
+    #[test]
+    fn restoration_checks_install_time_targets_and_preserves_unrelated_versions() {
+        let members = [RestoreCandidate {
+            name: "foo".into(),
+            current: Some("1.1.0".into()),
+            installed: "1.2.0".into(),
+        }];
+        let before = lock(&[("foo", "1.1.0"), ("solo", "1.0.0")]);
+        let installed = lock(&[("foo", "1.2.0"), ("solo", "1.1.0")]);
+        let good = lock(&[("foo", "1.2.0"), ("solo", "1.0.0")]);
+        assert!(check_restoration(&before, &good, &members, &[], &installed).is_ok());
+        let with_edge = before.replace(
+            "name = \"solo\"\nversion = \"1.0.0\"",
+            "name = \"solo\"\nversion = \"1.0.0\"\ndependencies = ['foo 1.1.0']",
+        );
+        assert!(
+            check_restoration(&with_edge, &good, &members, &[], &installed)
+                .unwrap_err()
+                .contains("unrelated dependency edges")
+        );
+        let retargeted = good.replace(
+            "name = \"solo\"\nversion = \"1.0.0\"",
+            "name = \"solo\"\nversion = \"1.0.0\"\ndependencies = ['foo 1.2.0']",
+        );
+        assert!(check_restoration(&with_edge, &retargeted, &members, &[], &installed).is_ok());
+        let external_table = format!("{before}checksum = 'external'\n");
+        assert!(
+            check_restoration(&external_table, &good, &members, &[], &installed)
+                .unwrap_err()
+                .contains("unrelated package table")
+        );
+        let extra_installed = lock(&[("foo", "1.2.0"), ("solo", "1.1.0"), ("extra", "1.0.0")]);
+        let extra_added = lock(&[("foo", "1.2.0"), ("solo", "1.0.0"), ("extra", "1.0.0")]);
+        assert!(
+            check_restoration(&before, &extra_added, &members, &[], &extra_installed)
+                .unwrap_err()
+                .contains("add an unrelated")
+        );
+        let changed_solo = lock(&[("foo", "1.2.0"), ("solo", "1.1.0")]);
+        assert!(
+            check_restoration(&before, &changed_solo, &members, &[], &installed)
+                .unwrap_err()
+                .contains("unrelated")
+        );
+        let third = lock(&[("foo", "1.2.0"), ("solo", "1.0.0"), ("new", "1.3.0")]);
+        assert!(
+            check_restoration(&before, &third, &members, &[], &installed)
+                .unwrap_err()
+                .contains("absent from the install-time")
+        );
+        let incomplete = lock(&[("foo", "1.1.0"), ("foo", "1.2.0"), ("solo", "1.0.0")]);
+        assert!(
+            check_restoration(&before, &incomplete, &members, &[], &installed)
+                .unwrap_err()
+                .contains("remained alongside")
+        );
     }
 
     /// 固定した crate が目標の版に、固定していない crate も今より古い同じ系列の版に移れば成功

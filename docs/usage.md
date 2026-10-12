@@ -426,7 +426,9 @@ If only versions below an available minimum satisfy the age filter, the crate go
     foo 1.50.1 → 1.50.0
 ```
 
-Crates such as `cc` and `syn` are rolled back one at a time with `cargo update -p <name>@<locked version> --precise <older version>`. This fails for groups of crates that pin each other with `=`, such as `wasm-bindgen`, `js-sys`, `web-sys`, `wasm-bindgen-futures`, and `wasm-bindgen-test`. `--precise` keeps the crates that depend on the target at their locked versions, and their `=` requirements do not allow an older target. When two or more crates in the group have no dependent within it, every one-at-a-time rollback conflicts. Instead, depup rolls back the conflicting crates together:
+Crates such as `cc` and `syn` are rolled back one at a time with `cargo update -p <name>@<locked version> --precise <older version>`. depup processes dependents before their dependencies, including relationships through crates outside the rollback list. Before resolving conflicts together, it retries failed individual rollbacks when the lock or requested version has changed; it does not repeat a failed attempt against the same lock and target.
+
+Individual rollbacks can still fail for groups of crates that pin each other with `=`, such as `wasm-bindgen`, `js-sys`, `web-sys`, `wasm-bindgen-futures`, and `wasm-bindgen-test`. `--precise` keeps the crates that depend on the target at their locked versions, and their `=` requirements do not allow an older target. When two or more crates in the group have no dependent within it, every one-at-a-time rollback conflicts. Instead, depup rolls back the conflicting crates together:
 
 1. It copies what Cargo needs to resolve the workspace into a temporary directory: the root and member `Cargo.toml` files, empty placeholders for their target source files, and `Cargo.lock`.
 2. It adds temporary pins to the copy and runs `cargo update` for those crates at once. Crates that depend on each other are resolved as one group, largest group first, so one crate that cannot be rolled back does not hold up the others. Within a group, depup first pins every crate to its rollback version; if Cargo cannot satisfy that, it pins only the crates that nothing else in the group depends on, and then allows any version up to the rollback version.
@@ -434,6 +436,10 @@ Crates such as `cc` and `syn` are rolled back one at a time with `cargo update -
 4. It runs `cargo update --workspace --locked` in the project to confirm that your `Cargo.toml` accepts the new lock file as is. If it does not, the previous `Cargo.lock` is restored.
 
 Your `Cargo.toml` files are never modified. If `Cargo.toml` or `Cargo.lock` changes while this is in progress, depup keeps your change and gives up on these crates. If the previous `Cargo.lock` cannot be restored after a failed check, depup says so even without `--verbose` and tells you where it saved the previous content. Cargo runs in the project directory, so the project's `.cargo/config.toml` (for example, source replacement) and `rust-toolchain.toml` (or `rust-toolchain`) also apply when the copy is resolved.
+
+If an unresolved install-time version remains related to a partial rollback, depup returns that partial change to the combination locked immediately after the install, including related dependencies automatically changed, added, or removed by Cargo. It uses a separate 60-second restoration budget and the same temporary-workspace verification. Related crates are identified by dependency paths in the install-time and current locks, so independent successful rollbacks and external changes stay in place. Changes observed outside an audited Cargo operation are excluded from restoration. Restoration cannot introduce a version absent from the install-time lock. Ambiguous versions or sources stop restoration with a warning. A restored partial change is reported with its reason and remains unresolved (exit code 2); a failed restoration also produces a warning.
+
+Avoid editing `Cargo.lock` while a single-crate rollback command is running. That command writes the live lock directly, so simultaneous edits in the same dependency scope cannot be distinguished reliably from Cargo's own changes. Changes observed between commands remain excluded from restoration.
 
 Crates rolled back together are reported with the others:
 
