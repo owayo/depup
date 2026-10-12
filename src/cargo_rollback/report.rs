@@ -228,6 +228,9 @@ fn lock_age_status_detail(status: &LockAgeStatus) -> String {
         LockAgeStatus::Restored => {
             "returned to the version locked before the install (also newer than --age)".to_string()
         }
+        LockAgeStatus::Reverted(reason) => {
+            format!("returned to the install-time version: {reason}")
+        }
         LockAgeStatus::NoOlderCandidate => "no older version satisfies --age".to_string(),
         LockAgeStatus::UpdateCommandFailed(msg) => format!("cargo update failed: {msg}"),
         LockAgeStatus::BlockedByManifest(requirement) => format!(
@@ -373,6 +376,30 @@ mod tests {
 
     fn texts(lines: &[ReportLine]) -> Vec<&str> {
         lines.iter().map(|line| line.text.as_str()).collect()
+    }
+
+    #[test]
+    fn reverted_partial_rollbacks_remain_unresolved_and_explain_why() {
+        let audit = LockAgeAuditResult {
+            adjustments: vec![adjustment(
+                "z-top",
+                "1.2.0",
+                None,
+                LockAgeStatus::Reverted("a-dep could not be rolled back".into()),
+            )],
+            ..Default::default()
+        };
+        assert!(audit.has_unresolved());
+        let lines = lock_age_report_lines(Path::new("."), &audit, false);
+        assert!(lines.iter().any(|line| {
+            line.text
+                .contains("returned to the install-time version: a-dep could not be rolled back")
+        }));
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.text.contains("crate(s) rolled back to satisfy"))
+        );
     }
 
     #[test]

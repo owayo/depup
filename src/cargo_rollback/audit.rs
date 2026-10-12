@@ -1,6 +1,7 @@
 //! Cargo.lock の公開日監査と差し戻し。時間予算と再試行の状態は lock ごとに保持する。
 
-use super::batch::{RollbackCandidate, TogetherOutcome, resolve_together};
+use super::batch::{RollbackCandidate, TogetherOutcome, resolve_together_tracked};
+use super::graph::LockGraph;
 use super::scratch::CargoCommand;
 use super::series::same_series;
 use crate::domain::Language;
@@ -67,12 +68,11 @@ const CARGO_UPDATE_TIMEOUT: Duration = Duration::from_secs(120);
 /// 差し戻しに着手するために必要な残り予算。
 ///
 /// `cargo update` に渡すタイムアウトは残り予算でクランプされるため、予算の末尾で
-/// 着手すると 1 秒程度で必ずタイムアウトする。1 件ずつ試した組合せは二度と
-/// 1 件ずつでは再試行されないため、本来差し戻せた依存が「失敗」として恒久的に
-/// 確定してしまう。着手できないなら未検証として残す方が良い。
+/// 着手すると 1 秒程度で必ずタイムアウトする。条件が変わるまで同じ単独試行は
+/// 繰り返さないので、着手できないなら未試行として残す。
 const MIN_CARGO_UPDATE_SLICE: Duration = Duration::from_secs(10);
 
-/// まとめ解き ([`resolve_together`]) に着手するために必要な残り予算。
+/// まとめ解き ([`resolve_together_tracked`]) に着手するために必要な残り予算。
 ///
 /// まとめ解きは workspace の写しを作り、cargo を少なくとも 3 回 (解き直し・固定の
 /// 除去・元の manifest での検証) 続けて起動する。1 件ずつの試行がこの分を食い潰すと、
@@ -177,6 +177,8 @@ pub enum LockAgeStatus {
     /// install 前の lock にあった版へ戻した。ただしその版も期間を満たさない
     /// (install 前から期間内の版が入っていた。install で入った変更だけを取り消した)
     Restored,
+    /// A partial rollback was undone to retain the install-time combination.
+    Reverted(String),
     /// age 内の代替バージョンが見つからずスキップ (全バージョンが新しい等)
     NoOlderCandidate,
     /// `cargo update` がエラーを返した (resolver 制約違反など。まとめ解きも失敗した場合は
@@ -502,6 +504,9 @@ async fn run_cargo_update_precise(
     ];
     match cargo.run(project_dir, &args, timeout).await {
         Ok(_) => LockAgeStatus::Downgraded,
+        Err(super::scratch::CargoError::TimedOut(timeout)) => {
+            LockAgeStatus::NotAttempted(format!("cargo update timed out after {timeout:?}"))
+        }
         Err(error) => LockAgeStatus::UpdateCommandFailed(error.to_string()),
     }
 }
@@ -509,12 +514,23 @@ async fn run_cargo_update_precise(
 /// lock ごとの監査状態。取得キャッシュだけが実行全体で共有される。
 struct AuditState {
     log: AdjustmentLog,
-    tried_alone: HashSet<(String, String)>,
-    conflicts: HashMap<(String, String), String>,
+    alone_failures: HashMap<(String, String), AloneFailure>,
     failed_together: HashSet<u64>,
     problems: Vec<String>,
     started: Instant,
     deadline: Instant,
+    installed_lock: String,
+    admitted: HashSet<(String, String)>,
+    changes: restore::AuditChanges,
+    #[cfg(test)]
+    elapsed_offset: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+}
+
+struct AloneFailure {
+    target: String,
+    lock: u64,
+    message: String,
+    conflict: bool,
 }
 
 impl AuditState {
@@ -522,13 +538,26 @@ impl AuditState {
         let started = Instant::now();
         Self {
             log: AdjustmentLog::default(),
-            tried_alone: HashSet::new(),
-            conflicts: HashMap::new(),
+            alone_failures: HashMap::new(),
             failed_together: HashSet::new(),
             problems: Vec::new(),
             started,
             deadline: started + budget,
+            installed_lock: String::new(),
+            admitted: HashSet::new(),
+            changes: Default::default(),
+            #[cfg(test)]
+            elapsed_offset: None,
         }
+    }
+
+    fn elapsed(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(offset) = &self.elapsed_offset {
+            return self.started.elapsed()
+                + Duration::from_millis(offset.load(std::sync::atomic::Ordering::SeqCst));
+        }
+        self.started.elapsed()
     }
 }
 
@@ -539,6 +568,9 @@ struct AuditPass {
     any_downgraded: bool,
     budget_exhausted: bool,
     completed: usize,
+    alone_successes: usize,
+    prioritize_singles: bool,
+    paused_for_reserve: bool,
 }
 
 /// 監査入力と、通常更新フローと共有するバージョン取得元。
@@ -546,6 +578,8 @@ pub(crate) struct LockAgeAuditor<'a> {
     input: &'a LockAgeAudit<'a>,
     versions: &'a VersionFetcher,
     verbose: bool,
+    #[cfg(test)]
+    elapsed_offset: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl<'a> LockAgeAuditor<'a> {
@@ -558,12 +592,30 @@ impl<'a> LockAgeAuditor<'a> {
             input,
             versions,
             verbose,
+            #[cfg(test)]
+            elapsed_offset: None,
         }
     }
 
     /// 検査・差し戻しを反復し、最終 lock の状態から結果を確定する。
     pub(crate) async fn run(&self, bar: Option<&ProgressBar>) -> LockAgeAuditResult {
         let mut state = AuditState::new(self.input.budget);
+        #[cfg(test)]
+        {
+            state.elapsed_offset = self.elapsed_offset.clone();
+        }
+        match read_audit_lock(&self.input.project_dir.join("Cargo.lock")) {
+            Ok((content, _)) => {
+                state.changes.observe(&content);
+                state.installed_lock = content;
+            }
+            Err(problem) => {
+                return LockAgeAuditResult {
+                    problems: vec![problem],
+                    ..Default::default()
+                };
+            }
+        }
         // 最後の一巡は差し戻さず、直前の解決で入った版を検証する。
         for pass_index in 0..=MAX_ENFORCE_LOCK_AGE_PASSES {
             let verify_only = pass_index == MAX_ENFORCE_LOCK_AGE_PASSES;
@@ -580,6 +632,12 @@ impl<'a> LockAgeAuditor<'a> {
             if !outcome.has_targets {
                 break;
             }
+            if !verify_only
+                && let Err(error) = self.retry_pending(&mut state, &mut outcome, bar).await
+            {
+                state.problems.push(error);
+                break;
+            }
             if !outcome.together.is_empty()
                 && !verify_only
                 && let Err(error) = self.resolve_conflicts(&mut state, &mut outcome, bar).await
@@ -593,6 +651,9 @@ impl<'a> LockAgeAuditor<'a> {
             if outcome.budget_exhausted || verify_only || !outcome.any_downgraded {
                 break;
             }
+        }
+        if state.problems.is_empty() {
+            self.restore_mixed(&mut state).await;
         }
         self.finalize(state, bar).await
     }
@@ -616,8 +677,17 @@ impl<'a> LockAgeAuditor<'a> {
             ..
         } = *self.input;
         let lock_path = project_dir.join("Cargo.lock");
-        let (_, entries) = read_audit_lock(&lock_path)?;
-        let targets = changed_entries(&entries, baseline);
+        let (content, entries) = read_audit_lock(&lock_path)?;
+        state.changes.observe(&content);
+        let keys: Vec<_> = changed_entries(&entries, baseline)
+            .into_iter()
+            .flat_map(|(name, versions)| {
+                versions
+                    .into_iter()
+                    .map(move |version| (name.clone(), version))
+            })
+            .collect();
+        let targets = LockGraph::from_lock_content(&content).dependents_first(&keys);
         if targets.is_empty() {
             return Ok(AuditPass::default());
         }
@@ -643,8 +713,9 @@ impl<'a> LockAgeAuditor<'a> {
             }
         }
 
-        'audit: for (index, (name, versions)) in targets.iter().enumerate() {
-            let elapsed = state.started.elapsed();
+        'audit: for (index, (name, version)) in targets.iter().enumerate() {
+            let versions = std::slice::from_ref(version);
+            let elapsed = state.elapsed();
             if elapsed >= budget {
                 // 予算切れ: 監査済みの調整は活かしつつ打ち切る。確かめられなかった件数は
                 // 最後に最終の lock から数える
@@ -689,7 +760,7 @@ impl<'a> LockAgeAuditor<'a> {
                 })
             }) {
                 // check と install の間に公開された版を、古いキャッシュだけで未確認にしない。
-                let remaining = budget.saturating_sub(state.started.elapsed());
+                let remaining = budget.saturating_sub(state.elapsed());
                 match tokio::time::timeout(remaining, self.versions.refresh(adapter, name)).await {
                     Ok(Ok(fresh)) => all_versions = fresh,
                     Ok(Err(_)) => {}
@@ -715,6 +786,7 @@ impl<'a> LockAgeAuditor<'a> {
                 };
 
                 if exemptions.admits(Language::Rust, name, current_info, cutoff) {
+                    state.admitted.insert((name.clone(), current.clone()));
                     continue;
                 }
 
@@ -771,7 +843,7 @@ impl<'a> LockAgeAuditor<'a> {
                     state.problems.push(error);
                     break 'audit;
                 }
-                if outcome.budget_exhausted {
+                if outcome.budget_exhausted || outcome.paused_for_reserve {
                     break 'audit;
                 }
             }
@@ -780,7 +852,7 @@ impl<'a> LockAgeAuditor<'a> {
         Ok(outcome)
     }
 
-    /// 一度だけ単独差し戻しを試し、解決衝突はまとめ解きへ渡す。
+    /// Retry a single rollback only when its lock or target changed.
     async fn rollback_one(
         &self,
         candidate: RollbackCandidate,
@@ -802,38 +874,59 @@ impl<'a> LockAgeAuditor<'a> {
             ..
         } = &candidate;
         let key = (name.clone(), current.clone());
-        if state.tried_alone.contains(&key) {
-            // 1 件ずつは試し済み。衝突で失敗したものは、まとめ解きの対象に戻す
-            // (lock が前回のまとめ解きの失敗時から変わっていれば試し直される)
-            if state.conflicts.contains_key(&key) {
-                outcome.together.push(candidate.clone());
+        let (content, entries) = read_audit_lock(&lock_path)?;
+        state.changes.observe(&content);
+        if let Some(moved) = locked_after_rollback(&entries, name, current) {
+            let status = match &moved {
+                None => LockAgeStatus::Removed,
+                Some(version) if compare_versions(version, current) == std::cmp::Ordering::Less => {
+                    LockAgeStatus::Downgraded
+                }
+                Some(version) => LockAgeStatus::UpdateCommandFailed(format!(
+                    "{name} is now locked at {version}, which is not older than {current}"
+                )),
+            };
+            outcome.any_downgraded |= status.is_resolved();
+            outcome.alone_successes += usize::from(status.is_resolved());
+            state.log.record(name, current, moved, status);
+            state.log.entries.get_mut(&key).unwrap().target = Some(target.clone());
+            state.alone_failures.remove(&key);
+            return Ok(());
+        }
+        let fingerprint = together_fingerprint(&content, &[]);
+        if let Some(failure) = state.alone_failures.get(&key)
+            && failure.lock == fingerprint
+            && failure.target == *target
+        {
+            if failure.conflict {
+                outcome.together.push(candidate);
             }
             return Ok(());
         }
 
         // 残り予算が `cargo update` 1 回分に満たないなら着手しない。
-        // 1 件ずつの試行は二度と再試行されないため、1 秒程度に切り詰められた
-        // タイムアウトで走らせると、本来差し戻せた依存が「失敗」として恒久的に
-        // 確定してしまう。未検証として残す方が次回の実行で救える。
+        // 同じ lock と目標では繰り返さないため、短く切り詰めたタイムアウトで
+        // 試すより、条件が変わった後に十分な時間を与えて再試行する。
         // まとめ解きを待っている crate があるときは、その分の時間も残す
         // (1 件ずつの試行だけで予算を使い切らない)
-        let remaining = budget.saturating_sub(state.started.elapsed());
-        let reserve = if outcome.together.is_empty() {
+        let remaining = budget.saturating_sub(state.elapsed());
+        let reserve = if outcome.prioritize_singles || outcome.together.is_empty() {
             Duration::ZERO
         } else {
             MIN_TOGETHER_SLICE
         };
         if remaining < MIN_CARGO_UPDATE_SLICE + reserve {
-            if !outcome.together.is_empty() && remaining >= MIN_TOGETHER_SLICE {
-                // 1 件ずつ試す時間は無いが、まとめ解きの枠は残っている
+            if reserve != Duration::ZERO && remaining >= MIN_CARGO_UPDATE_SLICE {
+                // End the scan without consuming more metadata budget; pending singles
+                // can use the remaining slice before deciding whether to resolve together.
                 outcome.together.push(candidate.clone());
+                outcome.paused_for_reserve = true;
                 return Ok(());
             }
             outcome.budget_exhausted = true;
             return Ok(());
         }
 
-        state.tried_alone.insert(key.clone());
         // `cargo update --precise` は 1 件あたり数秒かかる。バーの位置は
         // 動かないため、何を差し戻し中かはメッセージで示す
         if let Some(b) = bar {
@@ -855,10 +948,15 @@ impl<'a> LockAgeAuditor<'a> {
         // 読み直し、実際に今の版から外れたことを確かめてから差し戻しとして数える
         let status = match status {
             LockAgeStatus::Downgraded => {
-                let (_, locked) = read_audit_lock(&lock_path)?;
+                let (after, locked) = read_audit_lock(&lock_path)?;
                 match locked_after_rollback(&locked, name, current) {
                     Some(moved) => {
+                        state
+                            .changes
+                            .applied(&content, &after, std::slice::from_ref(&key));
                         outcome.any_downgraded = true;
+                        outcome.alone_successes += 1;
+                        state.alone_failures.remove(&key);
                         let status = if moved.is_some() {
                             LockAgeStatus::Downgraded
                         } else {
@@ -877,7 +975,15 @@ impl<'a> LockAgeAuditor<'a> {
         };
         match status {
             LockAgeStatus::UpdateCommandFailed(message) => {
-                state.conflicts.insert(key, message.clone());
+                state.alone_failures.insert(
+                    key,
+                    AloneFailure {
+                        target: target.clone(),
+                        lock: fingerprint,
+                        message: message.clone(),
+                        conflict: true,
+                    },
+                );
                 outcome.together.push(candidate.clone());
                 state.log.record(
                     name,
@@ -886,7 +992,68 @@ impl<'a> LockAgeAuditor<'a> {
                     LockAgeStatus::UpdateCommandFailed(message),
                 );
             }
+            LockAgeStatus::NotAttempted(message) => {
+                // A timeout does not establish a resolver conflict, but must not restart
+                // against the same lock and target on a later pass.
+                state.alone_failures.insert(
+                    key,
+                    AloneFailure {
+                        target: target.clone(),
+                        lock: fingerprint,
+                        message: message.clone(),
+                        conflict: false,
+                    },
+                );
+                state.log.record(
+                    name,
+                    current,
+                    Some(target.clone()),
+                    LockAgeStatus::NotAttempted(message),
+                );
+            }
             other => state.log.record(name, current, Some(target.clone()), other),
+        }
+        Ok(())
+    }
+
+    async fn retry_pending(
+        &self,
+        state: &mut AuditState,
+        outcome: &mut AuditPass,
+        bar: Option<&ProgressBar>,
+    ) -> Result<(), String> {
+        outcome.paused_for_reserve = false;
+        while !outcome.budget_exhausted && !outcome.together.is_empty() {
+            let (content, _) = read_audit_lock(&self.input.project_dir.join("Cargo.lock"))?;
+            let mut pending: BTreeMap<_, _> = std::mem::take(&mut outcome.together)
+                .into_iter()
+                .map(|candidate| {
+                    (
+                        (candidate.name.clone(), candidate.current.clone()),
+                        candidate,
+                    )
+                })
+                .collect();
+            // Every changed-lock retry gets priority over the together reserve,
+            // including retries after an earlier candidate failed again.
+            // It can finish a simple dependency chain even when fewer than 20 seconds remain.
+            let order = LockGraph::from_lock_content(&content)
+                .dependents_first(&pending.keys().cloned().collect::<Vec<_>>());
+            let successes = outcome.alone_successes;
+            for key in order {
+                let candidate = pending.remove(&key).unwrap();
+                outcome.prioritize_singles = true;
+                let attempt = self.rollback_one(candidate, state, outcome, bar).await;
+                outcome.prioritize_singles = false;
+                attempt?;
+                if outcome.budget_exhausted {
+                    outcome.together.extend(pending.into_values());
+                    break;
+                }
+            }
+            if outcome.alone_successes == successes {
+                break;
+            }
         }
         Ok(())
     }
@@ -907,8 +1074,9 @@ impl<'a> LockAgeAuditor<'a> {
         let lock_path = project_dir.join("Cargo.lock");
         // 同じパスの 1 件ずつの差し戻しで lock は変わっているので、直前の状態で判定する
         let (content, _) = read_audit_lock(&lock_path)?;
+        state.changes.observe(&content);
         let fingerprint = together_fingerprint(&content, &outcome.together);
-        let remaining = budget.saturating_sub(state.started.elapsed());
+        let remaining = budget.saturating_sub(state.elapsed());
         if remaining < MIN_TOGETHER_SLICE {
             for candidate in &outcome.together {
                 state.log.record_if_absent(
@@ -928,7 +1096,7 @@ impl<'a> LockAgeAuditor<'a> {
                     outcome.together.len()
                 ));
             }
-            let report = resolve_together(
+            let (report, changes) = resolve_together_tracked(
                 project_dir,
                 &outcome.together,
                 cargo,
@@ -936,6 +1104,13 @@ impl<'a> LockAgeAuditor<'a> {
                 CARGO_UPDATE_TIMEOUT,
             )
             .await;
+            for change in changes {
+                state
+                    .changes
+                    .applied(&change.before, &change.after, &change.selected);
+            }
+            let (after, _) = read_audit_lock(&lock_path)?;
+            state.changes.observe(&after);
             state.problems.extend(report.problems);
             let mut resolved_any = false;
             for (candidate, outcome) in report.outcomes {
@@ -943,7 +1118,7 @@ impl<'a> LockAgeAuditor<'a> {
                 match outcome {
                     TogetherOutcome::Resolved(version) => {
                         resolved_any = true;
-                        state.conflicts.remove(&key);
+                        state.alone_failures.remove(&key);
                         state.log.record(
                             &candidate.name,
                             &candidate.current,
@@ -955,7 +1130,7 @@ impl<'a> LockAgeAuditor<'a> {
                     }
                     TogetherOutcome::Removed => {
                         resolved_any = true;
-                        state.conflicts.remove(&key);
+                        state.alone_failures.remove(&key);
                         state.log.record(
                             &candidate.name,
                             &candidate.current,
@@ -964,7 +1139,7 @@ impl<'a> LockAgeAuditor<'a> {
                         );
                     }
                     TogetherOutcome::BlockedByManifest(requirement) => {
-                        state.conflicts.remove(&key);
+                        state.alone_failures.remove(&key);
                         state.log.record(
                             &candidate.name,
                             &candidate.current,
@@ -973,7 +1148,11 @@ impl<'a> LockAgeAuditor<'a> {
                         );
                     }
                     TogetherOutcome::Failed(reason) => {
-                        let message = match state.conflicts.get(&key) {
+                        let message = match state
+                            .alone_failures
+                            .get(&key)
+                            .map(|failure| &failure.message)
+                        {
                             Some(alone) => {
                                 format!("{alone}\n(resolving together also failed: {reason})")
                             }
@@ -989,7 +1168,11 @@ impl<'a> LockAgeAuditor<'a> {
                     // 時間切れは cargo の失敗ではない。1 件ずつで衝突した理由があれば
                     // それを残し、無ければ試さなかったことを記録する
                     TogetherOutcome::NotAttempted(reason) => {
-                        let status = match state.conflicts.get(&key) {
+                        let status = match state
+                            .alone_failures
+                            .get(&key)
+                            .map(|failure| &failure.message)
+                        {
                             Some(alone) => LockAgeStatus::UpdateCommandFailed(format!(
                                 "{alone}\n(resolving together was not finished: {reason})"
                             )),
@@ -1170,3 +1353,5 @@ impl<'a> LockAgeAuditor<'a> {
 
 #[cfg(test)]
 mod helper_tests;
+
+mod restore;
