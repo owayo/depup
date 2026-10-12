@@ -403,6 +403,10 @@ age が有効な `--install` では、直接依存・推移依存・開発依存
 
 Node の監査では lock を書き換えません。違反は実際のロック版・公開日・基準日時を、未確認の依存は理由を常に表示します。PM 自身の age フィルターで新規の解決を制限できる場合も、最後の検証を省略しません。
 
+age が有効な `--install` では、更新を書き込む前にも既存の `pnpm-lock.yaml` を監査します。install・最終監査と同じ workspace の共有設定を使い、更新のないメンバーの厳しい設定も含めます。Node 自身に更新がなくても、つながる Node/Cargo install のどちらかに実更新があれば確認します。違反・未確認・lock の読み込みや依存グラフの取得失敗・age 設定の読み込みや解釈失敗があれば、その scope のマニフェストと install を止めます。予定した更新は失敗として数え、終了コード 2 で通知します。独立した scope は処理を続けます。Tauri は共有 Node/Cargo workspace でつながるプロジェクトもまとめて止め、同期した片側だけの書き込みを防ぎます。Cargo の所属判定が失敗した manifest は、成功した Cargo の実行環境から読み取り専用の `locate-project` で再確認します。成功した回答が同じ root を示せば所属を確定し、回答が食い違う場合や成功がない場合は未確認のまま扱います。独立と確認できない Rust と対応する Node を止め、判定エラーの理由を表示します。別の root と確認できた scope は、同じ Node install を共有していなければ続行します。通常の Rust helper の所属が不明なだけでは、確認済みの別 root 同士をつなぎません。停止した Node/Cargo scope は install 後の監査と Cargo lock の差し戻しから除外します。残る独立した Rust install は、確認済みの root で full cargo update を実行します。root の判定が失敗した場合は、停止した Tauri ディレクトリを選ばずエラーを表示します。確認を通った scope と、更新のない独立した既存 lock の最終監査は維持します。dry-run と `--install` を付けない実行では、この事前監査を行いません。
+
+実際の age 違反がある場合は、手動で作り直すコマンドを表示します。`pnpm clean --lockfile` の後に、`npm_config_minimum_release_age` と `pnpm_config_minimum_release_age` の両方を付けた `pnpm install` を実行する手順です。分数は、固定した基準日時から表示時までの経過期間を計算し、切り上げた値です。時間を置いて実行する場合は、depup を再実行して案内を生成してください。`clean --lockfile` には [pnpm 11 以降](https://pnpm.io/blog/releases/11.0) が必要で、`node_modules` と lockfile を削除します。作り直すと lock 全体を解決し直すため、無関係な依存の版も変わります。depup はこのコマンドを実行せず、age の除外設定も緩めません。違反を確認できていない読み込み・メタデータ・検証の失敗だけでは、clean の手順を案内しません。
+
 #### Rust の `Cargo.lock` 監査
 
 Rust では、最終 `Cargo.lock` の crates.io の版を、無変更の直接依存・推移依存も含めて確認します。まず新しく解決されたクレートの age 違反を、元のマニフェストの制約と install 前の下限が許す範囲で差し戻します。その後、別の読み取り専用の検証で最終 lock の全件を確認します。

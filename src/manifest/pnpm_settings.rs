@@ -47,6 +47,19 @@ impl PnpmSettings {
         }
         None
     }
+
+    /// 指定なしと、設定の読取・解釈失敗を区別する。
+    /// 有効な値の優先順位は既存の読み取り経路と同じ。
+    pub(crate) fn checked_minimum_release_age_with_source(
+        dir: &Path,
+    ) -> Result<Option<(Duration, &'static str)>, String> {
+        for source in [".npmrc", "pnpm-workspace.yaml", "package.json"] {
+            if let Some(age) = checked_release_age(dir, source)? {
+                return Ok(Some((age, source)));
+            }
+        }
+        Ok(None)
+    }
 }
 
 /// 期間文字列をパースする。形式: Nd (日), Nw (週), Nm (月)
@@ -92,81 +105,68 @@ fn parse_release_age_value(value: &str) -> Option<Duration> {
     parse_duration(value)
 }
 
-/// .npmrc ファイルから minimum-release-age を読み取る
-///
-/// `key=value` に加えて `key = value` (= の前後の空白あり) も受け付ける。
-/// 裸の数値は pnpm ネイティブの分単位として解釈する
 fn read_npmrc_minimum_release_age(dir: &Path) -> Option<Duration> {
-    let npmrc_path = dir.join(".npmrc");
-    let content = std::fs::read_to_string(npmrc_path).ok()?;
-
-    for line in content.lines() {
-        let line = line.trim();
-        // コメントをスキップする
-        if line.starts_with('#') || line.starts_with(';') {
-            continue;
-        }
-
-        // minimum-release-age 設定を探す (= の前後の空白を許容)
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        if key.trim() != "minimum-release-age" {
-            continue;
-        }
-
-        // "10d" や '2w' のようなクォート付き値を処理する
-        let value = value.trim().trim_matches('"').trim_matches('\'');
-        return parse_release_age_value(value);
-    }
-
-    None
+    checked_release_age(dir, ".npmrc").ok().flatten()
 }
 
-/// pnpm-workspace.yaml から minimumReleaseAge を読み取る
-///
-/// pnpm-workspace.yaml の値は分単位 (例: 14400 = 10日)
 fn read_workspace_yaml_minimum_release_age(dir: &Path) -> Option<Duration> {
-    let workspace_path = dir.join("pnpm-workspace.yaml");
-    let content = std::fs::read_to_string(workspace_path).ok()?;
-
-    // minimumReleaseAge の簡易 YAML パース
-    for line in content.lines() {
-        let line = line.trim();
-        if let Some(value) = line.strip_prefix("minimumReleaseAge:") {
-            // `14400 # comment` のようなインラインコメントを取り除く
-            let value = value.split('#').next().unwrap_or(value).trim();
-            // "10d" のようなクォート付き文字列形式もサポートする
-            let value = value.trim_matches('"').trim_matches('\'');
-            // 裸の数値は分単位、サフィックス付きは期間として解釈する
-            return parse_release_age_value(value);
-        }
-    }
-
-    None
+    checked_release_age(dir, "pnpm-workspace.yaml")
+        .ok()
+        .flatten()
 }
 
-/// package.json の pnpm 設定から minimumReleaseAge を読み取る
-///
-/// `pnpm.minimumReleaseAge` と `pnpm.settings.minimumReleaseAge` の両方を受け付け、
-/// 数値型 (例: `14400`) は pnpm ネイティブの分単位として解釈する
 fn read_package_json_minimum_release_age(dir: &Path) -> Option<Duration> {
-    let package_json_path = dir.join("package.json");
-    let content = std::fs::read_to_string(package_json_path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+    checked_release_age(dir, "package.json").ok().flatten()
+}
 
-    let pnpm = json.get("pnpm")?;
-    let value = pnpm.get("minimumReleaseAge").or_else(|| {
-        pnpm.get("settings")
-            .and_then(|settings| settings.get("minimumReleaseAge"))
-    })?;
-
-    // 数値型は分として解釈する
-    if let Some(minutes) = value.as_u64() {
-        // オーバーフローと上限超過の両方を弾く (巨大値でカットオフ算出が panic しないように)
-        return checked_age_from_minutes(minutes);
+fn checked_release_age(dir: &Path, source: &str) -> Result<Option<Duration>, String> {
+    let path = dir.join(source);
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("could not inspect {source}: {error}")),
+        Ok(_) => {}
     }
-    parse_release_age_value(value.as_str()?)
+    let content = std::fs::read_to_string(&path)
+        .map_err(|error| format!("could not read {source}: {error}"))?;
+    let raw = match source {
+        ".npmrc" => content.lines().find_map(|line| {
+            let line = line.trim();
+            if line.starts_with('#') || line.starts_with(';') {
+                return None;
+            }
+            let (key, value) = line.split_once('=')?;
+            (key.trim() == "minimum-release-age").then(|| value.trim().to_string())
+        }),
+        "pnpm-workspace.yaml" => content.lines().find_map(|line| {
+            line.trim()
+                .strip_prefix("minimumReleaseAge:")
+                .map(|value| value.split('#').next().unwrap_or(value).trim().to_string())
+        }),
+        _ => {
+            let json: serde_json::Value = serde_json::from_str(&content)
+                .map_err(|error| format!("invalid {source}: {error}"))?;
+            json.get("pnpm")
+                .and_then(|pnpm| {
+                    pnpm.get("minimumReleaseAge").or_else(|| {
+                        pnpm.get("settings")
+                            .and_then(|settings| settings.get("minimumReleaseAge"))
+                    })
+                })
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| value.to_string())
+                })
+        }
+    };
+    if let Some(raw) = raw {
+        let value = raw.trim().trim_matches('"').trim_matches('\'');
+        let age = parse_release_age_value(value)
+            .ok_or_else(|| format!("invalid minimumReleaseAge in {source}"))?;
+        return Ok(Some(age));
+    }
+    Ok(None)
 }
 
 /// ディレクトリに pnpm ワークスペース設定があるかどうかを判定する
@@ -177,6 +177,65 @@ pub fn has_pnpm_workspace(dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checked_settings_distinguish_invalid_or_unreadable_from_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            PnpmSettings::checked_minimum_release_age_with_source(temp.path()).unwrap(),
+            None
+        );
+        for (source, content) in [
+            (".npmrc", "minimum-release-age=invalid\n"),
+            ("pnpm-workspace.yaml", "minimumReleaseAge: invalid\n"),
+            ("package.json", r#"{"pnpm":{"minimumReleaseAge":false}}"#),
+        ] {
+            let path = temp.path().join(source);
+            std::fs::write(&path, content).unwrap();
+            assert!(
+                PnpmSettings::checked_minimum_release_age_with_source(temp.path())
+                    .unwrap_err()
+                    .contains(source)
+            );
+            std::fs::remove_file(path).unwrap();
+        }
+        std::fs::create_dir(temp.path().join(".npmrc")).unwrap();
+        assert!(
+            PnpmSettings::checked_minimum_release_age_with_source(temp.path())
+                .unwrap_err()
+                .contains("could not read .npmrc")
+        );
+    }
+
+    #[test]
+    fn checked_settings_keep_valid_source_priority() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join(".npmrc"), "minimum-release-age=1w\n").unwrap();
+        std::fs::write(
+            temp.path().join("pnpm-workspace.yaml"),
+            "minimumReleaseAge: 30d\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("package.json"),
+            r#"{"pnpm":{"minimumReleaseAge":43200}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            PnpmSettings::checked_minimum_release_age_with_source(temp.path()).unwrap(),
+            Some((Duration::from_secs(7 * 86400), ".npmrc"))
+        );
+        std::fs::remove_file(temp.path().join(".npmrc")).unwrap();
+        assert_eq!(
+            PnpmSettings::checked_minimum_release_age_with_source(temp.path()).unwrap(),
+            Some((Duration::from_secs(30 * 86400), "pnpm-workspace.yaml"))
+        );
+        std::fs::remove_file(temp.path().join("pnpm-workspace.yaml")).unwrap();
+        assert_eq!(
+            PnpmSettings::checked_minimum_release_age_with_source(temp.path()).unwrap(),
+            Some((Duration::from_secs(30 * 86400), "package.json"))
+        );
+    }
     use std::fs;
     use tempfile::TempDir;
 
