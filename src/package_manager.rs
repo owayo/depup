@@ -10,6 +10,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
 
+/// A package-manager update may refresh everything or only the applied updates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstallScope {
+    Full,
+    Packages(Vec<String>),
+    /// Reconcile changed requirements without unlocking unrelated Cargo packages.
+    CargoWorkspace,
+}
+
 /// パッケージマネージャの実行ファイルを PATH から解決する。
 ///
 /// Windows では `npm` / `pnpm` / `yarn` / `bun` / `composer` / `gradle` などが
@@ -211,6 +220,40 @@ impl SystemPackageManager {
             out.push(cutoff.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
         }
         out
+    }
+
+    fn scoped_install_args(
+        &self,
+        pm: &str,
+        policy: &crate::update::AgePolicy,
+        scope: &InstallScope,
+    ) -> Result<Vec<String>, String> {
+        let mut args = self.get_install_command_args_for_policy(pm, policy);
+        match (pm, scope) {
+            ("cargo", InstallScope::CargoWorkspace) => args.push("--workspace".into()),
+            ("cargo", InstallScope::Packages(packages)) if !packages.is_empty() => {
+                for package in packages {
+                    if !valid_cargo_selector(package) {
+                        return Err("Invalid package ID for scoped Cargo update".into());
+                    }
+                    args.extend(["--package".into(), package.clone()]);
+                }
+            }
+            ("composer", InstallScope::Packages(packages)) if !packages.is_empty() => {
+                if packages.iter().any(|package| !valid_composer_name(package)) {
+                    return Err("Invalid package name for scoped Composer update".into());
+                }
+                args.extend([
+                    "--with-all-dependencies".into(),
+                    "--minimal-changes".into(),
+                    "--".into(),
+                ]);
+                args.extend(packages.iter().cloned());
+            }
+            (_, InstallScope::Full) => {}
+            _ => return Err("Invalid or empty package-manager update scope".into()),
+        }
+        Ok(args)
     }
 
     /// パッケージマネージャ実行時に追加する環境変数を決定する。
@@ -437,11 +480,45 @@ impl SystemPackageManager {
         working_dir: &Path,
         policy: &crate::update::AgePolicy,
     ) -> InstallResult {
-        let Some((effective_dir, pm)) = self.resolve_package_manager(language, working_dir) else {
+        self.run_install_scoped(language, working_dir, policy, &InstallScope::Full)
+    }
+
+    /// Run an install with selectors planned from successfully applied updates.
+    pub fn run_install_scoped(
+        &self,
+        language: Language,
+        working_dir: &Path,
+        policy: &crate::update::AgePolicy,
+        scope: &InstallScope,
+    ) -> InstallResult {
+        if language == Language::Rust
+            && *scope != InstallScope::Full
+            && !working_dir.join("Cargo.toml").is_file()
+        {
+            return InstallResult::failure(
+                language,
+                "cargo update (scoped)".into(),
+                String::new(),
+                "The planned Cargo manifest is no longer available".into(),
+            );
+        }
+        let Some((effective_dir, pm)) =
+            self.resolve_scoped_package_manager(language, working_dir, scope)
+        else {
             return InstallResult::skipped(language);
         };
 
-        let command_parts = self.get_install_command_args_for_policy(pm, policy);
+        let command_parts = match self.scoped_install_args(pm, policy, scope) {
+            Ok(parts) => parts,
+            Err(error) => {
+                return InstallResult::failure(
+                    language,
+                    format!("{pm} update (scoped)"),
+                    String::new(),
+                    error,
+                );
+            }
+        };
         if command_parts.is_empty() {
             return InstallResult::skipped(language);
         }
@@ -456,11 +533,14 @@ impl SystemPackageManager {
             let env_str: Vec<String> = env.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
             format!("{} {}", env_str.join(" "), command_parts.join(" "))
         };
+        let command_str = redact_install_output(&command_str, &command_parts);
 
         match self.run_command(&command_refs, &effective_dir, &env) {
             Ok(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                let stdout =
+                    redact_install_output(&String::from_utf8_lossy(&output.stdout), &command_parts);
+                let stderr =
+                    redact_install_output(&String::from_utf8_lossy(&output.stderr), &command_parts);
 
                 if output.status.success() {
                     InstallResult::success(language, command_str, stdout, stderr)
@@ -476,6 +556,90 @@ impl SystemPackageManager {
             ),
         }
     }
+
+    fn resolve_scoped_package_manager(
+        &self,
+        language: Language,
+        working_dir: &Path,
+        scope: &InstallScope,
+    ) -> Option<(PathBuf, &'static str)> {
+        if language == Language::Rust && *scope != InstallScope::Full {
+            // The planner has already obtained this root from Cargo itself.
+            // Re-detecting a Tauri subdirectory can select a different workspace.
+            Some((working_dir.to_path_buf(), "cargo"))
+        } else {
+            self.resolve_package_manager(language, working_dir)
+        }
+    }
+}
+
+fn valid_cargo_selector(selector: &str) -> bool {
+    let Some((source, package)) = selector.rsplit_once('#') else {
+        return false;
+    };
+    let Some((name, version)) = package.rsplit_once('@') else {
+        return false;
+    };
+    let url = source
+        .strip_prefix("registry+")
+        .or_else(|| source.strip_prefix("sparse+"))
+        .or_else(|| source.strip_prefix("git+"));
+    url.is_some_and(|url| reqwest::Url::parse(url).is_ok())
+        && !name.is_empty()
+        && !name.starts_with('-')
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
+        && semver::Version::parse(version).is_ok()
+}
+
+fn valid_composer_name(package: &str) -> bool {
+    package.split_once('/').is_some_and(|(vendor, name)| {
+        [vendor, name].into_iter().all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphanumeric())
+                && segment
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b'_'))
+        })
+    })
+}
+
+pub(crate) fn redact_install_output(text: &str, args: &[String]) -> String {
+    static URLS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"(?i)\b(?:https?|ssh|git)://[^\s<>"'`]+"#).unwrap()
+    });
+    // Tags and full updates have no source selector in argv. Cargo can still
+    // echo an authenticated manifest URL in its output, so scan every URL.
+    let mut text = URLS
+        .replace_all(text, |captures: &regex::Captures<'_>| {
+            let url = &captures[0];
+            let authority_start = url.find("://").unwrap() + 3;
+            let authority_end = url[authority_start..]
+                .find(['/', '?', '#'])
+                .map_or(url.len(), |offset| authority_start + offset);
+            format!(
+                "{}{}",
+                crate::registry::redact_url(&url[..authority_end]),
+                &url[authority_end..]
+            )
+        })
+        .into_owned();
+    for argument in args {
+        if let Some(source) = argument.strip_prefix("git+") {
+            let url = source.split('#').next().unwrap_or(source);
+            text = text.replace(url, &crate::registry::redact_url(url));
+            if let Ok(parsed) = reqwest::Url::parse(url)
+                && let Some(password) = parsed.password().filter(|password| !password.is_empty())
+            {
+                text = text.replace(password, "***");
+            }
+        }
+    }
+    text
 }
 
 impl PackageManagerRunner for SystemPackageManager {
@@ -513,6 +677,380 @@ pub fn run_installs<R: PackageManagerRunner>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_install_preserves_unselected_locked_dependencies() {
+        use crate::test_support::local_registry::{LocalRegistry, TestProject};
+        let registry = LocalRegistry::new();
+        registry.publish("selected", "1.0.0", &[]);
+        registry.publish("untouched", "1.0.0", &[]);
+        let manifest = |version: &str| {
+            format!(
+                "[package]\nname = 'example'\nversion = '0.1.0'\nedition = '2024'\n[dependencies]\nselected = '{version}'\nuntouched = '1.0.0'\n"
+            )
+        };
+        let project = TestProject::new(&registry, &manifest("1.0.0"));
+        project.cargo_ok(&["generate-lockfile"]);
+        registry.publish("selected", "2.0.0", &[("required", "1.1.0")]);
+        registry.publish("required", "1.1.0", &[]);
+        registry.publish("untouched", "1.0.1", &[]);
+        project.write("Cargo.toml", &manifest("2.0.0"));
+        let command = planned_cargo_args(&project, "selected", "1.0.0", true);
+        let command_refs: Vec<_> = command[1..].iter().map(String::as_str).collect();
+        project.cargo_ok(&command_refs);
+        assert_eq!(project.locked_versions("selected"), ["2.0.0"]);
+        assert_eq!(project.locked_versions("required"), ["1.1.0"]);
+        assert_eq!(project.locked_versions("untouched"), ["1.0.0"]);
+    }
+
+    fn planned_cargo_args(
+        project: &crate::test_support::local_registry::TestProject,
+        name: &str,
+        old_requirement: &str,
+        only: bool,
+    ) -> Vec<String> {
+        use crate::domain::{Dependency, VersionSpec, VersionSpecKind};
+        planned_cargo_dependency_args(
+            project,
+            Dependency::production(
+                name,
+                VersionSpec::new(VersionSpecKind::Caret, old_requirement, old_requirement),
+                Language::Rust,
+            ),
+            only,
+        )
+    }
+
+    fn planned_cargo_dependency_args(
+        project: &crate::test_support::local_registry::TestProject,
+        dependency: crate::domain::Dependency,
+        only: bool,
+    ) -> Vec<String> {
+        use crate::domain::{ManifestUpdateResult, UpdateResult, UpdateSummary};
+        use clap::Parser;
+        let mut args = crate::cli::CliArgs::parse_from(["depup", "--no-age"]);
+        args.path = project.path().to_path_buf();
+        if only {
+            args.only = vec![dependency.manifest_name().into()];
+        }
+        let orchestrator = crate::orchestrator::Orchestrator::new(args).unwrap();
+        let mut manifest =
+            ManifestUpdateResult::new(project.path().join("Cargo.toml"), Language::Rust);
+        manifest.add_result(UpdateResult::update(dependency, "2.0.0"));
+        let mut summary = UpdateSummary::new(false);
+        summary.add_manifest(manifest);
+        let result = crate::orchestrator::OrchestratorResult {
+            summary,
+            write_results: vec![],
+            errors: vec![],
+        };
+        let plan = crate::install::InstallPlan::new_scoped(
+            &orchestrator,
+            &result,
+            &None,
+            project.path(),
+            only,
+        );
+        let job = &plan.jobs[0];
+        SystemPackageManager::new()
+            .scoped_install_args(
+                "cargo",
+                job.policy.as_ref().unwrap(),
+                job.scope.as_ref().unwrap(),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn scoped_install_arguments_reject_patterns_and_keep_full_updates() {
+        let pm = SystemPackageManager::new();
+        let policy = crate::update::AgePolicy {
+            min_age: None,
+            evaluated_at: chrono::Utc::now(),
+            exemptions: Default::default(),
+        };
+        for manager in ["cargo", "composer"] {
+            assert_eq!(
+                pm.scoped_install_args(manager, &policy, &InstallScope::Full)
+                    .unwrap(),
+                [manager, "update"]
+            );
+            assert!(
+                pm.scoped_install_args(manager, &policy, &InstallScope::Packages(vec![]))
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            pm.scoped_install_args("cargo", &policy, &InstallScope::CargoWorkspace)
+                .unwrap(),
+            ["cargo", "update", "--workspace"]
+        );
+        assert_eq!(
+            pm.scoped_install_args(
+                "composer",
+                &policy,
+                &InstallScope::Packages(vec!["vendor/selected".into()])
+            )
+            .unwrap(),
+            [
+                "composer",
+                "update",
+                "--with-all-dependencies",
+                "--minimal-changes",
+                "--",
+                "vendor/selected"
+            ]
+        );
+        for name in ["-x", "vendor/*", "vendor/name:1.0", "vendor/../name"] {
+            assert!(
+                pm.scoped_install_args(
+                    "composer",
+                    &policy,
+                    &InstallScope::Packages(vec![name.into()])
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            pm.scoped_install_args(
+                "cargo",
+                &policy,
+                &InstallScope::Packages(vec!["--workspace".into()])
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn only_install_handles_renamed_multiple_series_and_no_lock() {
+        use crate::test_support::local_registry::{LocalRegistry, TestProject};
+        let registry = LocalRegistry::new();
+        registry.publish("selected", "1.0.0", &[]);
+        registry.publish("selected", "2.0.0", &[]);
+        registry.publish("untouched", "1.0.0", &[]);
+        let manifest = |version: &str| {
+            format!(
+                "[package]\nname = 'example'\nversion = '0.1.0'\nedition = '2024'\n[dependencies]\nalias = {{package = 'selected', version = '{version}'}}\nold = {{package = 'selected', version = '1.0.0'}}\nuntouched = '1.0.0'\n"
+            )
+        };
+        let project = TestProject::new(&registry, &manifest("2.0.0"));
+        project.cargo_ok(&["generate-lockfile"]);
+        registry.publish("selected", "1.0.1", &[]);
+        registry.publish("selected", "3.0.0", &[]);
+        registry.publish("untouched", "1.0.1", &[]);
+        project.write("Cargo.toml", &manifest("3.0.0"));
+        let args = planned_cargo_args(&project, "selected", "2.0.0", true);
+        let refs: Vec<_> = args[1..].iter().map(String::as_str).collect();
+        project.cargo_ok(&refs);
+        assert_eq!(project.locked_versions("selected"), ["1.0.0", "3.0.0"]);
+        assert_eq!(project.locked_versions("untouched"), ["1.0.0"]);
+        let fresh = TestProject::new(&registry, &manifest("3.0.0"));
+        let args = planned_cargo_args(&fresh, "selected", "2.0.0", true);
+        assert_eq!(args, ["cargo", "update", "--workspace"]);
+        fresh.cargo_ok(&args[1..].iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(fresh.locked_versions("selected"), ["1.0.1", "3.0.0"]);
+    }
+
+    #[test]
+    fn install_without_only_still_refreshes_unselected_packages() {
+        use crate::test_support::local_registry::{LocalRegistry, TestProject};
+        let registry = LocalRegistry::new();
+        registry.publish("selected", "1.0.0", &[]);
+        registry.publish("untouched", "1.0.0", &[]);
+        let project = TestProject::new(
+            &registry,
+            "[package]\nname = 'example'\nversion = '0.1.0'\n[dependencies]\nselected = '1.0.0'\nuntouched = '1.0.0'\n",
+        );
+        project.cargo_ok(&["generate-lockfile"]);
+        registry.publish("selected", "1.0.1", &[]);
+        registry.publish("untouched", "1.0.1", &[]);
+        let args = planned_cargo_args(&project, "selected", "1.0.0", false);
+        assert_eq!(args, ["cargo", "update"]);
+        project.cargo_ok(&args[1..].iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(project.locked_versions("untouched"), ["1.0.1"]);
+    }
+
+    #[test]
+    fn scoped_git_branch_and_tag_updates_preserve_unrelated_registry_versions() {
+        use crate::domain::{Dependency, GitReference, GitSource, VersionSpec, VersionSpecKind};
+        use crate::test_support::local_registry::{LocalRegistry, TestProject};
+        let repository = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(repository.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--initial-branch=main"]);
+        let write_revision = |version: &str| {
+            std::fs::create_dir_all(repository.path().join("src")).unwrap();
+            std::fs::write(
+                repository.path().join("Cargo.toml"),
+                format!("[package]\nname = 'selected'\nversion = '{version}'\nedition = '2024'\n"),
+            )
+            .unwrap();
+            std::fs::write(repository.path().join("src/lib.rs"), "").unwrap();
+            git(&["add", "Cargo.toml", "src/lib.rs"]);
+            git(&[
+                "-c",
+                "user.name=Example",
+                "-c",
+                "user.email=you@example.com",
+                "commit",
+                "-m",
+                "test revision",
+            ]);
+        };
+        write_revision("1.0.0");
+        git(&["tag", "v1.0.0"]);
+        let url = reqwest::Url::from_directory_path(repository.path())
+            .unwrap()
+            .to_string();
+        let registry = LocalRegistry::new();
+        registry.publish("untouched", "1.0.0", &[]);
+        let manifest = |reference: &str| {
+            format!(
+                "[package]\nname = 'example'\nversion = '0.1.0'\nedition = '2024'\n[dependencies]\nalias = {{package = 'selected', git = '{url}', {reference}}}\nuntouched = '1.0.0'\n"
+            )
+        };
+        let branch = TestProject::new(&registry, &manifest("branch = 'main'"));
+        let tag = TestProject::new(&registry, &manifest("tag = 'v1.0.0'"));
+        let local_cargo = |project: &TestProject, args: &[String]| {
+            // All sources are local: file:// git and the fake local registry.
+            let output = Command::new(TestProject::cargo_program())
+                .args(args)
+                .current_dir(project.path())
+                .envs(project.cargo_envs())
+                .env("CARGO_NET_OFFLINE", "false")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        local_cargo(&branch, &["generate-lockfile".into()]);
+        local_cargo(&tag, &["generate-lockfile".into()]);
+        write_revision("2.0.0");
+        git(&["tag", "v2.0.0"]);
+        registry.publish("untouched", "1.0.1", &[]);
+        tag.write("Cargo.toml", &manifest("tag = 'v2.0.0'"));
+        for (project, reference) in [
+            (&branch, GitReference::Branch("main".into())),
+            (&tag, GitReference::Tag("v1.0.0".into())),
+        ] {
+            let dependency = Dependency::production(
+                "selected",
+                VersionSpec::new(VersionSpecKind::Exact, "old", "old"),
+                Language::Rust,
+            )
+            .with_manifest_name("alias")
+            .with_git_source(GitSource::new(&url, reference));
+            let args = planned_cargo_dependency_args(project, dependency, true);
+            local_cargo(project, &args[1..]);
+            let packages = crate::manifest::parse_lock_packages(&project.read("Cargo.lock"));
+            assert_eq!(
+                packages
+                    .iter()
+                    .find(|package| package.name == "selected")
+                    .unwrap()
+                    .version,
+                "2.0.0"
+            );
+            assert_eq!(project.locked_versions("untouched"), ["1.0.0"]);
+        }
+    }
+
+    #[test]
+    fn scoped_git_command_output_redacts_embedded_credentials() {
+        let url = format!("https://{}:{}@example.com", "user", "example-password");
+        let argument = format!("git+{url}/repository?branch=main#selected@1.0.0");
+        let text = redact_install_output(
+            &format!("cargo update --package {argument}; password example-password"),
+            &[argument],
+        );
+        assert!(!text.contains("example-password"));
+        assert!(!text.contains("user:"));
+        assert!(text.contains("https://***@example.com"));
+    }
+
+    #[test]
+    fn tag_and_full_install_outputs_redact_url_credentials_without_selectors() {
+        let url = format!(
+            "https://{}:{}@example.com/repository.git?tag=v2",
+            "user", "encoded%40password"
+        );
+        let message = format!("failed to fetch `{url}`; retain unrelated encoded%40password text");
+        for args in [
+            vec!["cargo".into(), "update".into(), "--workspace".into()],
+            vec!["cargo".into(), "update".into()],
+        ] {
+            let redacted = redact_install_output(&message, &args);
+            assert_eq!(
+                redacted,
+                "failed to fetch `https://***@example.com/repository.git?tag=v2`; retain unrelated encoded%40password text"
+            );
+        }
+    }
+
+    #[test]
+    fn install_output_redaction_preserves_url_queries_and_nonsecret_text() {
+        let https = format!(
+            "https://{}:{}@example.com?tag=v2&note=value@other",
+            "user", "encoded%40password"
+        );
+        let ssh = format!(
+            "ssh://{}:{}@example.com/repository",
+            "git", "example-password"
+        );
+        let message = format!(
+            "fetch '{https}' and `{ssh}`; https://example.com?note=value@other; encoded%40password"
+        );
+        assert_eq!(
+            redact_install_output(&message, &[]),
+            "fetch 'https://***@example.com?tag=v2&note=value@other' and `ssh://***@example.com/repository`; https://example.com?note=value@other; encoded%40password"
+        );
+    }
+
+    #[test]
+    fn scoped_rust_install_keeps_the_cargo_resolution_root_in_a_tauri_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("Cargo.toml"),
+            "[workspace]\nexclude = ['src-tauri']\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(temp.path().join("src-tauri")).unwrap();
+        std::fs::write(temp.path().join("src-tauri/Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(
+            temp.path().join("package.json"),
+            "{\"dependencies\":{\"@tauri-apps/api\":\"^2.0.0\"}}",
+        )
+        .unwrap();
+        let pm = SystemPackageManager::new();
+        let (directory, command) = pm
+            .resolve_scoped_package_manager(
+                Language::Rust,
+                temp.path(),
+                &InstallScope::CargoWorkspace,
+            )
+            .unwrap();
+        assert_eq!(directory, temp.path());
+        assert_eq!(command, "cargo");
+        assert_eq!(
+            pm.resolve_scoped_package_manager(Language::Rust, temp.path(), &InstallScope::Full)
+                .unwrap()
+                .0,
+            temp.path().join("src-tauri")
+        );
+    }
 
     #[cfg(unix)]
     #[test]

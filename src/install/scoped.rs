@@ -1,0 +1,333 @@
+//! Plan selective updates from the applied dependencies and the old lockfile.
+
+use super::*;
+use crate::domain::{Dependency, GitReference, ManifestUpdateResult};
+use crate::manifest::{LockPackage, is_crates_io_source, parse_lock_packages};
+
+pub(super) fn replace_scoped_jobs(
+    jobs: &mut Vec<InstallJob>,
+    orchestrator: &Orchestrator,
+    result: &OrchestratorResult,
+) {
+    jobs.retain(|job| !matches!(job.language, Language::Rust | Language::Php));
+    let boundary = orchestrator.rust_lock_boundary();
+    let mut groups: BTreeMap<(PathBuf, String), Vec<&ManifestUpdateResult>> = BTreeMap::new();
+    let mut rust_roots: BTreeMap<PathBuf, Result<PathBuf, String>> = BTreeMap::new();
+    for manifest in &result.summary.manifests {
+        if !manifest.has_updates() || !matches!(manifest.language, Language::Rust | Language::Php) {
+            continue;
+        }
+        let parent = manifest.path.parent().unwrap_or(Path::new("."));
+        let directory = if manifest.language == Language::Rust {
+            let key =
+                std::fs::canonicalize(&manifest.path).unwrap_or_else(|_| manifest.path.clone());
+            match rust_roots
+                .entry(key)
+                .or_insert_with(|| rust_resolution_directory(&manifest.path, &boundary))
+            {
+                Ok(directory) => directory.clone(),
+                Err(error) => {
+                    jobs.push(InstallJob {
+                        directory: parent.to_path_buf(),
+                        language: Language::Rust,
+                        policy: install_age_policy(orchestrator, result, parent, Language::Rust),
+                        scope: Err(error.clone()),
+                    });
+                    continue;
+                }
+            }
+        } else {
+            parent.to_path_buf()
+        };
+        groups
+            .entry((directory, manifest.language.to_string()))
+            .or_default()
+            .push(manifest);
+    }
+    for ((directory, _), manifests) in groups {
+        let language = manifests[0].language;
+        let scope = match language {
+            Language::Rust => cargo_scope(&directory, &manifests),
+            Language::Php => composer_scope(&directory, &manifests),
+            _ => unreachable!(),
+        };
+        jobs.push(InstallJob {
+            policy: install_age_policy(orchestrator, result, &directory, language),
+            directory,
+            language,
+            scope,
+        });
+    }
+    jobs.sort_by(|left, right| {
+        left.directory
+            .cmp(&right.directory)
+            .then_with(|| left.language.to_string().cmp(&right.language.to_string()))
+    });
+}
+
+fn rust_resolution_directory(manifest: &Path, boundary: &Path) -> Result<PathBuf, String> {
+    let manifest = std::fs::canonicalize(manifest)
+        .map_err(|error| format!("Cannot locate Cargo workspace: {error}"))?;
+    let parent = manifest
+        .parent()
+        .ok_or("Cargo manifest has no parent directory")?;
+    let program = which::which_in("cargo", std::env::var_os("PATH"), parent)
+        .map_err(|error| format!("Cannot locate Cargo executable: {error}"))?;
+    // Cargo accounts for exclusions, implicit path members and package.workspace.
+    // locate-project only reads manifests; it never resolves or writes a lock.
+    let output = std::process::Command::new(program)
+        .args([
+            "locate-project",
+            "--workspace",
+            "--message-format",
+            "json",
+            "--manifest-path",
+        ])
+        // Canonical Windows paths use an extended-length prefix that Cargo's
+        // workspace member matching does not consistently accept in argv.
+        // The resolved parent cwd keeps this relative filename unambiguous.
+        .arg(
+            manifest
+                .file_name()
+                .ok_or("Cargo manifest has no filename")?,
+        )
+        .current_dir(parent)
+        .env("CARGO_NET_OFFLINE", "true")
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .output()
+        .map_err(|error| format!("Cannot run cargo locate-project: {error}"))?;
+    if !output.status.success() {
+        let message = crate::package_manager::redact_install_output(
+            &String::from_utf8_lossy(&output.stderr),
+            &[],
+        );
+        return Err(format!("Cannot locate Cargo workspace: {}", message.trim()));
+    }
+    let location: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|_| "Cannot parse cargo locate-project output")?;
+    let root = location
+        .get("root")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("cargo locate-project returned no root")?;
+    let root = std::fs::canonicalize(root)
+        .map_err(|error| format!("Cannot read located Cargo root: {error}"))?;
+    let directory = root
+        .parent()
+        .ok_or("Located Cargo root has no parent directory")?;
+    let boundary = std::fs::canonicalize(boundary)
+        .map_err(|error| format!("Cannot read Cargo execution boundary: {error}"))?;
+    if !directory.starts_with(boundary) {
+        return Err("Cargo resolved a workspace outside the execution boundary".into());
+    }
+    Ok(directory.to_path_buf())
+}
+
+fn composer_scope(
+    directory: &Path,
+    manifests: &[&ManifestUpdateResult],
+) -> Result<InstallScope, String> {
+    let has_lock = directory
+        .join("composer.lock")
+        .try_exists()
+        .map_err(|error| format!("Cannot inspect composer.lock: {error}"))?;
+    if !has_lock {
+        return Ok(InstallScope::Full);
+    }
+    let names: BTreeSet<_> = manifests
+        .iter()
+        .flat_map(|manifest| manifest.updates())
+        .map(|update| update.dependency().name.to_ascii_lowercase())
+        .collect();
+    Ok(InstallScope::Packages(names.into_iter().collect()))
+}
+
+fn cargo_scope(
+    directory: &Path,
+    manifests: &[&ManifestUpdateResult],
+) -> Result<InstallScope, String> {
+    let path = directory.join("Cargo.lock");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(InstallScope::CargoWorkspace);
+        }
+        Err(error) => return Err(format!("Cannot read pre-install Cargo.lock: {error}")),
+    };
+    let lock: toml::Value =
+        toml::from_str(&content).map_err(|_| "Cannot parse pre-install Cargo.lock".to_string())?;
+    let entries = lock
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .ok_or("Pre-install Cargo.lock has no package list")?;
+    if entries.iter().any(|entry| {
+        entry.get("name").and_then(toml::Value::as_str).is_none()
+            || entry.get("version").and_then(toml::Value::as_str).is_none()
+    }) {
+        return Err("Pre-install Cargo.lock contains an invalid package".into());
+    }
+    let packages = parse_lock_packages(&content);
+    let mut selectors = BTreeSet::new();
+    for manifest in manifests {
+        for update in manifest.updates() {
+            let dependency = update.dependency();
+            // A tag change creates a new source ID. Reconcile it without unlocking the old source.
+            if dependency
+                .git_source
+                .as_ref()
+                .is_some_and(|git| matches!(git.reference, GitReference::Tag(_)))
+            {
+                continue;
+            }
+            let requirement = if dependency.git_source.is_none() {
+                Some(
+                    semver::VersionReq::parse(&dependency.version_spec.raw).map_err(|_| {
+                        format!(
+                            "Cannot identify the old Cargo requirement for {}",
+                            dependency.name
+                        )
+                    })?,
+                )
+            } else {
+                None
+            };
+            let mut candidates: Vec<_> = packages
+                .iter()
+                .filter(|package| {
+                    package.name == dependency.name
+                        && matches_source(package, dependency)
+                        && requirement.as_ref().is_none_or(|requirement| {
+                            semver::Version::parse(&package.version)
+                                .is_ok_and(|version| requirement.matches(&version))
+                        })
+                })
+                .collect();
+            if candidates.len() > 1 {
+                let direct = direct_packages(&manifest.path, dependency, &packages)?;
+                candidates.retain(|candidate| direct.contains(candidate));
+            }
+            match candidates.as_slice() {
+                [package] => {
+                    let source = package
+                        .source
+                        .as_deref()
+                        .unwrap()
+                        .split('#')
+                        .next()
+                        .unwrap();
+                    selectors.insert(format!("{source}#{}@{}", package.name, package.version));
+                }
+                [] if dependency.git_source.is_none() => {
+                    // A changed manifest may refer to a dependency that has never been locked.
+                }
+                _ => {
+                    return Err(format!(
+                        "Cannot uniquely identify {} in pre-install Cargo.lock",
+                        dependency.name
+                    ));
+                }
+            }
+        }
+    }
+    if selectors.is_empty() {
+        Ok(InstallScope::CargoWorkspace)
+    } else {
+        Ok(InstallScope::Packages(selectors.into_iter().collect()))
+    }
+}
+
+fn matches_source(package: &LockPackage, dependency: &Dependency) -> bool {
+    let Some(source) = package.source.as_deref() else {
+        return false;
+    };
+    let Some(git) = &dependency.git_source else {
+        return is_crates_io_source(source);
+    };
+    let Some(source) = source.strip_prefix("git+") else {
+        return false;
+    };
+    let Ok(mut source) = reqwest::Url::parse(source) else {
+        return false;
+    };
+    let Ok(mut expected) = reqwest::Url::parse(&git.url) else {
+        return false;
+    };
+    let reference_matches = match &git.reference {
+        GitReference::Branch(branch) => source
+            .query_pairs()
+            .any(|(key, value)| key == "branch" && value == branch.as_str()),
+        GitReference::DefaultBranch => source.query().is_none(),
+        GitReference::Tag(_) | GitReference::Rev(_) => false,
+    };
+    source.set_query(None);
+    source.set_fragment(None);
+    expected.set_query(None);
+    expected.set_fragment(None);
+    reference_matches
+        && source
+            .as_str()
+            .trim_end_matches('/')
+            .trim_end_matches(".git")
+            == expected
+                .as_str()
+                .trim_end_matches('/')
+                .trim_end_matches(".git")
+}
+
+fn read_manifest(path: &Path) -> Result<toml::Value, String> {
+    std::fs::read_to_string(path)
+        .map_err(|_| "Cannot read Cargo.toml for scoped install".into())
+        .and_then(|content| {
+            toml::from_str(&content)
+                .map_err(|_| "Cannot parse Cargo.toml for scoped install".into())
+        })
+}
+
+fn direct_packages<'a>(
+    path: &Path,
+    dependency: &Dependency,
+    packages: &'a [LockPackage],
+) -> Result<Vec<&'a LockPackage>, String> {
+    let manifest = read_manifest(path)?;
+    let workspace_dependency = manifest
+        .get("workspace")
+        .and_then(|workspace| workspace.get("dependencies"))
+        .and_then(|dependencies| dependencies.get(dependency.manifest_name()))
+        .is_some();
+    let member_name = manifest
+        .get("package")
+        .and_then(|package| package.get("name"))
+        .and_then(toml::Value::as_str);
+    let parents: Vec<_> = packages
+        .iter()
+        .filter(|package| {
+            package.source.is_none()
+                && (workspace_dependency || member_name == Some(package.name.as_str()))
+        })
+        .collect();
+    Ok(packages
+        .iter()
+        .filter(|candidate| {
+            parents.iter().any(|parent| {
+                parent.dependencies.iter().any(|edge| {
+                    edge.name == candidate.name
+                        && edge
+                            .version
+                            .as_ref()
+                            .is_none_or(|version| version == &candidate.version)
+                        && edge.source.as_ref().is_none_or(|source| {
+                            candidate.source.as_ref().is_some_and(|candidate_source| {
+                                source
+                                    == candidate_source
+                                        .split('#')
+                                        .next()
+                                        .unwrap_or(candidate_source)
+                            })
+                        })
+                })
+            })
+        })
+        .collect())
+}
+
+#[cfg(test)]
+mod tests;

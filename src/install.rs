@@ -9,6 +9,7 @@ use crate::manifest::{
     RegistryLockEntries, detect_manifests, find_cargo_lock_upward, read_registry_entries,
 };
 use crate::orchestrator::{Orchestrator, OrchestratorResult};
+use crate::package_manager::InstallScope;
 use crate::update::AgePolicy;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -19,6 +20,8 @@ pub struct InstallJob {
     pub language: Language,
     /// 解釈できない native 設定は実行時にエラーとして扱う。
     pub policy: Result<AgePolicy, String>,
+    /// Scope preparation errors must never fall back to a full update.
+    pub scope: Result<InstallScope, String>,
 }
 
 /// install 前に確定する実行単位と、変更を判定するための lock の保存。
@@ -37,6 +40,16 @@ impl InstallPlan {
         result: &OrchestratorResult,
         monorepo_dirs: &Option<Vec<PathBuf>>,
         default_path: &Path,
+    ) -> Self {
+        Self::new_scoped(orchestrator, result, monorepo_dirs, default_path, false)
+    }
+
+    pub fn new_scoped(
+        orchestrator: &Orchestrator,
+        result: &OrchestratorResult,
+        monorepo_dirs: &Option<Vec<PathBuf>>,
+        default_path: &Path,
+        only_mode: bool,
     ) -> Self {
         let node_audits = node_audit_jobs(orchestrator, result);
         let wrapper_updates = result
@@ -67,7 +80,7 @@ impl InstallPlan {
             })
             .collect();
         let shared_node_policies = &node_audits;
-        let jobs = build_install_map(result, monorepo_dirs, default_path)
+        let mut jobs: Vec<_> = build_install_map(result, monorepo_dirs, default_path)
             .into_iter()
             .flat_map(|(directory, languages)| {
                 languages.into_iter().map(move |language| InstallJob {
@@ -83,9 +96,13 @@ impl InstallPlan {
                     },
                     directory: directory.clone(),
                     language,
+                    scope: Ok(InstallScope::Full),
                 })
             })
             .collect();
+        if only_mode {
+            scoped::replace_scoped_jobs(&mut jobs, orchestrator, result);
+        }
         let groups = RustLockGroups::collect(orchestrator, result);
         let baselines = groups
             .locks
@@ -407,6 +424,7 @@ fn node_audit_jobs(orchestrator: &Orchestrator, result: &OrchestratorResult) -> 
                 directory,
                 language: Language::Node,
                 policy,
+                scope: Ok(InstallScope::Full),
             }
         })
         .collect()
@@ -442,3 +460,5 @@ fn build_install_map(
 
 #[cfg(test)]
 mod tests;
+
+mod scoped;
