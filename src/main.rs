@@ -135,7 +135,13 @@ async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
     let mut age_audit_failed = false;
     // dry-run でない場合、要求があればパッケージマネージャの install を実行
     if args.install && !args.dry_run {
-        let plan = InstallPlan::new(&orchestrator, &result, &monorepo_dirs, &args.path);
+        let plan = InstallPlan::new_scoped(
+            &orchestrator,
+            &result,
+            &monorepo_dirs,
+            &args.path,
+            !args.only.is_empty(),
+        );
         // 他の言語の install が失敗しても、Rust / Node lock の監査は行う。
         let install_result = run_package_installs(&args, &plan);
         let audit_plan = plan.rust_audit_plan(&orchestrator, &result);
@@ -235,7 +241,15 @@ fn run_package_installs(args: &CliArgs, plan: &InstallPlan) -> anyhow::Result<()
             .policy
             .as_ref()
             .map_err(|error| anyhow::Error::msg(error.clone()))?;
-        let result = pm_runner.run_install_with_age_policy(job.language, &job.directory, policy);
+        let result = match &job.scope {
+            Ok(scope) => pm_runner.run_install_scoped(job.language, &job.directory, policy, scope),
+            Err(error) => depup::package_manager::InstallResult::failure(
+                job.language,
+                "scoped update preparation".into(),
+                String::new(),
+                error.clone(),
+            ),
+        };
         progress.finish_and_clear();
         if result.command.is_empty() {
             continue;
