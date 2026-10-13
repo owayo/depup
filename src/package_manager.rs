@@ -21,6 +21,17 @@ pub enum InstallScope {
     CargoWorkspace,
 }
 
+/// One resolved command is shared by snapshot preparation and execution.
+#[derive(Debug, Clone)]
+pub struct PreparedInstall {
+    pub language: Language,
+    pub directory: PathBuf,
+    pub package_manager: &'static str,
+    pub argv: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub program: PathBuf,
+}
+
 /// パッケージマネージャの実行ファイルを PATH から解決する。
 ///
 /// Windows では `npm` / `pnpm` / `yarn` / `bun` / `composer` / `gradle` などが
@@ -499,40 +510,106 @@ impl SystemPackageManager {
         policy: &crate::update::AgePolicy,
         scope: &InstallScope,
     ) -> InstallResult {
-        if language == Language::Rust
-            && *scope != InstallScope::Full
-            && !working_dir.join("Cargo.toml").is_file()
-        {
-            return InstallResult::failure(
-                language,
-                "cargo update (scoped)".into(),
-                String::new(),
-                "The planned Cargo manifest is no longer available".into(),
-            );
+        match self.prepare_install(language, working_dir, policy, scope) {
+            Ok(Some(prepared)) => self.run_prepared_install(&prepared),
+            Ok(None) => InstallResult::skipped(language),
+            Err(error) => {
+                InstallResult::failure(language, "install preparation".into(), String::new(), error)
+            }
         }
+    }
+
+    pub fn prepare_install(
+        &self,
+        language: Language,
+        working_dir: &Path,
+        policy: &crate::update::AgePolicy,
+        scope: &InstallScope,
+    ) -> Result<Option<PreparedInstall>, String> {
         let Some((effective_dir, pm)) =
             self.resolve_scoped_package_manager(language, working_dir, scope)
         else {
-            return InstallResult::skipped(language);
+            return Ok(None);
         };
+        self.prepare_resolved_install(language, &effective_dir, pm, policy, scope)
+    }
 
-        let command_parts = match self.scoped_install_args(pm, policy, scope) {
-            Ok(parts) => parts,
-            Err(error) => {
-                return InstallResult::failure(
-                    language,
-                    format!("{pm} update (scoped)"),
-                    String::new(),
-                    error,
-                );
-            }
-        };
-        if command_parts.is_empty() {
-            return InstallResult::skipped(language);
+    /// Build argv from the same manager selection used to determine file ownership.
+    pub(crate) fn prepare_resolved_install(
+        &self,
+        language: Language,
+        effective_dir: &Path,
+        pm: &'static str,
+        policy: &crate::update::AgePolicy,
+        scope: &InstallScope,
+    ) -> Result<Option<PreparedInstall>, String> {
+        if language == Language::Rust
+            && *scope != InstallScope::Full
+            && !effective_dir.join("Cargo.toml").is_file()
+        {
+            return Err("The planned Cargo manifest is no longer available".into());
         }
+        let command_parts = self.scoped_install_args(pm, policy, scope)?;
+        if command_parts.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(PreparedInstall {
+            language,
+            program: resolve_program(&command_parts[0], effective_dir),
+            directory: effective_dir.into(),
+            package_manager: pm,
+            argv: command_parts,
+            env: self.get_install_env(pm, policy.install_min_age()),
+        }))
+    }
 
-        let env = self.get_install_env(pm, policy.install_min_age());
-        let command_refs: Vec<&str> = command_parts.iter().map(|s| s.as_str()).collect();
+    pub fn prepare_gradle_wrapper(
+        &self,
+        directory: &Path,
+        version: &str,
+    ) -> Result<PreparedInstall, String> {
+        if version.is_empty()
+            || !version
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
+        {
+            return Err("invalid Gradle Wrapper version".into());
+        }
+        let script = if cfg!(windows) {
+            "./gradlew.bat"
+        } else {
+            "./gradlew"
+        };
+        if !directory.join(script).is_file() {
+            return Err(format!("Gradle Wrapper script is missing: {script}"));
+        }
+        Ok(PreparedInstall {
+            language: Language::Java,
+            directory: directory.into(),
+            package_manager: script,
+            argv: vec![
+                script.into(),
+                "wrapper".into(),
+                "--gradle-version".into(),
+                version.into(),
+            ],
+            env: vec![],
+            program: resolve_program(script, directory),
+        })
+    }
+
+    pub fn run_prepared_install(&self, prepared: &PreparedInstall) -> InstallResult {
+        let language = prepared.language;
+        let command_parts = &prepared.argv;
+        let env = &prepared.env;
+        if command_parts.is_empty() {
+            return InstallResult::failure(
+                language,
+                "install preparation".into(),
+                String::new(),
+                "Empty prepared command".into(),
+            );
+        }
 
         // 表示用コマンド文字列: env var 付与時は `KEY=VALUE cmd args...` で表現
         let command_str = if env.is_empty() {
@@ -541,14 +618,19 @@ impl SystemPackageManager {
             let env_str: Vec<String> = env.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
             format!("{} {}", env_str.join(" "), command_parts.join(" "))
         };
-        let command_str = redact_install_output(&command_str, &command_parts);
+        let command_str = redact_install_output(&command_str, command_parts);
 
-        match self.run_command(&command_refs, &effective_dir, &env) {
+        let output = Command::new(&prepared.program)
+            .args(&prepared.argv[1..])
+            .current_dir(&prepared.directory)
+            .envs(prepared.env.iter().cloned())
+            .output();
+        match output {
             Ok(output) => {
                 let stdout =
-                    redact_install_output(&String::from_utf8_lossy(&output.stdout), &command_parts);
+                    redact_install_output(&String::from_utf8_lossy(&output.stdout), command_parts);
                 let stderr =
-                    redact_install_output(&String::from_utf8_lossy(&output.stderr), &command_parts);
+                    redact_install_output(&String::from_utf8_lossy(&output.stderr), command_parts);
 
                 if output.status.success() {
                     InstallResult::success(language, command_str, stdout, stderr)

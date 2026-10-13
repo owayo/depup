@@ -104,6 +104,8 @@ depup --cd ./projects/myapp -n
 
 ### JSON Output
 
+With `--json --install`, output is deferred until install recovery and age audits finish, then one JSON value is flushed even if install fails. Updates canceled by a failed project, including recovery conflicts and lock-only Git updates, move from `updates` to `failed` with a reason. Successful independent projects remain in `updates`. Recovery details and copy locations go to stderr.
+
 ```bash
 depup --json
 ```
@@ -172,7 +174,7 @@ Updates that could not be written get no hunk. The last line counts updates the 
 | Code | Meaning |
 |------|---------|
 | `0` | No failures. This includes runs with no updates, dry runs, and runs whose only `Errors:` entries are OSV notices (fallbacks or failed lookups). |
-| `1` | A package manager install failed, `--cd` could not change the directory, or depup itself could not continue (for example, the HTTP client failed to initialize or the results could not be written). |
+| `1` | A package manager install or recovery failed, `--cd` could not change the directory, or depup itself could not continue (for example, the HTTP client failed to initialize or the results could not be written). |
 | `2` | Part of the run failed: a manifest could not be read, parsed, or written (including a refused ambiguous write), a registry lookup failed, or a Rust or Node lockfile age audit left violations or unverified entries (including an unreadable lock or an exhausted time budget). Invalid command-line arguments also exit with `2`. |
 
 A code-2 failure does not stop the run. A failed lookup skips that dependency, and a manifest that cannot be read or parsed is left out; everything else is still written and installed. If a file cannot be saved, it keeps its original content. If only some updates in a manifest cannot be written (for example, one refused as ambiguous), the rest are still saved. Either way, the updates that could not be written are reported as failed instead of updated, and they do not make `--install` run. When both `1` and `2` apply, `1` wins.

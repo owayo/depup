@@ -336,7 +336,19 @@ With `--install`, depup runs each project's package manager after writing the ma
 - Node installs run at the shared pnpm workspace root or the manifest directory. With `--only`, Rust updates are grouped at their shared Cargo.lock directory (or workspace root for a new lock), and PHP installs run beside each updated composer.json. Other installs use the target directory (PATH) without [`.depup`](configuration.md#depup-configuration-file), or the deepest listed directory containing the updated manifest when `.depup` is present.
 - Installs run one at a time, in directory path order, and each language runs at most once per directory. The package manager's output is captured instead of streamed; its stderr is printed only when the install fails.
 
-If an install fails, depup still runs the remaining installs, prints the failed command with the package manager's stderr, and exits with code 1 at the end (`Error: Some package manager installs failed`). A package manager that is not installed counts as a failure. Manifests that were already rewritten are not rolled back, and the Rust and Node lockfile age audits still run even when another install fails. An unchanged `--install` run also audits existing locks; it does not rerun package managers when there are no manifest updates.
+If an install fails, depup restores that project's manifests and known package-manager files, then exits with code 1 (`Error: Some package manager installs failed`). This also applies to command startup, policy, scope preparation, snapshot, and Gradle Wrapper failures. Jobs sharing a Cargo lock, a pnpm workspace, a Tauri project, or a Gradle Wrapper succeed or recover together; remaining jobs in a failed unit are skipped. Independent projects continue and keep their successful changes.
+
+If a shared mise or uv scope cannot be verified safely from its active configuration, preparation fails before running the manager and the affected writes are recovered. This also applies when started at the workspace root. Examples include complex workspace patterns such as `**`, custom mise config paths, nested mise monorepo roots, and monorepo settings in alternate containers such as `.mise/config.toml`.
+
+When started inside a member, depup also checks for parent uv and mise scopes beyond the permitted recovery scope. If a parent project's managed files lie outside that scope, it stops before running the manager and restores the member's writes; run depup from the shared project root. A mise dependency metadata path such as `.mise/locks` that follows a symlink outside that scope also stops preparation, leaving the external metadata untouched. Confirmed file relationships are retained even when a job has a policy, scope preparation, or snapshot error, so that error blocks all jobs in the shared unit.
+
+Manifest recovery uses the bytes saved immediately before depup wrote the file. Package-manager files are saved before install; for a file both depup and the manager write, such as `go.mod` or Wrapper properties, the manifest's earlier copy takes precedence. Known locks created by a failed install are removed. Binary Wrapper files, script permissions, and existing symlink structure are preserved. Installed artifacts and caches (`node_modules`, `.venv`, `vendor`, `target`, and similar directories) are retained. Recovery applies to reported failures, not interruption or abrupt process termination.
+
+A file changed outside a package-manager command, or a replaced file/parent symlink, is kept. depup reports the remaining change and saves the original bytes to an exclusive recovery copy, printing its location and manual recovery instructions. Copy or permission failures are reported too. Do not edit manifests or managed files during install: edits made while a package-manager command is running cannot always be distinguished from that command's own writes.
+
+Rust and Node age audits skip the entire failed unit, including recovery conflicts, so an audit cannot change its restored lock again. Other projects and unchanged existing locks are still audited. An unresolved age audit alone leaves the resolved files in place and returns code 2; an install or recovery failure takes precedence and returns code 1. An unchanged `--install` run does not rerun package managers when there are no manifest updates.
+
+Text and diff reports describe the writes before install; stderr then lists restored files, newly created files removed, and changes requiring manual recovery. `--json --install` emits and flushes one final result after recovery and audits, even on install failure. Canceled updates, including conflicts and lock-only Git updates, appear in `failed`, with their reason, rather than `updates`.
 
 ### Commands per Package Manager
 
@@ -390,7 +402,7 @@ With `--verbose`, depup prints a note naming the package managers used in the ru
 
 #### Auditing Node Lockfiles
 
-With an active age policy, `--install` checks the actual resolved versions of direct and transitive dependencies, including dev dependencies. It also checks unchanged locks on subsequent runs and after another install fails. If no lock exists and no install is needed, no lock audit runs.
+With an active age policy, `--install` checks the actual resolved versions of direct and transitive dependencies, including dev dependencies. It also checks unchanged locks on subsequent runs and in independent projects after another install fails. If no lock exists and no install is needed, no lock audit runs.
 
 - pnpm: reads the lock graph using `pnpm list --depth Infinity --lockfile-only --json`. Shared workspaces include all projects and the root, with the strictest member policy. Missing required dependencies or CLI warnings make the graph unverified.
 - npm: reads the `packages` table of `npm-shrinkwrap.json` (preferred) or `package-lock.json`, format 2 or 3, and verifies required dependencies across packages and workspaces.
