@@ -45,6 +45,23 @@ pub(super) fn replace_full_rust_jobs(
             continue;
         }
         jobs.push(InstallJob {
+            manifests: result
+                .summary
+                .manifests
+                .iter()
+                .filter(|manifest| {
+                    manifest.language == Language::Rust
+                        && locations
+                            .entry(
+                                std::fs::canonicalize(&manifest.path)
+                                    .unwrap_or_else(|_| manifest.path.clone()),
+                            )
+                            .or_insert_with(|| rust_resolution_directory(&manifest.path, &boundary))
+                            .as_ref()
+                            .is_ok_and(|root| root == &directory)
+                })
+                .map(|manifest| manifest.path.clone())
+                .collect(),
             policy: install_age_policy(orchestrator, result, &directory, Language::Rust),
             directory,
             language: Language::Rust,
@@ -82,6 +99,7 @@ pub(super) fn replace_scoped_jobs(
                 Ok(directory) => directory.clone(),
                 Err(error) => {
                     jobs.push(InstallJob {
+                        manifests: vec![manifest.path.clone()],
                         directory: parent.to_path_buf(),
                         language: Language::Rust,
                         policy: install_age_policy(orchestrator, result, parent, Language::Rust),
@@ -106,6 +124,10 @@ pub(super) fn replace_scoped_jobs(
             _ => unreachable!(),
         };
         jobs.push(InstallJob {
+            manifests: manifests
+                .iter()
+                .map(|manifest| manifest.path.clone())
+                .collect(),
             policy: install_age_policy(orchestrator, result, &directory, language),
             directory,
             language,

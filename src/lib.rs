@@ -15,6 +15,7 @@ pub mod cli;
 pub mod config;
 pub mod domain;
 pub mod error;
+mod file_snapshot;
 pub mod global_config;
 pub mod install;
 pub mod manifest;

@@ -23,6 +23,8 @@ pub struct InstallJob {
     pub policy: Result<AgePolicy, String>,
     /// Scope preparation errors must never fall back to a full update.
     pub scope: Result<InstallScope, String>,
+    /// The planned manifests, including lock-only Git updates.
+    pub manifests: Vec<PathBuf>,
 }
 
 /// install 前に確定する実行単位と、変更を判定するための lock の保存。
@@ -98,6 +100,25 @@ impl InstallPlan {
                     directory: directory.clone(),
                     language,
                     scope: Ok(InstallScope::Full),
+                    manifests: result
+                        .summary
+                        .manifests
+                        .iter()
+                        .filter(|manifest| {
+                            manifest.language == language
+                                && if language == Language::Node {
+                                    node_resolution_directory(&manifest.path) == directory
+                                } else {
+                                    monorepo_dirs.as_ref().map_or_else(
+                                        || default_path.to_path_buf(),
+                                        |dirs| {
+                                            nearest_monorepo_dir(&manifest.path, dirs, default_path)
+                                        },
+                                    ) == directory
+                                }
+                        })
+                        .map(|manifest| manifest.path.clone())
+                        .collect(),
                 })
             })
             .collect();
@@ -431,10 +452,11 @@ fn node_audit_jobs(orchestrator: &Orchestrator, result: &OrchestratorResult) -> 
         matches!(error, crate::orchestrator::OrchestratorError::NodePreflightError { directory, .. } if directory == &scope.directory)
     }))
     .map(|scope| InstallJob {
-        directory: scope.directory,
+        directory: scope.directory.clone(),
         language: Language::Node,
         policy: scope.policy,
         scope: Ok(InstallScope::Full),
+        manifests: result.summary.manifests.iter().filter(|manifest| manifest.language == Language::Node && node_resolution_directory(&manifest.path) == scope.directory).map(|manifest| manifest.path.clone()).collect(),
     })
     .collect()
 }
@@ -471,3 +493,5 @@ fn build_install_map(
 mod tests;
 
 mod scoped;
+
+pub mod transaction;

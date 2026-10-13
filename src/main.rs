@@ -16,13 +16,13 @@ use depup::cli::CliArgs;
 use depup::config::DepupConfig;
 use depup::domain::Language;
 use depup::global_config::{GlobalConfig, resolve_max_change, resolve_osv};
+use depup::install::transaction::{InstallTransactions, RollbackReport};
 use depup::install::{InstallPlan, RustAuditPlan};
 use depup::node_lock::audit_node_lock;
 use depup::orchestrator::Orchestrator;
 use depup::output::{OutputConfig, create_formatter};
 use depup::package_manager::SystemPackageManager;
 use depup::progress::Progress;
-use std::collections::HashSet;
 use std::io::{self, Write};
 use std::process::ExitCode;
 
@@ -98,7 +98,7 @@ async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
     // オーケストレーターを作成 (global_config を渡して age 解決に利用)
     let orchestrator = Orchestrator::new(args.clone())?.with_global_config(global_config);
 
-    let (result, monorepo_dirs) = if let Some(config) = monorepo_config {
+    let (mut result, monorepo_dirs) = if let Some(config) = monorepo_config {
         let dirs = config.directories_with_root(&args.path);
         if args.verbose {
             eprintln!("Monorepo mode: {} directories", dirs.len());
@@ -120,8 +120,11 @@ async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
 
     // 結果を出力
     let mut stdout = io::stdout().lock();
-    formatter.format(&result, &mut stdout)?;
-    stdout.flush()?;
+    let defer_json = args.json && args.install && !args.dry_run;
+    if !defer_json {
+        formatter.format(&result, &mut stdout)?;
+        stdout.flush()?;
+    }
 
     // verbose モードではエラーを表示
     if args.verbose && !result.errors.is_empty() {
@@ -143,15 +146,16 @@ async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
             !args.only.is_empty(),
         );
         // 他の言語の install が失敗しても、Rust / Node lock の監査は行う。
-        let install_result = run_package_installs(&args, &plan);
-        let audit_plan = plan.rust_audit_plan(&orchestrator, &result);
-        age_audit_failed = enforce_rust_lock_age(&args, &orchestrator, &audit_plan).await;
-        age_audit_failed |= enforce_node_lock_age(&args, &plan).await;
-
-        // 画面に出した更新先と、実際に Cargo.lock へ入った版の食い違いを知らせる。
-        // 結果の一覧は install 前に出しているので、ここで別に注記する
-        report_rust_lock_mismatches(&audit_plan);
-        install_result?;
+        age_audit_failed = finish_install(
+            &args,
+            &orchestrator,
+            &plan,
+            &mut result,
+            formatter.as_ref(),
+            &mut stdout,
+            defer_json,
+        )
+        .await?;
     }
 
     // 適切な終了コードを返す。
@@ -170,116 +174,96 @@ async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
     }
 }
 
-/// 計画されたパッケージマネージャの install を実行する。
-fn run_package_installs(args: &CliArgs, plan: &InstallPlan) -> anyhow::Result<()> {
-    if plan.jobs.is_empty() && plan.wrapper_updates.is_empty() {
-        return Ok(());
+/// Recovery and audit finish before the single final JSON value is flushed.
+async fn finish_install(
+    args: &CliArgs,
+    orchestrator: &Orchestrator,
+    plan: &InstallPlan,
+    result: &mut depup::orchestrator::OrchestratorResult,
+    formatter: &dyn depup::output::OutputFormatter,
+    stdout: &mut impl Write,
+    defer_json: bool,
+) -> anyhow::Result<bool> {
+    let recovery = run_package_installs(args, plan, result, &orchestrator.rust_lock_boundary());
+    recovery.print(&mut io::stderr())?;
+    recovery.mark_summary(&mut result.summary);
+    let mut audit_plan = plan.rust_audit_plan(orchestrator, result);
+    recovery.exclude_rust_audits(&mut audit_plan);
+    let mut age_audit_failed = enforce_rust_lock_age(args, orchestrator, &audit_plan).await;
+    age_audit_failed |= enforce_node_lock_age(args, plan, &recovery).await;
+    report_rust_lock_mismatches(&audit_plan);
+    if defer_json {
+        formatter.format(result, stdout)?;
+        stdout.flush()?;
     }
+    if recovery.has_failures() {
+        anyhow::bail!("Some package manager installs failed");
+    }
+    Ok(age_audit_failed)
+}
+
+/// 計画されたパッケージマネージャの install を実行する。
+fn run_package_installs(
+    args: &CliArgs,
+    plan: &InstallPlan,
+    result: &depup::orchestrator::OrchestratorResult,
+    boundary: &std::path::Path,
+) -> RollbackReport {
     let pm_runner = SystemPackageManager::new();
-    if args.verbose {
-        eprintln!();
-        eprintln!("Running package manager install...");
-        if plan.jobs.iter().any(|job| {
+    let mut transactions = InstallTransactions::begin(plan, result, boundary);
+    if args.verbose
+        && plan.jobs.iter().any(|job| {
             job.policy
                 .as_ref()
                 .is_ok_and(|policy| policy.min_age.is_some())
-        }) {
-            let mut unsupported: Vec<String> = plan
-                .jobs
-                .iter()
-                .filter_map(|job| {
-                    let (_, pm) =
-                        pm_runner.resolve_package_manager(job.language, &job.directory)?;
-                    (job.language != depup::domain::Language::Node
-                        && !job.language.pm_has_native_transitive_age_support(pm))
-                    .then(|| pm.to_string())
-                })
-                .collect();
-            unsupported.sort();
-            unsupported.dedup();
-            if !unsupported.is_empty() {
-                eprintln!(
-                    "  Note: --age applies to direct deps only for: {} (no native transitive-age support)",
-                    unsupported.join(", ")
-                );
-            }
-        }
-    }
-    let mut any_install_failed = false;
-    let mut failed_wrapper_roots = HashSet::new();
-    for (directory, version) in &plan.wrapper_updates {
-        if args.verbose {
+        })
+    {
+        let mut unsupported: Vec<_> = transactions
+            .commands()
+            .filter(|command| {
+                command.language != Language::Node
+                    && !command
+                        .language
+                        .pm_has_native_transitive_age_support(command.package_manager)
+            })
+            .map(|command| command.package_manager)
+            .collect();
+        unsupported.sort();
+        unsupported.dedup();
+        if !unsupported.is_empty() {
             eprintln!(
-                "Updating Gradle Wrapper to {version} ({})...",
-                directory.display()
+                "  Note: --age applies to direct deps only for: {} (no native transitive-age support)",
+                unsupported.join(", ")
             );
         }
-        if let Err(error) = pm_runner.update_gradle_wrapper(directory, version) {
-            eprintln!(
-                "  Gradle Wrapper update failed ({}): {error}",
-                directory.display()
-            );
-            failed_wrapper_roots.insert(directory);
-            any_install_failed = true;
-        }
     }
-    // install の出力をキャプチャしている間も、実行中の言語をスピナーで示す。
     let mut progress = Progress::new(!args.quiet);
-    for job in &plan.jobs {
-        if job.language == Language::Java
-            && failed_wrapper_roots
-                .iter()
-                .any(|root| job.directory.starts_with(root) || root.starts_with(&job.directory))
-        {
-            continue;
-        }
+    transactions.execute(|command| {
         progress.spinner(&format!(
             "Running {} install...",
-            job.language.display_name()
+            command.language.display_name()
         ));
-        let policy = job
-            .policy
-            .as_ref()
-            .map_err(|error| anyhow::Error::msg(error.clone()))?;
-        let result = match &job.scope {
-            Ok(scope) => pm_runner.run_install_scoped(job.language, &job.directory, policy, scope),
-            Err(error) => depup::package_manager::InstallResult::failure(
-                job.language,
-                "scoped update preparation".into(),
-                String::new(),
-                error.clone(),
-            ),
-        };
+        let result = pm_runner.run_prepared_install(command);
         progress.finish_and_clear();
-        if result.command.is_empty() {
-            continue;
-        }
-        if result.success {
-            if args.verbose {
-                eprintln!(
-                    "  {} install completed: {} ({})",
-                    result.language.display_name(),
-                    result.command,
-                    job.directory.display()
-                );
-            }
-        } else {
+        if !result.success || args.verbose {
             eprintln!(
-                "  {} install failed: {} ({})",
+                "  {} install {}: {} ({})",
                 result.language.display_name(),
+                if result.success {
+                    "completed"
+                } else {
+                    "failed"
+                },
                 result.command,
-                job.directory.display()
+                command.directory.display()
             );
-            if !result.stderr.is_empty() {
+            if !result.success && !result.stderr.is_empty() {
                 eprintln!("    {}", result.stderr);
             }
-            any_install_failed = true;
         }
-    }
-    if any_install_failed {
-        anyhow::bail!("Some package manager installs failed");
-    }
-    Ok(())
+        result
+    });
+    transactions.rollback()
 }
 
 /// 計画された共有 lock ごとに、既存版も含め crate の age を監査する。
@@ -347,11 +331,18 @@ async fn enforce_rust_lock_age(
 }
 
 /// Node は lock の実際の解決版を検査し、違反・未確認を必ず報告する。
-async fn enforce_node_lock_age(args: &CliArgs, plan: &InstallPlan) -> bool {
+async fn enforce_node_lock_age(
+    args: &CliArgs,
+    plan: &InstallPlan,
+    recovery: &RollbackReport,
+) -> bool {
     let pm_runner = SystemPackageManager::new();
     let mut failed = false;
     let mut progress = Progress::new(!args.quiet);
     for job in &plan.node_audits {
+        if recovery.covers_directory(&job.directory) {
+            continue;
+        }
         let has_lock = [
             "pnpm-lock.yaml",
             "package-lock.json",
@@ -381,7 +372,9 @@ async fn enforce_node_lock_age(args: &CliArgs, plan: &InstallPlan) -> bool {
                 continue;
             }
         };
-        let Some((directory, pm)) = pm_runner.resolve_package_manager(job.language, &job.directory)
+        let Some((directory, pm)) = recovery
+            .node_manager(&job.directory)
+            .or_else(|| pm_runner.resolve_package_manager(job.language, &job.directory))
         else {
             eprintln!(
                 "  {} — cannot audit --age: Node package manager could not be determined",
@@ -420,5 +413,183 @@ fn report_rust_lock_mismatches(plan: &RustAuditPlan) {
         for line in lock_mismatch_lines(&manifest, &mismatches) {
             eprintln!("{}", line.yellow());
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod install_tests {
+    use super::*;
+    use depup::domain::{
+        Dependency, ManifestUpdateResult, UpdateResult, UpdateSummary, VersionSpec, VersionSpecKind,
+    };
+    use depup::manifest::{GradleParser, ManifestWriter};
+    use depup::orchestrator::OrchestratorResult;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn failed_install_restores_the_written_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("build.gradle");
+        let before = "dependencies { implementation 'org.example:library:1.0.0' }\n";
+        std::fs::write(&path, before).unwrap();
+        let script = temp.path().join("gradlew");
+        std::fs::write(&script, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut manifest = ManifestUpdateResult::new(&path, Language::Java);
+        manifest.add_result(UpdateResult::update(
+            Dependency::new(
+                "org.example:library",
+                VersionSpec::new(VersionSpecKind::Exact, "1.0.0", "1.0.0"),
+                false,
+                Language::Java,
+            ),
+            "2.0.0",
+        ));
+        let write = ManifestWriter::new(false)
+            .apply_updates(&manifest, &GradleParser)
+            .unwrap();
+        assert!(write.file_modified);
+        let mut summary = UpdateSummary::new(false);
+        summary.add_manifest(manifest);
+        let result = OrchestratorResult {
+            summary,
+            write_results: vec![write],
+            errors: vec![],
+        };
+        let mut args = CliArgs::parse_from(["depup", "--install", "--no-age", "--quiet"]);
+        args.path = temp.path().into();
+        let orchestrator = Orchestrator::new(args.clone()).unwrap();
+        let plan = InstallPlan::new(&orchestrator, &result, &None, temp.path());
+        let recovery = run_package_installs(&args, &plan, &result, temp.path());
+        assert!(recovery.has_failures());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), before);
+    }
+}
+
+#[cfg(test)]
+mod final_output_tests {
+    use super::*;
+    use depup::domain::{
+        Dependency, ManifestUpdateResult, UpdateResult, UpdateSummary, VersionSpec, VersionSpecKind,
+    };
+    use depup::manifest::{ManifestWriter, PackageJsonParser};
+    use depup::orchestrator::OrchestratorResult;
+    #[derive(Default)]
+    struct Output {
+        bytes: Vec<u8>,
+        flushes: usize,
+    }
+    impl Write for Output {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn failed_scope_recovers_excludes_missing_lock_audit_and_flushes_one_final_json() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("package.json");
+        let before = "{\"dependencies\":{\"example\":\"1.0.0\"}}";
+        std::fs::write(&path, before).unwrap();
+        let mut manifest = ManifestUpdateResult::new(&path, Language::Node);
+        manifest.add_result(UpdateResult::update(
+            Dependency::new(
+                "example",
+                VersionSpec::new(VersionSpecKind::Exact, "1.0.0", "1.0.0"),
+                false,
+                Language::Node,
+            ),
+            "2.0.0",
+        ));
+        let write = ManifestWriter::new(false)
+            .apply_updates(&manifest, &PackageJsonParser)
+            .unwrap();
+        let mut summary = UpdateSummary::new(false);
+        summary.add_manifest(manifest);
+        let mut result = OrchestratorResult {
+            summary,
+            write_results: vec![write],
+            errors: vec![],
+        };
+        let mut args =
+            CliArgs::parse_from(["depup", "--install", "--json", "--age", "2w", "--quiet"]);
+        args.path = temp.path().into();
+        let orchestrator = Orchestrator::new(args.clone()).unwrap();
+        let mut plan = InstallPlan::new(&orchestrator, &result, &None, temp.path());
+        plan.jobs[0].scope = Err("simulated scope preparation failure".into());
+        let formatter = create_formatter(OutputConfig::from_cli(true, false, false, true, false));
+        let mut output = Output::default();
+        let error = finish_install(
+            &args,
+            &orchestrator,
+            &plan,
+            &mut result,
+            formatter.as_ref(),
+            &mut output,
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("installs failed"));
+        assert_eq!(output.flushes, 1);
+        let values = serde_json::Deserializer::from_slice(&output.bytes)
+            .into_iter::<serde_json::Value>()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0]["summary"]["updates"], 0);
+        assert_eq!(values[0]["summary"]["failed"], 1);
+        assert!(
+            values[0]["manifests"][0]["failed"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("canceled")
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), before);
+    }
+    #[tokio::test]
+    async fn age_only_failure_keeps_the_resolved_files_and_does_not_become_install_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("package.json");
+        std::fs::write(&path, "{}").unwrap();
+        let lock = temp.path().join("bun.lock");
+        std::fs::write(&lock, "existing unsupported lock").unwrap();
+        let mut summary = UpdateSummary::new(false);
+        summary.add_manifest(ManifestUpdateResult::new(path, Language::Node));
+        let mut result = OrchestratorResult {
+            summary,
+            write_results: vec![],
+            errors: vec![],
+        };
+        let mut args =
+            CliArgs::parse_from(["depup", "--install", "--json", "--age", "2w", "--quiet"]);
+        args.path = temp.path().into();
+        let orchestrator = Orchestrator::new(args.clone()).unwrap();
+        let plan = InstallPlan::new(&orchestrator, &result, &None, temp.path());
+        assert!(plan.jobs.is_empty());
+        let formatter = create_formatter(OutputConfig::from_cli(true, false, false, true, false));
+        let mut output = Output::default();
+        assert!(
+            finish_install(
+                &args,
+                &orchestrator,
+                &plan,
+                &mut result,
+                formatter.as_ref(),
+                &mut output,
+                true
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(lock).unwrap(),
+            "existing unsupported lock"
+        );
+        assert_eq!(output.flushes, 1);
     }
 }

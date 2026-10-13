@@ -8,12 +8,21 @@
 
 use crate::domain::{Dependency, GitReference, Language, ManifestUpdateResult, UpdateResult};
 use crate::error::ManifestError;
+use crate::file_snapshot::{FileGuard, write_checked};
 use crate::manifest::ManifestParser;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write as _;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Exact file state at a successful manifest write, before any install begins.
+#[derive(Debug, Clone)]
+pub struct ManifestJournal {
+    pub target: std::path::PathBuf,
+    pub before: Vec<u8>,
+    pub written: Vec<u8>,
+    pub permissions: fs::Permissions,
+    pub(crate) guard: FileGuard,
+}
 
 /// マニフェストへの更新を書き戻すライター
 pub struct ManifestWriter {
@@ -35,6 +44,7 @@ pub struct WriteResult {
     pub file_modified: bool,
     /// 更新中に発生したエラー
     pub errors: Vec<String>,
+    pub journal: Option<ManifestJournal>,
 }
 
 /// 書き込めなかった更新 1 件
@@ -55,6 +65,7 @@ impl WriteResult {
             failed_updates: Vec::new(),
             file_modified: false,
             errors: Vec::new(),
+            journal: None,
         }
     }
 
@@ -146,10 +157,28 @@ impl ManifestWriter {
         let mut result = WriteResult::new(path);
 
         // 現在のファイル内容を読む
-        let content = fs::read_to_string(path).map_err(|e| ManifestError::ReadError {
+        let guard = FileGuard::capture(path).map_err(|e| ManifestError::ReadError {
             path: path.clone(),
             source: e,
         })?;
+        let before = guard.read().map_err(|e| ManifestError::ReadError {
+            path: path.clone(),
+            source: e,
+        })?;
+        let content =
+            String::from_utf8(
+                before
+                    .bytes
+                    .clone()
+                    .ok_or_else(|| ManifestError::ReadError {
+                        path: path.clone(),
+                        source: std::io::Error::from(std::io::ErrorKind::NotFound),
+                    })?,
+            )
+            .map_err(|error| ManifestError::ReadError {
+                path: path.clone(),
+                source: std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+            })?;
 
         // 現行のパーサAPIは依存名だけで書き換えるため、同じキーが複数箇所にあると
         // 更新対象外の宣言まで変更してしまう。位置情報付き編集へ移行するまでは、
@@ -283,7 +312,12 @@ impl ManifestWriter {
 
         // dry-run でなく、実際に変更がある場合のみ書き戻す
         if result.updates_applied > 0 && !self.dry_run {
-            if let Err(source) = write_atomically(path, &current_content) {
+            if let Err(source) = write_checked(
+                &guard,
+                &before,
+                current_content.as_bytes(),
+                before.permissions.as_ref(),
+            ) {
                 let error = ManifestError::WriteError {
                     path: path.clone(),
                     source,
@@ -295,6 +329,13 @@ impl ManifestWriter {
                 return Ok(result);
             }
             result.file_modified = true;
+            result.journal = Some(ManifestJournal {
+                target: guard.target.clone(),
+                before: content.into_bytes(),
+                written: current_content.into_bytes(),
+                permissions: before.permissions.unwrap(),
+                guard,
+            });
         }
 
         Ok(result)
@@ -349,83 +390,14 @@ pub fn write_manifest(path: &Path, content: &str) -> Result<(), ManifestError> {
 /// マニフェストを部分内容のまま破壊しうるため、同一ディレクトリの一時ファイルへ
 /// 書き切ってから rename で置き換える。既存ファイルのパーミッションは引き継ぐ。
 fn write_atomically(path: &Path, content: &str) -> std::io::Result<()> {
-    // path 自体が symlink の場合はリンク先の実体を更新対象にする。
-    // rename(2) は path が symlink のときリンク先ではなく symlink そのものを置き換えるため、
-    // そのまま rename すると symlink が通常ファイルに化け、リンク先 (共有マニフェスト等) が
-    // 古いまま取り残される (従来の `fs::write` は symlink を辿って実体を truncate→write していた)。
-    // canonicalize で実パスへ解決し、その実体に対してアトミック置換を行うことで symlink 構造を
-    // 保ったまま中身だけを更新する。tmp も実体側のディレクトリに作るため rename は同一
-    // ファイルシステム内に収まり EXDEV にならない。
-    let resolved;
-    let target = if path
-        .symlink_metadata()
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(false)
-    {
-        resolved = fs::canonicalize(path)?;
-        resolved.as_path()
-    } else {
-        path
-    };
-
-    // 既存ファイルが書き込み不可なら従来の `fs::write` と同じくエラーにする。
-    // rename はディレクトリ権限だけで成功し、読み取り専用による保護を
-    // 迂回してしまうため、先に書き込み権限を確認する。
-    if target.exists() {
-        fs::OpenOptions::new().write(true).open(target)?;
-    }
-
-    let dir = target
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let file_name = target
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("manifest");
-    // 一時ファイル名は PID だけだと予測可能で、同じ名前の symlink を先に置かれると
-    // `File::create` (O_CREAT|O_TRUNC、O_NOFOLLOW なし) がリンク先へ書き込んでしまう。
-    // ナノ秒を混ぜて推測を難しくし、`create_new` で「既存 (symlink 含む) があれば
-    // EEXIST で失敗」させることで、リンク先の実体を破壊する経路を塞ぐ。
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    let tmp_path = dir.join(format!(
-        ".{}.depup-tmp-{}-{}",
-        file_name,
-        std::process::id(),
-        nonce
-    ));
-
-    let result = (|| -> std::io::Result<()> {
-        {
-            // rename の前にデータを永続化する。`fs::write` はページキャッシュへ書くだけなので、
-            // fsync しないと rename のメタデータだけが先に永続化され、電源断で
-            // ゼロ長または部分内容のマニフェストが残りうる (元の内容も失われる)。
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp_path)?;
-            file.write_all(content.as_bytes())?;
-            file.sync_all()?;
-        }
-        if let Ok(metadata) = fs::metadata(target) {
-            let _ = fs::set_permissions(&tmp_path, metadata.permissions());
-        }
-        fs::rename(&tmp_path, target)?;
-        // rename エントリ自体の永続化 (best-effort。ディレクトリを開けない
-        // プラットフォームでは無視する)
-        if let Ok(dir_handle) = fs::File::open(dir) {
-            let _ = dir_handle.sync_all();
-        }
-        Ok(())
-    })();
-
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp_path);
-    }
-    result
+    let guard = FileGuard::capture(path)?;
+    let before = guard.read()?;
+    write_checked(
+        &guard,
+        &before,
+        content.as_bytes(),
+        before.permissions.as_ref(),
+    )
 }
 
 #[cfg(test)]
@@ -611,6 +583,7 @@ mod tests {
 
         assert_eq!(result.updates_applied, 1);
         assert!(!result.file_modified); // dry-run では書き換えない
+        assert!(result.journal.is_none());
 
         // ファイル内容は変わらない
         let content = fs::read_to_string(&path).unwrap();
