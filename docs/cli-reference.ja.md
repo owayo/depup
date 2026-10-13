@@ -100,6 +100,7 @@ depup --cd ./projects/myapp -n
 - スキップした依存の件数は、マニフェストの見出し（`— N updates, M skips`）と Summary に表示します。更新が 0 件のマニフェストでは、理由ごとの件数も表示します。
 - マニフェストへ書き込めなかった更新（書き込み先が曖昧なための拒否など）は、行末に `✗ failed` が付き、更新の件数に入りません。見出しは `— N updates, K failed, M skips` になり、Summary に `K package(s) failed to update` の行が加わります。理由は `Errors:` 欄に表示します。
 - `--verbose` を付けると、スキップした依存を理由ごとに一覧し、Summary にも理由別・言語別の内訳を付けます。
+- `latest` と `newer than --age` のスキップ一覧には、確認できた現在版自身の公開日を付けます。日付不明、wildcard・prefix の浮動指定の場合は日付を付けません。`newer than --age` は、現在版が適用される age より新しく、公開者の免除にも該当しないことを示します。依存を古い版へ差し戻す表示ではありません。
 - エラーは、OSV の通知も含めて `Errors:` 欄に表示します。
 
 ### JSON 出力
@@ -150,6 +151,19 @@ depup --json
 ```
 
 `summary.updates` と各マニフェストの `updates` に入るのは、書き込めた更新（`--dry-run` では書き込める見込みの更新）だけです。書き込めなかった更新は `summary.failed` に数え、マニフェストの `failed` 配列に入れて、理由を `error` に入れます。git 依存は `"kind": "git"` になり、`source`（認証情報を伏せたリポジトリの URL）と `reference` が加わります。`--verbose` を付けると、各マニフェストに `skips` が、`summary` に `by_language` が加わります。
+
+verbose のスキップ要素は、確認できた現在版が適用される age より新しく、更新先が選ばれていない場合に `reason: "current_version_too_recent"` を使います。他のフィルターやエラーの理由は維持します。この age のケースは従来の `already_latest` から変わり、デフォルトや設定由来の age にも適用されます。スキップの `released_at` は、条件を満たす最新候補ではなく現在版自身の公開日です。日付が不明、または指定が 1 つのリリースを特定しない場合は省略します。
+
+```json
+{
+  "name": "library",
+  "version": "2.0.0",
+  "reason": "current_version_too_recent",
+  "released_at": "2024-05-30T12:00:00+00:00"
+}
+```
+
+理由を選ぶ条件と、その他のスキップ理由は[更新されないとき](usage.ja.md#更新されないとき)を参照してください。
 
 ### diff 出力
 

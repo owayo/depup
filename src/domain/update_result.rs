@@ -13,6 +13,8 @@ pub enum SkipReason {
     Pinned,
     /// 既に最新バージョン
     AlreadyLatest,
+    /// 現在版の公開日が age の境界より新しい
+    CurrentVersionTooRecent,
     /// --exclude フラグで除外された
     Excluded,
     /// --only リストに含まれていない
@@ -37,6 +39,7 @@ impl fmt::Display for SkipReason {
         match self {
             SkipReason::Pinned => write!(f, "pinned version"),
             SkipReason::AlreadyLatest => write!(f, "already at latest"),
+            SkipReason::CurrentVersionTooRecent => write!(f, "current version is newer than --age"),
             SkipReason::Excluded => write!(f, "excluded by --exclude"),
             SkipReason::NotInOnlyList => write!(f, "not in --only list"),
             SkipReason::FetchFailed(msg) => write!(f, "fetch failed: {}", msg),
@@ -89,7 +92,7 @@ pub enum UpdateResult {
         dependency: Dependency,
         /// スキップの理由
         reason: SkipReason,
-        /// 現在のバージョンのリリース日時 (AlreadyLatest の場合)
+        /// 現在版自身の公開日時 (AlreadyLatest / CurrentVersionTooRecent)。不明なら省略
         #[serde(skip_serializing_if = "Option::is_none")]
         released_at: Option<DateTime<Utc>>,
     },
@@ -200,9 +203,18 @@ impl UpdateResult {
         dependency: Dependency,
         released_at: Option<DateTime<Utc>>,
     ) -> Self {
+        Self::skip_with_optional_date(dependency, SkipReason::AlreadyLatest, released_at)
+    }
+
+    /// 現在版の公開日の有無を保った Skip 結果を作成する
+    pub fn skip_with_optional_date(
+        dependency: Dependency,
+        reason: SkipReason,
+        released_at: Option<DateTime<Utc>>,
+    ) -> Self {
         UpdateResult::Skip {
             dependency,
-            reason: SkipReason::AlreadyLatest,
+            reason,
             released_at,
         }
     }
@@ -345,6 +357,22 @@ mod tests {
             format!("{}", SkipReason::LanguageFiltered),
             "language filtered"
         );
+    }
+
+    #[test]
+    fn current_release_age_skip_preserves_date_and_round_trips() {
+        use chrono::TimeZone;
+        let date = Utc.with_ymd_and_hms(2024, 5, 30, 12, 0, 0).unwrap();
+        let reason = SkipReason::CurrentVersionTooRecent;
+        assert_eq!(reason.to_string(), "current version is newer than --age");
+        assert_eq!(
+            serde_json::to_string(&reason).unwrap(),
+            "\"current_version_too_recent\""
+        );
+        let result = UpdateResult::skip_with_optional_date(sample_dependency(), reason, Some(date));
+        let json = serde_json::to_string(&result).unwrap();
+        assert_eq!(serde_json::from_str::<UpdateResult>(&json).unwrap(), result);
+        assert!(json.contains("2024-05-30T12:00:00Z"));
     }
 
     #[test]

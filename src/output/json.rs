@@ -149,7 +149,7 @@ struct JsonSkip {
     version: String,
     /// スキップ理由
     reason: String,
-    /// 現在のバージョンがリリースされた日時 (ISO 8601)
+    /// 現在版自身の公開日時 (ISO 8601)。不明な場合と浮動指定では省略
     #[serde(skip_serializing_if = "Option::is_none")]
     released_at: Option<String>,
 }
@@ -160,6 +160,7 @@ impl JsonFormatter {
         match reason {
             SkipReason::Pinned => "pinned".to_string(),
             SkipReason::AlreadyLatest => "already_latest".to_string(),
+            SkipReason::CurrentVersionTooRecent => "current_version_too_recent".to_string(),
             SkipReason::Excluded => "excluded".to_string(),
             SkipReason::NotInOnlyList => "not_in_only_list".to_string(),
             SkipReason::FetchFailed(msg) => format!("fetch_failed: {}", msg),
@@ -431,6 +432,34 @@ mod tests {
             JsonFormatter::skip_reason_to_string(&SkipReason::Excluded),
             "excluded"
         );
+    }
+
+    #[test]
+    fn current_release_age_skip_is_visible_in_verbose_json() {
+        use chrono::TimeZone;
+        let date = chrono::Utc.with_ymd_and_hms(2024, 5, 30, 12, 0, 0).unwrap();
+        let mut manifest = ManifestUpdateResult::new(PathBuf::from("package.json"), Language::Node);
+        manifest.add_result(UpdateResult::skip_with_optional_date(
+            sample_dependency("library", "2.0.0"),
+            SkipReason::CurrentVersionTooRecent,
+            Some(date),
+        ));
+        manifest.add_result(UpdateResult::skip_already_latest(sample_dependency(
+            "undated-library",
+            "1.0.0",
+        )));
+        let output = serde_json::to_value(
+            JsonFormatter::new(Verbosity::Verbose).manifest_to_json(&manifest),
+        )
+        .unwrap();
+        assert_eq!(output["skips"][0]["version"], "2.0.0");
+        assert_eq!(output["skips"][0]["reason"], "current_version_too_recent");
+        assert_eq!(output["skips"][0]["released_at"], date.to_rfc3339());
+        assert!(output["skips"][1].get("released_at").is_none());
+        let normal =
+            serde_json::to_value(JsonFormatter::new(Verbosity::Normal).manifest_to_json(&manifest))
+                .unwrap();
+        assert!(normal.get("skips").is_none());
     }
 
     #[test]

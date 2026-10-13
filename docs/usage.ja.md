@@ -66,6 +66,10 @@ age フィルターを適用するのは、depup がマニフェストに書き�
 
 プロジェクトポリシーは `--age` でも `--no-age` でも上書きできません。別の値を使いたい場合は、プロジェクトのファイル側で値を変更または削除してください。
 
+本来 `latest` と報告するケースで、確認できた現在版の公開日が適用される age の境界より新しい場合は、`newer than --age` と表示します。デフォルト、グローバル設定、プロジェクトの最小公開期間にも同じ判定を適用します。公開者の確認済み免除に該当する場合は、この理由を表示しません。マニフェストはそのまま維持し、現在版を古い版へ差し戻すことはありません。
+
+該当する `max-change` や `release date unavailable` の理由は維持します。すべての候補が age で除外され、現在版より新しい若いリリースもある場合は、従来どおり `no suitable version` になります。若い現在版だけなら `newer than --age` です。Java の現在版の公開日は、verbose 出力で完全一致指定を処理するときに必要に応じて取得するため、日付を確認できた場合だけこの理由を表示します。
+
 #### `minimumReleaseAge` を読み取る設定ファイル
 
 **pnpm**（`.npmrc` → `pnpm-workspace.yaml` → `package.json` の順に探し、最初に見つかった値を使用）
@@ -527,14 +531,24 @@ Python プロジェクトで `--install` が `uv sync` を呼び出すとき、d
 | 理由 | 意味 | 参照先 |
 |------|------|--------|
 | `latest` | フィルターを通った候補の中に、現在より新しいバージョンがなかった。新しいリリースがあっても、公開から日が浅い、脆弱性がある、プレリリースである、範囲の上限を超える、のどれかに当たれば `latest` になる | [更新候補の絞り込み](#更新候補の絞り込み)、[範囲の上限と下限](#範囲の上限と下限) |
+| `newer than --age` | 確認できた現在版の公開日が適用される age の境界より新しく、公開者の免除にも該当しない。更新先は選ばれていない | [age フィルター](#age-フィルター) |
 | `pinned` | 固定指定なので、レジストリに問い合わせていない | [固定指定と `--include-pinned`](#固定指定と---include-pinned) |
 | `max-change=<LEVEL>` | 新しいバージョンはあるが、すべて `--max-change` の上限を超えている | [更新幅の制限](#更新幅の制限--max-change) |
 | `excluded` / `not in --only` | `--exclude` で除外した、または `--only` に含まれていない | [オプション](cli-reference.ja.md#オプション) |
-| `no suitable version` | 現在のバージョンも含めて、フィルターを通るバージョンが 1 つもない（例: すべてのリリースが age の基準より新しい） | [更新候補の絞り込み](#更新候補の絞り込み) |
+| `no suitable version` | フィルターを通るバージョンが 1 つもない（例: 現在版と、それより新しいリリースがどちらも age の基準より新しい） | [更新候補の絞り込み](#更新候補の絞り込み) |
 | `parse error: ...` | 制約は読み取れたが、安全に書き換えられない（例: `parse error: constraint cannot be updated safely`）。ラベルに反してマニフェスト自体は正しく解析できており、終了コードも変わらない | [自動更新しない制約](#自動更新しない制約) |
 | `fetch failed: ...` | バージョンの取得に失敗した（レジストリのエラーや `git ls-remote` の失敗など）。終了コードが変わるかどうかは原因による | [終了コード](cli-reference.ja.md#終了コード) |
 
-表の理由はテキスト出力の表記です。`--verbose` を付けた `--json` の出力では、同じ理由が `already_latest`、`pinned`、`change_level_limited: <LEVEL>`、`excluded`、`not_in_only_list`、`no_suitable_version`、`parse_error: ...`、`fetch_failed: ...` と表記されます。
+表の理由はテキスト出力の表記です。`--verbose` を付けた `--json` の出力では、同じ理由が `already_latest`、`current_version_too_recent`、`pinned`、`change_level_limited: <LEVEL>`、`excluded`、`not_in_only_list`、`no_suitable_version`、`parse_error: ...`、`fetch_failed: ...` と表記されます。条件に合う新しい候補の公開日が不明な場合は `release_date_unknown: <VERSION>` です。日付付きの古い候補だけが残り、それらが `--max-change` の許容範囲から外れる場合にも、日付不明の新しい候補をこの理由で報告します。
+
+verbose のスキップ一覧に付く日付は、現在版自身の公開日です。古い候補の日付は使いません。現在版の日付が不明、別表記の対応が曖昧、または wildcard・prefix の浮動指定の場合は、日付を表示しません。
+
+```text
+  1 newer than --age:
+    library              2.0.0  (2024/05/30 12:00)
+  1 latest:
+    undated-library      1.0.0
+```
 
 行末に `✗ failed`（色なしでは `[failed]`）が付いた更新の行は、depup が見つけたもののマニフェストへ書き込めなかった更新です。書き込み先が曖昧で拒否した場合などがこれにあたります（[書き込みの共通原則](#書き込みの共通原則)を参照）。更新ではなく失敗として数え、理由は `Errors:` 欄に出し、終了コードは `2` になります。
 

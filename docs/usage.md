@@ -66,6 +66,10 @@ When a project policy overrides the CLI value, depup prints a yellow warning so 
 
 `--age` and `--no-age` cannot override a project policy. To use a different age, change or remove the setting in the project file.
 
+When depup would otherwise report `latest` and the current version's confirmed publication date is newer than the effective age cutoff, it reports `newer than --age`. This also applies to the default, global configuration, and project minimum release age. A verified publisher exemption suppresses this age reason. The manifest is kept as it is; this report does not downgrade the current version.
+
+An applicable `max-change` or `release date unavailable` reason is preserved. If all candidates fail the age check and a newer young release also exists, the result remains `no suitable version`; a young current version alone is reported as `newer than --age`. Java's current publication date is fetched lazily for exact versions in verbose output, so this reason is shown only when that date has been confirmed.
+
 #### Supported `minimumReleaseAge` Sources
 
 **pnpm** (checked in this order; the first value found wins):
@@ -524,14 +528,24 @@ By default, the text output only counts skipped dependencies. Run with `--verbos
 | Reason | Meaning | See |
 |--------|---------|-----|
 | `latest` | No version newer than the current one passes the filters. A newer release may exist but be too recent, vulnerable, a prerelease, or above the range's upper bound. | [Filtering Candidates](#filtering-candidates), [Upper and Lower Bounds of Ranges](#upper-and-lower-bounds-of-ranges) |
+| `newer than --age` | The confirmed current release is newer than the effective age cutoff and has no publisher exemption. No update is selected. | [Age Filter](#age-filter) |
 | `pinned` | The version is pinned, so depup did not query the registry. | [Pinned Versions and `--include-pinned`](#pinned-versions-and---include-pinned) |
 | `max-change=<LEVEL>` | Newer versions exist, but all of them exceed the `--max-change` cap. | [Limiting Bumps](#limiting-bumps---max-change) |
 | `excluded` / `not in --only` | The package was excluded with `--exclude`, or `--only` lists other packages. | [Options](cli-reference.md#options) |
-| `no suitable version` | No published version passes the filters, not even the current one (for example, every release is newer than the age cutoff). | [Filtering Candidates](#filtering-candidates) |
+| `no suitable version` | No published version passes the filters (for example, the current release and a newer release are both newer than the age cutoff). | [Filtering Candidates](#filtering-candidates) |
 | `parse error: ...` | depup read the constraint but cannot rewrite it safely (for example, `parse error: constraint cannot be updated safely`). Despite the label, the manifest itself parsed correctly, and the exit code is not affected. | [Constraints Left Unchanged](#constraints-left-unchanged) |
 | `fetch failed: ...` | The version lookup failed, for example because of a registry error or a failed `git ls-remote`. Whether the exit code changes depends on the cause. | [Exit Codes](cli-reference.md#exit-codes) |
 
-These are the labels in the text output. In `--json` output with `--verbose`, the same reasons appear as `already_latest`, `pinned`, `change_level_limited: <LEVEL>`, `excluded`, `not_in_only_list`, `no_suitable_version`, `parse_error: ...`, and `fetch_failed: ...`.
+These are the labels in the text output. In `--json` output with `--verbose`, the same reasons appear as `already_latest`, `current_version_too_recent`, `pinned`, `change_level_limited: <LEVEL>`, `excluded`, `not_in_only_list`, `no_suitable_version`, `parse_error: ...`, and `fetch_failed: ...`. An otherwise allowed newer release with an unknown publication date is reported as `release_date_unknown: <VERSION>`. This also applies when dated candidates are all older and outside the `--max-change` limit.
+
+Dates in the verbose skip list belong to the current version itself, never to an older candidate. An unknown current date, an ambiguous version alias, or a floating wildcard/prefix has no displayed date. For example:
+
+```text
+  1 newer than --age:
+    library              2.0.0  (2024/05/30 12:00)
+  1 latest:
+    undated-library      1.0.0
+```
 
 An update row that ends with `✗ failed` (`[failed]` without color) is an update depup found but could not write to the manifest, for example because the write was refused as ambiguous (see [Writing Rules](#writing-rules)). It is counted as failed instead of updated, its reason is listed in the `Errors:` section, and the exit code is `2`.
 
