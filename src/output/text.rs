@@ -151,6 +151,7 @@ impl TextFormatter {
         match reason {
             SkipReason::Pinned => "pinned".to_string(),
             SkipReason::AlreadyLatest => "latest".to_string(),
+            SkipReason::CurrentVersionTooRecent => "newer than --age".to_string(),
             SkipReason::Excluded => "excluded".to_string(),
             SkipReason::NotInOnlyList => "not in --only".to_string(),
             SkipReason::FetchFailed(msg) => format!("fetch failed: {}", msg),
@@ -998,6 +999,26 @@ mod tests {
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("release date unknown"));
         assert!(!output.contains("1970"));
+    }
+
+    #[test]
+    fn current_release_age_skip_uses_its_own_group_and_date() {
+        use chrono::TimeZone;
+        let date = chrono::Utc.with_ymd_and_hms(2024, 5, 30, 12, 0, 0).unwrap();
+        let mut manifest =
+            ManifestUpdateResult::new(std::path::PathBuf::from("package.json"), Language::Node);
+        manifest.add_result(UpdateResult::skip_with_optional_date(
+            sample_dependency("library", "2.0.0", false),
+            SkipReason::CurrentVersionTooRecent,
+            Some(date),
+        ));
+        let formatter = TextFormatter::with_color(Verbosity::Verbose, false, false);
+        let mut output = Vec::new();
+        formatter.format_manifest(&manifest, &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("1 newer than --age:"), "{output}");
+        assert!(output.contains("2.0.0  (2024/05/30 12:00)"), "{output}");
+        assert!(!output.contains(" latest:"), "{output}");
     }
 
     #[test]

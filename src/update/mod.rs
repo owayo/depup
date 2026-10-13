@@ -457,6 +457,9 @@ impl UpdateJudge {
             available_versions
         };
 
+        let current = current_version_info(dependency, available_versions);
+        let current_released_at = current.and_then(|info| info.released_at);
+
         // mise はバックエンドによって公開日を一切返さない。同じツール・同じ
         // flavor に日付付きの版が一つでもあれば、日付欠落を age の対象にする。
         // Swift の tag と Java の Maven metadata は一覧に日付がない。
@@ -493,19 +496,31 @@ impl UpdateJudge {
         } else {
             None
         };
+        let has_newer_before_age = before_age.iter().any(|info| {
+            compare_dependency_versions(dependency, &info.version, dependency.version())
+                == std::cmp::Ordering::Greater
+        });
         let eligible = self.apply_age_filter(dependency, before_age, allow_undated);
 
         if eligible.is_empty() {
-            return UpdateResult::skip(
-                dependency.clone(),
-                unknown_newer
-                    .map(SkipReason::ReleaseDateUnknown)
-                    .unwrap_or(SkipReason::NoSuitableVersion),
-            );
+            if let Some(version) = unknown_newer {
+                return UpdateResult::skip(
+                    dependency.clone(),
+                    SkipReason::ReleaseDateUnknown(version),
+                );
+            }
+            if !has_newer_before_age && self.current_is_too_recent(dependency, current) {
+                return UpdateResult::skip_with_optional_date(
+                    dependency.clone(),
+                    SkipReason::CurrentVersionTooRecent,
+                    current_released_at,
+                );
+            }
+            return UpdateResult::skip(dependency.clone(), SkipReason::NoSuitableVersion);
         }
 
         let allowed = apply_max_change_filter(dependency, &eligible, self.filter.max_change);
-        if allowed.is_empty() {
+        let result = if allowed.is_empty() {
             // 全候補が max_change で除外された。除外された候補の中に現在版より新しい
             // ものが存在する場合のみ ChangeLevelLimited とし、新しい候補がそもそも
             // 無い場合は AlreadyLatest として扱う (max_change が原因ではないため)。
@@ -517,19 +532,19 @@ impl UpdateJudge {
             if let (true, Some(max)) = (has_newer_excluded, self.filter.max_change) {
                 return UpdateResult::skip(dependency.clone(), SkipReason::ChangeLevelLimited(max));
             }
-            // eligible は非空が保証されているため最新候補のリリース日時を添える
-            let latest = eligible
-                .iter()
-                .max_by(|a, b| compare_dependency_versions(dependency, &a.version, &b.version))
-                .unwrap();
-            return UpdateResult::skip_already_latest_with_optional_date(
+            UpdateResult::skip_already_latest_with_optional_date(
                 dependency.clone(),
-                latest.released_at,
-            );
-        }
-
-        let result =
-            select_latest_candidate(dependency, &eligible, &allowed, self.filter.max_change);
+                current_released_at,
+            )
+        } else {
+            select_latest_candidate(
+                dependency,
+                &eligible,
+                &allowed,
+                self.filter.max_change,
+                current_released_at,
+            )
+        };
         let exemption = match &result {
             UpdateResult::Update { new_version, .. } => self
                 .filter
@@ -554,11 +569,46 @@ impl UpdateJudge {
                 reason: SkipReason::AlreadyLatest,
                 ..
             }
-        ) && let Some(version) = unknown_newer
-        {
-            return UpdateResult::skip(dependency.clone(), SkipReason::ReleaseDateUnknown(version));
+        ) {
+            if let Some(version) = unknown_newer {
+                return UpdateResult::skip(
+                    dependency.clone(),
+                    SkipReason::ReleaseDateUnknown(version),
+                );
+            }
+            if self.current_is_too_recent(dependency, current) {
+                return UpdateResult::skip_with_optional_date(
+                    dependency.clone(),
+                    SkipReason::CurrentVersionTooRecent,
+                    current_released_at,
+                );
+            }
         }
         result.with_age_exemption(exemption)
+    }
+
+    /// 確認できた現在版にも、候補と同じ cutoff と公開者免除を適用する。
+    fn current_is_too_recent(
+        &self,
+        dependency: &Dependency,
+        current: Option<&VersionInfo>,
+    ) -> bool {
+        let Some(cutoff) = self
+            .filter
+            .min_age
+            .and_then(|age| crate::domain::cutoff_from(self.now, age))
+        else {
+            return false;
+        };
+        current.is_some_and(|info| {
+            info.released_at.is_some()
+                && !self.filter.age_exempt.admits(
+                    dependency.language,
+                    &dependency.name,
+                    info,
+                    cutoff,
+                )
+        })
     }
 
     /// 既定ではプレリリースを除外する。現在版がプレリリースなら全候補を残す。
@@ -845,12 +895,61 @@ pub fn compare_dependency_versions(
     }
 }
 
+/// 順序が等しいだけの別ビルドから、現在版の日付を借りない。
+fn is_same_release(dependency: &Dependency, a: &str, b: &str) -> bool {
+    match dependency.language {
+        Language::Python => matches!(
+            (a.parse::<pep440_rs::Version>(), b.parse::<pep440_rs::Version>()),
+            (Ok(a), Ok(b)) if a == b
+        ),
+        Language::Node
+        | Language::Rust
+        | Language::Go
+        | Language::Swift
+        | Language::Php
+        | Language::Mise => {
+            let (a, b) = (
+                version_info::strip_ascii_v_prefix(a),
+                version_info::strip_ascii_v_prefix(b),
+            );
+            match (semver::Version::parse(a), semver::Version::parse(b)) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => a == b,
+            }
+        }
+        Language::Ruby | Language::Java => false,
+    }
+}
+
+/// 絞り込み前の一覧から、完全一致を優先し、一意な安全な別表記だけを許す。
+fn current_version_info<'a>(
+    dependency: &Dependency,
+    versions: &'a [VersionInfo],
+) -> Option<&'a VersionInfo> {
+    if matches!(
+        dependency.version_spec.kind,
+        VersionSpecKind::Wildcard | VersionSpecKind::Prefix | VersionSpecKind::Any
+    ) {
+        return None;
+    }
+    let current = dependency.version();
+    if let Some(exact) = versions.iter().find(|info| info.version == current) {
+        return Some(exact);
+    }
+    let mut aliases = versions
+        .iter()
+        .filter(|info| is_same_release(dependency, &info.version, current));
+    let first = aliases.next()?;
+    aliases.next().is_none().then_some(first)
+}
+
 /// 最新候補を選び、ダウングレード防止・更新先制約フォーマット可否を判定して結果を返す。
 fn select_latest_candidate(
     dependency: &Dependency,
     eligible: &[&VersionInfo],
     allowed: &[&VersionInfo],
     max_change: Option<crate::domain::ChangeLevel>,
+    current_released_at: Option<DateTime<Utc>>,
 ) -> UpdateResult {
     // 言語ごとの比較規則で最新の更新候補を選ぶ
     let latest = allowed
@@ -877,7 +976,7 @@ fn select_latest_candidate(
         }
         return UpdateResult::skip_already_latest_with_optional_date(
             dependency.clone(),
-            latest.released_at,
+            current_released_at,
         );
     }
 
@@ -895,7 +994,7 @@ fn select_latest_candidate(
     if formatted == dependency.version_spec.raw {
         return UpdateResult::skip_already_latest_with_optional_date(
             dependency.clone(),
-            latest.released_at,
+            current_released_at,
         );
     }
 
@@ -991,6 +1090,348 @@ mod tests {
 
     fn make_version_info_at(version: &str, date: DateTime<Utc>) -> VersionInfo {
         VersionInfo::new(version, date)
+    }
+
+    #[test]
+    fn current_release_date_is_not_borrowed_from_an_older_candidate() {
+        let now = fixed_time();
+        let current_date = now - chrono::Duration::days(2);
+        let versions = vec![
+            make_version_info_at("1.0.0", now - chrono::Duration::days(30)),
+            make_version_info_at("2.0.0", current_date),
+        ];
+        for language in [Language::Node, Language::Rust] {
+            let dep = make_dependency("library", "2.0.0", language, false);
+            for max_change in [None, Some(crate::domain::ChangeLevel::Patch)] {
+                let mut filter = UpdateFilter::new().with_min_age(Duration::from_secs(7 * 86400));
+                filter.max_change = max_change;
+                let result = UpdateJudge::with_time(filter, now).judge(&dep, &versions);
+                match result {
+                    UpdateResult::Skip {
+                        reason,
+                        released_at,
+                        ..
+                    } => {
+                        assert_eq!(released_at, Some(current_date));
+                        assert_eq!(reason.to_string(), "current version is newer than --age");
+                    }
+                    _ => panic!("Expected a current-version skip: {result:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn current_release_date_matching_keeps_release_identity() {
+        let date = fixed_time() - chrono::Duration::days(30);
+        let other_date = fixed_time() - chrono::Duration::days(2);
+        let dated = |version: &str| VersionInfo::new(version, date);
+        for language in [
+            Language::Node,
+            Language::Rust,
+            Language::Go,
+            Language::Swift,
+            Language::Php,
+            Language::Mise,
+        ] {
+            let dep = make_dependency("library", "1.0.0", language, false);
+            for prefix in ["v", "V"] {
+                let versions = [dated(&format!("{prefix}1.0.0"))];
+                assert_eq!(
+                    current_version_info(&dep, &versions).and_then(|info| info.released_at),
+                    Some(date),
+                    "{language:?} {prefix}"
+                );
+            }
+            // An exact spelling wins even when its publication date is unknown.
+            let versions = [dated("v1.0.0"), VersionInfo::undated("1.0.0")];
+            assert_eq!(
+                current_version_info(&dep, &versions).unwrap().released_at,
+                None
+            );
+            let versions = [dated("v1.0.0"), VersionInfo::new("1.0.0", other_date)];
+            assert_eq!(
+                current_version_info(&dep, &versions).unwrap().released_at,
+                Some(other_date)
+            );
+            let versions = [dated("v1.0.0"), dated("V1.0.0")];
+            assert!(
+                current_version_info(&dep, &versions).is_none(),
+                "{language:?}"
+            );
+
+            let build_dep = make_dependency("library", "1.0.0+a", language, false);
+            let versions = [dated("1.0.0+b")];
+            assert!(
+                current_version_info(&build_dep, &versions).is_none(),
+                "{language:?}"
+            );
+            let versions = [dated("1.0.0+a"), VersionInfo::new("1.0.0+b", other_date)];
+            assert_eq!(
+                current_version_info(&build_dep, &versions)
+                    .unwrap()
+                    .released_at,
+                Some(date)
+            );
+        }
+        for language in [Language::Ruby, Language::Java] {
+            for alias in ["v1.0.0", "1.0.0.0", "1.0.0.Final"] {
+                let dep = make_dependency("library", "1.0.0", language, false);
+                assert!(
+                    current_version_info(&dep, &[dated(alias)]).is_none(),
+                    "{language:?} {alias}"
+                );
+            }
+        }
+        for (current, alias) in [
+            ("1.0", "1.0.0"),
+            ("v1.0", "1.0"),
+            ("1.0RC1", "1.0rc1"),
+            ("1.0+CPU", "1.0+cpu"),
+        ] {
+            let dep = make_dependency("library", current, Language::Python, false);
+            let versions = [dated(alias)];
+            assert_eq!(
+                current_version_info(&dep, &versions).unwrap().released_at,
+                Some(date),
+                "{current} {alias}"
+            );
+        }
+        let dep = make_dependency("library", "1.0", Language::Python, false);
+        assert!(current_version_info(&dep, &[dated("1.0.0"), dated("v1.0")]).is_none());
+        let local_dep = make_dependency("library", "1.0+cpu", Language::Python, false);
+        assert!(current_version_info(&local_dep, &[dated("1.0+cu118")]).is_none());
+        assert!(current_version_info(&local_dep, &[dated("1.0")]).is_none());
+    }
+
+    #[test]
+    fn current_release_date_is_absent_for_floating_specs_and_missing_versions() {
+        let now = fixed_time();
+        let versions = [make_version_info_at(
+            "1.2.0",
+            now - chrono::Duration::days(30),
+        )];
+        let judge = UpdateJudge::with_time(UpdateFilter::new(), now);
+        for (kind, raw, current) in [
+            (VersionSpecKind::Wildcard, "1.x", "1.0.0"),
+            (VersionSpecKind::Wildcard, "==1.2.*", "1.2.0"),
+            (VersionSpecKind::Prefix, "prefix:1", "1.2.0"),
+            (VersionSpecKind::Any, "*", "1.2.0"),
+        ] {
+            let language = if raw.starts_with("==") {
+                Language::Python
+            } else {
+                Language::Node
+            };
+            let dep = Dependency::new(
+                "library",
+                VersionSpec::new(kind, raw, current),
+                false,
+                language,
+            );
+            assert!(current_version_info(&dep, &versions).is_none(), "{raw}");
+            if kind == VersionSpecKind::Wildcard {
+                assert!(
+                    matches!(
+                        judge.judge(&dep, &versions),
+                        UpdateResult::Skip {
+                            reason: SkipReason::AlreadyLatest,
+                            released_at: None,
+                            ..
+                        }
+                    ),
+                    "{raw}"
+                );
+            }
+        }
+        for max_change in [None, Some(crate::domain::ChangeLevel::Patch)] {
+            let mut filter = UpdateFilter::new();
+            filter.max_change = max_change;
+            for current in ["1.3.0", "2.0.0"] {
+                let dep = make_dependency("library", current, Language::Rust, false);
+                assert!(matches!(
+                    UpdateJudge::with_time(filter.clone(), now).judge(&dep, &versions),
+                    UpdateResult::Skip {
+                        reason: SkipReason::AlreadyLatest,
+                        released_at: None,
+                        ..
+                    }
+                ));
+            }
+        }
+        let dep = make_dependency("library", "1.2.0", Language::Rust, false);
+        let versions = [
+            make_version_info_at("1.0.0", now - chrono::Duration::days(30)),
+            VersionInfo::undated("1.2.0"),
+        ];
+        let judge = UpdateJudge::with_time(
+            UpdateFilter::new().with_min_age(Duration::from_secs(7 * 86400)),
+            now,
+        );
+        assert!(matches!(
+            judge.judge(&dep, &versions),
+            UpdateResult::Skip {
+                reason: SkipReason::AlreadyLatest,
+                released_at: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn current_release_age_boundaries_and_exemptions() {
+        let now = fixed_time();
+        let cutoff = now - chrono::Duration::days(7);
+        let dep = make_dependency("library", "1.0.0", Language::Rust, false);
+        for (date, age, exempt, expected) in [
+            (
+                cutoff,
+                Some(Duration::from_secs(7 * 86400)),
+                false,
+                SkipReason::AlreadyLatest,
+            ),
+            (
+                cutoff + chrono::Duration::seconds(1),
+                Some(Duration::from_secs(7 * 86400)),
+                false,
+                SkipReason::CurrentVersionTooRecent,
+            ),
+            (now, None, false, SkipReason::AlreadyLatest),
+            (now, Some(Duration::MAX), false, SkipReason::AlreadyLatest),
+            (
+                now,
+                Some(Duration::from_secs(7 * 86400)),
+                true,
+                SkipReason::AlreadyLatest,
+            ),
+        ] {
+            let mut filter = UpdateFilter::new();
+            filter.min_age = age;
+            filter.age_exempt.github = vec!["example-dev".into()];
+            let mut current = make_version_info_at("1.0.0", date);
+            if exempt {
+                current.publisher = PublisherEvidence::GithubUser {
+                    login: "example-dev".into(),
+                };
+            }
+            let result = UpdateJudge::with_time(filter, now).judge(&dep, &[current]);
+            assert!(
+                matches!(result, UpdateResult::Skip { reason, released_at, .. } if reason == expected && released_at == Some(date)),
+                "age={age:?} exempt={exempt}"
+            );
+        }
+    }
+
+    #[test]
+    fn current_release_age_empty_candidates_preserve_newer_candidate_reason() {
+        let now = fixed_time();
+        let date = now - chrono::Duration::days(2);
+        let dep = make_dependency("library", "1.0.0", Language::Rust, false);
+        let judge = UpdateJudge::with_time(
+            UpdateFilter::new().with_min_age(Duration::from_secs(7 * 86400)),
+            now,
+        );
+        let current = make_version_info_at("1.0.0", date);
+        assert!(
+            matches!(judge.judge(&dep, std::slice::from_ref(&current)), UpdateResult::Skip { reason: SkipReason::CurrentVersionTooRecent, released_at: Some(actual), .. } if actual == date)
+        );
+        let newer = make_version_info_at("1.1.0", now - chrono::Duration::days(1));
+        assert!(matches!(
+            judge.judge(&dep, &[current.clone(), newer.clone()]),
+            UpdateResult::Skip {
+                reason: SkipReason::NoSuitableVersion,
+                released_at: None,
+                ..
+            }
+        ));
+        // Keeping the pre-existing nonempty-candidate path does not unify all age skips.
+        let older = make_version_info_at("0.9.0", now - chrono::Duration::days(30));
+        assert!(
+            matches!(judge.judge(&dep, &[older, current, newer]), UpdateResult::Skip { reason: SkipReason::CurrentVersionTooRecent, released_at: Some(actual), .. } if actual == date)
+        );
+    }
+
+    #[test]
+    fn current_release_age_does_not_override_update_or_other_skip_reasons() {
+        let now = fixed_time();
+        let current_date = now - chrono::Duration::days(2);
+        let older_date = now - chrono::Duration::days(30);
+        let filter = UpdateFilter::new()
+            .with_min_age(Duration::from_secs(7 * 86400))
+            .with_max_change(crate::domain::ChangeLevel::Patch);
+        let judge = UpdateJudge::with_time(filter, now);
+        let dep = make_dependency("library", "2.0.0", Language::Rust, false);
+        for older in [None, Some(make_version_info_at("1.0.0", older_date))] {
+            let mut versions = vec![
+                make_version_info_at("2.0.0", current_date),
+                VersionInfo::undated("2.0.1"),
+            ];
+            versions.extend(older);
+            assert!(
+                matches!(judge.judge(&dep, &versions), UpdateResult::Skip { reason: SkipReason::ReleaseDateUnknown(version), released_at: None, .. } if version == "2.0.1")
+            );
+        }
+        let versions = [
+            make_version_info_at("2.0.0", current_date),
+            make_version_info_at("3.0.0", older_date),
+        ];
+        assert!(matches!(
+            judge.judge(&dep, &versions),
+            UpdateResult::Skip {
+                reason: SkipReason::ChangeLevelLimited(crate::domain::ChangeLevel::Patch),
+                ..
+            }
+        ));
+        let versions = [
+            make_version_info_at("2.0.0", current_date),
+            make_version_info_at("2.0.1", older_date),
+        ];
+        assert!(
+            matches!(judge.judge(&dep, &versions), UpdateResult::Update { new_version, released_at: Some(actual), .. } if new_version == "2.0.1" && actual == older_date)
+        );
+
+        let range = Dependency::new(
+            "library",
+            VersionSpec::new(VersionSpecKind::Range, ">=2.0.0, <3.0.0", "2.0.0"),
+            false,
+            Language::Rust,
+        );
+        assert!(
+            matches!(judge.judge(&range, &[make_version_info_at("1.0.0", older_date), make_version_info_at("2.0.0", current_date)]), UpdateResult::Skip { reason: SkipReason::CurrentVersionTooRecent, released_at: Some(actual), .. } if actual == current_date)
+        );
+    }
+
+    #[test]
+    fn current_release_date_stays_with_mise_flavor() {
+        let now = fixed_time();
+        let date = now - chrono::Duration::days(2);
+        let dep = Dependency::new(
+            "java",
+            VersionSpec::new(VersionSpecKind::Caret, "temurin-21.0.9", "21.0.9")
+                .with_prefix("temurin-"),
+            false,
+            Language::Mise,
+        );
+        let judge = UpdateJudge::with_time(
+            UpdateFilter::new().with_min_age(Duration::from_secs(7 * 86400)),
+            now,
+        );
+        let versions = [
+            make_version_info_at("temurin-21.0.8", now - chrono::Duration::days(30)),
+            make_version_info_at("temurin-21.0.9", date),
+            make_version_info_at("zulu-21.0.9", now - chrono::Duration::days(60)),
+        ];
+        assert!(
+            matches!(judge.judge(&dep, &versions), UpdateResult::Skip { reason: SkipReason::CurrentVersionTooRecent, released_at: Some(actual), .. } if actual == date)
+        );
+        assert!(matches!(
+            judge.judge(&dep, &[versions[0].clone(), versions[2].clone()]),
+            UpdateResult::Skip {
+                reason: SkipReason::AlreadyLatest,
+                released_at: None,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1185,8 +1626,8 @@ mod tests {
         } = result
         {
             assert_eq!(reason, SkipReason::AlreadyLatest);
-            // `released_at` には最新候補のリリース日時が入る
-            assert!(released_at.is_some());
+            // 現在版自身の日時を使う
+            assert_eq!(released_at, versions[1].released_at);
         }
     }
 
@@ -1208,6 +1649,7 @@ mod tests {
                 result,
                 UpdateResult::Skip {
                     reason: SkipReason::AlreadyLatest,
+                    released_at: None,
                     ..
                 }
             ));
@@ -2937,8 +3379,8 @@ mod tests {
         } = result
         {
             assert_eq!(reason, SkipReason::AlreadyLatest);
-            // 最新候補のリリース日時が添えられる
-            assert!(released_at.is_some());
+            // ワイルドカードは具体的なリリースを特定しない
+            assert_eq!(released_at, None);
         }
     }
 
@@ -2984,7 +3426,7 @@ mod tests {
         } = result
         {
             assert_eq!(reason, SkipReason::AlreadyLatest);
-            assert!(released_at.is_some());
+            assert_eq!(released_at, None);
         }
     }
 

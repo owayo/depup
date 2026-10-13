@@ -100,6 +100,7 @@ depup --cd ./projects/myapp -n
 - Skipped dependencies are counted in each manifest heading (`— N updates, M skips`) and in the summary; a manifest with no updates also shows the count per reason
 - An update that could not be written to the manifest (for example, a write refused as ambiguous) ends with `✗ failed` and is not counted as an update: the heading becomes `— N updates, K failed, M skips`, and the summary adds `K package(s) failed to update`. The reason is listed in the `Errors:` section
 - With `--verbose`, every skipped dependency is listed under its reason, and the summary is broken down by reason and language
+- The `latest` and `newer than --age` skip groups show the current version's own publication date when confirmed. Unknown dates and floating wildcard/prefix specifications have no date. `newer than --age` means the current release is too young for the effective age policy and is not publisher-exempt; it does not downgrade the dependency
 - Errors, including OSV notices, are listed in the `Errors:` section
 
 ### JSON Output
@@ -150,6 +151,19 @@ depup --json
 ```
 
 `summary.updates` and each manifest's `updates` cover only the updates that were written (with `--dry-run`, the updates that would be written). Updates that could not be written are counted in `summary.failed` and listed in the manifest's `failed` array, with the reason in `error`. Git dependencies use `"kind": "git"` and add `source` (the repository URL with any credentials masked) and `reference`. With `--verbose`, each manifest also lists its `skips`, and the summary adds `by_language`.
+
+Verbose skip entries use `reason: "current_version_too_recent"` when the confirmed current release is younger than the effective age policy and no update is selected. Other filters and errors keep their own reasons. This replaces `already_latest` for those age cases and also applies to the default and configured age values. Skip `released_at` belongs to the current release, rather than the latest eligible candidate; it is omitted when unknown or when the specification does not identify one release. For example:
+
+```json
+{
+  "name": "library",
+  "version": "2.0.0",
+  "reason": "current_version_too_recent",
+  "released_at": "2024-05-30T12:00:00+00:00"
+}
+```
+
+The reporting rules and other skip reasons are described in [When a Dependency Is Not Updated](usage.md#when-a-dependency-is-not-updated).
 
 ### Diff Output
 

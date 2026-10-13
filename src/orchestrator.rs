@@ -1033,9 +1033,15 @@ impl Orchestrator {
                     (
                         versions
                             .iter()
-                            .find(|candidate| {
-                                compare_dependency_versions(dep, &candidate.version, dep.version())
-                                    == std::cmp::Ordering::Equal
+                            .find(|candidate| candidate.version == dep.version())
+                            .or_else(|| {
+                                versions.iter().find(|candidate| {
+                                    compare_dependency_versions(
+                                        dep,
+                                        &candidate.version,
+                                        dep.version(),
+                                    ) == std::cmp::Ordering::Equal
+                                })
                             })
                             .map(|candidate| candidate.version.clone()),
                         false,
@@ -1855,6 +1861,7 @@ mod git_helper_tests {
             SkipReason::ChangeLevelLimited(crate::domain::ChangeLevel::Patch),
             SkipReason::FetchFailed("boom".to_string()),
             SkipReason::ParseError("bad".to_string()),
+            SkipReason::CurrentVersionTooRecent,
         ] {
             assert!(
                 tauri_sync_protected(&UpdateResult::skip(dep.clone(), reason.clone())),
@@ -2404,6 +2411,272 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn current_maven_release_age_is_confirmed_only_in_verbose_output() {
+        use crate::domain::{VersionSpec, VersionSpecKind};
+        use chrono::TimeZone;
+        let now = chrono::Utc.with_ymd_and_hms(2024, 6, 1, 12, 0, 0).unwrap();
+        let dir = TempDir::new().unwrap();
+        let dep = Dependency::new(
+            "example:library",
+            VersionSpec::new(VersionSpecKind::Exact, "3.0.0", "3.0.0"),
+            false,
+            Language::Java,
+        );
+        let judge = UpdateJudge::with_time(
+            UpdateFilter::new()
+                .with_include_pinned(true)
+                .with_min_age(Duration::from_secs(7 * 86400)),
+            now,
+        );
+        for verbose in [false, true] {
+            let args = if verbose {
+                vec!["--java", "--include-pinned", "--verbose"]
+            } else {
+                vec!["--java", "--include-pinned"]
+            };
+            let orchestrator = Orchestrator::new(make_args_with_path(dir.path(), &args)).unwrap();
+            let adapter = DatedMavenAdapter {
+                calls: AtomicUsize::new(0),
+                now,
+            };
+            let versions = vec![
+                VersionInfo::new("1.0.0", now - chrono::Duration::days(30)),
+                VersionInfo::undated("3.0.0"),
+            ];
+            let resolved = orchestrator
+                .resolve_java_release_dates(&dep, &adapter, &judge, versions)
+                .await
+                .unwrap();
+            assert_eq!(adapter.calls.load(Ordering::SeqCst), usize::from(verbose));
+            let expected = if verbose {
+                SkipReason::CurrentVersionTooRecent
+            } else {
+                SkipReason::AlreadyLatest
+            };
+            let result = judge.judge(&dep, &resolved);
+            assert!(
+                matches!(&result, UpdateResult::Skip { reason, released_at, .. } if *reason == expected && *released_at == verbose.then_some(now - chrono::Duration::days(1))),
+                "verbose={verbose}: {result:?}"
+            );
+            // Gradle ordering may equate spellings without identifying one release.
+            let alias = Dependency::new(
+                "example:library",
+                VersionSpec::new(VersionSpecKind::Exact, "3-0-0", "3-0-0"),
+                false,
+                Language::Java,
+            );
+            let resolved = orchestrator
+                .resolve_java_release_dates(
+                    &alias,
+                    &adapter,
+                    &judge,
+                    vec![
+                        VersionInfo::new("1.0.0", now - chrono::Duration::days(30)),
+                        VersionInfo::undated("3.0.0"),
+                    ],
+                )
+                .await
+                .unwrap();
+            assert_eq!(adapter.calls.load(Ordering::SeqCst), usize::from(verbose));
+            assert!(matches!(
+                judge.judge(&alias, &resolved),
+                UpdateResult::Skip {
+                    reason: SkipReason::AlreadyLatest,
+                    released_at: None,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn current_maven_release_date_prefers_exact_spelling_before_aliases() {
+        use crate::domain::{VersionSpec, VersionSpecKind};
+        use chrono::TimeZone;
+        let now = chrono::Utc.with_ymd_and_hms(2024, 6, 1, 12, 0, 0).unwrap();
+        let old_date = now - chrono::Duration::days(30);
+        let current_date = now - chrono::Duration::days(1);
+        let dir = TempDir::new().unwrap();
+        let judge = UpdateJudge::with_time(
+            UpdateFilter::new()
+                .with_include_pinned(true)
+                .with_min_age(Duration::from_secs(7 * 86400)),
+            now,
+        );
+        let dep = Dependency::new(
+            "example:library",
+            VersionSpec::new(VersionSpecKind::Exact, "3.0.0", "3.0.0"),
+            false,
+            Language::Java,
+        );
+        for (spellings, known_exact_date) in [
+            (vec!["3-0-0", "3.0.0"], None),
+            (vec!["3.0.0", "3-0-0"], None),
+            (vec!["3-0-0"], None),
+            (vec!["3.0.0"], None),
+            (vec!["3-0-0", "3.0.0"], Some(old_date)),
+            (vec!["3-0-0", "3.0.0"], Some(current_date)),
+        ] {
+            for verbose in [false, true] {
+                let args = if verbose {
+                    vec!["--java", "--include-pinned", "--verbose"]
+                } else {
+                    vec!["--java", "--include-pinned"]
+                };
+                let orchestrator =
+                    Orchestrator::new(make_args_with_path(dir.path(), &args)).unwrap();
+                let adapter = DatedMavenAdapter {
+                    calls: AtomicUsize::new(0),
+                    now,
+                };
+                let mut versions = vec![VersionInfo::new("1.0.0", old_date)];
+                versions.extend(spellings.iter().map(|spelling| {
+                    VersionInfo::with_released_at(
+                        *spelling,
+                        if *spelling == "3.0.0" {
+                            known_exact_date
+                        } else {
+                            None
+                        },
+                    )
+                }));
+                let resolved = orchestrator
+                    .resolve_java_release_dates(&dep, &adapter, &judge, versions)
+                    .await
+                    .unwrap();
+                let expected_date = known_exact_date
+                    .or_else(|| (verbose && spellings.contains(&"3.0.0")).then_some(current_date));
+                let expected_reason = if expected_date == Some(current_date) {
+                    SkipReason::CurrentVersionTooRecent
+                } else {
+                    SkipReason::AlreadyLatest
+                };
+                let result = judge.judge(&dep, &resolved);
+                assert!(
+                    matches!(&result, UpdateResult::Skip { reason, released_at, .. } if *reason == expected_reason && *released_at == expected_date),
+                    "verbose={verbose}, spellings={spellings:?}: {result:?}"
+                );
+                assert_eq!(
+                    adapter.calls.load(Ordering::SeqCst),
+                    usize::from(verbose && known_exact_date.is_none()),
+                    "verbose={verbose}, spellings={spellings:?}"
+                );
+                if spellings.contains(&"3.0.0") {
+                    assert!(
+                        resolved
+                            .iter()
+                            .filter(|info| info.version == "3-0-0")
+                            .all(|info| info.released_at.is_none())
+                    );
+                }
+            }
+        }
+
+        // Verbose output alone does not fetch the current date for non-exact specs.
+        let orchestrator =
+            Orchestrator::new(make_args_with_path(dir.path(), &["--java", "--verbose"])).unwrap();
+        let adapter = DatedMavenAdapter {
+            calls: AtomicUsize::new(0),
+            now,
+        };
+        for (kind, raw) in [
+            (VersionSpecKind::Caret, "^3.0.0"),
+            (VersionSpecKind::Range, ">=3.0.0, <4.0.0"),
+        ] {
+            let dep = Dependency::new(
+                "example:library",
+                VersionSpec::new(kind, raw, "3.0.0"),
+                false,
+                Language::Java,
+            );
+            let resolved = orchestrator
+                .resolve_java_release_dates(
+                    &dep,
+                    &adapter,
+                    &judge,
+                    vec![VersionInfo::undated("3-0-0"), VersionInfo::undated("3.0.0")],
+                )
+                .await
+                .unwrap();
+            assert_eq!(adapter.calls.load(Ordering::SeqCst), 0);
+            assert!(matches!(
+                judge.judge(&dep, &resolved),
+                UpdateResult::Skip {
+                    reason: SkipReason::AlreadyLatest,
+                    released_at: None,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn current_release_age_skip_returns_from_osv_without_a_query() {
+        use crate::domain::{VersionSpec, VersionSpecKind};
+        use chrono::TimeZone;
+        let now = chrono::Utc.with_ymd_and_hms(2024, 6, 1, 12, 0, 0).unwrap();
+        let dir = TempDir::new().unwrap();
+        let orchestrator = Orchestrator::new(make_args_with_path(dir.path(), &["--rust"])).unwrap();
+        let dep = Dependency::new(
+            "library",
+            VersionSpec::new(VersionSpecKind::Caret, "^3.0.0", "3.0.0").with_prefix("^"),
+            false,
+            Language::Rust,
+        );
+        let judge = UpdateJudge::with_time(
+            UpdateFilter::new().with_min_age(Duration::from_secs(7 * 86400)),
+            now,
+        );
+        let current_date = now - chrono::Duration::days(2);
+        let mut versions = vec![
+            VersionInfo::new("2.0.0", now - chrono::Duration::days(30)),
+            VersionInfo::new("3.0.0", current_date),
+            VersionInfo::new("3.0.1", now - chrono::Duration::days(30)),
+        ];
+        assert!(
+            matches!(judge.judge(&dep, &versions), UpdateResult::Update { new_version, .. } if new_version == "3.0.1")
+        );
+        // The fallback loop removes a rejected candidate before judging again.
+        versions.retain(|info| {
+            compare_dependency_versions(&dep, &info.version, "3.0.1") != std::cmp::Ordering::Equal
+        });
+        assert!(matches!(
+            judge.judge(&dep, &versions),
+            UpdateResult::Skip {
+                reason: SkipReason::CurrentVersionTooRecent,
+                ..
+            }
+        ));
+        let adapter = DatedMavenAdapter {
+            calls: AtomicUsize::new(0),
+            now,
+        };
+        let checker = OsvChecker::new().unwrap();
+        let mut warnings = Vec::new();
+        let mut context = OsvJudgeContext {
+            checker: &checker,
+            ecosystem: "crates.io",
+            bar: None,
+            warnings: &mut warnings,
+        };
+        let result = judge_with_osv(
+            &orchestrator,
+            &adapter,
+            &judge,
+            &dep,
+            versions,
+            &mut context,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(result, UpdateResult::Skip { reason: SkipReason::CurrentVersionTooRecent, released_at: Some(date), .. } if date == current_date)
+        );
+        assert!(warnings.is_empty());
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 0);
     }
 
     fn make_args(args: &[&str]) -> CliArgs {
