@@ -218,6 +218,12 @@ Only the `[tools]` section is rewritten; identically named keys under `[settings
 
 Tool declarations inside multiline task strings are ignored. Triple-quote markers inside ordinary strings or comments do not hide subsequent `[tools]` declarations.
 
+#### Lockfile Platforms
+
+With `--install`, depup records the platform metadata in existing mise lockfiles before running `mise install`. If the install drops metadata, depup refreshes the affected tools with `mise lock <tool...> --platform <original-platforms>`, preserving each tool's platform set and the install's age cutoff. It does not request a format upgrade or re-resolve selectors with `--bump`.
+
+After refreshing, depup checks that platform download metadata is present, the resolved versions have not changed during the refresh, and the existing `lockfile_version` is preserved. A failed refresh or incomplete result is an install failure: depup reports the reason and restores the affected manifests, lockfiles, and managed sidecars through [install recovery](usage.md#running-the-package-manager---install). An existing lockfile whose layout or target cannot be verified safely stops preparation. No refresh runs when the platform metadata is already complete or there was no existing lockfile to preserve.
+
 #### mise and the Age Filter
 
 When `[settings] minimum_release_age` is **explicitly set**, depup treats it as a [project policy](usage.md#resolution-priority), just like pnpm's and Bun's `minimumReleaseAge`, so it takes precedence over the CLI `--age`. Only a value written in a config file counts; mise's built-in 24-hour default is ignored. The syntax is shown under [Supported `minimumReleaseAge` Sources](usage.md#supported-minimumreleaseage-sources).
