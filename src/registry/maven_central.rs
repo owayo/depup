@@ -24,7 +24,7 @@ pub struct MavenCentralAdapter {
     base_url: String,
     fallback_urls: Vec<String>,
     plugin_urls: Vec<String>,
-    package_sources: Mutex<HashMap<String, String>>,
+    package_sources: Mutex<HashMap<String, HashMap<String, String>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -248,7 +248,8 @@ impl RegistryAdapter for MavenCentralAdapter {
         if package == crate::manifest::GRADLE_WRAPPER_PACKAGE {
             return super::gradle_versions::fetch_versions(&self.client).await;
         }
-        let mut selected = None;
+        let mut sources = HashMap::new();
+        let mut found_metadata = false;
         let repositories: Vec<&String> = if package.ends_with(".gradle.plugin") {
             self.plugin_urls.iter().collect()
         } else {
@@ -261,52 +262,55 @@ impl RegistryAdapter for MavenCentralAdapter {
                 "{}/maven-metadata.xml",
                 self.artifact_url_at(base_url, package)?
             );
-            match self
+            let xml = match self
                 .client
                 .get_text(&url, package, Self::repository_label(base_url))
                 .await
             {
-                Ok(xml) => {
-                    selected = Some((base_url.clone(), xml));
-                    break;
-                }
+                Ok(xml) => xml,
                 Err(RegistryError::PackageNotFound { .. }) => continue,
                 Err(error) => return Err(error),
+            };
+            let metadata: MavenMetadata =
+                quick_xml::de::from_str(&xml).map_err(|error| RegistryError::InvalidResponse {
+                    package: package.to_string(),
+                    registry: Self::repository_label(base_url).to_string(),
+                    message: format!("Maven metadata XML: {error}"),
+                })?;
+            let (group, artifact) = package.split_once(':').expect("validated coordinate");
+            if metadata.group_id != group || metadata.artifact_id != artifact {
+                return Err(RegistryError::InvalidResponse {
+                    package: package.to_string(),
+                    registry: Self::repository_label(base_url).to_string(),
+                    message: "Maven metadata coordinate does not match request".to_string(),
+                });
+            }
+            found_metadata = true;
+            for version in metadata.versioning.versions.version {
+                // The first configured repository listing a version owns its POM date.
+                sources.entry(version).or_insert_with(|| base_url.clone());
             }
         }
-        let (base_url, xml) = selected.ok_or_else(|| RegistryError::PackageNotFound {
-            package: package.to_string(),
-            registry: "configured Maven repositories".to_string(),
-        })?;
-        let metadata: MavenMetadata =
-            quick_xml::de::from_str(&xml).map_err(|error| RegistryError::InvalidResponse {
+        if !found_metadata {
+            return Err(RegistryError::PackageNotFound {
                 package: package.to_string(),
-                registry: Self::repository_label(&base_url).to_string(),
-                message: format!("Maven metadata XML: {error}"),
-            })?;
-        let (group, artifact) = package.split_once(':').expect("validated coordinate");
-        if metadata.group_id != group || metadata.artifact_id != artifact {
-            return Err(RegistryError::InvalidResponse {
-                package: package.to_string(),
-                registry: Self::repository_label(&base_url).to_string(),
-                message: "Maven metadata coordinate does not match request".to_string(),
+                registry: "configured Maven repositories".to_string(),
             });
         }
 
         // The listing has no per-version timestamps. Resolve selected candidates
         // from their POMs before the judge makes a final decision.
-        let mut versions = metadata
-            .versioning
-            .versions
-            .version
-            .into_iter()
+        let mut versions = sources
+            .keys()
+            .cloned()
             .map(VersionInfo::undated)
             .collect::<Vec<_>>();
         versions.sort();
+        // Commit only a complete, validated listing, replacing any older source map.
         self.package_sources
             .lock()
             .await
-            .insert(package.to_string(), base_url);
+            .insert(package.to_string(), sources);
         Ok(versions)
     }
 
@@ -315,16 +319,30 @@ impl RegistryAdapter for MavenCentralAdapter {
         package: &str,
         version: &str,
     ) -> Result<Option<DateTime<Utc>>, RegistryError> {
-        if !self.package_sources.lock().await.contains_key(package) {
-            self.fetch_versions(package).await?;
-        }
-        let base_url = self
+        let source = self
             .package_sources
             .lock()
             .await
             .get(package)
-            .cloned()
-            .unwrap_or_else(|| self.base_url.clone());
+            .and_then(|sources| sources.get(version))
+            .cloned();
+        let base_url = match source {
+            Some(source) => source,
+            None => {
+                self.fetch_versions(package).await?;
+                self.package_sources
+                    .lock()
+                    .await
+                    .get(package)
+                    .and_then(|sources| sources.get(version))
+                    .cloned()
+                    .ok_or_else(|| RegistryError::InvalidResponse {
+                        package: package.to_string(),
+                        registry: "configured Maven repositories".to_string(),
+                        message: format!("version {version} is absent from Maven metadata"),
+                    })?
+            }
+        };
         let url = self.version_url_at(&base_url, package, version)?;
         let registry = Self::repository_label(&base_url);
         let response = self
@@ -496,6 +514,7 @@ mod tests {
         ]);
         let mut adapter = MavenCentralAdapter::new(HttpClient::new().unwrap());
         adapter.base_url = base_url;
+        adapter.fallback_urls.clear();
         let versions = adapter.fetch_versions("example:library").await.unwrap();
         assert_eq!(versions.len(), 2);
         assert_eq!(versions[1].version, "2.0");
@@ -544,6 +563,205 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn all_repository_metadata_is_merged_and_dates_follow_each_version() {
+        let first_xml = "<metadata><groupId>example</groupId><artifactId>library</artifactId><versioning><versions><version>2.0</version><version>3.0</version></versions></versioning></metadata>";
+        let second_xml = "<metadata><groupId>example</groupId><artifactId>library</artifactId><versioning><versions><version>1.0</version><version>3.0</version></versions></versioning></metadata>";
+        let (first, first_handle) = serve_responses(vec![
+            (
+                "GET /example/library/maven-metadata.xml ",
+                "200 OK\r\n",
+                first_xml,
+            ),
+            (
+                "HEAD /example/library/3.0/library-3.0.pom ",
+                "200 OK\r\nLast-Modified: Wed, 23 Sep 2026 00:00:00 GMT\r\n",
+                "",
+            ),
+        ]);
+        let (second, second_handle) = serve_responses(vec![
+            (
+                "GET /example/library/maven-metadata.xml ",
+                "200 OK\r\n",
+                second_xml,
+            ),
+            (
+                "HEAD /example/library/1.0/library-1.0.pom ",
+                "200 OK\r\nLast-Modified: Sun, 16 Aug 2026 16:12:45 GMT\r\n",
+                "",
+            ),
+        ]);
+        let mut adapter = MavenCentralAdapter::new(HttpClient::new().unwrap());
+        adapter.base_url = first;
+        adapter.fallback_urls = vec![second];
+        let versions = adapter.fetch_versions("example:library").await.unwrap();
+        assert_eq!(
+            versions
+                .iter()
+                .map(|v| v.version.as_str())
+                .collect::<Vec<_>>(),
+            ["1.0", "2.0", "3.0"]
+        );
+        let newest_date = adapter
+            .fetch_release_date("example:library", "3.0")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(newest_date.to_rfc3339(), "2026-09-23T00:00:00+00:00");
+        let current_date = adapter
+            .fetch_release_date("example:library", "1.0")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current_date.to_rfc3339(), "2026-08-16T16:12:45+00:00");
+        first_handle.join().unwrap();
+        second_handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn plugin_metadata_merges_only_the_plugin_repository_scope() {
+        let (first, first_handle) = serve_responses(vec![(
+            "GET /example/library.gradle.plugin/maven-metadata.xml ",
+            "200 OK\r\n",
+            "<metadata><groupId>example</groupId><artifactId>library.gradle.plugin</artifactId><versioning><versions><version>2.0</version></versions></versioning></metadata>",
+        )]);
+        let (second, second_handle) = serve_responses(vec![(
+            "GET /example/library.gradle.plugin/maven-metadata.xml ",
+            "200 OK\r\n",
+            "<metadata><groupId>example</groupId><artifactId>library.gradle.plugin</artifactId><versioning><versions><version>1.0</version></versions></versioning></metadata>",
+        )]);
+        let mut adapter = MavenCentralAdapter::new(HttpClient::new().unwrap());
+        adapter.base_url = "http://127.0.0.1:0/unused-library-scope".into();
+        adapter.fallback_urls.clear();
+        adapter.plugin_urls = vec![first, second];
+        let versions = adapter
+            .fetch_versions("example:library.gradle.plugin")
+            .await
+            .unwrap();
+        assert_eq!(
+            versions
+                .iter()
+                .map(|v| v.version.as_str())
+                .collect::<Vec<_>>(),
+            ["1.0", "2.0"]
+        );
+        first_handle.join().unwrap();
+        second_handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn all_metadata_not_found_is_an_error_but_an_empty_listing_is_valid() {
+        for (status, body, empty) in [
+            ("404 Not Found\r\n", "", false),
+            (
+                "200 OK\r\n",
+                "<metadata><groupId>example</groupId><artifactId>library</artifactId><versioning><versions/></versioning></metadata>",
+                true,
+            ),
+        ] {
+            let (base, handle) = serve_responses(vec![(
+                "GET /example/library/maven-metadata.xml ",
+                status,
+                body,
+            )]);
+            let mut adapter = MavenCentralAdapter::new(HttpClient::new().unwrap());
+            adapter.base_url = base;
+            adapter.fallback_urls.clear();
+            let versions = adapter.fetch_versions("example:library").await;
+            if empty {
+                assert!(versions.unwrap().is_empty());
+            } else {
+                assert!(matches!(
+                    versions,
+                    Err(RegistryError::PackageNotFound { .. })
+                ));
+            }
+            handle.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_later_metadata_does_not_commit_a_partial_source_map() {
+        for (status, body) in [
+            ("403 Forbidden\r\n", ""),
+            ("200 OK\r\n", "<invalid>"),
+            (
+                "200 OK\r\n",
+                "<metadata><groupId>other</groupId><artifactId>library</artifactId><versioning><versions><version>1.0</version></versions></versioning></metadata>",
+            ),
+        ] {
+            let (first, first_handle) = serve_responses(vec![(
+                "GET /example/library/maven-metadata.xml ",
+                "200 OK\r\n",
+                "<metadata><groupId>example</groupId><artifactId>library</artifactId><versioning><versions><version>2.0</version></versions></versioning></metadata>",
+            )]);
+            let (second, second_handle) = serve_responses(vec![(
+                "GET /example/library/maven-metadata.xml ",
+                status,
+                body,
+            )]);
+            let mut adapter = MavenCentralAdapter::new(HttpClient::new().unwrap());
+            adapter.base_url = first;
+            adapter.fallback_urls = vec![second];
+            let before = HashMap::from([("old".into(), "http://example.invalid/old".into())]);
+            adapter
+                .package_sources
+                .lock()
+                .await
+                .insert("example:library".into(), before.clone());
+            assert!(adapter.fetch_versions("example:library").await.is_err());
+            assert_eq!(
+                adapter.package_sources.lock().await["example:library"],
+                before
+            );
+            first_handle.join().unwrap();
+            second_handle.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn release_dates_load_missing_sources_and_reject_unlisted_versions() {
+        let xml = "<metadata><groupId>example</groupId><artifactId>library</artifactId><versioning><versions><version>2.0</version></versions></versioning></metadata>";
+        let (base, handle) = serve_responses(vec![
+            (
+                "GET /example/library/maven-metadata.xml ",
+                "200 OK\r\n",
+                xml,
+            ),
+            (
+                "HEAD /example/library/2.0/library-2.0.pom ",
+                "200 OK\r\nLast-Modified: Wed, 23 Sep 2026 00:00:00 GMT\r\n",
+                "",
+            ),
+            (
+                "GET /example/library/maven-metadata.xml ",
+                "200 OK\r\n",
+                xml,
+            ),
+        ]);
+        let mut adapter = MavenCentralAdapter::new(HttpClient::new().unwrap());
+        adapter.base_url = base;
+        adapter.fallback_urls.clear();
+        // A stale package map must not stand in for the requested version's source.
+        adapter.package_sources.lock().await.insert(
+            "example:library".into(),
+            HashMap::from([("old".into(), "http://example.invalid/old".into())]),
+        );
+        assert!(
+            adapter
+                .fetch_release_date("example:library", "2.0")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(!adapter.package_sources.lock().await["example:library"].contains_key("old"));
+        assert!(matches!(
+            adapter.fetch_release_date("example:library", "3.0").await,
+            Err(RegistryError::InvalidResponse { .. })
+        ));
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
     async fn not_found_pom_does_not_use_its_last_modified_header() {
         let (base_url, handle) = serve_responses(vec![(
             "HEAD /example/library/2.0/library-2.0.pom ",
@@ -552,11 +770,10 @@ mod tests {
         )]);
         let mut adapter = MavenCentralAdapter::new(HttpClient::new().unwrap());
         adapter.base_url = base_url;
-        adapter
-            .package_sources
-            .lock()
-            .await
-            .insert("example:library".to_string(), adapter.base_url.clone());
+        adapter.package_sources.lock().await.insert(
+            "example:library".to_string(),
+            HashMap::from([("2.0".to_string(), adapter.base_url.clone())]),
+        );
         assert!(
             adapter
                 .fetch_release_date("example:library", "2.0")
