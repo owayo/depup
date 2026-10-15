@@ -4,6 +4,7 @@ use super::*;
 pub(super) struct MiseScope {
     pub paths: Vec<PathBuf>,
     pub configs: BTreeSet<PathBuf>,
+    pub locks: Vec<super::mise_lock::LockContext>,
 }
 
 pub(super) fn managed_paths(
@@ -13,13 +14,30 @@ pub(super) fn managed_paths(
 ) -> Result<MiseScope, String> {
     let boundary = identity(boundary);
     let directory = identity(directory);
-    let environments: Vec<_> = std::env::var("MISE_ENV")
+    let mut environments: Vec<_> = std::env::var("MISE_ENV")
         .unwrap_or_default()
         .split(',')
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .collect();
+    // Explicitly selected environment configs must bring their local and parent
+    // layers into the same recovery scope before a repair enables that env.
+    for manifest in manifests {
+        let Some(environment) = manifest
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.trim_start_matches('.').strip_prefix("mise."))
+            .and_then(|name| name.strip_suffix(".toml"))
+            .map(|name| name.strip_suffix(".local").unwrap_or(name))
+            .filter(|name| !name.is_empty() && *name != "local")
+        else {
+            continue;
+        };
+        if !environments.iter().any(|known| known == environment) {
+            environments.push(environment.to_string());
+        }
+    }
     if ["MISE_CONFIG_FILE", "MISE_CONFIG_DIR"]
         .iter()
         .any(|name| std::env::var_os(name).is_some())
@@ -175,6 +193,7 @@ pub(super) fn managed_paths(
             .cloned(),
     );
     let mut paths = BTreeSet::new();
+    let mut locks = Vec::new();
     for config in &configs {
         let parent = config.parent().ok_or("Mise config has no directory")?;
         let filename = config
@@ -192,10 +211,46 @@ pub(super) fn managed_paths(
         let name = format!("mise{suffix}.lock");
         // Save both the destination and old colocated locks migrated by mise.
         let colocated = parent.join(&name);
-        paths.insert(colocated);
-        if let Some((root, true, _)) = &monorepo {
-            paths.insert(root.join(&name));
-        }
+        let destination = if let Some((root, true, _)) = &monorepo {
+            root.join(&name)
+        } else {
+            colocated.clone()
+        };
+        paths.insert(colocated.clone());
+        paths.insert(destination.clone());
+        // Alternate containers load the config from the enclosing project.
+        let project = [
+            ".config/mise/config.toml",
+            "mise/config.toml",
+            ".mise/config.toml",
+            ".config/mise.toml",
+        ]
+        .into_iter()
+        .find_map(|suffix| {
+            config.ends_with(suffix).then(|| {
+                config
+                    .ancestors()
+                    .nth(Path::new(suffix).components().count())
+                    .unwrap()
+            })
+        })
+        .unwrap_or(parent);
+        locks.push(super::mise_lock::LockContext {
+            source: identity(&colocated),
+            destination: identity(&destination),
+            directory: identity(if let Some((root, true, _)) = &monorepo {
+                root
+            } else {
+                project
+            }),
+            config: identity(config),
+            local: suffix == ".local" || suffix.ends_with(".local"),
+            environment: suffix
+                .strip_prefix('.')
+                .map(|suffix| suffix.strip_suffix(".local").unwrap_or(suffix))
+                .filter(|environment| !environment.is_empty() && *environment != "local")
+                .map(str::to_string),
+        });
     }
     // Return confirmed logical paths independently of individual snapshot failures.
     // The transaction validates each target against its recovery boundary.
@@ -205,6 +260,7 @@ pub(super) fn managed_paths(
             .into_iter()
             .map(|config| identity(&config))
             .collect(),
+        locks,
     })
 }
 

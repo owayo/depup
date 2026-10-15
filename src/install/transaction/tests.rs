@@ -86,6 +86,657 @@ fn success(command: &PreparedInstall) -> InstallResult {
     )
 }
 
+fn platform_lock(version: &str, platforms: &[&str]) -> String {
+    let mut lock = format!(
+        "lockfile_version = 2\n[[tools.node]]\nversion = \"{version}\"\nbackend = \"core:node\"\nspecifiers = [\"{version}\"]\n"
+    );
+    for platform in platforms {
+        lock.push_str(&format!(
+            "[tools.node.\"platforms.{platform}\"]\nurl = \"https://example.com/node-{version}-{platform}\"\nchecksum = \"sha256:example\"\n"
+        ));
+    }
+    lock
+}
+
+#[test]
+fn mise_install_repairs_lost_platforms_with_the_prepared_environment() {
+    let temp = tempfile::tempdir().unwrap();
+    let directory = temp.path();
+    let manifest = directory.join("mise.toml");
+    let lock = directory.join("mise.lock");
+    let mut result = result();
+    update(
+        &mut result,
+        &manifest,
+        Language::Mise,
+        "[tools]\nnode = \"1.0.0\"\n",
+        "node",
+    );
+    let platforms = ["linux-x64", "macos-arm64", "windows-x64"];
+    fs::write(&lock, platform_lock("1.0.0", &platforms)).unwrap();
+    let mut job = job(directory, Language::Mise, &[manifest]);
+    job.policy.as_mut().unwrap().min_age = Some(std::time::Duration::from_secs(14 * 86400));
+    let plan = plan(vec![job]);
+    let mut tx = InstallTransactions::begin(&plan, &result, directory);
+    let prepared = tx.commands().next().unwrap().clone();
+    let mut calls = 0;
+    tx.execute(|command| {
+        calls += 1;
+        if calls == 1 {
+            fs::write(&lock, platform_lock("2.0.0", &[])).unwrap();
+        } else {
+            assert_eq!(
+                command.argv,
+                [
+                    "mise",
+                    "lock",
+                    "--platform",
+                    "linux-x64,macos-arm64,windows-x64",
+                    "--",
+                    "node"
+                ]
+            );
+            assert_eq!(command.program, prepared.program);
+            assert_eq!(command.env, prepared.env);
+            fs::write(&lock, platform_lock("2.0.0", &platforms)).unwrap();
+        }
+        success(command)
+    });
+    assert_eq!(calls, 2);
+    assert!(!tx.rollback().has_failures());
+    assert_eq!(
+        fs::read_to_string(lock).unwrap(),
+        platform_lock("2.0.0", &platforms)
+    );
+}
+
+#[test]
+fn mise_platform_repair_failures_restore_manifests_locks_and_new_sidecars() {
+    for outcome in [
+        "nonzero",
+        "missing",
+        "empty",
+        "format",
+        "version",
+        "other-tool",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path();
+        let manifest = directory.join("mise.toml");
+        let lock = directory.join("mise.lock");
+        let original_manifest = "[tools]\nnode = \"1.0.0\"\n";
+        let original_lock = platform_lock("1.0.0", &["linux-x64"]);
+        let mut result = result();
+        update(
+            &mut result,
+            &manifest,
+            Language::Mise,
+            original_manifest,
+            "node",
+        );
+        fs::write(&lock, &original_lock).unwrap();
+        let plan = plan(vec![job(
+            directory,
+            Language::Mise,
+            std::slice::from_ref(&manifest),
+        )]);
+        let mut tx = InstallTransactions::begin(&plan, &result, directory);
+        let sidecar = directory.join(".mise/locks/example/2.0.0/package.json");
+        let mut calls = 0;
+        tx.execute(|command| {
+            calls += 1;
+            if calls == 1 {
+                fs::write(&lock, platform_lock("2.0.0", &[])).unwrap();
+                return success(command);
+            }
+            fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+            fs::write(&sidecar, "{}").unwrap();
+            let repaired = match outcome {
+                "missing" => platform_lock("2.0.0", &[]),
+                "empty" => platform_lock("2.0.0", &["linux-x64"])
+                    .replace(
+                        "url = \"https://example.com/node-2.0.0-linux-x64\"",
+                        "url = \"\"",
+                    )
+                    .replace("checksum = \"sha256:example\"", "checksum = \"\""),
+                "format" => platform_lock("2.0.0", &["linux-x64"])
+                    .replace("lockfile_version = 2", "lockfile_version = 3"),
+                "version" => platform_lock("3.0.0", &["linux-x64"]),
+                "other-tool" => format!(
+                    "{}\n[[tools.python]]\nversion = \"3.0.0\"\n",
+                    platform_lock("2.0.0", &["linux-x64"])
+                ),
+                _ => platform_lock("2.0.0", &["linux-x64"]),
+            };
+            fs::write(&lock, repaired).unwrap();
+            if outcome == "nonzero" {
+                failure(command)
+            } else {
+                success(command)
+            }
+        });
+        assert_eq!(calls, 2, "{outcome}");
+        let report = tx.rollback();
+        assert!(report.has_failures(), "{outcome}");
+        assert_eq!(
+            fs::read_to_string(&manifest).unwrap(),
+            original_manifest,
+            "{outcome}"
+        );
+        assert_eq!(
+            fs::read_to_string(&lock).unwrap(),
+            original_lock,
+            "{outcome}"
+        );
+        assert!(!sidecar.exists(), "{outcome}");
+    }
+}
+
+#[test]
+fn mise_platform_preservation_skips_complete_new_and_empty_locks() {
+    for initial in [
+        None,
+        Some(String::new()),
+        Some(platform_lock("1.0.0", &["linux-x64"])),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path();
+        let manifest = directory.join("mise.toml");
+        let lock = directory.join("mise.lock");
+        let mut result = result();
+        update(
+            &mut result,
+            &manifest,
+            Language::Mise,
+            "[tools]\nnode = \"1.0.0\"\n",
+            "node",
+        );
+        if let Some(initial) = &initial {
+            fs::write(&lock, initial).unwrap();
+        }
+        let plan = plan(vec![job(directory, Language::Mise, &[manifest])]);
+        let mut tx = InstallTransactions::begin(&plan, &result, directory);
+        let mut calls = 0;
+        tx.execute(|command| {
+            calls += 1;
+            fs::write(&lock, platform_lock("2.0.0", &["linux-x64"])).unwrap();
+            success(command)
+        });
+        assert_eq!(calls, 1);
+        assert!(!tx.rollback().has_failures());
+    }
+}
+
+#[test]
+fn mise_install_rejects_lock_format_changes_before_platform_repair() {
+    for old_format in [Some(2), None] {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path();
+        let manifest = directory.join("mise.toml");
+        let lock = directory.join("mise.lock");
+        let mut result = result();
+        update(
+            &mut result,
+            &manifest,
+            Language::Mise,
+            "[tools]\nnode = \"1.0.0\"\n",
+            "node",
+        );
+        let initial = if old_format.is_some() {
+            platform_lock("1.0.0", &["linux-x64"])
+        } else {
+            platform_lock("1.0.0", &["linux-x64"]).replace("lockfile_version = 2\n", "")
+        };
+        fs::write(&lock, &initial).unwrap();
+        let plan = plan(vec![job(directory, Language::Mise, &[manifest])]);
+        let mut tx = InstallTransactions::begin(&plan, &result, directory);
+        let mut calls = 0;
+        tx.execute(|command| {
+            calls += 1;
+            fs::write(
+                &lock,
+                platform_lock("2.0.0", &[]).replace("lockfile_version = 2", "lockfile_version = 3"),
+            )
+            .unwrap();
+            success(command)
+        });
+        assert_eq!(calls, 1);
+        assert!(tx.rollback().has_failures());
+        assert_eq!(fs::read_to_string(lock).unwrap(), initial);
+    }
+}
+
+#[test]
+fn mise_repairs_each_tools_own_platform_set() {
+    let temp = tempfile::tempdir().unwrap();
+    let directory = temp.path();
+    let manifest = directory.join("mise.toml");
+    let lock = directory.join("mise.lock");
+    let mut result = result();
+    update(
+        &mut result,
+        &manifest,
+        Language::Mise,
+        "[tools]\nnode = \"1.0.0\"\npython = \"1.0.0\"\n",
+        "node",
+    );
+    let combined = |version: &str, node: &[&str], python: &[&str]| {
+        format!(
+            "{}{}",
+            platform_lock(version, node),
+            platform_lock(version, python)
+                .replace("lockfile_version = 2\n", "")
+                .replace("tools.node", "tools.python")
+                .replace("core:node", "core:python")
+        )
+    };
+    fs::write(&lock, combined("1.0.0", &["windows-x64"], &["linux-x64"])).unwrap();
+    let plan = plan(vec![job(directory, Language::Mise, &[manifest])]);
+    let mut tx = InstallTransactions::begin(&plan, &result, directory);
+    let mut calls = 0;
+    let mut node_platforms = Vec::new();
+    let mut python_platforms = Vec::new();
+    tx.execute(|command| {
+        calls += 1;
+        if calls > 1 {
+            match command.argv.last().unwrap().as_str() {
+                "node" => {
+                    assert_eq!(command.argv[3], "windows-x64");
+                    node_platforms.push("windows-x64");
+                }
+                "python" => {
+                    assert_eq!(command.argv[3], "linux-x64");
+                    python_platforms.push("linux-x64");
+                }
+                _ => panic!("unexpected tool"),
+            }
+        }
+        fs::write(&lock, combined("2.0.0", &node_platforms, &python_platforms)).unwrap();
+        success(command)
+    });
+    assert_eq!(calls, 3);
+    assert!(!tx.rollback().has_failures());
+}
+
+#[test]
+fn mise_platform_repair_uses_local_environment_and_alternate_contexts() {
+    for (config_name, lock_name, expected_flags) in [
+        ("mise.local.toml", "mise.local.lock", vec!["--local"]),
+        (
+            "mise.production.toml",
+            "mise.production.lock",
+            vec!["--env", "production"],
+        ),
+        (
+            "mise.production.local.toml",
+            "mise.production.local.lock",
+            vec!["--env", "production", "--local"],
+        ),
+        (".config/mise/config.toml", ".config/mise/mise.lock", vec![]),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path();
+        fs::write(directory.join("mise.toml"), "[tools]\n").unwrap();
+        let manifest = directory.join(config_name);
+        let lock = directory.join(lock_name);
+        let mut result = result();
+        update(
+            &mut result,
+            &manifest,
+            Language::Mise,
+            "[tools]\nnode = \"1.0.0\"\n",
+            "node",
+        );
+        fs::write(&lock, platform_lock("1.0.0", &["linux-x64"])).unwrap();
+        let plan = plan(vec![job(directory, Language::Mise, &[manifest])]);
+        let mut tx = InstallTransactions::begin(&plan, &result, directory);
+        let mut calls = 0;
+        tx.execute(|command| {
+            calls += 1;
+            let platforms = if calls == 1 {
+                vec![]
+            } else {
+                assert_eq!(command.directory, identity(directory), "{config_name}");
+                assert_eq!(
+                    &command.argv[2..2 + expected_flags.len()],
+                    expected_flags,
+                    "{config_name}"
+                );
+                vec!["linux-x64"]
+            };
+            fs::write(&lock, platform_lock("2.0.0", &platforms)).unwrap();
+            success(command)
+        });
+        assert_eq!(calls, 2, "{config_name}");
+        assert!(!tx.rollback().has_failures(), "{config_name}");
+    }
+}
+
+#[test]
+fn mise_platform_repair_follows_monorepo_lock_migration() {
+    let temp = tempfile::tempdir().unwrap();
+    let directory = temp.path();
+    let app = directory.join("packages/app");
+    fs::write(
+        directory.join("mise.toml"),
+        "monorepo_root = true\n[monorepo]\nlockfile = true\nconfig_roots = [\"packages/*\"]\n",
+    )
+    .unwrap();
+    let manifest = app.join("mise.toml");
+    let old_lock = app.join("mise.lock");
+    let shared_lock = directory.join("mise.lock");
+    let mut result = result();
+    update(
+        &mut result,
+        &manifest,
+        Language::Mise,
+        "[tools]\nnode = \"1.0.0\"\n",
+        "node",
+    );
+    fs::write(&old_lock, platform_lock("1.0.0", &["linux-x64"])).unwrap();
+    let plan = plan(vec![job(&app, Language::Mise, &[manifest])]);
+    let mut tx = InstallTransactions::begin(&plan, &result, directory);
+    let mut calls = 0;
+    tx.execute(|command| {
+        calls += 1;
+        let platforms = if calls == 1 {
+            fs::remove_file(&old_lock).unwrap();
+            vec![]
+        } else {
+            assert_eq!(command.directory, identity(directory));
+            vec!["linux-x64"]
+        };
+        fs::write(&shared_lock, platform_lock("2.0.0", &platforms)).unwrap();
+        success(command)
+    });
+    assert_eq!(calls, 2);
+    assert!(!tx.rollback().has_failures());
+    assert!(!old_lock.exists());
+    assert_eq!(
+        fs::read_to_string(shared_lock).unwrap(),
+        platform_lock("2.0.0", &["linux-x64"])
+    );
+}
+
+#[test]
+fn mise_shared_lock_with_root_and_member_tools_uses_root_context() {
+    let temp = tempfile::tempdir().unwrap();
+    let directory = temp.path();
+    let app = directory.join("packages/app");
+    let manifest = app.join("mise.toml");
+    let lock = directory.join("mise.lock");
+    fs::write(directory.join("mise.toml"), "monorepo_root = true\n[monorepo]\nlockfile = true\nconfig_roots = [\"packages/*\"]\n[tools]\nnode = \"1.0.0\"\n").unwrap();
+    let mut result = result();
+    update(
+        &mut result,
+        &manifest,
+        Language::Mise,
+        "[tools]\nnode = \"1.0.0\"\n",
+        "node",
+    );
+    fs::write(&lock, platform_lock("1.0.0", &["linux-x64"])).unwrap();
+    let plan = plan(vec![job(&app, Language::Mise, &[manifest])]);
+    let mut tx = InstallTransactions::begin(&plan, &result, directory);
+    let mut calls = 0;
+    tx.execute(|command| {
+        calls += 1;
+        let platforms = if calls == 1 {
+            vec![]
+        } else {
+            assert_eq!(command.directory, identity(directory));
+            vec!["linux-x64"]
+        };
+        fs::write(&lock, platform_lock("2.0.0", &platforms)).unwrap();
+        success(command)
+    });
+    assert_eq!(calls, 2);
+    assert!(!tx.rollback().has_failures());
+}
+
+#[test]
+fn mise_platform_repair_preserves_existing_metadata_and_install_added_platforms() {
+    for corruption in ["other-url", "other-platform", "target-url"] {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path();
+        let manifest = directory.join("mise.toml");
+        let lock = directory.join("mise.lock");
+        let mut result = result();
+        let original_manifest = "[tools]\nnode = \"1.0.0\"\npython = \"1.0.0\"\n";
+        update(
+            &mut result,
+            &manifest,
+            Language::Mise,
+            original_manifest,
+            "node",
+        );
+        let combined = |node: &[&str], python: &[&str], node_version: &str| {
+            format!(
+                "{}{}",
+                platform_lock(node_version, node),
+                platform_lock("1.0.0", python)
+                    .replace("lockfile_version = 2\n", "")
+                    .replace("tools.node", "tools.python")
+                    .replace("core:node", "core:python")
+            )
+        };
+        let original_lock = combined(&["linux-x64", "macos-arm64"], &["linux-x64"], "1.0.0");
+        fs::write(&lock, &original_lock).unwrap();
+        let plan = plan(vec![job(
+            directory,
+            Language::Mise,
+            std::slice::from_ref(&manifest),
+        )]);
+        let mut tx = InstallTransactions::begin(&plan, &result, directory);
+        let mut calls = 0;
+        tx.execute(|command| {
+            calls += 1;
+            let content = if calls == 1 {
+                combined(&["macos-arm64"], &["linux-x64", "windows-x64"], "2.0.0")
+            } else {
+                let content = combined(
+                    &["linux-x64", "macos-arm64"],
+                    if corruption == "other-platform" {
+                        &["linux-x64"]
+                    } else {
+                        &["linux-x64", "windows-x64"]
+                    },
+                    "2.0.0",
+                );
+                if corruption == "other-url" {
+                    content.replace(
+                        "https://example.com/node-1.0.0-linux-x64",
+                        "https://example.com/wrong-artifact",
+                    )
+                } else if corruption == "target-url" {
+                    content.replace(
+                        "https://example.com/node-2.0.0-macos-arm64",
+                        "https://example.com/wrong-artifact",
+                    )
+                } else {
+                    content
+                }
+            };
+            fs::write(&lock, content).unwrap();
+            success(command)
+        });
+        assert_eq!(calls, 2, "{corruption}");
+        assert!(tx.rollback().has_failures(), "{corruption}");
+        assert_eq!(
+            fs::read_to_string(lock).unwrap(),
+            original_lock,
+            "{corruption}"
+        );
+        assert_eq!(
+            fs::read_to_string(manifest).unwrap(),
+            original_manifest,
+            "{corruption}"
+        );
+    }
+}
+
+#[test]
+fn mise_multiple_versions_can_merge_into_one_resolution_with_combined_platforms() {
+    for already_complete in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path();
+        let manifest = directory.join("mise.toml");
+        let lock = directory.join("mise.lock");
+        fs::write(&manifest, "[tools]\nnode = [\"2.0.0\", \"2.0.0\"]\n").unwrap();
+        fs::write(
+            &lock,
+            format!(
+                "{}{}",
+                platform_lock("1.0.0", &["linux-x64"]),
+                platform_lock("2.0.0", &["windows-x64"]).replace("lockfile_version = 2\n", "")
+            ),
+        )
+        .unwrap();
+        let plan = plan(vec![job(directory, Language::Mise, &[manifest])]);
+        let mut tx = InstallTransactions::begin(&plan, &result(), directory);
+        let mut calls = 0;
+        tx.execute(|command| {
+            calls += 1;
+            let platforms = if calls == 1 && !already_complete {
+                vec![]
+            } else {
+                vec!["linux-x64", "windows-x64"]
+            };
+            if calls == 2 {
+                assert_eq!(
+                    command.argv,
+                    [
+                        "mise",
+                        "lock",
+                        "--platform",
+                        "linux-x64,windows-x64",
+                        "--",
+                        "node"
+                    ]
+                );
+            }
+            fs::write(&lock, platform_lock("2.0.0", &platforms)).unwrap();
+            success(command)
+        });
+        assert_eq!(calls, if already_complete { 1 } else { 2 });
+        assert!(!tx.rollback().has_failures());
+    }
+}
+
+#[test]
+fn mise_later_platform_repair_cannot_change_metadata_restored_by_an_earlier_repair() {
+    let temp = tempfile::tempdir().unwrap();
+    let directory = temp.path();
+    let manifest = directory.join("mise.toml");
+    let lock = directory.join("mise.lock");
+    let original_manifest = "[tools]\nnode = \"1.0.0\"\npython = \"1.0.0\"\n";
+    let combined = |version: &str, node: &[&str], python: &[&str]| {
+        format!(
+            "{}{}",
+            platform_lock(version, node),
+            platform_lock(version, python)
+                .replace("lockfile_version = 2\n", "")
+                .replace("tools.node", "tools.python")
+                .replace("core:node", "core:python")
+        )
+    };
+    let original_lock = combined("1.0.0", &["linux-x64"], &["windows-x64"]);
+    let mut result = result();
+    update(
+        &mut result,
+        &manifest,
+        Language::Mise,
+        original_manifest,
+        "node",
+    );
+    fs::write(&lock, &original_lock).unwrap();
+    let plan = plan(vec![job(
+        directory,
+        Language::Mise,
+        std::slice::from_ref(&manifest),
+    )]);
+    let mut tx = InstallTransactions::begin(&plan, &result, directory);
+    let sidecar = directory.join(".mise/locks/example/2.0.0/package.json");
+    let mut calls = 0;
+    tx.execute(|command| {
+        calls += 1;
+        let content = match calls {
+            1 => combined("2.0.0", &[], &[]),
+            2 => {
+                assert_eq!(command.argv.last().unwrap(), "node");
+                combined("2.0.0", &["linux-x64"], &[])
+            }
+            3 => {
+                assert_eq!(command.argv.last().unwrap(), "python");
+                fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+                fs::write(&sidecar, "{}").unwrap();
+                combined("2.0.0", &["linux-x64"], &["windows-x64"]).replace(
+                    "https://example.com/node-2.0.0-linux-x64",
+                    "https://example.com/wrong-artifact",
+                )
+            }
+            _ => panic!("unexpected repair"),
+        };
+        fs::write(&lock, content).unwrap();
+        success(command)
+    });
+    assert_eq!(calls, 3);
+    assert!(tx.rollback().has_failures());
+    assert_eq!(fs::read_to_string(manifest).unwrap(), original_manifest);
+    assert_eq!(fs::read_to_string(lock).unwrap(), original_lock);
+    assert!(!sidecar.exists());
+}
+
+#[test]
+fn mise_multiple_versions_keep_their_backend_options_and_platform_requirements() {
+    for ambiguous in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path();
+        let manifest = directory.join("mise.toml");
+        let lock = directory.join("mise.lock");
+        fs::write(&manifest, "[tools]\nnode = [\"2.0.0\", \"4.0.0\"]\n").unwrap();
+        let locks = |first: &str, second: &str, platforms: &[&str]| {
+            let first = platform_lock(first, platforms).replace(
+                "backend = \"core:node\"",
+                "backend = \"core:node\"\noptions = { flavor = \"first\" }",
+            );
+            let second = platform_lock(second, platforms)
+                .replace("lockfile_version = 2\n", "")
+                .replace(
+                    "backend = \"core:node\"",
+                    if ambiguous {
+                        "backend = \"core:node\"\noptions = { flavor = \"first\" }"
+                    } else {
+                        "backend = \"core:node\"\noptions = { flavor = \"second\" }"
+                    },
+                );
+            format!("{first}{second}")
+        };
+        let initial = locks("1.0.0", "3.0.0", &["linux-x64"]);
+        fs::write(&lock, &initial).unwrap();
+        let plan = plan(vec![job(directory, Language::Mise, &[manifest])]);
+        let mut tx = InstallTransactions::begin(&plan, &result(), directory);
+        let mut calls = 0;
+        tx.execute(|command| {
+            calls += 1;
+            fs::write(
+                &lock,
+                locks(
+                    "2.0.0",
+                    "4.0.0",
+                    if calls == 1 { &[] } else { &["linux-x64"] },
+                ),
+            )
+            .unwrap();
+            success(command)
+        });
+        assert_eq!(calls, if ambiguous { 1 } else { 2 });
+        assert_eq!(tx.rollback().has_failures(), ambiguous);
+        if ambiguous {
+            assert_eq!(fs::read_to_string(lock).unwrap(), initial);
+        }
+    }
+}
+
 #[test]
 fn failed_node_install_restores_unchanged_partial_deleted_and_new_locks() {
     for change in ["unchanged", "partial", "deleted", "new"] {
@@ -754,7 +1405,7 @@ fn mise_dot_config_lock_and_deleted_dependency_metadata_are_recovered() {
         "[tools]\nnode = \"1.0.0\"\n",
         "node",
     );
-    fs::write(directory.join("mise.lock"), "old mise lock").unwrap();
+    fs::write(directory.join("mise.lock"), "# old mise lock").unwrap();
     let receipt = directory.join(".mise/locks/pipx-tool/1.0.0");
     fs::create_dir_all(&receipt).unwrap();
     fs::write(receipt.join("uv.lock"), "old dependency lock").unwrap();
@@ -781,7 +1432,7 @@ fn mise_dot_config_lock_and_deleted_dependency_metadata_are_recovered() {
     report.mark_summary(&mut result.summary);
     assert_eq!(
         fs::read_to_string(directory.join("mise.lock")).unwrap(),
-        "old mise lock"
+        "# old mise lock"
     );
     assert!(!directory.join(".mise.lock").exists());
     assert_eq!(
@@ -900,7 +1551,7 @@ fn mise_monorepo_migration_restores_child_locks_and_shared_destination() {
     for root in [directory, app.as_path(), worker.as_path()] {
         fs::write(
             root.join("mise.lock"),
-            format!("old {} lock", root.file_name().unwrap().to_string_lossy()),
+            format!("# old {} lock", root.file_name().unwrap().to_string_lossy()),
         )
         .unwrap();
     }
@@ -1189,7 +1840,7 @@ fn shared_non_cargo_project(
             );
             fs::write(member.join("uv.lock"), "old member lock").unwrap();
             let lock = directory.join("uv.lock");
-            fs::write(&lock, "original shared lock").unwrap();
+            fs::write(&lock, "# original shared lock").unwrap();
             (manifest, lock)
         }
         Language::Mise => {
@@ -1203,7 +1854,7 @@ fn shared_non_cargo_project(
                 "node",
             );
             let lock = directory.join("mise.lock");
-            fs::write(&lock, "original shared lock").unwrap();
+            fs::write(&lock, "# original shared lock").unwrap();
             (manifest, lock)
         }
         _ => unreachable!(),
@@ -1241,7 +1892,7 @@ fn member_execution_boundary_does_not_prove_uv_or_mise_recovery_is_local() {
         report.mark_summary(&mut result.summary);
         assert_eq!(
             fs::read_to_string(&lock).unwrap(),
-            "original shared lock",
+            "# original shared lock",
             "{language}"
         );
         assert_eq!(
@@ -1287,7 +1938,7 @@ fn uv_and_mise_policy_or_scope_error_poison_the_confirmed_shared_unit() {
             let report = tx.rollback();
             report.mark_summary(&mut result.summary);
             assert_eq!(calls, 0, "{language} {error}");
-            assert_eq!(fs::read_to_string(&lock).unwrap(), "original shared lock");
+            assert_eq!(fs::read_to_string(&lock).unwrap(), "# original shared lock");
             assert_eq!(result.summary.total_failed(), 2);
             assert_eq!(result.summary.total_updates(), 0);
             for write in &result.write_results {
@@ -1342,7 +1993,7 @@ fn unverified_uv_root_scope_stops_before_running_and_recovers_all_writes() {
         let report = tx.rollback();
         report.mark_summary(&mut result.summary);
         assert_eq!(calls, 0, "{workspace}");
-        assert_eq!(fs::read_to_string(&lock).unwrap(), "original shared lock");
+        assert_eq!(fs::read_to_string(&lock).unwrap(), "# original shared lock");
         assert_eq!(result.summary.total_failed(), 2);
         for write in &result.write_results {
             assert_eq!(
@@ -1388,7 +2039,7 @@ fn uv_member_scope_errors_block_only_the_confirmed_workspace() {
             "example",
         );
         let lock = directory.join("uv.lock");
-        fs::write(&lock, "original shared lock").unwrap();
+        fs::write(&lock, "# original shared lock").unwrap();
         fs::write(child.join("uv.lock"), "original child lock").unwrap();
         let plan = plan(vec![
             job(directory, Language::Python, &[root_manifest]),
@@ -1418,7 +2069,7 @@ fn uv_member_scope_errors_block_only_the_confirmed_workspace() {
         assert_eq!(
             fs::read_to_string(&lock).unwrap(),
             if related {
-                "original shared lock"
+                "# original shared lock"
             } else {
                 "successful root lock"
             }
@@ -1493,7 +2144,7 @@ fn mise_preparation_failure_preserves_the_confirmed_shared_unit() {
                 vec![]
             }
         );
-        assert_eq!(fs::read_to_string(&lock).unwrap(), "original shared lock");
+        assert_eq!(fs::read_to_string(&lock).unwrap(), "# original shared lock");
         assert_eq!(result.summary.total_failed(), 2);
         assert_eq!(result.summary.total_updates(), usize::from(independent));
         for write in result.write_results.iter().take(2) {
@@ -1551,7 +2202,7 @@ fn mise_sidecar_directory_links_respect_recovery_boundary() {
                 "python",
             );
             let lock = directory.join("mise.lock");
-            fs::write(&lock, "original project lock").unwrap();
+            fs::write(&lock, "# original project lock").unwrap();
             let tree = directory.join(".mise/locks");
             let link = match level {
                 "root" => tree.clone(),
@@ -1619,7 +2270,10 @@ fn mise_sidecar_directory_links_respect_recovery_boundary() {
                     0o640
                 );
             }
-            assert_eq!(fs::read_to_string(&lock).unwrap(), "original project lock");
+            assert_eq!(
+                fs::read_to_string(&lock).unwrap(),
+                "# original project lock"
+            );
             assert_eq!(
                 fs::read(&manifest).unwrap(),
                 result.write_results[0].journal.as_ref().unwrap().before
@@ -1658,7 +2312,7 @@ fn new_or_replaced_mise_directory_links_keep_existing_target_metadata() {
                 "python",
             );
             let lock = directory.join("mise.lock");
-            fs::write(&lock, "original project lock").unwrap();
+            fs::write(&lock, "# original project lock").unwrap();
             let tree = directory.join(".mise/locks");
             let link = match level {
                 "root" => tree.clone(),
@@ -1702,7 +2356,10 @@ fn new_or_replaced_mise_directory_links_keep_existing_target_metadata() {
                 fs::read_to_string(&metadata_manifest).unwrap(),
                 "existing target manifest"
             );
-            assert_eq!(fs::read_to_string(&lock).unwrap(), "original project lock");
+            assert_eq!(
+                fs::read_to_string(&lock).unwrap(),
+                "# original project lock"
+            );
             assert_eq!(
                 fs::read(&manifest).unwrap(),
                 result.write_results[0].journal.as_ref().unwrap().before
@@ -1999,7 +2656,7 @@ fn uv_policy_error_keeps_excluded_and_nested_projects_independent() {
         let report = tx.rollback();
         report.mark_summary(&mut result.summary);
         assert_eq!(calls, vec![identity(&b)]);
-        assert_eq!(fs::read_to_string(&lock).unwrap(), "original shared lock");
+        assert_eq!(fs::read_to_string(&lock).unwrap(), "# original shared lock");
         assert_eq!(
             fs::read_to_string(b.join("uv.lock")).unwrap(),
             "successful independent lock"

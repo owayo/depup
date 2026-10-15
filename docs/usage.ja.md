@@ -341,6 +341,8 @@ depup が書き換えるのは、解析した依存宣言だけです。依存�
 - Node は pnpm workspace の共有ルート、またはマニフェストのあるディレクトリで install を実行します。`--only` があると、Rust は共有 Cargo.lock のディレクトリ（lock の新規生成時は workspace ルート）へまとめ、PHP は更新した composer.json のディレクトリで実行します。それ以外は [`.depup`](configuration.ja.md#depup-設定ファイル) がなければ対象ディレクトリ（PATH 引数）を使い、あれば更新したマニフェストを含む対象のうち最も深いディレクトリを使います。
 - install は 1 つずつ、ディレクトリのパス順に実行します。同じディレクトリでは、言語ごとに 1 回だけです。パッケージマネージャーの出力は画面に流さずに depup が受け取り、標準エラー出力は install が失敗したときだけ表示します。
 
+mise では、`mise install` が成功しても既存の platform 情報が欠けていれば、対象のツールの lock を再生成します。元の platform 集合と lock の形式を保てない場合は、install 失敗と同じ復元処理を行います。詳しくは「[lock の platform 情報](ecosystems.ja.md#lock-の-platform-情報)」を参照してください。
+
 install が失敗すると、そのプロジェクトのマニフェストと既知のパッケージマネージャー管理ファイルを復元します。最後に `Error: Some package manager installs failed` を出し、終了コード 1 で終わります。起動不能、ポリシーや実行範囲の準備エラー、保存用コピーの取得失敗、Gradle Wrapper の更新失敗も対象です。Cargo.lock、pnpm workspace、Tauri プロジェクト、Gradle Wrapper を共有する処理は、まとめて成功か復元にします。失敗した単位の残りの処理は実行しません。独立したプロジェクトの処理は続け、成功した変更を残します。
 
 mise や uv の共有範囲を有効な設定から安全に確認できない場合は、パッケージマネージャーの実行前に準備失敗として書き込みを復元します。workspace のルートから起動した場合も同様です。workspace の `**` などの複雑なパターン、mise の独自設定パスや入れ子の monorepo、`.mise/config.toml` など別の設定位置にある monorepo 設定が該当します。

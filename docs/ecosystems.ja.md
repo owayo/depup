@@ -214,6 +214,12 @@ mise（[jdx/mise](https://mise.jdx.dev)）の設定ファイルに書かれた�
 
 タスクの複数行文字列に含まれるツール宣言は無視します。通常の文字列やコメントの中に三重引用符があっても、その後の `[tools]` 宣言は更新対象として読み取ります。
 
+#### lock の platform 情報
+
+`--install` では、`mise install` の実行前に既存の mise lock が持つ platform 情報を保存します。install で情報が欠けた場合は、対象のツールだけ `mise lock <tool...> --platform <元のplatform集合>` で再生成します。ツールごとの platform 集合と install の age 制約を引き継ぎ、形式のアップグレードや `--bump` による版の再選択は行いません。
+
+再生成後は、platform のダウンロード情報が揃っていること、再生成中に解決済みの版が変わっていないこと、既存の `lockfile_version` が保たれていることを確認します。再生成に失敗した場合や結果が不完全な場合は、install 失敗として理由を表示し、[install の復元処理](usage.ja.md#パッケージマネージャーの実行--install)で対象のマニフェスト・lock・管理対象の sidecar を戻します。既存 lock の構造や更新先を安全に確認できない場合は、実行前の準備で停止します。platform 情報が揃っている場合や、保持すべき既存 lock がない場合は再生成しません。
+
 #### mise と age フィルター
 
 mise の `[settings] minimum_release_age` が**明示的に書かれている**場合は、pnpm・Bun の `minimumReleaseAge` と同じ[プロジェクトポリシー](usage.ja.md#適用される-age-の優先順位)として、CLI の `--age` より優先します。採用するのは設定ファイルに書かれた値だけで、mise の組み込みのデフォルト（24 時間）は採用しません。書き方は「[`minimumReleaseAge` を読み取る設定ファイル](usage.ja.md#minimumreleaseage-を読み取る設定ファイル)」を参照してください。

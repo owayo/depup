@@ -31,6 +31,7 @@ struct Task {
     node_root: Option<PathBuf>,
     trees: Vec<FileGuard>,
     tree_links: BTreeMap<PathBuf, FileGuard>,
+    mise_locks: Option<mise_lock::Preservation>,
 }
 struct Unit {
     files: BTreeSet<PathBuf>,
@@ -285,6 +286,14 @@ impl InstallTransactions {
                 if manager == "mise" {
                     match mise::managed_paths(&effective_dir, &job.manifests, boundary) {
                         Ok(scope) => {
+                            for config in &scope.configs {
+                                tx.add_guarded_path(
+                                    &mut task,
+                                    config,
+                                    false,
+                                    Some(&identity(boundary)),
+                                );
+                            }
                             // A peer can confirm which configs the shared command reads,
                             // even when this manifest's own job failed during preparation.
                             for (index, manifest) in result.summary.manifests.iter().enumerate() {
@@ -328,6 +337,10 @@ impl InstallTransactions {
                                             Err(format!("Cannot snapshot mise metadata: {error}"))
                                     }
                                 }
+                            }
+                            match mise_lock::Preservation::capture(scope.locks, &tx.files) {
+                                Ok(preservation) => task.mise_locks = Some(preservation),
+                                Err(error) => task.command = Err(error),
                             }
                         }
                         Err(error) => task.command = Err(error),
@@ -554,6 +567,57 @@ impl InstallTransactions {
                     format!("{} failed: {}", result.command, result.stderr.trim())
                 });
             }
+            if self.units[unit].failure.is_none() {
+                self.repair_mise_locks(index, &command, &mut runner);
+            }
+        }
+    }
+
+    fn repair_mise_locks(
+        &mut self,
+        index: usize,
+        command: &PreparedInstall,
+        runner: &mut impl FnMut(&PreparedInstall) -> InstallResult,
+    ) {
+        let Some(preservation) = self.tasks[index].mise_locks.as_ref() else {
+            return;
+        };
+        let unit = self.task_units[index];
+        let mut repair = match preservation.prepare(&self.files, command) {
+            Ok(repair) => repair,
+            Err(error) => {
+                self.units[unit].failure = Some(error);
+                return;
+            }
+        };
+        for command in repair.commands.clone() {
+            self.observe_trees(index, false);
+            self.observe(unit, &BTreeSet::new());
+            if self.units[unit].failure.is_some() {
+                return;
+            }
+            let result = runner(&command);
+            self.observe_trees(index, true);
+            let managed = self.tasks[index].managed.clone();
+            self.observe(unit, &managed);
+            if !result.success {
+                self.units[unit].failure.get_or_insert_with(|| {
+                    format!(
+                        "Mise platform lock regeneration failed: {}",
+                        result.stderr.trim()
+                    )
+                });
+            }
+            if self.units[unit].failure.is_some() {
+                return;
+            }
+            if let Err(error) = repair.checkpoint(&self.files) {
+                self.units[unit].failure = Some(error);
+                return;
+            }
+        }
+        if let Err(error) = repair.validate(&self.files) {
+            self.units[unit].failure = Some(error);
         }
     }
 
@@ -721,6 +785,7 @@ impl Task {
             node_root: None,
             trees: vec![],
             tree_links: BTreeMap::new(),
+            mise_locks: None,
         }
     }
 }
@@ -1001,6 +1066,7 @@ impl RollbackReport {
 }
 
 mod mise;
+mod mise_lock;
 mod scope;
 
 #[cfg(test)]
