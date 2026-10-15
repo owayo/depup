@@ -1,7 +1,9 @@
 //! Install failure recovery, scoped to jobs that share managed files.
 use super::{InstallPlan, RustAuditPlan};
 use crate::domain::{Language, UpdateSummary};
-use crate::file_snapshot::{FileGuard, FileState, resolved_path, write_checked};
+use crate::file_snapshot::{
+    FileGuard, FileState, resolved_path, save_recovery_copy as backup, write_checked,
+};
 use crate::manifest::detect_manifests;
 use crate::node_scope::node_resolution_directory;
 use crate::orchestrator::OrchestratorResult;
@@ -10,7 +12,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 struct FileRecord {
     guards: Vec<FileGuard>,
@@ -899,43 +900,6 @@ fn recovery_copy(record: &FileRecord) -> Result<PathBuf, String> {
         );
     }
     backup(&record.before)
-}
-fn backup(state: &FileState) -> Result<PathBuf, String> {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let directory =
-        std::env::temp_dir().join(format!("depup-recovery-{}-{nonce}", std::process::id()));
-    fs::create_dir(&directory)
-        .map_err(|error| format!("Cannot create recovery directory: {error}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
-            .map_err(|error| format!("Cannot protect recovery directory: {error}"))?;
-    }
-    let path = directory.join(if state.bytes.is_some() {
-        "before"
-    } else {
-        "originally-absent"
-    });
-    let result = (|| -> io::Result<()> {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)?;
-        if let Some(bytes) = &state.bytes {
-            file.write_all(bytes)?;
-        }
-        if let Some(permissions) = &state.permissions {
-            file.set_permissions(permissions.clone())?;
-        }
-        file.sync_all()
-    })();
-    result
-        .map(|()| path)
-        .map_err(|error| format!("Cannot save recovery copy: {error}"))
 }
 
 impl RollbackReport {

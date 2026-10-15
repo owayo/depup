@@ -417,6 +417,21 @@ fn workspace_members(metadata: &Metadata) -> impl Iterator<Item = &MetadataPacka
         .filter(move |package| ids.contains(package.id.as_str()))
 }
 
+/// Use the same root/member inventory for audit recovery and scratch resolution.
+pub(super) async fn workspace_manifest_paths(
+    root: &Path,
+    cargo: &CargoCommand,
+    timeout: Duration,
+) -> Result<Vec<PathBuf>, String> {
+    let root = canonical_path(root).map_err(|error| error.to_string())?;
+    let metadata = read_metadata(cargo, &root, &root.join(MANIFEST_FILE), timeout).await?;
+    Ok(CopyPlan::new(&root, &metadata)?
+        .manifests
+        .into_iter()
+        .map(|manifest| manifest.original)
+        .collect())
+}
+
 /// crates.io の依存なら (実パッケージ名, 版要求) を返す
 fn crates_io_requirement(dependency: &serde_json::Value) -> Option<(String, String)> {
     if dependency.get("source")?.as_str()? != CRATES_IO_SOURCE {

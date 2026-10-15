@@ -937,6 +937,339 @@ mod retry_regressions {
         assert_eq!(project.locked_versions("s-solo"), ["1.1.0"]);
         project.cargo_ok(&["update", "--workspace", "--locked"]);
     }
+
+    #[tokio::test]
+    async fn failed_partial_restoration_returns_the_install_time_lock() {
+        check_failed_audit_recovery(RecoveryEdit::None).await;
+    }
+
+    #[tokio::test]
+    async fn missing_manifest_snapshot_prevents_live_age_rollbacks() {
+        let (_registry, project, baseline, dates, cargo) = fixture(false);
+        let installed = project.read("Cargo.lock");
+        let mut table: toml::Value = toml::from_str(&project.read("Cargo.toml")).unwrap();
+        table["package"]["version"] = "invalid-version".into();
+        project.write("Cargo.toml", &toml::to_string(&table).unwrap());
+        let input = LockAgeAudit {
+            project_dir: project.path(),
+            cutoff: cutoff(),
+            exemptions: &Default::default(),
+            baseline: &baseline,
+            preferred: &PreferredVersions::new(),
+            adapter: &dates,
+            cargo: &cargo,
+            budget: Duration::from_secs(19),
+        };
+        let versions = VersionFetcher::new(4, 1);
+        let result = LockAgeAuditor::new(&input, &versions, false)
+            .run(None)
+            .await;
+        assert!(result.has_unresolved(), "{result:?}");
+        assert!(
+            result
+                .problems
+                .iter()
+                .any(|problem| problem.contains("invalid-version")),
+            "{result:?}"
+        );
+        assert_eq!(project.read("Cargo.lock"), installed);
+        assert!(
+            result
+                .adjustments
+                .iter()
+                .all(|entry| !entry.status.is_resolved())
+        );
+    }
+
+    #[tokio::test]
+    async fn aborted_age_audit_returns_the_install_time_lock() {
+        check_failed_audit_recovery(RecoveryEdit::Aborted).await;
+    }
+
+    #[tokio::test]
+    async fn snapshot_recovery_accepts_a_successful_selective_restoration_checkpoint() {
+        check_failed_audit_recovery(RecoveryEdit::AfterSelective).await;
+    }
+
+    #[tokio::test]
+    async fn failed_audit_preserves_external_edits_and_saves_the_snapshot() {
+        for edit in [
+            RecoveryEdit::Comment,
+            RecoveryEdit::ObservedComment,
+            RecoveryEdit::Manifest,
+            RecoveryEdit::Member,
+            RecoveryEdit::NewMember,
+            RecoveryEdit::NewNestedMember,
+            RecoveryEdit::NewRecursiveMember,
+        ] {
+            check_failed_audit_recovery(edit).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_audit_preserves_links_permissions_and_unwritable_locks() {
+        for edit in [
+            RecoveryEdit::Symlink,
+            RecoveryEdit::Permissions,
+            RecoveryEdit::Unwritable,
+        ] {
+            check_failed_audit_recovery(edit).await;
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum RecoveryEdit {
+        None,
+        Aborted,
+        AfterSelective,
+        Comment,
+        ObservedComment,
+        Manifest,
+        Member,
+        NewMember,
+        NewNestedMember,
+        NewRecursiveMember,
+        #[cfg(unix)]
+        Symlink,
+        #[cfg(unix)]
+        Permissions,
+        #[cfg(unix)]
+        Unwritable,
+    }
+
+    async fn check_failed_audit_recovery(edit: RecoveryEdit) {
+        use crate::file_snapshot::FileState;
+        let (_registry, project, baseline, dates, cargo) = fixture(true);
+        if edit == RecoveryEdit::Member {
+            project.write(
+                "Cargo.toml",
+                &format!(
+                    "{}\n[workspace]\nmembers=['member']\n",
+                    project.read("Cargo.toml")
+                ),
+            );
+            project.write(
+                "member/Cargo.toml",
+                "[package]\nname='member'\nversion='0.1.0'\nedition='2024'\n",
+            );
+            project.write("member/src/lib.rs", "");
+            project.cargo_ok(&["update", "--workspace"]);
+        }
+        let member_layout = match edit {
+            RecoveryEdit::NewMember => Some(("member/*", "member/existing", "member/new")),
+            RecoveryEdit::NewNestedMember => {
+                Some(("member/*/lib", "member/existing/lib", "member/new/lib"))
+            }
+            RecoveryEdit::NewRecursiveMember => Some((
+                "member/**/lib",
+                "member/old/deep/lib",
+                "member/new/even/deeper/lib",
+            )),
+            _ => None,
+        };
+        if let Some((pattern, existing, _)) = member_layout {
+            project.write(
+                "Cargo.toml",
+                &format!(
+                    "{}\n[workspace]\nmembers=['{pattern}']\n",
+                    project.read("Cargo.toml")
+                ),
+            );
+            project.write(
+                &format!("{existing}/Cargo.toml"),
+                "[package]\nname='existing'\nversion='0.1.0'\nedition='2024'\n",
+            );
+            project.write(&format!("{existing}/src/lib.rs"), "");
+            project.cargo_ok(&["update", "--workspace"]);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                project.path().join("Cargo.lock"),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
+        let installed = project.read("Cargo.lock");
+        let installed_state = FileState::read(&project.path().join("Cargo.lock")).unwrap();
+        let manifest = project.read("Cargo.toml");
+        let input = LockAgeAudit {
+            project_dir: project.path(),
+            cutoff: cutoff(),
+            exemptions: &Default::default(),
+            baseline: &baseline,
+            preferred: &PreferredVersions::new(),
+            adapter: &dates,
+            cargo: &cargo,
+            budget: Duration::from_secs(19),
+        };
+        let versions = VersionFetcher::new(4, 1);
+        let auditor = LockAgeAuditor::new(&input, &versions, false);
+        let snapshot = snapshot::AuditSnapshot::capture(&input, &installed)
+            .await
+            .unwrap();
+        let mut state = AuditState::new(input.budget);
+        state.installed_lock = installed.clone();
+        state.changes.observe(&installed);
+        auditor.run_pass(&mut state, 0, false, None).await.unwrap();
+        assert_eq!(project.locked_versions("z-top"), ["1.1.0"]);
+        assert_eq!(project.locked_versions("s-solo"), ["1.0.0"]);
+
+        let partial = project.read("Cargo.lock");
+        match edit {
+            RecoveryEdit::None => {}
+            RecoveryEdit::Aborted => state
+                .problems
+                .push("age audit interrupted after a partial rollback".into()),
+            RecoveryEdit::AfterSelective => {
+                auditor.restore_mixed(&mut state).await;
+                assert!(state.problems.is_empty(), "{:?}", state.problems);
+                assert_eq!(project.locked_versions("z-top"), ["1.2.0"]);
+                assert_eq!(project.locked_versions("s-solo"), ["1.0.0"]);
+                state
+                    .problems
+                    .push("a subsequent restoration component failed".into());
+            }
+            RecoveryEdit::Comment => {
+                project.write("Cargo.lock", &format!("{partial}\n# external edit\n"))
+            }
+            RecoveryEdit::ObservedComment => {
+                state
+                    .changes
+                    .observe(&format!("{partial}\n# external edit\n"));
+                state.changes.observe(&partial);
+            }
+            RecoveryEdit::Manifest => {
+                project.write("Cargo.toml", &format!("{manifest}\n# external edit\n"))
+            }
+            RecoveryEdit::Member => project.write(
+                "member/Cargo.toml",
+                &format!("{}\n# external edit\n", project.read("member/Cargo.toml")),
+            ),
+            RecoveryEdit::NewMember
+            | RecoveryEdit::NewNestedMember
+            | RecoveryEdit::NewRecursiveMember => {
+                let (_, _, new_member) = member_layout.unwrap();
+                project.write(
+                    &format!("{new_member}/Cargo.toml"),
+                    "[package]\nname='new-member'\nversion='0.1.0'\nedition='2024'\n",
+                );
+                project.write(&format!("{new_member}/src/lib.rs"), "");
+                project.cargo_ok(&["update", "--workspace"]);
+                let after = project.read("Cargo.lock");
+                // Model an audited Cargo command noticing the new glob member.
+                state.changes.applied(&partial, &after, &[]);
+                assert!(
+                    state
+                        .changes
+                        .allows_snapshot_restore(Some(after.as_bytes()))
+                );
+            }
+            #[cfg(unix)]
+            RecoveryEdit::Symlink => {
+                project.write("external.lock", &partial);
+                std::fs::remove_file(project.path().join("Cargo.lock")).unwrap();
+                std::os::unix::fs::symlink("external.lock", project.path().join("Cargo.lock"))
+                    .unwrap();
+            }
+            #[cfg(unix)]
+            RecoveryEdit::Permissions | RecoveryEdit::Unwritable => {
+                use std::os::unix::fs::PermissionsExt;
+                let (path, mode) = if edit == RecoveryEdit::Permissions {
+                    (project.path().join("Cargo.lock"), 0o644)
+                } else {
+                    (project.path().to_path_buf(), 0o555)
+                };
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+            }
+        }
+        let expected_lock = FileState::read(&project.path().join("Cargo.lock")).unwrap();
+        let expected_manifest = project.read("Cargo.toml");
+
+        // The actual rollbacks used Cargo; only the subsequent recovery is broken.
+        let unavailable = CargoCommand::new().program(project.path().join("missing-cargo"));
+        let input = LockAgeAudit {
+            cargo: &unavailable,
+            ..input
+        };
+        let auditor = LockAgeAuditor::new(&input, &versions, false);
+        let result = auditor.complete(state, &snapshot, None).await;
+        #[cfg(unix)]
+        if edit == RecoveryEdit::Unwritable {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(project.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        assert!(result.has_unresolved(), "{edit:?}: {result:?}");
+        assert_eq!(project.read("Cargo.toml"), expected_manifest);
+        if !matches!(
+            edit,
+            RecoveryEdit::None | RecoveryEdit::Aborted | RecoveryEdit::AfterSelective
+        ) {
+            if matches!(
+                edit,
+                RecoveryEdit::NewMember
+                    | RecoveryEdit::NewNestedMember
+                    | RecoveryEdit::NewRecursiveMember
+            ) {
+                assert!(
+                    result
+                        .problems
+                        .iter()
+                        .any(|problem| problem.contains("workspace manifest inventory changed")),
+                    "{result:?}"
+                );
+            }
+            assert!(
+                expected_lock
+                    .matches(&FileState::read(&project.path().join("Cargo.lock")).unwrap()),
+                "{edit:?}: {result:?}"
+            );
+            let backup = result
+                .problems
+                .iter()
+                .find_map(|problem| {
+                    problem
+                        .split_once("the install-time Cargo.lock was saved to ")
+                        .and_then(|(_, rest)| rest.split_once(" — copy it back to restore"))
+                        .map(|(path, _)| std::path::PathBuf::from(path))
+                })
+                .unwrap_or_else(|| panic!("{edit:?}: {result:?}"));
+            assert!(installed_state.matches(&FileState::read(&backup).unwrap()));
+            std::fs::remove_dir_all(backup.parent().unwrap()).unwrap();
+            #[cfg(unix)]
+            if edit == RecoveryEdit::Symlink {
+                assert_eq!(
+                    std::fs::read_link(project.path().join("Cargo.lock")).unwrap(),
+                    Path::new("external.lock")
+                );
+                assert_eq!(project.read("external.lock"), partial);
+            }
+            return;
+        }
+        assert!(
+            result
+                .problems
+                .iter()
+                .any(|problem| problem.contains("restored the install-time Cargo.lock snapshot")),
+            "{result:?}"
+        );
+        assert_eq!(project.read("Cargo.lock"), installed, "{result:?}");
+        assert!(
+            installed_state.matches(&FileState::read(&project.path().join("Cargo.lock")).unwrap())
+        );
+        assert_eq!(project.read("Cargo.toml"), manifest);
+        assert!(result.has_unresolved());
+        assert!(
+            result
+                .adjustments
+                .iter()
+                .all(|entry| !entry.status.is_resolved())
+        );
+        project.cargo_ok(&["update", "--workspace", "--locked"]);
+    }
 }
 
 #[test]

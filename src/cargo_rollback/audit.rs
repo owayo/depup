@@ -605,9 +605,14 @@ impl<'a> LockAgeAuditor<'a> {
             state.elapsed_offset = self.elapsed_offset.clone();
         }
         match read_audit_lock(&self.input.project_dir.join("Cargo.lock")) {
-            Ok((content, _)) => {
+            Ok((content, entries)) => {
                 state.changes.observe(&content);
                 state.installed_lock = content;
+                if self.input.budget.is_zero()
+                    || changed_entries(&entries, self.input.baseline).is_empty()
+                {
+                    return self.finalize(state, bar).await;
+                }
             }
             Err(problem) => {
                 return LockAgeAuditResult {
@@ -616,6 +621,14 @@ impl<'a> LockAgeAuditor<'a> {
                 };
             }
         }
+        let snapshot =
+            match snapshot::AuditSnapshot::capture(self.input, &state.installed_lock).await {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    state.problems.push(error);
+                    return self.finalize(state, bar).await;
+                }
+            };
         // 最後の一巡は差し戻さず、直前の解決で入った版を検証する。
         for pass_index in 0..=MAX_ENFORCE_LOCK_AGE_PASSES {
             let verify_only = pass_index == MAX_ENFORCE_LOCK_AGE_PASSES;
@@ -652,8 +665,20 @@ impl<'a> LockAgeAuditor<'a> {
                 break;
             }
         }
+        self.complete(state, &snapshot, bar).await
+    }
+
+    async fn complete(
+        &self,
+        mut state: AuditState,
+        snapshot: &snapshot::AuditSnapshot,
+        bar: Option<&ProgressBar>,
+    ) -> LockAgeAuditResult {
         if state.problems.is_empty() {
             self.restore_mixed(&mut state).await;
+        }
+        if !state.problems.is_empty() {
+            snapshot.restore(&mut state);
         }
         self.finalize(state, bar).await
     }
@@ -1355,3 +1380,4 @@ impl<'a> LockAgeAuditor<'a> {
 mod helper_tests;
 
 mod restore;
+mod snapshot;
