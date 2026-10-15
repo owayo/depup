@@ -858,7 +858,7 @@ async fn test_failed_restore_is_reported_with_backup() {
     let lock_path = project.path().join("Cargo.lock");
     std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-    assert_eq!(result.problems.len(), 1, "{:?}", result.problems);
+    assert_eq!(result.problems.len(), 2, "{:?}", result.problems);
     let problem = &result.problems[0];
     assert!(problem.contains("simulated rejection"), "{problem}");
     assert!(problem.contains("restoring the previous"), "{problem}");
@@ -869,6 +869,15 @@ async fn test_failed_restore_is_reported_with_backup() {
         .unwrap_or_else(|| panic!("no backup path in: {problem}"));
     assert_eq!(std::fs::read_to_string(backup).unwrap(), before);
     std::fs::remove_file(backup).unwrap();
+    let snapshot_problem = &result.problems[1];
+    assert!(snapshot_problem.contains("could not restore the age audit snapshot"));
+    let snapshot_backup = snapshot_problem
+        .split("the install-time Cargo.lock was saved to ")
+        .nth(1)
+        .and_then(|rest| rest.split(" — ").next())
+        .unwrap_or_else(|| panic!("no snapshot backup path in: {snapshot_problem}"));
+    assert_eq!(std::fs::read_to_string(snapshot_backup).unwrap(), before);
+    std::fs::remove_dir_all(Path::new(snapshot_backup).parent().unwrap()).unwrap();
 }
 
 /// 時間予算が尽きていれば何も変えず、監査できなかった件数を返す

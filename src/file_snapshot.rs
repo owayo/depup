@@ -182,6 +182,45 @@ pub(crate) fn write_checked(
     result
 }
 
+/// Save original bytes and permissions without replacing any existing file.
+pub(crate) fn save_recovery_copy(state: &FileState) -> Result<PathBuf, String> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let directory =
+        std::env::temp_dir().join(format!("depup-recovery-{}-{nonce}", std::process::id()));
+    fs::create_dir(&directory)
+        .map_err(|error| format!("Cannot create recovery directory: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("Cannot protect recovery directory: {error}"))?;
+    }
+    let path = directory.join(if state.bytes.is_some() {
+        "before"
+    } else {
+        "originally-absent"
+    });
+    let result = (|| -> io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        if let Some(bytes) = &state.bytes {
+            file.write_all(bytes)?;
+        }
+        if let Some(permissions) = &state.permissions {
+            file.set_permissions(permissions.clone())?;
+        }
+        file.sync_all()
+    })();
+    result
+        .map(|()| path)
+        .map_err(|error| format!("Cannot save recovery copy: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

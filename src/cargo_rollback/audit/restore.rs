@@ -18,6 +18,7 @@ type LockId = (String, String, Option<String>);
 #[derive(Clone, Default)]
 pub(super) struct AuditChanges {
     checkpoint: String,
+    between_commands_changed: bool,
     owned: BTreeSet<LockId>,
     external: BTreeSet<LockId>,
 }
@@ -66,6 +67,7 @@ impl AuditChanges {
 
     pub(super) fn observe(&mut self, content: &str) {
         if !self.checkpoint.is_empty() {
+            self.between_commands_changed |= self.checkpoint != content;
             let before = lock_tables(&self.checkpoint);
             let after = lock_tables(content);
             self.disown(
@@ -78,6 +80,10 @@ impl AuditChanges {
             );
         }
         self.checkpoint = content.to_string();
+    }
+
+    pub(super) fn allows_snapshot_restore(&self, content: Option<&[u8]>) -> bool {
+        !self.between_commands_changed && content == Some(self.checkpoint.as_bytes())
     }
 
     pub(super) fn applied(&mut self, before: &str, after: &str, selected: &[PackageKey]) {
@@ -551,6 +557,10 @@ impl LockAgeAuditor<'_> {
             };
             match restore_installed(self.input.project_dir, scope, self.input.cargo, deadline, CARGO_UPDATE_TIMEOUT).await {
                 Ok(committed) => {
+                    let selected: Vec<_> = plan.members.iter().map(|member| {
+                        (member.name.clone(), member.installed.clone())
+                    }).collect();
+                    state.changes.applied(&expected_lock, &committed, &selected);
                     expected_lock = committed;
                     for member in &plan.members {
                         let key = (member.name.clone(), member.installed.clone());
