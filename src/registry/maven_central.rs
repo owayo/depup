@@ -76,8 +76,9 @@ impl MavenCentralAdapter {
 
     fn repository_urls(content: &str) -> Vec<String> {
         let mut urls = Vec::new();
-        let pattern = regex::Regex::new(r"\b(google|mavenCentral|gradlePluginPortal)\s*\(\s*\)")
-            .expect("static Gradle repository pattern");
+        let pattern =
+            regex::Regex::new(r"\b(google|mavenCentral|gradlePluginPortal)\s*(?:\(\s*\)|\{)")
+                .expect("static Gradle repository pattern");
         for capture in pattern.captures_iter(content) {
             let url = match &capture[1] {
                 "google" => GOOGLE_MAVEN_URL,
@@ -427,6 +428,55 @@ mod tests {
                 GRADLE_PLUGIN_PORTAL_URL
             ]
         );
+    }
+
+    #[test]
+    fn settings_repository_blocks_keep_order_and_scopes() {
+        for filename in ["settings.gradle", "settings.gradle.kts"] {
+            let root = tempfile::TempDir::new().unwrap();
+            std::fs::write(
+                root.path().join(filename),
+                r#"
+                // gradlePluginPortal { }
+                /* mavenCentral { } */
+                pluginManagement {
+                    repositories {
+                        google {
+                            content {
+                                includeGroupByRegex("com\\.android.*")
+                                includeGroupByRegex("com\\.google.*")
+                                includeGroupByRegex("androidx.*")
+                            }
+                        }
+                        mavenCentral()
+                        gradlePluginPortal { content { includeGroup("example") } }
+                        google()
+                    }
+                }
+                dependencyResolutionManagement {
+                    repositories {
+                        mavenCentral { content { includeGroup("example") } }
+                        google()
+                    }
+                }
+                "#,
+            )
+            .unwrap();
+            let adapter = MavenCentralAdapter::for_manifest(
+                HttpClient::new().unwrap(),
+                &root.path().join("gradle/libs.versions.toml"),
+            );
+            assert_eq!(adapter.base_url, MAVEN_CENTRAL_URL);
+            assert_eq!(adapter.fallback_urls, [GOOGLE_MAVEN_URL]);
+            assert_eq!(
+                adapter.plugin_urls,
+                [
+                    GOOGLE_MAVEN_URL,
+                    MAVEN_CENTRAL_URL,
+                    GRADLE_PLUGIN_PORTAL_URL
+                ]
+            );
+        }
     }
 
     #[tokio::test]
