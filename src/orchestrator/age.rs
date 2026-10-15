@@ -31,9 +31,13 @@ pub(super) fn resolve(
     let root = project_scope_root(&args.path);
     let dir = absolute(dir);
     let mut project = None;
+    let ignored_mise_global = args
+        .no_age
+        .then(|| crate::manifest::native_age::global_config_path(crate::domain::Language::Mise))
+        .flatten();
     if dir.starts_with(&root) {
         for scope in dir.ancestors().take_while(|scope| scope.starts_with(&root)) {
-            for candidate in project_ages(scope) {
+            for candidate in project_ages(scope, ignored_mise_global.as_deref()) {
                 if project
                     .as_ref()
                     .is_none_or(|old: &ProjectAge| candidate.duration > old.duration)
@@ -107,7 +111,7 @@ impl ResolvedAge {
     }
 }
 
-fn project_ages(dir: &Path) -> Vec<ProjectAge> {
+fn project_ages(dir: &Path, ignored_mise_global: Option<&Path>) -> Vec<ProjectAge> {
     let mut ages = Vec::new();
     // 設定ファイル自体が明示指定の根拠。lockfile の有無には依存しない。
     if let Some((duration, source)) = PnpmSettings::minimum_release_age_with_source(dir) {
@@ -122,7 +126,7 @@ fn project_ages(dir: &Path) -> Vec<ProjectAge> {
             source: dir.join("bunfig.toml"),
         });
     }
-    let mise = MiseSettings::from_dir(dir);
+    let mise = MiseSettings::from_dir_ignoring_age(dir, ignored_mise_global);
     if let Some(duration) = mise.minimum_release_age {
         ages.push(ProjectAge {
             duration,

@@ -231,6 +231,9 @@ impl SystemPackageManager {
             }
             // 絶対日時を渡して、子プロセス開始までの待ち時間で境界を動かさない。
             out.push(cutoff.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+        } else if pm == "mise" {
+            // 解決済みの無効化を、mise のグローバル設定や既定値で復活させない。
+            out.extend(["--minimum-release-age".into(), "0".into()]);
         }
         out
     }
@@ -302,13 +305,14 @@ impl SystemPackageManager {
                 minutes.to_string(),
             ));
         }
-        if let Some(age) = min_age
-            && pm == "mise"
-        {
+        if pm == "mise" {
             // mise は humantime 表記を受け付ける (`604800s` のような秒指定も可)
             env.push((
                 "MISE_MINIMUM_RELEASE_AGE".to_string(),
-                format!("{}s", age.as_secs() + u64::from(age.subsec_nanos() != 0)),
+                min_age.map_or_else(
+                    || "0".into(),
+                    |age| format!("{}s", age.as_secs() + u64::from(age.subsec_nanos() != 0)),
+                ),
             ));
         }
         if pm == "uv" {
@@ -1606,7 +1610,14 @@ mod tests {
     #[test]
     fn test_get_install_env_mise_without_age() {
         let pm = SystemPackageManager::new();
-        assert!(pm.get_install_env("mise", None).is_empty());
+        assert_eq!(
+            pm.get_install_env("mise", None),
+            vec![("MISE_MINIMUM_RELEASE_AGE".into(), "0".into())]
+        );
+        assert_eq!(
+            pm.get_install_command_args("mise", None),
+            ["mise", "install", "--minimum-release-age", "0"]
+        );
     }
 
     #[test]

@@ -47,13 +47,23 @@ impl MiseSettings {
     /// 複数のファイルがある場合は mise の優先順 (`MISE_CONFIG_FILENAMES` の順) に
     /// 最初に見つかった `minimum_release_age` を採用する。
     pub fn from_dir(dir: &Path) -> Self {
+        Self::from_dir_ignoring_age(dir, None)
+    }
+
+    /// グローバル設定がプロジェクト設定として再解釈される場合だけ age を除外する。
+    pub(crate) fn from_dir_ignoring_age(dir: &Path, ignored_global: Option<&Path>) -> Self {
         let mut merged = MiseSettings::default();
         for filename in MISE_CONFIG_FILENAMES {
             let path = dir.join(filename);
             let Ok(content) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            let parsed = Self::parse(&content);
+            let mut parsed = Self::parse(&content);
+            if ignored_global
+                .is_some_and(|global| super::native_age::same_config_path(&path, global))
+            {
+                parsed.minimum_release_age = None;
+            }
             if merged.minimum_release_age.is_none()
                 && let Some(age) = parsed.minimum_release_age
             {
