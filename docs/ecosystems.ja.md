@@ -152,7 +152,7 @@ Composer は `~>` 演算子を受け付けない（`Invalid operator "~>"`）た
 
 ### Java（Gradle）
 
-Gradle の依存では、Maven Central・Google Maven・Gradle Plugin Portal のアーティファクト単位の `maven-metadata.xml` から版一覧を取得します。最も近い `settings.gradle` / `settings.gradle.kts` の組み込みリポジトリ宣言を使い、ライブラリには `dependencyResolutionManagement`、プラグインには `pluginManagement` の順序を適用します。設定がなければ Maven Central、Google Maven、Plugin Portal の順に試します。選んだ版の POM の `Last-Modified` を確認してから age フィルタを適用します。完全一致の現在版が版一覧に無い場合や、公開日が無い・不正な場合は取得失敗を報告します。
+Gradle の依存では、Maven Central・Google Maven・Gradle Plugin Portal のアーティファクト単位の `maven-metadata.xml` から版一覧を取得します。最も近い `settings.gradle` / `settings.gradle.kts` の組み込みリポジトリ宣言を使い、ライブラリには `dependencyResolutionManagement`、プラグインには `pluginManagement` の順序を適用します。設定がなければ Maven Central、Google Maven、Plugin Portal の順に試します。設定された全リポジトリの版一覧を統合し、同じ版文字列の重複を除きます。各版を最初に掲載したリポジトリの POM の `Last-Modified` を使い、age フィルタを適用します。404 の取得先は飛ばしますが、その他の HTTP エラー・不正な XML・座標の不一致があれば、一部だけの一覧を使わず取得失敗を報告します。完全一致の現在版が版一覧に無い場合や、公開日が無い・不正な場合は取得失敗を報告します。
 
 組み込みリポジトリは、Google Maven・Maven Central・Plugin Portal のいずれも、括弧付きの呼び出し（`google()`）とブロック形式（`google { content { ... } }`）に対応します。宣言順を保ち、同じリポジトリへの重複した宣言は1回だけ問い合わせます。`content` フィルタ自体は depup では解釈しません。
 
