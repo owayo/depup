@@ -9,32 +9,30 @@ pub(crate) fn native_min_age(
     language: Language,
     dir: &Path,
     now: DateTime<Utc>,
+    include_user_settings: bool,
 ) -> Result<Option<Duration>, String> {
-    let (env_key, config_name) = match language {
-        Language::Python => ("UV_EXCLUDE_NEWER", "uv/uv.toml"),
-        Language::Mise => ("MISE_MINIMUM_RELEASE_AGE", "mise/config.toml"),
+    let env_key = match language {
+        Language::Python => "UV_EXCLUDE_NEWER",
+        Language::Mise => "MISE_MINIMUM_RELEASE_AGE",
         _ => return Ok(None),
     };
     let mut values = Vec::new();
-    let config_home = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".config")));
-    let global = if language == Language::Mise {
-        std::env::var_os("MISE_GLOBAL_CONFIG_FILE")
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("MISE_CONFIG_DIR")
-                    .map(|dir| PathBuf::from(dir).join("config.toml"))
-            })
-            .or_else(|| config_home.map(|home| home.join(config_name)))
-    } else {
-        config_home.map(|home| home.join(config_name))
-    };
-    if let Some(path) = global {
-        values.extend(read_age_values(language, &path)?);
+    let global = global_config_path(language);
+    if let Some(path) = &global {
+        // --no-age は共通の利用者設定を外すが、ツール別の明示制約は残す。
+        values.extend(read_age_values_with_scope(
+            language,
+            path,
+            include_user_settings,
+        )?);
     }
     // native PM は実行ルートより上の設定も継承する。CLI 注入でその制約を弱めない。
-    values.extend(read_scoped_values(language, dir)?);
+    // グローバル設定が祖先の .config/mise/config.toml として再登場しても除外する。
+    values.extend(read_scoped_values(
+        language,
+        dir,
+        global.as_deref().filter(|_| !include_user_settings),
+    )?);
     let custom_key = if language == Language::Python {
         "UV_CONFIG_FILE"
     } else {
@@ -57,7 +55,7 @@ pub(crate) fn native_min_age(
             values.extend(read_age_values(language, &system_dir.join("uv/uv.toml"))?);
         }
     }
-    if let Ok(value) = std::env::var(env_key) {
+    if include_user_settings && let Ok(value) = std::env::var(env_key) {
         values.push(value);
     }
     values.into_iter().try_fold(None, |age, value| {
@@ -67,21 +65,48 @@ pub(crate) fn native_min_age(
     })
 }
 
-fn read_scoped_values(language: Language, dir: &Path) -> Result<Vec<String>, String> {
+pub(crate) fn global_config_path(language: Language) -> Option<PathBuf> {
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".config")));
+    match language {
+        Language::Mise => std::env::var_os("MISE_GLOBAL_CONFIG_FILE")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("MISE_CONFIG_DIR")
+                    .map(|dir| PathBuf::from(dir).join("config.toml"))
+            })
+            .or_else(|| config_home.map(|home| home.join("mise/config.toml"))),
+        Language::Python => config_home.map(|home| home.join("uv/uv.toml")),
+        _ => None,
+    }
+}
+
+pub(crate) fn same_config_path(left: &Path, right: &Path) -> bool {
+    let canonical =
+        |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    canonical(left) == canonical(right)
+}
+
+fn read_scoped_values(
+    language: Language,
+    dir: &Path,
+    ignored_global: Option<&Path>,
+) -> Result<Vec<String>, String> {
     let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-    let mut values = Vec::new();
+    let mut paths = Vec::new();
     let environments = std::env::var("MISE_ENV").unwrap_or_default();
     for scope in dir.ancestors() {
         if language == Language::Python {
             for name in ["uv.toml", "pyproject.toml"] {
-                values.extend(read_age_values(language, &scope.join(name))?);
+                paths.push(scope.join(name));
             }
         } else {
             for name in super::MISE_CONFIG_FILENAMES
                 .iter()
                 .chain(["mise.local.toml", ".mise.local.toml"].iter())
             {
-                values.extend(read_age_values(language, &scope.join(name))?);
+                paths.push(scope.join(name));
             }
             for environment in environments.split(',').filter(|env| {
                 !env.is_empty()
@@ -95,17 +120,33 @@ fn read_scoped_values(language: Language, dir: &Path) -> Result<Vec<String>, Str
                             format!("{stem}.{environment}.toml"),
                             format!("{stem}.{environment}.local.toml"),
                         ] {
-                            values.extend(read_age_values(language, &scope.join(name))?);
+                            paths.push(scope.join(name));
                         }
                     }
                 }
             }
         }
     }
-    Ok(values)
+    paths.into_iter().try_fold(Vec::new(), |mut values, path| {
+        let include_settings = ignored_global.is_none_or(|global| !same_config_path(&path, global));
+        values.extend(read_age_values_with_scope(
+            language,
+            &path,
+            include_settings,
+        )?);
+        Ok(values)
+    })
 }
 
 fn read_age_values(language: Language, path: &Path) -> Result<Vec<String>, String> {
+    read_age_values_with_scope(language, path, true)
+}
+
+fn read_age_values_with_scope(
+    language: Language,
+    path: &Path,
+    include_settings_age: bool,
+) -> Result<Vec<String>, String> {
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -131,7 +172,8 @@ fn read_age_values(language: Language, path: &Path) -> Result<Vec<String>, Strin
         "exclude-newer"
     };
     let mut values = Vec::new();
-    if let Some(value) = table.and_then(|table| table.get(key))
+    if include_settings_age
+        && let Some(value) = table.and_then(|table| table.get(key))
         && value.as_bool() != Some(false)
     {
         values.push(
@@ -250,6 +292,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ignoring_global_age_keeps_project_settings_in_ancestor_scans() {
+        let temp = tempfile::tempdir().unwrap();
+        let global = temp.path().join(".config/mise/config.toml");
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(&global, "[settings]\nminimum_release_age = '30d'\n[tools]\npython = { version = '3.14.7', minimum_release_age = '7d' }\n").unwrap();
+        std::fs::write(
+            project.join("mise.local.toml"),
+            "[settings]\nminimum_release_age = '14d'\n",
+        )
+        .unwrap();
+
+        let inherited = read_scoped_values(Language::Mise, &project, None).unwrap();
+        assert!(inherited.contains(&"30d".into()));
+        assert!(inherited.contains(&"14d".into()));
+        assert_eq!(
+            read_scoped_values(Language::Mise, &project, Some(&global)).unwrap(),
+            ["14d", "7d"]
+        );
+    }
+
+    #[test]
     fn native_configuration_above_the_run_root_is_preserved() {
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
@@ -261,12 +326,12 @@ mod tests {
         )
         .unwrap();
         assert!(
-            read_scoped_values(Language::Python, &project)
+            read_scoped_values(Language::Python, &project, None)
                 .unwrap()
                 .contains(&"30 days".into())
         );
         assert!(
-            read_scoped_values(Language::Mise, &project)
+            read_scoped_values(Language::Mise, &project, None)
                 .unwrap()
                 .contains(&"14d".into())
         );

@@ -872,9 +872,14 @@ impl Orchestrator {
                 }
             }
         }
-        if let Some(age) =
-            crate::manifest::native_age::native_min_age(language, dir, self.evaluated_at)?
-        {
+        // mise の利用者設定は --no-age で上書きする。プロジェクトの明示制約は残す。
+        let include_user_settings = language != Language::Mise || !self.args.no_age;
+        if let Some(age) = crate::manifest::native_age::native_min_age(
+            language,
+            dir,
+            self.evaluated_at,
+            include_user_settings,
+        )? {
             policy.min_age = policy.min_age.max(Some(age));
             policy.exemptions = crate::update::AgeExemptions::default();
         }
