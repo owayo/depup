@@ -26,7 +26,7 @@ Paths expanded from `go.work` and `settings.gradle` are subject to the same cont
 
 ### Tauri Projects
 
-depup automatically detects `src-tauri/Cargo.toml` in Tauri projects.
+depup automatically detects `src-tauri/Cargo.toml` in Tauri projects. If that manifest defines a Cargo workspace, depup also expands its members (including glob patterns and exclusions), even when you run depup from the project root. A manifest found through both the root workspace and the Tauri workspace is processed once.
 
 #### Tauri Version Synchronization
 

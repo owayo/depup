@@ -108,17 +108,7 @@ pub fn detect_manifests(dir: &Path) -> Vec<ManifestInfo> {
     }
 
     // Cargo ワークスペースメンバーを確認する
-    let cargo_toml_path = dir.join("Cargo.toml");
-    if cargo_toml_path.exists()
-        && let Ok(content) = std::fs::read_to_string(&cargo_toml_path)
-    {
-        for member_dir in detect_cargo_workspace_members(dir, &content) {
-            let member_cargo = member_dir.join("Cargo.toml");
-            if member_cargo.exists() {
-                push_unique_manifest(&mut manifests, member_cargo, Language::Rust);
-            }
-        }
-    }
+    add_cargo_workspace_manifests(&mut manifests, dir);
 
     // Tauri プロジェクト (src-tauri/Cargo.toml) を確認する
     let tauri_cargo_path = dir.join("src-tauri").join("Cargo.toml");
@@ -134,6 +124,7 @@ pub fn detect_manifests(dir: &Path) -> Vec<ManifestInfo> {
                 ManifestInfo::new(&tauri_cargo_path, Language::Rust).with_tauri_rust(true);
             manifests.push(tauri_info);
         }
+        add_cargo_workspace_manifests(&mut manifests, &dir.join("src-tauri"));
     }
 
     // pnpm-workspace.yaml が存在する場合、pnpm ワークスペースパッケージを確認する
@@ -177,6 +168,19 @@ pub fn detect_manifests(dir: &Path) -> Vec<ManifestInfo> {
     }
 
     manifests
+}
+
+/// Cargo workspace の起点を問わず、同じ規則でメンバーを追加する。
+fn add_cargo_workspace_manifests(manifests: &mut Vec<ManifestInfo>, dir: &Path) {
+    let Ok(content) = std::fs::read_to_string(dir.join("Cargo.toml")) else {
+        return;
+    };
+    for member_dir in detect_cargo_workspace_members(dir, &content) {
+        let member_cargo = member_dir.join("Cargo.toml");
+        if member_cargo.exists() {
+            push_unique_manifest(manifests, member_cargo, Language::Rust);
+        }
+    }
 }
 
 /// ディレクトリ直下の mise 設定ファイルを検出する。
@@ -1003,6 +1007,74 @@ mod tests {
         // 一方は Tauri、もう一方は非 Tauri であるべき
         assert!(rust_manifests.iter().any(|m| m.is_tauri_rust));
         assert!(rust_manifests.iter().any(|m| !m.is_tauri_rust));
+    }
+
+    #[test]
+    fn test_detect_tauri_workspace_members_match_direct_detection() {
+        for has_root_workspace in [false, true] {
+            let dir = create_temp_dir();
+            let tauri_dir = dir.path().join("src-tauri");
+            for member in ["helper", "excluded", "no-manifest"] {
+                fs::create_dir_all(tauri_dir.join("tools").join(member)).unwrap();
+            }
+            for member in ["helper", "excluded"] {
+                fs::write(
+                    tauri_dir.join("tools").join(member).join("Cargo.toml"),
+                    "[dependencies]\nitoa = \"1.0\"\n",
+                )
+                .unwrap();
+            }
+            fs::write(
+                tauri_dir.join("Cargo.toml"),
+                "[workspace]\nmembers = [\"tools/*\", \"tools/helper\", \"missing\"]\nexclude = [\"tools/excluded\"]\n",
+            )
+            .unwrap();
+            if has_root_workspace {
+                fs::write(
+                    dir.path().join("Cargo.toml"),
+                    "[workspace]\nmembers = [\"src-tauri\", \"src-tauri/tools/helper\"]\n",
+                )
+                .unwrap();
+            }
+
+            let manifests = detect_manifests(dir.path());
+            let rust_manifests: Vec<_> = manifests
+                .iter()
+                .filter(|m| m.language == Language::Rust)
+                .collect();
+            assert_eq!(rust_manifests.len(), if has_root_workspace { 3 } else { 2 });
+            let mut nested_paths: Vec<_> = rust_manifests
+                .iter()
+                .filter(|m| m.path.starts_with(&tauri_dir))
+                .map(|m| m.path.clone())
+                .collect();
+            let mut direct_paths: Vec<_> = detect_manifests(&tauri_dir)
+                .into_iter()
+                .map(|m| m.path)
+                .collect();
+            nested_paths.sort();
+            direct_paths.sort();
+            assert_eq!(nested_paths, direct_paths);
+            for manifest in rust_manifests {
+                assert_eq!(
+                    manifest.is_tauri_rust,
+                    manifest.path == tauri_dir.join("Cargo.toml")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_detect_tauri_invalid_workspace_keeps_manifest() {
+        let dir = create_temp_dir();
+        let tauri_dir = dir.path().join("src-tauri");
+        fs::create_dir(&tauri_dir).unwrap();
+        fs::write(tauri_dir.join("Cargo.toml"), "[workspace\n").unwrap();
+
+        let manifests = detect_manifests(dir.path());
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(manifests[0].path, tauri_dir.join("Cargo.toml"));
+        assert!(manifests[0].is_tauri_rust);
     }
 
     #[test]
