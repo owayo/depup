@@ -14,6 +14,8 @@ use std::time::Duration;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallScope {
     Full,
+    /// Explicit lock refresh; only supported by pnpm and Cargo.
+    Refresh,
     /// Full Cargo update at a root already confirmed by the planner.
     CargoFull,
     Packages(Vec<String>),
@@ -246,6 +248,23 @@ impl SystemPackageManager {
     ) -> Result<Vec<String>, String> {
         let mut args = self.get_install_command_args_for_policy(pm, policy);
         match (pm, scope) {
+            ("cargo", InstallScope::Refresh) => {}
+            ("pnpm", InstallScope::Refresh) => {
+                args = vec![
+                    "pnpm".into(),
+                    "update".into(),
+                    "--no-save".into(),
+                    "--lockfile-only".into(),
+                    "--ignore-scripts".into(),
+                    "--no-include-github-actions".into(),
+                    "--no-changeset".into(),
+                ];
+            }
+            (_, InstallScope::Refresh) => {
+                return Err(format!(
+                    "--refresh-lock is supported only by pnpm and Cargo; selected package manager: {pm}"
+                ));
+            }
             ("cargo", InstallScope::CargoFull) => {}
             ("cargo", InstallScope::CargoWorkspace) => args.push("--workspace".into()),
             ("cargo", InstallScope::Packages(packages)) if !packages.is_empty() => {
@@ -554,6 +573,13 @@ impl SystemPackageManager {
             return Err("The planned Cargo manifest is no longer available".into());
         }
         let command_parts = self.scoped_install_args(pm, policy, scope)?;
+        let mut command_parts = command_parts;
+        if pm == "pnpm"
+            && *scope == InstallScope::Refresh
+            && effective_dir.join("pnpm-workspace.yaml").is_file()
+        {
+            command_parts.extend(["--recursive".into(), "--include-workspace-root".into()]);
+        }
         if command_parts.is_empty() {
             return Ok(None);
         }
@@ -657,6 +683,32 @@ impl SystemPackageManager {
         working_dir: &Path,
         scope: &InstallScope,
     ) -> Option<(PathBuf, &'static str)> {
+        if language == Language::Node
+            && *scope == InstallScope::Refresh
+            && ![
+                "pnpm-lock.yaml",
+                "yarn.lock",
+                "bun.lock",
+                "bun.lockb",
+                "npm-shrinkwrap.json",
+                "package-lock.json",
+            ]
+            .iter()
+            .any(|name| working_dir.join(name).exists())
+            && (working_dir.join("pnpm-workspace.yaml").is_file()
+                || std::fs::read(working_dir.join("package.json"))
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                    .and_then(|value| {
+                        value
+                            .get("packageManager")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .is_some_and(|pm| pm.starts_with("pnpm@")))
+        {
+            return Some((working_dir.to_path_buf(), "pnpm"));
+        }
         if language == Language::Rust && *scope != InstallScope::Full {
             // The planner has already obtained this root from Cargo itself.
             // Re-detecting a Tauri subdirectory can select a different workspace.

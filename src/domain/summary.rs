@@ -119,6 +119,18 @@ pub struct UpdateSummary {
     pub manifests: Vec<ManifestUpdateResult>,
     /// ドライランかどうか
     pub dry_run: bool,
+    /// Lock refresh results are separate from direct dependency update counts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lock_refreshes: Vec<LockRefreshResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LockRefreshResult {
+    pub directory: PathBuf,
+    pub language: Option<Language>,
+    pub status: String,
+    pub changed: bool,
+    pub error: Option<String>,
 }
 
 impl UpdateSummary {
@@ -127,6 +139,7 @@ impl UpdateSummary {
         Self {
             manifests: Vec::new(),
             dry_run,
+            lock_refreshes: Vec::new(),
         }
     }
 

@@ -102,6 +102,21 @@ fn failed_suffix(summary: &UpdateSummary) -> String {
 
 impl OutputFormatter for DiffFormatter {
     fn format(&self, result: &OrchestratorResult, writer: &mut dyn Write) -> std::io::Result<()> {
+        for refresh in &result.summary.lock_refreshes {
+            writeln!(
+                writer,
+                "# Lock refresh {} ({}): {}{}",
+                refresh.directory.display(),
+                refresh
+                    .language
+                    .map_or("no eligible scope", |language| language.display_name()),
+                refresh.status,
+                refresh
+                    .error
+                    .as_ref()
+                    .map_or(String::new(), |error| format!(" — {error}"))
+            )?;
+        }
         let prefix = self.dry_run_prefix();
 
         for manifest in &result.summary.manifests {

@@ -333,7 +333,7 @@ fn excluded_independent_package_uses_its_own_existing_or_new_lock() {
                     command.extend(["--package", selector]);
                 }
             }
-            InstallScope::Full | InstallScope::CargoFull => {
+            InstallScope::Full | InstallScope::CargoFull | InstallScope::Refresh => {
                 panic!("selective install must not fall back to full update")
             }
         }

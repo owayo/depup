@@ -332,6 +332,16 @@ depup only rewrites the dependency declarations it parsed. Other sections of a m
 
 If the same dependency key is declared more than once in a manifest, or several dependencies share one Gradle version variable or version-catalog `version.ref`, depup cannot tell which declaration to change. It refuses the write and reports an error (exit code 2) rather than silently changing a declaration that should stay as it is, such as a pinned one. The error is reported once per dependency, even when several of its declarations had an update. In `Cargo.toml`, declarations that point to the same source with an identically written version count as one dependency and are rewritten together, so they are not refused (see [Rust](ecosystems.md#rust)). Updates that leave the manifest as written, such as a Cargo git dependency that follows a branch, are never refused.
 
+## Refreshing Lockfiles (`--install --refresh-lock`)
+
+Use `depup --install --refresh-lock` to re-resolve pnpm and Cargo lockfiles within the manifest requirements, including transitive dependencies even when no direct dependency changes. Each shared workspace lock is refreshed once. Ordinary `--install` retains its existing behavior.
+
+pnpm first runs `update --no-save --lockfile-only --ignore-scripts --no-include-github-actions --no-changeset`. Workspace resolution includes all members and the root. After verification succeeds, `pnpm install --frozen-lockfile` installs the verified resolution with the project's normal script permissions. The same effective age setting is passed to both commands. A pnpm version that rejects these options fails explicitly; depup does not retry with weaker options. Other Node package managers are unsupported for refresh. With no existing lock, pnpm must be identified by `pnpm-workspace.yaml` or the `packageManager` field.
+
+Cargo runs `cargo update`, then applies its existing age rollback and final verification. Both ecosystems check newly introduced public registry versions against OSV after age verification. An OSV error, an unresolved age violation, a changed external git/private-registry/remote-tarball identity, or inconsistent direct Tauri npm/Cargo versions causes the affected shared install unit to be restored. Unrelated projects continue. Local workspace/path packages are not public-registry audit targets. This incremental OSV check does not certify unchanged versions already in the lock. `--no-age` and `--no-osv` retain their existing configuration precedence.
+
+Refresh cannot be combined with `--only`, `--exclude`, or `--max-change`, including a global `max-change` default; depup rejects the combination before changing files. Language filters still apply. A dry run never starts the package manager. The `Lock refresh` result and JSON `lock_refreshes` array report each scope separately; transitive changes do not increase direct update counts. PM failures return exit code 1; verification failures return 2, with 1 taking precedence when both occur. Recovery retains install artifacts and preserves external file edits, as described below.
+
 ## Running the Package Manager (`--install`)
 
 With `--install`, depup runs each project's package manager after writing the manifests, so lock files and installed packages follow the new versions.

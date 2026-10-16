@@ -28,6 +28,8 @@ impl JsonFormatter {
 /// 全結果の JSON 表現
 #[derive(Serialize)]
 struct JsonOutput {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    lock_refreshes: Vec<crate::domain::LockRefreshResult>,
     /// dry-run だったかどうか
     dry_run: bool,
     /// サマリ統計
@@ -292,6 +294,7 @@ impl OutputFormatter for JsonFormatter {
         };
 
         let output = JsonOutput {
+            lock_refreshes: result.summary.lock_refreshes.clone(),
             dry_run: result.summary.dry_run,
             summary: JsonSummary {
                 updates,

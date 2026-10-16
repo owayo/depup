@@ -74,9 +74,27 @@ impl NodeLockAuditResult {
 }
 
 #[derive(Debug, Default)]
-struct LockSnapshot {
-    packages: BTreeSet<(String, String)>,
+pub(crate) struct LockSnapshot {
+    pub(crate) packages: BTreeSet<(String, String)>,
     unverified: BTreeSet<NodeUnverifiedDependency>,
+    pub(crate) protected: BTreeSet<String>,
+    pub(crate) direct: BTreeMap<PathBuf, BTreeMap<String, String>>,
+    sources: BTreeMap<(String, String), BTreeSet<String>>,
+}
+
+/// Read the graph and verify that it still describes these exact lock bytes.
+pub(crate) async fn refresh_snapshot(directory: &Path) -> Result<(Vec<u8>, LockSnapshot), String> {
+    let deadline = Instant::now() + NODE_AUDIT_BUDGET;
+    let path = directory.join("pnpm-lock.yaml");
+    let bytes = read_lock(&path, deadline).await?;
+    let program = which::which_in("pnpm", std::env::var_os("PATH"), directory)
+        .unwrap_or_else(|_| "pnpm".into());
+    let mut snapshot = read_pnpm_graph(directory, &program, deadline).await?;
+    verify_pnpm_registry_sources(directory, &program, &mut snapshot, deadline).await?;
+    if read_lock(&path, deadline).await? != bytes {
+        return Err("pnpm-lock.yaml changed while reading the refresh snapshot".into());
+    }
+    Ok((bytes, snapshot))
 }
 
 #[async_trait]
@@ -215,6 +233,9 @@ async fn verify_pnpm_registry_sources(
                 snapshot.packages.insert((name, version));
             }
             Ok(false) => {
+                if let Some(sources) = snapshot.sources.get(&(name.clone(), version.clone())) {
+                    snapshot.protected.extend(sources.iter().cloned());
+                }
                 snapshot.unverified.insert(NodeUnverifiedDependency {
                     name,
                     version,
@@ -222,6 +243,9 @@ async fn verify_pnpm_registry_sources(
                 });
             }
             Err(error) => {
+                if let Some(sources) = snapshot.sources.get(&(name.clone(), version.clone())) {
+                    snapshot.protected.extend(sources.iter().cloned());
+                }
                 snapshot.unverified.insert(NodeUnverifiedDependency {
                     name,
                     version,
@@ -325,8 +349,42 @@ async fn read_pnpm_graph(
     }
     let value: Value = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("invalid pnpm lockfile graph: {error}"))?;
-    let snapshot = parse_pnpm_snapshot(&value)?;
+    let mut snapshot = parse_pnpm_snapshot(&value)?;
     verify_pnpm_manifest_dependencies(directory, &value)?;
+    for project in value.as_array().expect("validated project graph") {
+        let path = project
+            .get("path")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| directory.to_path_buf());
+        let path = path.canonicalize().map_err(|error| error.to_string())?;
+        let mut direct = BTreeMap::new();
+        for section in ["dependencies", "devDependencies", "optionalDependencies"] {
+            for (name, package) in project
+                .get(section)
+                .and_then(Value::as_object)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(version) = package.get("version").and_then(Value::as_str) {
+                    let real_name = package
+                        .get("resolved")
+                        .and_then(Value::as_str)
+                        .and_then(|source| public_tarball_package(source, version))
+                        .unwrap_or_else(|| name.clone());
+                    direct
+                        .entry(real_name)
+                        .and_modify(|old: &mut String| {
+                            if old != version {
+                                *old = "<ambiguous>".into();
+                            }
+                        })
+                        .or_insert_with(|| version.to_string());
+                }
+            }
+        }
+        snapshot.direct.insert(path, direct);
+    }
     if !output.stderr.is_empty() {
         return Err(format!(
             "pnpm list --lockfile-only emitted a warning; the lockfile is unverified: {}",
@@ -576,17 +634,46 @@ fn collect_package(snapshot: &mut LockSnapshot, alias: &str, package: &Value) {
         .unwrap_or("<unknown>");
     let resolved = package.get("resolved").and_then(Value::as_str);
     if resolved.is_some_and(is_non_registry_source) || is_non_registry_source(version) {
+        if ![version, resolved.unwrap_or("")].iter().any(|source| {
+            ["link:", "workspace:", "file:"]
+                .iter()
+                .any(|prefix| source.starts_with(prefix))
+        }) {
+            snapshot
+                .protected
+                .insert(protected_identity(alias, package));
+        }
         return;
     }
     if let Some(name) = resolved.and_then(|source| public_tarball_package(source, version)) {
+        snapshot
+            .sources
+            .entry((name.clone(), version.to_string()))
+            .or_default()
+            .insert(protected_identity(alias, package));
         snapshot.packages.insert((name, version.to_string()));
     } else {
+        snapshot
+            .protected
+            .insert(protected_identity(alias, package));
         snapshot.unverified.insert(NodeUnverifiedDependency {
             name: alias.to_string(),
             version: version.to_string(),
             reason: "release source is not a verified public npm registry tarball".into(),
         });
     }
+}
+
+fn protected_identity(alias: &str, package: &Value) -> String {
+    serde_json::json!([
+        alias,
+        package.get("version"),
+        package.get("resolved"),
+        package.get("id"),
+        package.get("from"),
+        package.get("path")
+    ])
+    .to_string()
 }
 
 fn is_non_registry_source(source: &str) -> bool {

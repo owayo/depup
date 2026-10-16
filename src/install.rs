@@ -122,7 +122,9 @@ impl InstallPlan {
                 })
             })
             .collect();
-        if only_mode {
+        if orchestrator.refresh_lock_requested() {
+            refresh::plan_jobs(&mut jobs, orchestrator, result, &node_audits);
+        } else if only_mode {
             scoped::replace_scoped_jobs(&mut jobs, orchestrator, result);
         } else if result.errors.iter().any(|error| {
             matches!(
@@ -492,6 +494,7 @@ fn build_install_map(
 #[cfg(test)]
 mod tests;
 
+pub mod refresh;
 mod scoped;
 
 pub mod transaction;

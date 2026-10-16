@@ -54,6 +54,30 @@ async fn check(snapshot: LockSnapshot, provider: &impl PublicationProvider) -> N
     .await
 }
 
+#[test]
+fn refresh_snapshot_preserves_external_sources_without_treating_local_links_as_registry_packages() {
+    let graph = json!([{"dependencies": {
+        "public":package("public","1.0.0"),
+        "private":{"version":"1.0.0","resolved":"https://registry.example.com/private/-/private-1.0.0.tgz"},
+        "git":{"version":"github:example/project#1234567","resolved":"git+https://github.com/example/project#1234567"},
+        "tarball":{"version":"1.0.0","resolved":"https://downloads.example.com/pkg.tgz"},
+        "member":{"version":"link:../member"},
+        "local":{"version":"file:../local"}
+    }}]);
+    let snapshot = parse_pnpm_snapshot(&graph).unwrap();
+    assert_eq!(
+        snapshot.packages,
+        BTreeSet::from([("public".into(), "1.0.0".into())])
+    );
+    assert_eq!(snapshot.protected.len(), 3);
+    assert!(
+        snapshot
+            .protected
+            .iter()
+            .all(|identity| !identity.contains("link:") && !identity.contains("file:"))
+    );
+}
+
 #[tokio::test]
 async fn pnpm_snapshot_checks_direct_and_transitive_releases() {
     let mut direct = package("example-parent", "1.0.0");

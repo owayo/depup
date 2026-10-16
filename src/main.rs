@@ -69,6 +69,7 @@ async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
     // orchestrator 側の build_filter で最終解決する。main では生の CLI 値を保持。
     args.osv = resolve_osv(args.osv, args.no_osv, global_config.as_ref());
     args.max_change = resolve_max_change(args.max_change, global_config.as_ref());
+    args.validate_refresh_lock().map_err(anyhow::Error::msg)?;
 
     // verbose モードではバージョン情報を表示
     if args.verbose {
@@ -120,7 +121,7 @@ async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
 
     // 結果を出力
     let mut stdout = io::stdout().lock();
-    let defer_json = args.json && args.install && !args.dry_run;
+    let defer_json = (args.json || args.refresh_lock) && args.install && !args.dry_run;
     if !defer_json {
         formatter.format(&result, &mut stdout)?;
         stdout.flush()?;
@@ -184,6 +185,17 @@ async fn finish_install(
     stdout: &mut impl Write,
     defer_json: bool,
 ) -> anyhow::Result<bool> {
+    if args.refresh_lock {
+        let outcome = depup::install::refresh::run(args, orchestrator, plan, result).await;
+        if defer_json {
+            formatter.format(result, stdout)?;
+            stdout.flush()?;
+        }
+        if outcome.install_failed {
+            anyhow::bail!("Some package manager installs failed");
+        }
+        return Ok(outcome.audit_failed);
+    }
     let recovery = run_package_installs(args, plan, result, &orchestrator.rust_lock_boundary());
     recovery.print(&mut io::stderr())?;
     recovery.mark_summary(&mut result.summary);

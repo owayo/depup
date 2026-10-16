@@ -1195,7 +1195,7 @@ mod retry_regressions {
             ..input
         };
         let auditor = LockAgeAuditor::new(&input, &versions, false);
-        let result = auditor.complete(state, &snapshot, None).await;
+        let result = auditor.complete(state, &snapshot, None, &mut None).await;
         #[cfg(unix)]
         if edit == RecoveryEdit::Unwritable {
             use std::os::unix::fs::PermissionsExt;
