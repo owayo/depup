@@ -26,7 +26,7 @@ depup は `pnpm-workspace.yaml` を検出し、すべてのワークスペース
 
 ### Tauri プロジェクト
 
-depup は Tauri プロジェクトの `src-tauri/Cargo.toml` を自動検出します。
+depup は Tauri プロジェクトの `src-tauri/Cargo.toml` を自動検出します。このファイルに Cargo ワークスペースの定義があれば、プロジェクト直下から実行してもメンバーを処理します。glob パターンと `exclude` にも対応し、ルートと Tauri の両方のワークスペースから見つかったマニフェストは 1 回だけ処理します。
 
 #### Tauri バージョン同期
 
