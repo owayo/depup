@@ -360,6 +360,7 @@ async fn policy_resolution_error_is_a_preflight_failure() {
             cargo: &membership,
         },
         &[],
+        false,
         |_| Err("invalid native setting".into()),
         &auditor,
         None,

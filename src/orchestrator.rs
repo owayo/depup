@@ -169,6 +169,27 @@ impl std::fmt::Display for OrchestratorError {
 impl std::error::Error for OrchestratorError {}
 
 impl Orchestrator {
+    pub(crate) fn refresh_lock_requested(&self) -> bool {
+        self.args.refresh_lock
+    }
+
+    pub(crate) async fn check_locked_version(
+        &self,
+        ecosystem: &str,
+        name: &str,
+        version: &str,
+    ) -> Result<(), String> {
+        let Some(checker) = &self.osv_checker else {
+            return Ok(());
+        };
+        match checker.check(ecosystem, name, version).await? {
+            OsvCheck::Safe => Ok(()),
+            OsvCheck::Vulnerable(ids) => Err(format!(
+                "{name}@{version} is vulnerable ({})",
+                ids.join(", ")
+            )),
+        }
+    }
     /// 指定されたCLI引数で新しいオーケストレータを作成する
     pub fn new(args: CliArgs) -> Result<Self, OrchestratorError> {
         let client =
@@ -246,8 +267,24 @@ impl Orchestrator {
         preferred: &PreferredVersions,
         bar: Option<&ProgressBar>,
     ) -> LockAgeAuditResult {
+        self.enforce_lock_age_rust_tracked(project_dir, policy, baseline, preferred, bar)
+            .await
+            .0
+    }
+
+    pub(crate) async fn enforce_lock_age_rust_tracked(
+        &self,
+        project_dir: &Path,
+        policy: &AgePolicy,
+        baseline: &RegistryLockEntries,
+        preferred: &PreferredVersions,
+        bar: Option<&ProgressBar>,
+    ) -> (
+        LockAgeAuditResult,
+        Option<crate::cargo_rollback::audit::AuditReceipt>,
+    ) {
         let Some(cutoff) = policy.cutoff() else {
-            return LockAgeAuditResult::default();
+            return (LockAgeAuditResult::default(), None);
         };
         // check フェーズと同じレート制限状態を使う。別インスタンスにすると
         // 直前のリクエストから 1 秒経たずに監査の 1 発目が飛ぶ
@@ -265,10 +302,15 @@ impl Orchestrator {
             cargo: &CargoCommand::new(),
             budget: LOCK_AGE_AUDIT_BUDGET,
         };
-        self.audit_lock_age(&audit, bar).await
+        let mut receipt = None;
+        let result = LockAgeAuditor::new(&audit, &self.versions, self.args.verbose)
+            .run_tracked(bar, &mut receipt)
+            .await;
+        (result, receipt)
     }
 
     /// 共有キャッシュを使って独立した lock 監査を実行する。
+    #[cfg(test)]
     async fn audit_lock_age(
         &self,
         audit: &LockAgeAudit<'_>,
@@ -567,6 +609,7 @@ impl Orchestrator {
                 &summary,
                 &scopes,
                 &errors,
+                self.args.refresh_lock,
                 |dir| self.resolved_age_policy_for_language(dir, Language::Node),
                 auditor,
                 bar.as_ref(),

@@ -171,9 +171,25 @@ pub struct CliArgs {
     /// 更新後にパッケージマネージャのインストール処理を実行する
     #[arg(long)]
     pub install: bool,
+
+    /// Re-resolve pnpm/Cargo lockfiles, including transitive dependencies
+    #[arg(long, requires = "install", conflicts_with_all = ["only", "exclude", "max_change"])]
+    pub refresh_lock: bool,
 }
 
 impl CliArgs {
+    /// Also validate defaults resolved from the global configuration before any writes.
+    pub fn validate_refresh_lock(&self) -> Result<(), String> {
+        if self.refresh_lock
+            && (!self.install
+                || !self.only.is_empty()
+                || !self.exclude.is_empty()
+                || self.max_change.is_some())
+        {
+            return Err("--refresh-lock requires --install and cannot be combined with --only, --exclude, or --max-change (including global configuration)".into());
+        }
+        Ok(())
+    }
     /// 言語フィルタが指定されているかを確認する
     pub fn has_language_filter(&self) -> bool {
         !self.selected_languages().is_empty()
@@ -203,6 +219,19 @@ impl CliArgs {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn refresh_lock_requires_install_and_rejects_selection_filters() {
+        use super::CliArgs;
+        use clap::Parser;
+        assert!(CliArgs::try_parse_from(["depup", "--install", "--refresh-lock"]).is_ok());
+        assert!(CliArgs::try_parse_from(["depup", "--refresh-lock"]).is_err());
+        for option in ["--only", "--exclude", "--max-change"] {
+            assert!(
+                CliArgs::try_parse_from(["depup", "--install", "--refresh-lock", option, "patch"])
+                    .is_err()
+            );
+        }
+    }
     use super::*;
     use clap::Parser;
 

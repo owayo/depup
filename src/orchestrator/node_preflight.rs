@@ -92,6 +92,7 @@ pub(super) async fn preflight(
     summary: &UpdateSummary,
     scopes: &ScopeContext<'_>,
     errors: &[OrchestratorError],
+    refresh_lock: bool,
     policy_for: impl Fn(&Path) -> Result<AgePolicy, String>,
     auditor: &impl ExistingLockAuditor,
     bar: Option<&ProgressBar>,
@@ -117,7 +118,9 @@ pub(super) async fn preflight(
     let mut blocked = Vec::new();
     for scope in node_scopes(&inventory, policy_for) {
         if matches!(&scope.policy, Ok(policy) if policy.min_age.is_none())
-            || (scope.updated.is_empty() && !has_related_updates(summary, scopes, &scope.directory))
+            || (!refresh_lock
+                && scope.updated.is_empty()
+                && !has_related_updates(summary, scopes, &scope.directory))
         {
             continue;
         }

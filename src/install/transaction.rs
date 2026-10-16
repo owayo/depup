@@ -38,6 +38,7 @@ struct Unit {
     summaries: BTreeSet<usize>,
     directories: BTreeSet<PathBuf>,
     failure: Option<String>,
+    policy_failure: bool,
 }
 
 /// Prepared commands and snapshots are created once, before any PM is run.
@@ -74,6 +75,7 @@ struct FailedUnit {
     summaries: BTreeSet<usize>,
     reason: String,
     files: BTreeMap<PathBuf, FileOutcome>,
+    policy_failure: bool,
 }
 
 #[derive(Default)]
@@ -206,6 +208,9 @@ impl InstallTransactions {
             }
             if job.language == Language::Node {
                 task.node_root = Some(directory.clone());
+                if matches!(job.scope, Ok(InstallScope::Refresh)) {
+                    tx.add_path(&mut task, &directory.join("pnpm-workspace.yaml"), true);
+                }
             }
             for (index, manifest) in result.summary.manifests.iter().enumerate() {
                 let applies = if job.language == Language::Rust
@@ -501,6 +506,7 @@ impl InstallTransactions {
                     summaries: BTreeSet::new(),
                     directories: BTreeSet::new(),
                     failure: None,
+                    policy_failure: false,
                 });
                 self.units.len() - 1
             });
@@ -540,37 +546,165 @@ impl InstallTransactions {
 
     pub fn execute(&mut self, mut runner: impl FnMut(&PreparedInstall) -> InstallResult) {
         for index in 0..self.tasks.len() {
-            let unit = self.task_units[index];
-            if self.units[unit].failure.is_some() {
-                continue;
-            }
-            // Ownership still matters when no package-manager command is needed.
-            self.observe_trees(index, false);
-            self.observe(unit, &BTreeSet::new());
-            if self.units[unit].failure.is_some() {
-                continue;
-            }
+            self.execute_task(index, None, &mut runner);
+        }
+    }
+
+    fn execute_task(
+        &mut self,
+        index: usize,
+        replacement: Option<PreparedInstall>,
+        runner: &mut impl FnMut(&PreparedInstall) -> InstallResult,
+    ) {
+        let unit = self.task_units[index];
+        if self.units[unit].failure.is_some() {
+            return;
+        }
+        // Ownership still matters when no package-manager command is needed.
+        self.observe_trees(index, false);
+        self.observe(unit, &BTreeSet::new());
+        if self.units[unit].failure.is_some() {
+            return;
+        }
+        let Some(command) = self.tasks[index]
+            .command
+            .as_ref()
+            .ok()
+            .and_then(|command| command.clone())
+            .map(|command| replacement.unwrap_or(command))
+        else {
+            return;
+        };
+        let result = runner(&command);
+        self.observe_trees(index, true);
+        let managed = self.tasks[index].managed.clone();
+        self.observe(unit, &managed);
+        if !result.success {
+            self.units[unit].failure.get_or_insert_with(|| {
+                format!("{} failed: {}", result.command, result.stderr.trim())
+            });
+        }
+        if self.units[unit].failure.is_none() {
+            self.repair_mise_locks(index, &command, runner);
+        }
+    }
+
+    pub(super) fn materialize_nodes(
+        &mut self,
+        mut runner: impl FnMut(&PreparedInstall) -> InstallResult,
+    ) {
+        for index in 0..self.tasks.len() {
             let Some(command) = self.tasks[index]
                 .command
                 .as_ref()
                 .ok()
-                .and_then(|command| command.clone())
+                .and_then(Option::as_ref)
             else {
                 continue;
             };
-            let result = runner(&command);
-            self.observe_trees(index, true);
-            let managed = self.tasks[index].managed.clone();
-            self.observe(unit, &managed);
-            if !result.success {
-                self.units[unit].failure.get_or_insert_with(|| {
-                    format!("{} failed: {}", result.command, result.stderr.trim())
-                });
+            if command.package_manager != "pnpm"
+                || command.argv.get(1).map(String::as_str) != Some("update")
+            {
+                continue;
             }
-            if self.units[unit].failure.is_none() {
-                self.repair_mise_locks(index, &command, &mut runner);
+            let mut command = command.clone();
+            command.argv = vec!["pnpm".into(), "install".into(), "--frozen-lockfile".into()];
+            self.execute_task(index, Some(command), &mut runner);
+        }
+    }
+
+    pub(super) fn pending_report(&self) -> RollbackReport {
+        RollbackReport {
+            units: self
+                .units
+                .iter()
+                .filter_map(|unit| {
+                    unit.failure.as_ref().map(|reason| FailedUnit {
+                        directories: unit.directories.clone(),
+                        summaries: unit.summaries.clone(),
+                        reason: reason.clone(),
+                        files: BTreeMap::new(),
+                        policy_failure: unit.policy_failure,
+                    })
+                })
+                .collect(),
+            node_managers: self.node_managers.clone(),
+        }
+    }
+
+    pub(super) fn declaration_snapshots(&self) -> Vec<(PathBuf, (FileGuard, FileState))> {
+        let mut out = Vec::new();
+        for unit in &self.units {
+            let Some(directory) = unit.directories.first() else {
+                continue;
+            };
+            for key in &unit.files {
+                if !key.file_name().is_some_and(|name| {
+                    name == "Cargo.toml" || name == "package.json" || name == "pnpm-workspace.yaml"
+                }) {
+                    continue;
+                }
+                let record = &self.files[key];
+                if let Some(guard) = record.guards.first() {
+                    out.push((directory.clone(), (guard.clone(), record.expected.clone())));
+                }
             }
         }
+        out
+    }
+
+    pub(super) fn fail_verification(&mut self, directory: &Path, reason: String) {
+        let directory = identity(directory);
+        for unit in &mut self.units {
+            if unit.directories.contains(&directory) && unit.failure.is_none() {
+                unit.failure = Some(reason.clone());
+                unit.policy_failure = true;
+            }
+        }
+    }
+
+    /// Only bytes attested by the auditor are adopted; a later disk read is never ownership evidence.
+    pub(super) fn accept_audit_lock(
+        &mut self,
+        path: &Path,
+        before: &[u8],
+        after: &[u8],
+    ) -> Result<(), String> {
+        let key = resolved_path(path).map_err(|error| error.to_string())?;
+        let record = self
+            .files
+            .get_mut(&key)
+            .ok_or("lockfile is outside the prepared transaction")?;
+        if record.conflict.is_some() || record.expected.bytes.as_deref() != Some(before) {
+            return Err("lockfile changed before the tracked audit".into());
+        }
+        let expected = FileState {
+            bytes: Some(after.to_vec()),
+            permissions: record.expected.permissions.clone(),
+        };
+        let current = read_record(record).map_err(|error| error.to_string())?;
+        if !expected.matches(&current) {
+            record.conflict = Some("lockfile changed after the tracked audit".into());
+            return Err("lockfile changed after the tracked audit".into());
+        }
+        record.expected = expected;
+        Ok(())
+    }
+
+    pub(super) fn check_lock(&self, path: &Path, bytes: Option<&[u8]>) -> Result<(), String> {
+        let key = resolved_path(path).map_err(|error| error.to_string())?;
+        let record = self
+            .files
+            .get(&key)
+            .ok_or("lockfile is outside the prepared transaction")?;
+        if record.conflict.is_some() || record.expected.bytes.as_deref() != bytes {
+            return Err("lockfile differs from the tracked resolution".into());
+        }
+        let current = read_record(record).map_err(|error| error.to_string())?;
+        if !record.expected.matches(&current) {
+            return Err("lockfile changed outside a tracked operation".into());
+        }
+        Ok(())
     }
 
     fn repair_mise_locks(
@@ -765,6 +899,7 @@ impl InstallTransactions {
                 directories: unit.directories.clone(),
                 summaries: unit.summaries.clone(),
                 files,
+                policy_failure: unit.policy_failure,
             });
         }
         report.node_managers = self.node_managers;
@@ -968,6 +1103,9 @@ fn recovery_copy(record: &FileRecord) -> Result<PathBuf, String> {
 }
 
 impl RollbackReport {
+    pub fn has_install_failures(&self) -> bool {
+        self.units.iter().any(|unit| !unit.policy_failure)
+    }
     pub fn node_manager(&self, directory: &Path) -> Option<(PathBuf, &'static str)> {
         self.node_managers.get(&identity(directory)).cloned()
     }
@@ -1003,7 +1141,12 @@ impl RollbackReport {
                 for result in &mut manifest.results {
                     if result.is_update() && result.write_error().is_none() {
                         result.record_write_error(format!(
-                            "install failed; update canceled: {}",
+                            "{} failed; update canceled: {}",
+                            if unit.policy_failure {
+                                "lock verification"
+                            } else {
+                                "install"
+                            },
                             unit.reason
                         ));
                     }
@@ -1015,7 +1158,12 @@ impl RollbackReport {
         for unit in &self.units {
             writeln!(
                 out,
-                "Install failed; recovering project changes ({})",
+                "{} failed; recovering project changes ({})",
+                if unit.policy_failure {
+                    "Lock verification"
+                } else {
+                    "Install"
+                },
                 unit.reason
             )?;
             for (path, outcome) in &unit.files {
@@ -1058,7 +1206,12 @@ impl RollbackReport {
             }
             writeln!(
                 out,
-                "  Install artifacts are retained. Re-run the package manager after recovery; age audits for this project were skipped."
+                "  Install artifacts are retained. Re-run the package manager after recovery{}",
+                if unit.policy_failure {
+                    "."
+                } else {
+                    "; age audits for this project were skipped."
+                }
             )?;
         }
         Ok(())

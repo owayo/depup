@@ -704,6 +704,26 @@ impl TextFormatter {
 
 impl OutputFormatter for TextFormatter {
     fn format(&self, result: &OrchestratorResult, writer: &mut dyn Write) -> std::io::Result<()> {
+        for refresh in &result.summary.lock_refreshes {
+            writeln!(
+                writer,
+                "Lock refresh {} ({}): {}{}{}",
+                refresh.directory.display(),
+                refresh
+                    .language
+                    .map_or("no eligible scope", |language| language.display_name()),
+                refresh.status,
+                if refresh.changed {
+                    " (lockfile changed)"
+                } else {
+                    ""
+                },
+                refresh
+                    .error
+                    .as_ref()
+                    .map_or(String::new(), |error| format!(" — {error}"))
+            )?;
+        }
         // quiet モードではサマリのみ表示
         if self.verbosity == Verbosity::Quiet {
             return self.format_summary(&result.summary, writer);

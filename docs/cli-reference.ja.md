@@ -38,6 +38,7 @@ depup [OPTIONS] [PATH]
 | `--json` | | JSON 形式で出力 |
 | `--diff` | | 変更内容を diff 形式で表示 |
 | `--install` | | 更新後にパッケージマネージャーの install を実行 |
+| `--refresh-lock` | | pnpm/Cargo の間接依存を含め lock を再解決。`--install` が必須。`--only`・`--exclude`・`--max-change`（グローバル設定を含む）とは併用不可 |
 | `--version` | `-V` | バージョンを表示 |
 | `--help` | `-h` | ヘルプを表示 |
 
@@ -104,6 +105,8 @@ depup --cd ./projects/myapp -n
 - エラーは、OSV の通知も含めて `Errors:` 欄に表示します。
 
 ### JSON 出力
+
+`--refresh-lock` では、`lock_refreshes` に各 lock の `directory`、`language`、`status`（`completed`・`failed`・`unsupported`）、`changed`、`error` を出します。`changed` は、採用された再解決で lock が変わったかを示します。外部編集で復元できなかった場合も、失敗した再解決では `false` です。対象がなければ `language` は `null` になります。直接依存の件数には足しません。検証と復元の条件は[ロックファイルの再解決](usage.ja.md#ロックファイルの再解決--install---refresh-lock)を参照してください。
 
 `--json --install` は、install の復元と age 監査が終わってから JSON を 1 回だけ出力して flush します。install が失敗しても JSON を出します。失敗したプロジェクトの取り消した更新は、復元の競合や lock だけを変える Git 更新も含め、理由付きで `updates` から `failed` に移ります。独立したプロジェクトの成功は `updates` に残ります。復元の詳細とコピーの保存先は標準エラー出力に出します。
 

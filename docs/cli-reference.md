@@ -38,6 +38,7 @@ depup [OPTIONS] [PATH]
 | `--json` | | Output results in JSON format |
 | `--diff` | | Show changes in diff format |
 | `--install` | | Run package manager install after update |
+| `--refresh-lock` | | Re-resolve pnpm/Cargo lockfiles, including transitive dependencies; requires `--install`; incompatible with `--only`, `--exclude`, and `--max-change` (including global defaults) |
 | `--version` | `-V` | Show version |
 | `--help` | `-h` | Show help |
 
@@ -104,6 +105,8 @@ depup --cd ./projects/myapp -n
 - Errors, including OSV notices, are listed in the `Errors:` section
 
 ### JSON Output
+
+With `--refresh-lock`, `lock_refreshes` reports each lock scope's `directory`, `language`, `status` (`completed`, `failed`, or `unsupported`), `changed`, and `error`. `changed` means an accepted refresh changed the lock; a failed refresh has `changed: false`, including when an external edit prevents recovery. If no eligible scope exists, `language` is `null`. Direct dependency counts retain their existing meaning. See [Refreshing Lockfiles](usage.md#refreshing-lockfiles---install---refresh-lock) for verification and recovery.
 
 With `--json --install`, output is deferred until install recovery and age audits finish, then one JSON value is flushed even if install fails. Updates canceled by a failed project, including recovery conflicts and lock-only Git updates, move from `updates` to `failed` with a reason. Successful independent projects remain in `updates`. Recovery details and copy locations go to stderr.
 

@@ -98,6 +98,12 @@ pub struct LockAgeAuditResult {
     pub problems: Vec<String>,
 }
 
+/// The initial checkpoint and the final bytes owned by audited Cargo operations.
+pub(crate) struct AuditReceipt {
+    pub(crate) before: Vec<u8>,
+    pub(crate) after: Vec<u8>,
+}
+
 impl LockAgeAuditResult {
     /// 最終 lock に age 違反や未確認の状態が残ったか。既存版も例外にしない。
     pub fn has_unresolved(&self) -> bool {
@@ -598,7 +604,16 @@ impl<'a> LockAgeAuditor<'a> {
     }
 
     /// 検査・差し戻しを反復し、最終 lock の状態から結果を確定する。
+    #[cfg(test)]
     pub(crate) async fn run(&self, bar: Option<&ProgressBar>) -> LockAgeAuditResult {
+        self.run_tracked(bar, &mut None).await
+    }
+
+    pub(crate) async fn run_tracked(
+        &self,
+        bar: Option<&ProgressBar>,
+        receipt: &mut Option<AuditReceipt>,
+    ) -> LockAgeAuditResult {
         let mut state = AuditState::new(self.input.budget);
         #[cfg(test)]
         {
@@ -611,7 +626,7 @@ impl<'a> LockAgeAuditor<'a> {
                 if self.input.budget.is_zero()
                     || changed_entries(&entries, self.input.baseline).is_empty()
                 {
-                    return self.finalize(state, bar).await;
+                    return self.finalize(state, bar, receipt).await;
                 }
             }
             Err(problem) => {
@@ -626,7 +641,7 @@ impl<'a> LockAgeAuditor<'a> {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
                     state.problems.push(error);
-                    return self.finalize(state, bar).await;
+                    return self.finalize(state, bar, receipt).await;
                 }
             };
         // 最後の一巡は差し戻さず、直前の解決で入った版を検証する。
@@ -665,7 +680,7 @@ impl<'a> LockAgeAuditor<'a> {
                 break;
             }
         }
-        self.complete(state, &snapshot, bar).await
+        self.complete(state, &snapshot, bar, receipt).await
     }
 
     async fn complete(
@@ -673,6 +688,7 @@ impl<'a> LockAgeAuditor<'a> {
         mut state: AuditState,
         snapshot: &snapshot::AuditSnapshot,
         bar: Option<&ProgressBar>,
+        receipt: &mut Option<AuditReceipt>,
     ) -> LockAgeAuditResult {
         if state.problems.is_empty() {
             self.restore_mixed(&mut state).await;
@@ -680,7 +696,7 @@ impl<'a> LockAgeAuditor<'a> {
         if !state.problems.is_empty() {
             snapshot.restore(&mut state);
         }
-        self.finalize(state, bar).await
+        self.finalize(state, bar, receipt).await
     }
 
     /// 一巡分の公開日検査と、単独で差し戻せる候補の適用。
@@ -1235,7 +1251,12 @@ impl<'a> LockAgeAuditor<'a> {
     }
 
     /// 差し戻しとは別の時間予算で、最終 lock の全件を検証する。
-    async fn finalize(&self, state: AuditState, bar: Option<&ProgressBar>) -> LockAgeAuditResult {
+    async fn finalize(
+        &self,
+        state: AuditState,
+        bar: Option<&ProgressBar>,
+        receipt: &mut Option<AuditReceipt>,
+    ) -> LockAgeAuditResult {
         let LockAgeAudit {
             project_dir,
             cutoff,
@@ -1249,6 +1270,8 @@ impl<'a> LockAgeAuditor<'a> {
         let AuditState {
             mut log,
             mut problems,
+            changes,
+            installed_lock,
             ..
         } = state;
         let (content, final_entries) = match read_audit_lock(&lock_path) {
@@ -1367,6 +1390,11 @@ impl<'a> LockAgeAuditor<'a> {
             .map_or(true, |final_content| final_content != content)
         {
             problems.push("Cargo.lock changed during final age verification; rerun --install to verify the new state".into());
+        } else if changes.allows_snapshot_restore(Some(content.as_bytes())) {
+            *receipt = Some(AuditReceipt {
+                before: installed_lock.into_bytes(),
+                after: content.into_bytes(),
+            });
         }
         LockAgeAuditResult {
             adjustments: log.into_adjustments(),
