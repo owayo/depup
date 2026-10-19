@@ -631,10 +631,50 @@ async fn pnpm_scoped_registry_overrides_default_and_private_tarballs_remain_unve
 
 #[cfg(unix)]
 #[tokio::test]
+async fn pnpm_unset_scoped_registry_falls_back_to_verified_default() {
+    let directory = tempfile::tempdir().unwrap();
+    for unset in ["", " \t\r\n", "null"] {
+        let program = fake_pnpm(
+            directory.path(),
+            &format!(
+                "case \"$3\" in registry) printf '\"https://registry.npmjs.org/\"';; *) printf '%s' '{unset}';; esac"
+            ),
+        );
+        let mut snapshot = parse_pnpm_snapshot(&json!([{"dependencies":{
+            "@example/public":package("@example/public","1.0.0")
+        }}]))
+        .unwrap();
+        verify_pnpm_registry_sources(
+            directory.path(),
+            &program,
+            &mut snapshot,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let provider = FakeDates {
+            dates: HashMap::from([(
+                "@example/public".into(),
+                dates(&[("1.0.0", "2026-09-01T00:00:00Z")]),
+            )]),
+            ..Default::default()
+        };
+        let result = check(snapshot, &provider).await;
+        assert!(!result.has_failures(), "{unset:?}: {result:?}");
+        assert_eq!(result.checked, 1);
+        assert_eq!(*provider.requests.lock().unwrap(), vec!["@example/public"]);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn pnpm_unreadable_registry_config_never_sends_names_to_public_npm() {
     let directory = tempfile::tempdir().unwrap();
     for script in [
         "exit 7",
+        "exit 0",
+        "printf ' \t\r\n'",
+        "printf warning >&2",
         "printf 'not JSON'",
         "printf null",
         "printf '\"https://registry.npmjs.org/\"'; printf warning >&2",

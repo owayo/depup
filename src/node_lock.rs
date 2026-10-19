@@ -278,6 +278,10 @@ async fn read_pnpm_registry(
     if !output.status.success() || !output.stderr.is_empty() {
         return Err("effective registry configuration could not be verified".into());
     }
+    // pnpm 11 emits no JSON for unset keys; newer versions emit null.
+    if output.stdout.trim_ascii().is_empty() {
+        return Ok(None);
+    }
     match serde_json::from_slice::<Value>(&output.stdout)
         .map_err(|_| "effective registry configuration was not valid JSON".to_string())?
     {
