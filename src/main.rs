@@ -121,8 +121,8 @@ async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
 
     // 結果を出力
     let mut stdout = io::stdout().lock();
-    let defer_json = (args.json || args.refresh_lock) && args.install && !args.dry_run;
-    if !defer_json {
+    let defer_output = args.install && !args.dry_run;
+    if !defer_output {
         formatter.format(&result, &mut stdout)?;
         stdout.flush()?;
     }
@@ -154,7 +154,7 @@ async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
             &mut result,
             formatter.as_ref(),
             &mut stdout,
-            defer_json,
+            defer_output,
         )
         .await?;
     }
@@ -175,7 +175,7 @@ async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
     }
 }
 
-/// Recovery and audit finish before the single final JSON value is flushed.
+/// Recovery and verification finish before the final output is flushed.
 async fn finish_install(
     args: &CliArgs,
     orchestrator: &Orchestrator,
@@ -183,11 +183,11 @@ async fn finish_install(
     result: &mut depup::orchestrator::OrchestratorResult,
     formatter: &dyn depup::output::OutputFormatter,
     stdout: &mut impl Write,
-    defer_json: bool,
+    defer_output: bool,
 ) -> anyhow::Result<bool> {
     if args.refresh_lock {
         let outcome = depup::install::refresh::run(args, orchestrator, plan, result).await;
-        if defer_json {
+        if defer_output {
             formatter.format(result, stdout)?;
             stdout.flush()?;
         }
@@ -203,8 +203,36 @@ async fn finish_install(
     recovery.exclude_rust_audits(&mut audit_plan);
     let mut age_audit_failed = enforce_rust_lock_age(args, orchestrator, &audit_plan).await;
     age_audit_failed |= enforce_node_lock_age(args, plan, &recovery).await;
+    let pm = SystemPackageManager::new();
+    let mut verification_progress = Progress::new(!args.quiet);
+    for job in plan
+        .jobs
+        .iter()
+        .filter(|job| job.language == Language::Node && !recovery.covers_directory(&job.directory))
+    {
+        let manager = recovery
+            .node_manager(&job.directory)
+            .or_else(|| pm.resolve_package_manager(job.language, &job.directory));
+        if let Some((directory, "pnpm")) = manager {
+            verification_progress.spinner("Verifying pnpm update targets in the final lockfile");
+            for message in
+                depup::node_lock::verify_pnpm_update_targets(&directory, &mut result.summary).await
+            {
+                verification_progress
+                    .suspend(|| eprintln!("  {} — {message}", directory.display()));
+                result.errors.push(
+                    depup::orchestrator::OrchestratorError::InstallResolutionError {
+                        directory: directory.clone(),
+                        message,
+                    },
+                );
+                age_audit_failed = true;
+            }
+        }
+    }
+    verification_progress.finish_and_clear();
     report_rust_lock_mismatches(&audit_plan);
-    if defer_json {
+    if defer_output {
         formatter.format(result, stdout)?;
         stdout.flush()?;
     }

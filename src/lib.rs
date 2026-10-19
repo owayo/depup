@@ -26,6 +26,7 @@ pub mod osv;
 pub mod output;
 pub mod package_manager;
 pub mod parser;
+mod pnpm_overrides;
 pub mod progress;
 pub mod registry;
 pub mod tauri_sync;

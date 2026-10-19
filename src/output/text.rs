@@ -154,6 +154,7 @@ impl TextFormatter {
             SkipReason::CurrentVersionTooRecent => "newer than --age".to_string(),
             SkipReason::Excluded => "excluded".to_string(),
             SkipReason::NotInOnlyList => "not in --only".to_string(),
+            SkipReason::PnpmOverride(message) => message.clone(),
             SkipReason::FetchFailed(msg) => format!("fetch failed: {}", msg),
             SkipReason::LanguageFiltered => "filtered".to_string(),
             SkipReason::NoSuitableVersion => "no suitable version".to_string(),

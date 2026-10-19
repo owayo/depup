@@ -21,6 +21,10 @@ pub(super) struct ScopeContext<'a> {
 
 #[async_trait]
 pub(super) trait ExistingLockAuditor: Sync {
+    async fn overrides(
+        &self,
+        directory: &Path,
+    ) -> Result<crate::pnpm_overrides::PnpmOverrides, String>;
     async fn audit(
         &self,
         directory: &Path,
@@ -33,6 +37,13 @@ pub(super) struct PnpmLockAuditor;
 
 #[async_trait]
 impl ExistingLockAuditor for PnpmLockAuditor {
+    async fn overrides(
+        &self,
+        directory: &Path,
+    ) -> Result<crate::pnpm_overrides::PnpmOverrides, String> {
+        crate::pnpm_overrides::PnpmOverrides::read(directory).await
+    }
+
     async fn audit(
         &self,
         directory: &Path,

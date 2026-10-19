@@ -735,6 +735,37 @@ async fn pnpm_list_reads_every_workspace_from_the_lock() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn pnpm_direct_edges_keep_aliases_separate_and_reject_conflicting_records() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"dependencies":{"first":"npm:actual@^1","second":"npm:actual@^2"}}"#,
+    )
+    .unwrap();
+    let graph = json!([{"dependencies":{"first":package("actual", "1.0.0"), "second":package("actual", "2.0.0")}}]);
+    let program = fake_pnpm(&root, &format!("printf '%s' '{}'", graph));
+    let snapshot = read_pnpm_graph(&root, &program, Instant::now() + Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot.direct_edges[&root]["first"],
+        ("actual".into(), "1.0.0".into())
+    );
+    assert_eq!(
+        snapshot.direct_edges[&root]["second"],
+        ("actual".into(), "2.0.0".into())
+    );
+    let graph = json!([{"dependencies":{"first":package("actual", "1.0.0"), "second":package("actual", "2.0.0")}, "devDependencies":{"first":package("actual", "3.0.0")}}]);
+    let program = fake_pnpm(&root, &format!("printf '%s' '{}'", graph));
+    let snapshot = read_pnpm_graph(&root, &program, Instant::now() + Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert_eq!(snapshot.direct_edges[&root]["first"].1, "<ambiguous>");
+}
+
 #[test]
 fn pnpm_empty_stale_importer_is_unverified_even_when_list_exits_successfully() {
     let directory = tempfile::tempdir().unwrap();
@@ -751,6 +782,22 @@ fn pnpm_empty_stale_importer_is_unverified_even_when_list_exits_successfully() {
     );
     let complete = json!([{"path": directory.path(), "dependencies": {"required": package("required", "1.0.0")}}]);
     assert!(verify_pnpm_manifest_dependencies(directory.path(), &complete).is_ok());
+}
+
+#[test]
+fn pnpm_rootless_workspace_graph_validates_its_member_manifests() {
+    let directory = tempfile::tempdir().unwrap();
+    let member = directory.path().join("member");
+    std::fs::create_dir_all(&member).unwrap();
+    std::fs::write(
+        member.join("package.json"),
+        r#"{"dependencies":{"example":"^1.0.0"}}"#,
+    )
+    .unwrap();
+    let graph = json!([{"path":member,"dependencies":{"example":package("example", "1.0.0")}}]);
+    assert!(verify_pnpm_manifest_dependencies(directory.path(), &graph).is_ok());
+    let stale = json!([{"path":member,"dependencies":{}}]);
+    assert!(verify_pnpm_manifest_dependencies(directory.path(), &stale).is_err());
 }
 
 #[test]

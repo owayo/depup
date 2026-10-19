@@ -87,6 +87,7 @@ fn fixture(root: &Path, languages: &[(PathBuf, Language)]) -> (OrchestratorResul
 
 #[derive(Default)]
 struct FakeVerification {
+    node_version: Option<String>,
     seen: Mutex<Vec<String>>,
     osv_error: Option<String>,
     age_error: bool,
@@ -122,6 +123,15 @@ impl Verification for FakeVerification {
             bytes: Some(content.into_bytes()),
             packages,
             protected,
+            node_direct_edges: self
+                .node_version
+                .as_ref()
+                .map_or_else(BTreeMap::new, |version| {
+                    BTreeMap::from([(
+                        job.directory.canonicalize().unwrap(),
+                        BTreeMap::from([("example".into(), ("example".into(), version.clone()))]),
+                    )])
+                }),
             ..Default::default()
         })
     }
@@ -167,6 +177,75 @@ impl Verification for FakeVerification {
             std::fs::write(path, "external edit").unwrap();
         }
         self.osv_error.clone().map_or(Ok(()), Err)
+    }
+}
+
+#[tokio::test]
+async fn pnpm_refresh_rolls_back_failed_direct_targets_and_accepts_newer_resolution() {
+    use crate::domain::{Dependency, VersionSpec, VersionSpecKind};
+    use crate::manifest::{ManifestWriter, PackageJsonParser};
+    for version in [None, Some("1.1.0"), Some("1.3.0")] {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut result, plan) = fixture(temp.path(), &[(temp.path().into(), Language::Node)]);
+        let path = temp.path().join("package.json");
+        let original = r#"{"dependencies":{"example":"^1.0.0"}}"#;
+        std::fs::write(&path, original).unwrap();
+        result.summary.manifests[0].add_result(UpdateResult::update(
+            Dependency::new(
+                "example",
+                VersionSpec::new(VersionSpecKind::Caret, "^1.0.0", "1.0.0"),
+                false,
+                Language::Node,
+            ),
+            "1.2.0",
+        ));
+        result.write_results.push(
+            ManifestWriter::new(false)
+                .apply_updates(&result.summary.manifests[0], &PackageJsonParser)
+                .unwrap(),
+        );
+        let args = args(temp.path());
+        let orchestrator = Orchestrator::new(args.clone()).unwrap();
+        let verifier = FakeVerification {
+            node_version: version.map(str::to_string),
+            ..Default::default()
+        };
+        let mut calls = 0;
+        let outcome = run_with(
+            &args,
+            &orchestrator,
+            &plan,
+            &mut result,
+            &verifier,
+            |command| {
+                calls += 1;
+                resolved(command)
+            },
+        )
+        .await;
+        assert!(!outcome.install_failed);
+        if version == Some("1.3.0") {
+            assert!(!outcome.audit_failed);
+            assert_eq!(calls, 2);
+            assert_eq!(result.summary.total_updates(), 1);
+        } else {
+            assert!(outcome.audit_failed);
+            assert_eq!(calls, 1);
+            assert_eq!(result.summary.total_updates(), 0);
+            assert_eq!(result.summary.total_failed(), 1);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+            assert_eq!(
+                std::fs::read_to_string(temp.path().join("pnpm-lock.yaml")).unwrap(),
+                lock("1.0.0")
+            );
+            assert!(
+                result.summary.lock_refreshes[0]
+                    .error
+                    .as_ref()
+                    .unwrap()
+                    .contains("target 1.2.0")
+            );
+        }
     }
 }
 

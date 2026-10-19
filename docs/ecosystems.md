@@ -10,6 +10,10 @@ To process additional directories, list them in a [`.depup` file](configuration.
 
 depup detects `pnpm-workspace.yaml` and processes all workspace packages. Both block-style (`- 'packages/*'`) and flow-style (`packages: ['packages/*', 'apps/*']`) `packages` arrays are supported, including negation patterns (`!packages/legacy`).
 
+For pnpm, depup leaves overrides unchanged and skips direct declarations controlled by an effective override, with a reason identifying the setting. Both fixed and ranged overrides are protected, even with `--include-pinned`. Version-qualified selectors are conservatively protected; a `parent>child` selector does not block an unrelated direct `child`. Scoped names and npm aliases are recognized. Effective settings are queried once per resolution scope with `pnpm config get overrides --json`, so pnpm must be available; an unsuccessful or invalid query stops that scope. Legacy `package.json` `pnpm.overrides` is considered only before pnpm 11, which stopped using that setting.
+
+After pnpm `--install`, including `--refresh-lock` and `--no-age`, depup checks each updated runtime, development, and optional dependency against its own workspace importer and declaration key in the final lock graph. The resolved version must equal or exceed the reported target. Missing, ambiguous, invalid, or unreadable resolutions are failures; a version from another alias, importer, or transitive dependency cannot satisfy the check. Peer-only requirements do not require a local installation. A failed check is shown in text, quiet, diff, and JSON output, is excluded from successful update counts, and returns exit code 2. Ordinary installs keep manifest and lockfile changes for inspection; refresh uses its existing recovery process. Package-manager execution failures still return exit code 1.
+
 ### Cargo Workspaces
 
 depup expands `[workspace] members` (including glob patterns like `crates/*`) and leaves out entries listed in `[workspace] exclude`.
