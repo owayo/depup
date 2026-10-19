@@ -165,6 +165,7 @@ impl JsonFormatter {
             SkipReason::CurrentVersionTooRecent => "current_version_too_recent".to_string(),
             SkipReason::Excluded => "excluded".to_string(),
             SkipReason::NotInOnlyList => "not_in_only_list".to_string(),
+            SkipReason::PnpmOverride(message) => format!("pnpm_override: {message}"),
             SkipReason::FetchFailed(msg) => format!("fetch_failed: {}", msg),
             SkipReason::LanguageFiltered => "language_filtered".to_string(),
             SkipReason::NoSuitableVersion => "no_suitable_version".to_string(),

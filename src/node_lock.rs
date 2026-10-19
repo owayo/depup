@@ -19,6 +19,10 @@ const NODE_AUDIT_BUDGET: Duration = Duration::from_secs(180);
 const PNPM_LIST_TIMEOUT: Duration = Duration::from_secs(60);
 const PUBLICATION_CONCURRENCY: usize = 8;
 
+mod targets;
+pub use targets::verify_pnpm_update_targets;
+pub(crate) use targets::{DirectEdges, target_failures};
+
 type PublicationDates = HashMap<String, DateTime<Utc>>;
 
 #[derive(Debug, Clone)]
@@ -79,6 +83,7 @@ pub(crate) struct LockSnapshot {
     unverified: BTreeSet<NodeUnverifiedDependency>,
     pub(crate) protected: BTreeSet<String>,
     pub(crate) direct: BTreeMap<PathBuf, BTreeMap<String, String>>,
+    pub(crate) direct_edges: DirectEdges,
     sources: BTreeMap<(String, String), BTreeSet<String>>,
 }
 
@@ -363,6 +368,7 @@ async fn read_pnpm_graph(
             .unwrap_or_else(|| directory.to_path_buf());
         let path = path.canonicalize().map_err(|error| error.to_string())?;
         let mut direct = BTreeMap::new();
+        let edges = snapshot.direct_edges.entry(path.clone()).or_default();
         for section in ["dependencies", "devDependencies", "optionalDependencies"] {
             for (name, package) in project
                 .get(section)
@@ -370,12 +376,25 @@ async fn read_pnpm_graph(
                 .into_iter()
                 .flatten()
             {
-                if let Some(version) = package.get("version").and_then(Value::as_str) {
+                {
+                    let version = package
+                        .get("version")
+                        .and_then(Value::as_str)
+                        .unwrap_or("<unknown>");
                     let real_name = package
                         .get("resolved")
                         .and_then(Value::as_str)
                         .and_then(|source| public_tarball_package(source, version))
                         .unwrap_or_else(|| name.clone());
+                    let edge = (real_name.clone(), version.to_string());
+                    edges
+                        .entry(name.clone())
+                        .and_modify(|old| {
+                            if old != &edge {
+                                *old = ("<ambiguous>".into(), "<ambiguous>".into());
+                            }
+                        })
+                        .or_insert(edge);
                     direct
                         .entry(real_name)
                         .and_modify(|old: &mut String| {
@@ -408,6 +427,7 @@ fn verify_pnpm_manifest_dependencies(directory: &Path, value: &Value) -> Result<
         .canonicalize()
         .map_err(|error| format!("could not locate pnpm audit directory: {error}"))?;
     let mut saw_root = false;
+    let root_manifest_missing = matches!(std::fs::symlink_metadata(root.join("package.json")), Err(error) if error.kind() == std::io::ErrorKind::NotFound);
     for project in projects {
         let project_path = match project.get("path").and_then(Value::as_str) {
             Some(path) => PathBuf::from(path),
@@ -424,6 +444,9 @@ fn verify_pnpm_manifest_dependencies(directory: &Path, value: &Value) -> Result<
             return Err("pnpm graph references a project outside the audited workspace".into());
         }
         saw_root |= project_path == root;
+        if project_path == root && root_manifest_missing {
+            continue;
+        }
         let manifest = std::fs::read(project_path.join("package.json"))
             .map_err(|error| format!("could not read pnpm graph project package.json: {error}"))?;
         let manifest: Value = serde_json::from_slice(&manifest)
@@ -459,7 +482,7 @@ fn verify_pnpm_manifest_dependencies(directory: &Path, value: &Value) -> Result<
             }
         }
     }
-    if !saw_root {
+    if !saw_root && !root_manifest_missing {
         return Err(
             "pnpm graph omitted the workspace root; completeness could not be checked".into(),
         );

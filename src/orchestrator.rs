@@ -38,7 +38,7 @@ use crate::update::{
 };
 use futures::stream::{self, StreamExt};
 use indicatif::ProgressBar;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -113,6 +113,8 @@ pub enum OrchestratorError {
     RegistryError { package: String, message: String },
     /// マニフェストの書き込みに失敗
     WriteError { path: String, message: String },
+    /// The final pnpm resolution did not reach an announced update target.
+    InstallResolutionError { directory: PathBuf, message: String },
     /// 書き込み前に停止した共有 pnpm scope。事後に同じ lock を再監査しない。
     NodePreflightError { directory: PathBuf, message: String },
     /// Stop a Cargo manifest and its confirmed install/audit root, if known.
@@ -140,6 +142,14 @@ impl std::fmt::Display for OrchestratorError {
             }
             OrchestratorError::WriteError { path, message } => {
                 write!(f, "Failed to write {}: {}", path, message)
+            }
+            OrchestratorError::InstallResolutionError { directory, message } => {
+                write!(
+                    f,
+                    "pnpm resolution verification failed in {}: {}",
+                    directory.display(),
+                    message
+                )
             }
             OrchestratorError::NodePreflightError { directory, message } => {
                 write!(
@@ -578,7 +588,7 @@ impl Orchestrator {
         let manifests = manifests.as_slice();
 
         let parsed = self.parse_phase(manifests, progress, &mut errors);
-        self.check_phase(parsed, progress, &mut summary, &mut errors)
+        self.check_phase(parsed, progress, &mut summary, &mut errors, auditor)
             .await;
         self.sync_tauri_if_needed(manifests, progress, &mut summary, &mut errors)
             .await;
@@ -679,11 +689,13 @@ impl Orchestrator {
         progress: &mut Progress,
         summary: &mut UpdateSummary,
         errors: &mut Vec<OrchestratorError>,
+        auditor: &impl node_preflight::ExistingLockAuditor,
     ) {
         let total_deps: usize = parsed.iter().map(|p| p.dependencies.len()).sum();
         progress.start(total_deps as u64, "Checking dependencies");
         let progress_bar = progress.bar();
 
+        let mut pnpm_settings = BTreeMap::new();
         for ParsedManifest { info, dependencies } in parsed {
             let dir = info.path.parent().unwrap_or(&self.args.path);
             let mut filter = self.build_filter_for(dir);
@@ -699,6 +711,32 @@ impl Orchestrator {
             };
             filter.min_age = policy.min_age;
             filter.age_exempt = policy.exemptions.clone();
+            let overrides = if info.language == Language::Node
+                && dependencies
+                    .iter()
+                    .any(|dependency| filter.package_filter_skip_reason(dependency).is_none())
+            {
+                let scope = crate::node_scope::node_resolution_directory(&info.path);
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    pnpm_settings.entry(scope.clone())
+                {
+                    entry.insert(auditor.overrides(&scope).await);
+                }
+                match &pnpm_settings[&scope] {
+                    Ok(settings) => Some(settings),
+                    Err(message) => {
+                        errors.push(OrchestratorError::ManifestParseError {
+                            path: info.path.display().to_string(),
+                            message: format!(
+                                "could not verify effective pnpm overrides: {message}"
+                            ),
+                        });
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
             if filter.min_age.is_some()
                 && !filter.age_exempt.is_empty()
                 && !dependencies.is_empty()
@@ -711,6 +749,7 @@ impl Orchestrator {
                     "Notice: age_exempt.github is unavailable for other registries; their dependencies retain the age filter"
                 );
             }
+            let package_filter = filter.clone();
             let judge = UpdateJudge::with_time(filter, self.evaluated_at);
             let judge = &judge;
             let mut manifest_result = ManifestUpdateResult::new(&info.path, info.language);
@@ -738,13 +777,25 @@ impl Orchestrator {
                 .map(|dep| {
                     let adapter = Arc::clone(&adapter);
                     let bar = progress_bar.clone();
+                    let override_reason = overrides.and_then(|settings| settings.reason(&dep));
+                    let package_filter = package_filter.package_filter_skip_reason(&dep);
                     async move {
                         if let Some(ref b) = bar {
                             b.set_message(format!("Checking {}", dep.name));
                         }
-                        let result = self
-                            .process_one_dependency(dep, &*adapter, judge, bar.as_ref())
-                            .await;
+                        let result = if let Some(reason) =
+                            package_filter.or_else(|| override_reason.map(SkipReason::PnpmOverride))
+                        {
+                            OnePassResult {
+                                name: dep.name.clone(),
+                                outcome: UpdateResult::skip(dep, reason),
+                                fetch_error: None,
+                                osv_warnings: Vec::new(),
+                            }
+                        } else {
+                            self.process_one_dependency(dep, &*adapter, judge, bar.as_ref())
+                                .await
+                        };
                         if let Some(ref b) = bar {
                             b.inc(1);
                         }

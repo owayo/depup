@@ -16,12 +16,31 @@ use std::time::Duration;
 
 #[derive(Default)]
 struct FakeAuditor {
+    override_settings:
+        Mutex<BTreeMap<PathBuf, Result<crate::pnpm_overrides::PnpmOverrides, String>>>,
+    override_calls: Mutex<Vec<PathBuf>>,
     results: Mutex<BTreeMap<PathBuf, NodeLockAuditResult>>,
     calls: Mutex<Vec<(PathBuf, AgePolicy)>>,
 }
 
 #[async_trait]
 impl ExistingLockAuditor for FakeAuditor {
+    async fn overrides(
+        &self,
+        directory: &Path,
+    ) -> Result<crate::pnpm_overrides::PnpmOverrides, String> {
+        self.override_calls
+            .lock()
+            .unwrap()
+            .push(directory.to_path_buf());
+        self.override_settings
+            .lock()
+            .unwrap()
+            .get(directory)
+            .cloned()
+            .unwrap_or_else(|| Ok(Default::default()))
+    }
+
     async fn audit(
         &self,
         directory: &Path,
@@ -47,6 +66,110 @@ fn write_project(directory: &Path) {
         r#"{"dependencies":{"example":"^1.0.0"}}"#,
     )
     .unwrap();
+}
+
+#[tokio::test]
+async fn pnpm_overrides_are_cached_per_workspace_and_protect_dry_run_without_age() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    std::fs::write(root.join("package.json"), "{}").unwrap();
+    std::fs::write(root.join("pnpm-workspace.yaml"), "packages: ['apps/*']\n").unwrap();
+    let a = root.join("apps/a");
+    let b = root.join("apps/b");
+    let outside = root.join("independent");
+    for member in [&a, &b, &outside] {
+        write_project(member);
+    }
+    let orchestrator = orchestrator(
+        &root,
+        &["--dry-run", "--install", "--no-age", "--include-pinned"],
+    )
+    .await;
+    let auditor = FakeAuditor::default();
+    auditor.override_settings.lock().unwrap().insert(
+        root.clone(),
+        Ok(crate::pnpm_overrides::PnpmOverrides::for_selectors(&[
+            "example",
+        ])),
+    );
+    let result = run(&orchestrator, &[&root, &outside], &auditor).await;
+    assert_eq!(result.summary.total_skips(), 2);
+    assert_eq!(result.summary.total_updates(), 1);
+    assert_eq!(
+        auditor
+            .override_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|path| **path == root)
+            .count(),
+        1
+    );
+    assert!(result.summary.all_skips().all(|item| matches!(
+        item,
+        crate::domain::UpdateResult::Skip {
+            reason: crate::domain::SkipReason::PnpmOverride(_),
+            ..
+        }
+    )));
+    assert!(auditor.calls.lock().unwrap().is_empty());
+    for member in [&a, &b] {
+        assert!(
+            std::fs::read_to_string(member.join("package.json"))
+                .unwrap()
+                .contains("^1.0.0")
+        );
+    }
+}
+
+#[tokio::test]
+async fn pnpm_unverified_overrides_stop_updates_before_write() {
+    let temp = tempfile::tempdir().unwrap();
+    write_project(temp.path());
+    let root = temp.path().canonicalize().unwrap();
+    let orchestrator = orchestrator(&root, &["--no-age"]).await;
+    let auditor = FakeAuditor::default();
+    auditor
+        .override_settings
+        .lock()
+        .unwrap()
+        .insert(root.clone(), Err("configuration unavailable".into()));
+    let result = run(&orchestrator, &[&root], &auditor).await;
+    assert_eq!(result.summary.total_updates(), 0);
+    assert!(
+        result
+            .errors
+            .iter()
+            .any(|error| error.to_string().contains("effective pnpm overrides"))
+    );
+    assert!(
+        std::fs::read_to_string(root.join("package.json"))
+            .unwrap()
+            .contains("^1.0.0")
+    );
+}
+
+#[tokio::test]
+async fn pnpm_override_queries_respect_package_filters() {
+    let temp = tempfile::tempdir().unwrap();
+    write_project(temp.path());
+    let root = temp.path().canonicalize().unwrap();
+    for options in [
+        vec!["--no-age", "--exclude", "example"],
+        vec!["--no-age", "--only", "other"],
+    ] {
+        let orchestrator = orchestrator(&root, &options).await;
+        let auditor = FakeAuditor::default();
+        auditor
+            .override_settings
+            .lock()
+            .unwrap()
+            .insert(root.clone(), Err("must not be queried".into()));
+        let result = run(&orchestrator, &[&root], &auditor).await;
+        assert_eq!(result.summary.total_skips(), 1);
+        assert!(result.errors.is_empty());
+        assert!(auditor.override_calls.lock().unwrap().is_empty());
+    }
 }
 
 fn lock(directory: &Path) {

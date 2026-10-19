@@ -128,6 +128,7 @@ struct Snapshot {
     packages: BTreeSet<(String, String)>,
     protected: BTreeSet<String>,
     node_direct: BTreeMap<PathBuf, BTreeMap<String, String>>,
+    node_direct_edges: crate::node_lock::DirectEdges,
 }
 
 fn lock_path(job: &InstallJob) -> PathBuf {
@@ -171,6 +172,7 @@ impl Verification for SystemVerification<'_> {
                 packages: node.packages,
                 protected: node.protected,
                 node_direct: node.direct,
+                node_direct_edges: node.direct_edges,
             });
         }
         let (content, entries) = read_audit_lock(&lock_path(job))?;
@@ -352,6 +354,10 @@ async fn run_with(
         let checked = async {
             let snapshot = verifier.snapshot(job).await?;
             tx.check_lock(&lock_path(job), snapshot.bytes.as_deref())?;
+            if job.language == Language::Node {
+                let failures = crate::node_lock::target_failures(&result.summary, &job.directory, &snapshot.node_direct_edges);
+                if !failures.is_empty() { return Err(failures.into_iter().map(|failure| failure.message).collect::<Vec<_>>().join("; ")); }
+            }
             if snapshot.protected != before.protected { return Err("lock refresh changed an external dependency whose registry policy cannot be verified".into()); }
             check_osv(verifier, job.language, &before.packages, &snapshot.packages, &progress).await?;
             // Recheck the admitted bytes after network operations.

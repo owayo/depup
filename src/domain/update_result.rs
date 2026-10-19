@@ -19,6 +19,8 @@ pub enum SkipReason {
     Excluded,
     /// --only リストに含まれていない
     NotInOnlyList,
+    /// An effective pnpm override controls this declaration; overrides remain unchanged.
+    PnpmOverride(String),
     /// レジストリからのバージョン情報取得に失敗
     FetchFailed(String),
     /// 適切なバージョンが見つからない (例: 経過日数フィルタで全バージョンが除外)
@@ -42,6 +44,7 @@ impl fmt::Display for SkipReason {
             SkipReason::CurrentVersionTooRecent => write!(f, "current version is newer than --age"),
             SkipReason::Excluded => write!(f, "excluded by --exclude"),
             SkipReason::NotInOnlyList => write!(f, "not in --only list"),
+            SkipReason::PnpmOverride(message) => write!(f, "{message}"),
             SkipReason::FetchFailed(msg) => write!(f, "fetch failed: {}", msg),
             SkipReason::NoSuitableVersion => write!(f, "no suitable version"),
             SkipReason::ReleaseDateUnknown(version) => {
@@ -82,6 +85,7 @@ pub enum UpdateResult {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         age_exemption: Option<crate::update::AgeExemption>,
         /// マニフェストへ書き込めなかったときの理由 (dry-run では書き込めない見込みの理由)。
+        /// install 後に更新先の解決版を確認できなかった場合も記録する。
         /// 書き込みの段階より前は常に `None`
         #[serde(default, skip_serializing_if = "Option::is_none")]
         write_error: Option<String>,
