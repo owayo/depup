@@ -453,11 +453,18 @@ A crate is rolled back to the following version:
 
 In both cases, a rollback never goes below an available pre-install version from the same semver series. Pre-install versions absent from usable crates.io metadata, including yanked versions and versions with unreadable release dates, are excluded from both this minimum and restoration. In that case, depup chooses an older compatible version that satisfies the age filter, or reports an unresolved violation if none exists.
 
-If only versions below an available minimum satisfy the age filter, the crate goes back to that pre-install version, so depup undoes only the change the install made. When that pre-install version is itself newer than the age filter allows, it remains an unresolved violation (exit code 2) and is reported on a separate yellow line instead of as rolled back. An unchanged violation at this minimum is also reported; it is never exempted merely because it was already locked:
+If only versions below an available minimum satisfy the age filter, the crate goes back to that pre-install version, so depup undoes only the change the install made. When that pre-install version is itself newer than the age filter allows, it remains an unresolved violation (exit code 2) and is reported on a separate yellow line instead of as rolled back:
 
 ```text
   . — 1 crate(s) returned to the version locked before the install, which is also newer than --age:
     foo 1.50.1 → 1.50.0
+```
+
+A version that was already locked before the install and left unchanged is never exempted merely because it was already locked; it also produces exit code 2. Because depup does not roll back below it, it is listed in its own yellow section, apart from the crates this run could not roll back:
+
+```text
+  . — 1 crate(s) already locked before the install do not satisfy --age (depup never rolls back below a pre-install version):
+    toml_datetime 1.1.2+spec-1.1.0
 ```
 
 Crates such as `cc` and `syn` are rolled back one at a time with `cargo update -p <name>@<locked version> --precise <older version>`. depup processes dependents before their dependencies, including relationships through crates outside the rollback list. Before resolving conflicts together, it retries failed individual rollbacks when the lock or requested version has changed; it does not repeat a failed attempt against the same lock and target.
@@ -471,9 +478,9 @@ Individual rollbacks can still fail for groups of crates that pin each other wit
 
 Your `Cargo.toml` files are never modified. If `Cargo.toml` or `Cargo.lock` changes while this is in progress, depup keeps your change and gives up on these crates. If the previous `Cargo.lock` cannot be restored after a failed check, depup says so even without `--verbose` and tells you where it saved the previous content. Cargo runs in the project directory, so the project's `.cargo/config.toml` (for example, source replacement) and `rust-toolchain.toml` (or `rust-toolchain`) also apply when the copy is resolved.
 
-If an unresolved install-time version remains related to a partial rollback, depup returns that partial change to the combination locked immediately after the install, including related dependencies automatically changed, added, or removed by Cargo. It uses a separate 60-second restoration budget and the same temporary-workspace verification. Related crates are identified by dependency paths in the install-time and current locks, so independent successful rollbacks and external changes stay in place. Changes observed outside an audited Cargo operation are excluded from restoration. Restoration cannot introduce a version absent from the install-time lock. Ambiguous versions or sources stop restoration with a warning. A restored partial change is reported with its reason and remains unresolved (exit code 2); a failed restoration also produces a warning.
+If an unresolved install-time version remains related to a partial rollback, depup returns that partial change to the combination locked immediately after the install, including related dependencies automatically changed, added, or removed by Cargo. It uses a separate 60-second restoration budget and the same temporary-workspace verification. Related crates are identified by dependency paths in the install-time and current locks, so independent successful rollbacks and external changes stay in place. Changes observed outside an audited Cargo operation are excluded from restoration. Lock entries are compared by the packages their dependency lists name, not by the text: when Cargo moves a crate, it also rewrites references in the crates that depend on it (for example, `"toml 0.9.8"` becomes `"toml 0.9.5"` when two `toml` series are locked). Such a rewrite belongs to the audited operation when it only moves the dependency within the same name, source, and semver series that the operation moved. Restoration cannot introduce a version absent from the install-time lock. Ambiguous versions or sources stop restoration with a warning. A restored partial change is reported with its reason and remains unresolved (exit code 2); a failed restoration also produces a warning.
 
-If selective restoration fails or an audit pass aborts unexpectedly, depup attempts to restore the entire `Cargo.lock` snapshot from the start of the audit (after install, when one ran). This also undoes independent successful age rollbacks. Recovery uses a checked atomic replacement without running Cargo again, then verifies the restored lock and returns exit code 2. If workspace membership, a manifest, file permissions, a symlink, or a change observed between Cargo commands prevents safe replacement, depup preserves the current files and reports the location of a recovery copy of the original lock. A failure to save that copy is also reported. If the initial snapshot or workspace inventory cannot be prepared, depup reports the error before starting age rollbacks. Ordinary unresolved age violations still retain independent successful rollbacks when selective restoration completes.
+If selective restoration fails or an audit pass aborts unexpectedly, depup attempts to restore the entire `Cargo.lock` snapshot from the start of the audit (after install, when one ran). This also undoes independent successful age rollbacks. Recovery uses a checked atomic replacement without running Cargo again, then verifies the restored lock and returns exit code 2. If workspace membership, a manifest, file permissions, a symlink, a change observed between Cargo commands, or a registry or git package changed outside the scope of an audited Cargo command prevents safe replacement, depup preserves the current files and reports the location of a recovery copy of the original lock. The message names those packages, as selective restoration also keeps them. A failure to save that copy is also reported. If the initial snapshot or workspace inventory cannot be prepared, depup reports the error before starting age rollbacks. Ordinary unresolved age violations still retain independent successful rollbacks when selective restoration completes.
 
 Avoid editing `Cargo.lock` while a single-crate rollback command is running. That command writes the live lock directly, so simultaneous edits in the same dependency scope cannot be distinguished reliably from Cargo's own changes. Changes observed between commands remain excluded from restoration.
 
@@ -516,6 +523,8 @@ With `--verbose`, depup prints `Enforcing --age on registry crates in Cargo.lock
 | `cargo update failed: ...` | Cargo rejected the rollback; its error message follows. |
 | `not attempted: ...` | depup did not try the rollback, because it reached its limit on rounds or its time budget. |
 | `release date unavailable` | The release date could not be retrieved, so the crate could not be checked. |
+
+Versions already locked before the install are not listed with these reasons; they have their own section, described above.
 
 An unresolved audit exits with code `2`.
 

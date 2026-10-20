@@ -420,11 +420,13 @@ mod retry_regressions {
         assert_eq!(project.locked_versions("old-only"), ["1.0.0"]);
         assert_eq!(project.locked_versions("z-top"), ["1.1.0"]);
         assert_eq!(project.locked_versions("s-solo"), ["1.0.0"]);
+        // Between audited commands, the edge of middle that the update moved is also an
+        // external change, and middle is the first required dependency reached.
         assert!(
             state
                 .problems
                 .iter()
-                .any(|problem| problem.contains("external change") && problem.contains("old-only")),
+                .any(|problem| problem.contains("external change") && problem.contains("middle")),
             "{:?}",
             state.problems
         );
@@ -763,6 +765,232 @@ mod retry_regressions {
         }
     }
 
+    /// Issue #54: with two series of a crate in the lock (`toml` in a Tauri app), rolling
+    /// one back rewrites the versioned reference of a dependent (`cargo_toml`). The
+    /// dependent was recorded as an external change, which stopped the selective
+    /// restoration and returned the whole lock, independent rollbacks included, to the
+    /// install-time snapshot.
+    #[tokio::test]
+    async fn rewritten_references_of_dependents_do_not_stop_selective_restoration() {
+        let registry = LocalRegistry::new();
+        for version in ["0.8.0", "0.9.0", "0.9.1"] {
+            registry.publish("d-dup", version, &[]);
+        }
+        registry
+            .publish("legacy", "1.0.0", &[("d-dup", "^0.8")])
+            .publish("reader", "1.0.0", &[("d-dup", "^0.9")]);
+        registry
+            .publish("a-dep", "1.1.0", &[])
+            .publish("a-dep", "1.2.0", &[]);
+        registry
+            .publish("z-top", "1.1.0", &[("reader", "^1"), ("a-dep", "^1.1")])
+            .publish("z-top", "1.2.0", &[("reader", "^1"), ("a-dep", "^1.2")]);
+        registry.publish("y-pin", "1.0.0", &[("a-dep", "^1.2")]);
+        registry
+            .publish("s-solo", "1.0.0", &[])
+            .publish("s-solo", "1.1.0", &[]);
+        let manifest = |old: bool| {
+            format!(
+                "[package]\nname = 'example'\nversion = '0.1.0'\nedition = '2024'\n[dependencies]\nlegacy = '1'\nz-top = '{}'\ns-solo = '{}'\n{}",
+                if old { "=1.1.0" } else { "1" },
+                if old { "=1.0.0" } else { "1" },
+                if old { "" } else { "y-pin = '1'\n" }
+            )
+        };
+        let project = TestProject::new(&registry, &manifest(true));
+        project.cargo_ok(&["generate-lockfile"]);
+        project.cargo_ok(&["update", "-p", "a-dep", "--precise", "1.1.0"]);
+        project.cargo_ok(&["update", "-p", "d-dup@0.9.1", "--precise", "0.9.0"]);
+        let baseline = parse_registry_entries(&project.read("Cargo.lock"));
+        project.write("Cargo.toml", &manifest(false));
+        project.cargo_ok(&["update"]);
+        assert_eq!(project.locked_versions("d-dup"), ["0.8.0", "0.9.1"]);
+        assert!(project.read("Cargo.lock").contains("\"d-dup 0.9.1\""));
+        let old = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let young = chrono::Utc.with_ymd_and_hms(2026, 1, 29, 0, 0, 0).unwrap();
+        let mut dates = FakeCratesIo::new();
+        for (name, version) in [
+            ("d-dup", "0.8.0"),
+            ("d-dup", "0.9.0"),
+            ("legacy", "1.0.0"),
+            ("reader", "1.0.0"),
+            ("a-dep", "1.1.0"),
+            ("z-top", "1.1.0"),
+            ("y-pin", "1.0.0"),
+            ("s-solo", "1.0.0"),
+        ] {
+            dates = dates.release(name, version, old);
+        }
+        for (name, version) in [
+            ("d-dup", "0.9.1"),
+            ("a-dep", "1.2.0"),
+            ("z-top", "1.2.0"),
+            ("s-solo", "1.1.0"),
+        ] {
+            dates = dates.release(name, version, young);
+        }
+        let mut cargo = CargoCommand::new().program(TestProject::cargo_program());
+        for (key, value) in project.cargo_envs() {
+            cargo = cargo.env(key, value);
+        }
+        let input = LockAgeAudit {
+            project_dir: project.path(),
+            cutoff: cutoff(),
+            exemptions: &Default::default(),
+            baseline: &baseline,
+            preferred: &PreferredVersions::new(),
+            adapter: &dates,
+            cargo: &cargo,
+            budget: LOCK_AGE_AUDIT_BUDGET,
+        };
+        let versions = VersionFetcher::new(4, 1);
+        let result = LockAgeAuditor::new(&input, &versions, false)
+            .run(None)
+            .await;
+        assert!(result.problems.is_empty(), "{result:?}");
+        // The rollback independent of the unresolved a-dep stays.
+        assert_eq!(project.locked_versions("s-solo"), ["1.0.0"], "{result:?}");
+        // Only the rollbacks related to a-dep return to the install-time combination.
+        assert_eq!(project.locked_versions("z-top"), ["1.2.0"]);
+        assert_eq!(project.locked_versions("d-dup"), ["0.8.0", "0.9.1"]);
+        assert_eq!(project.locked_versions("a-dep"), ["1.2.0"]);
+        assert!(result.has_unresolved());
+        for name in ["z-top", "d-dup"] {
+            assert!(
+                result
+                    .adjustments
+                    .iter()
+                    .any(|adjustment| adjustment.name == name
+                        && matches!(adjustment.status, LockAgeStatus::Reverted(_))),
+                "{name}: {result:?}"
+            );
+        }
+        project.cargo_ok(&["update", "--workspace", "--locked"]);
+    }
+
+    /// A command that exits successfully without moving its target still wrote the lock,
+    /// so its changes must not count as an edit between audited commands.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_commands_that_leave_the_target_record_their_changes() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_registry, project, baseline, dates, _cargo) = fixture(false);
+        // Leaves z-top in place but moves its dependency and rewrites the file.
+        let script = project.path().join("rewrite-lock");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nperl -0pi -e 's/name = \"a-dep\"\\nversion = \"1.2.0\"/name = \"a-dep\"\\nversion = \"1.1.0\"/' Cargo.lock\nprintf '\\n# rewritten\\n' >> Cargo.lock\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cargo = CargoCommand::new().program(&script);
+        let input = LockAgeAudit {
+            project_dir: project.path(),
+            cutoff: cutoff(),
+            exemptions: &Default::default(),
+            baseline: &baseline,
+            preferred: &PreferredVersions::new(),
+            adapter: &dates,
+            cargo: &cargo,
+            budget: Duration::from_secs(60),
+        };
+        let versions = VersionFetcher::new(4, 1);
+        let auditor = LockAgeAuditor::new(&input, &versions, false);
+        let candidate = RollbackCandidate {
+            name: "z-top".into(),
+            current: "1.2.0".into(),
+            target: "1.1.0".into(),
+            minimum: None,
+        };
+        let key = (candidate.name.clone(), candidate.current.clone());
+        let mut state = AuditState::new(input.budget);
+        state.changes.observe(&project.read("Cargo.lock"));
+        let mut pass = AuditPass::default();
+        auditor
+            .rollback_one(candidate, &mut state, &mut pass, None)
+            .await
+            .unwrap();
+        let after = project.read("Cargo.lock");
+        assert!(after.ends_with("# rewritten\n"));
+        assert_eq!(project.locked_versions("z-top"), ["1.2.0"]);
+        assert_eq!(project.locked_versions("a-dep"), ["1.1.0"]);
+        assert!(matches!(
+            state.log.entries[&key].status,
+            LockAgeStatus::UpdateCommandFailed(_)
+        ));
+        // The moved dependency belongs to the command, not to an external edit.
+        assert!(state.changes.owns("a-dep", "1.1.0"));
+        assert!(
+            !state
+                .changes
+                .externally_changed(&("a-dep".into(), "1.1.0".into()))
+        );
+        assert!(
+            state
+                .changes
+                .allows_snapshot_restore(Some(after.as_bytes()))
+        );
+        // The same lock and target are not tried again because of its own write.
+        assert_eq!(
+            state.alone_failures[&key].lock,
+            together_fingerprint(&after, &[])
+        );
+    }
+
+    /// Replace the checksum of one package, as an edit made while Cargo was running.
+    fn edit_checksum(lock: &str, name: &str) -> String {
+        let mut in_package = false;
+        let mut edited: Vec<String> = Vec::new();
+        for line in lock.lines() {
+            if line.starts_with("name = ") {
+                in_package = line == format!("name = \"{name}\"");
+            }
+            edited.push(if in_package && line.starts_with("checksum = ") {
+                "checksum = \"edited\"".into()
+            } else {
+                line.into()
+            });
+        }
+        assert!(edited.iter().any(|line| line == "checksum = \"edited\""));
+        edited.join("\n") + "\n"
+    }
+
+    #[tokio::test]
+    async fn external_registry_changes_withhold_the_audit_receipt() {
+        for external in [false, true] {
+            let (_registry, project, baseline, dates, cargo) = fixture(false);
+            let input = LockAgeAudit {
+                project_dir: project.path(),
+                cutoff: cutoff(),
+                exemptions: &Default::default(),
+                baseline: &baseline,
+                preferred: &PreferredVersions::new(),
+                adapter: &dates,
+                cargo: &cargo,
+                budget: Duration::from_secs(60),
+            };
+            let versions = VersionFetcher::new(4, 1);
+            let auditor = LockAgeAuditor::new(&input, &versions, false);
+            let installed = project.read("Cargo.lock");
+            let mut state = AuditState::new(input.budget);
+            state.installed_lock = installed.clone();
+            state.changes.observe(&installed);
+            project.cargo_ok(&["update", "-p", "s-solo@1.1.0", "--precise", "1.0.0"]);
+            let mut after = project.read("Cargo.lock");
+            if external {
+                // a-dep is outside the scope of the s-solo command.
+                after = edit_checksum(&after, "a-dep");
+                project.write("Cargo.lock", &after);
+            }
+            state
+                .changes
+                .applied(&installed, &after, &[("s-solo".into(), "1.1.0".into())]);
+            let mut receipt = None;
+            auditor.finalize(state, None, &mut receipt).await;
+            assert_eq!(receipt.is_some(), !external);
+        }
+    }
+
     #[tokio::test]
     async fn singles_retry_only_after_the_lock_changes() {
         let (_registry, project, baseline, dates, cargo) = fixture(false);
@@ -996,6 +1224,7 @@ mod retry_regressions {
         for edit in [
             RecoveryEdit::Comment,
             RecoveryEdit::ObservedComment,
+            RecoveryEdit::DuringCommand,
             RecoveryEdit::Manifest,
             RecoveryEdit::Member,
             RecoveryEdit::NewMember,
@@ -1025,6 +1254,7 @@ mod retry_regressions {
         AfterSelective,
         Comment,
         ObservedComment,
+        DuringCommand,
         Manifest,
         Member,
         NewMember,
@@ -1141,6 +1371,14 @@ mod retry_regressions {
                     .observe(&format!("{partial}\n# external edit\n"));
                 state.changes.observe(&partial);
             }
+            RecoveryEdit::DuringCommand => {
+                // y-pin changed outside the scope of an audited s-solo command.
+                let edited = edit_checksum(&partial, "y-pin");
+                project.write("Cargo.lock", &edited);
+                state
+                    .changes
+                    .applied(&partial, &edited, &[("s-solo".into(), "1.0.0".into())]);
+            }
             RecoveryEdit::Manifest => {
                 project.write("Cargo.toml", &format!("{manifest}\n# external edit\n"))
             }
@@ -1208,6 +1446,14 @@ mod retry_regressions {
             edit,
             RecoveryEdit::None | RecoveryEdit::Aborted | RecoveryEdit::AfterSelective
         ) {
+            if edit == RecoveryEdit::DuringCommand {
+                assert!(
+                    result.problems.iter().any(|problem| problem.contains(
+                        "Cargo.lock changed outside an audited Cargo operation: y-pin 1.0.0"
+                    )),
+                    "{result:?}"
+                );
+            }
             if matches!(
                 edit,
                 RecoveryEdit::NewMember

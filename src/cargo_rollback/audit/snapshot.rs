@@ -142,7 +142,15 @@ impl AuditSnapshot {
                 .changes
                 .allows_snapshot_restore(current.bytes.as_deref())
             {
-                return Err("Cargo.lock changed outside an audited Cargo operation".into());
+                let external = state.changes.external_packages();
+                return Err(if external.is_empty() {
+                    "Cargo.lock changed outside an audited Cargo operation".into()
+                } else {
+                    format!(
+                        "Cargo.lock changed outside an audited Cargo operation: {}",
+                        external.join(", ")
+                    )
+                });
             }
             let expected = FileState {
                 bytes: current.bytes.clone(),

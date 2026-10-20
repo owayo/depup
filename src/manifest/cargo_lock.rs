@@ -258,7 +258,7 @@ pub fn parse_lock_packages(content: &str) -> Vec<LockPackage> {
 /// Cargo の `EncodablePackageId` の読み方に合わせ、空白 1 つで最大 3 つに区切り、
 /// 3 つ目は括弧で囲まれた source とする。名前や版が空の要素、3 つ目が括弧で
 /// 囲まれていない要素は Cargo 自身も拒否する形なので None を返す。
-fn parse_dependency_ref(raw: &str) -> Option<LockDependencyRef> {
+pub(crate) fn parse_dependency_ref(raw: &str) -> Option<LockDependencyRef> {
     let mut parts = raw.splitn(3, ' ');
     let name = parts.next().filter(|name| !name.is_empty())?;
     let version = match parts.next() {
