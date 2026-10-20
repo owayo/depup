@@ -15,6 +15,16 @@ use crate::update::AgePolicy;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
+/// install の結果。終了コードに対応する
+pub struct InstallOutcome {
+    /// パッケージマネージャが失敗した、または準備できなかった (終了コード 1)
+    pub install_failed: bool,
+    /// 監査・検証で未解消のものが残った、またはそのために更新前へ戻した (終了コード 2)
+    pub audit_failed: bool,
+    /// 復元の報告 (復旧用コピーの場所など) を書けなかった。最終出力の後に返す
+    pub report_error: Option<std::io::Error>,
+}
+
 /// 1 つのディレクトリ・言語の install。
 pub struct InstallJob {
     pub directory: PathBuf,
@@ -494,6 +504,7 @@ fn build_install_map(
 #[cfg(test)]
 mod tests;
 
+pub mod ordinary;
 pub mod refresh;
 mod scoped;
 

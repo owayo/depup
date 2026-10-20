@@ -1083,6 +1083,65 @@ fn tauri_node_and_lock_only_rust_updates_fail_together_in_either_direction() {
     }
 }
 
+/// A lock verification failure follows the unit that holds the lockfile: the Tauri pair returns
+/// together, while an independent install in the same directory keeps its update.
+#[test]
+fn lock_verification_failures_follow_the_lockfile_holder() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut result = result();
+    node(&mut result, temp.path());
+    let rust = temp.path().join("src-tauri");
+    update(
+        &mut result,
+        &rust.join("Cargo.toml"),
+        Language::Rust,
+        "[package]\nname = \"desktop\"\nversion = \"0.1.0\"\n[dependencies]\nexample = \"1.0.0\"\n",
+        "example",
+    );
+    fs::create_dir_all(rust.join("src")).unwrap();
+    fs::write(rust.join("src/lib.rs"), "").unwrap();
+    fs::write(rust.join("Cargo.lock"), "original lock").unwrap();
+    let gemfile = temp.path().join("Gemfile");
+    update(
+        &mut result,
+        &gemfile,
+        Language::Ruby,
+        "source \"https://rubygems.org\"\ngem \"example\", \"1.0.0\"\n",
+        "example",
+    );
+    let plan = plan(vec![
+        job(
+            temp.path(),
+            Language::Node,
+            &[temp.path().join("package.json")],
+        ),
+        job(temp.path(), Language::Rust, &[rust.join("Cargo.toml")]),
+        job(temp.path(), Language::Ruby, std::slice::from_ref(&gemfile)),
+    ]);
+    let mut tx = InstallTransactions::begin(&plan, &result, temp.path());
+    tx.execute(|command| {
+        if command.language == Language::Rust {
+            fs::write(rust.join("Cargo.lock"), "installed lock").unwrap();
+        }
+        success(command)
+    });
+    tx.fail_holder(&rust.join("Cargo.lock"), "simulated age failure".into());
+    let report = tx.rollback();
+    report.mark_summary(&mut result.summary);
+    assert!(!report.has_install_failures());
+    assert_eq!(
+        fs::read_to_string(rust.join("Cargo.lock")).unwrap(),
+        "original lock"
+    );
+    assert!(
+        fs::read_to_string(temp.path().join("package.json"))
+            .unwrap()
+            .contains("\"1.0.0\"")
+    );
+    assert!(fs::read_to_string(&gemfile).unwrap().contains("\"2.0.0\""));
+    assert_eq!(result.summary.total_failed(), 2);
+}
+
 #[cfg(unix)]
 #[test]
 fn symlink_and_permissions_survive_recovery_and_replaced_links_are_kept() {

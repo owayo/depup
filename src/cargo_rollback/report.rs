@@ -467,6 +467,7 @@ mod tests {
             ],
             unchecked: 0,
             problems: Vec::new(),
+            ..Default::default()
         };
 
         let lines = lock_age_report_lines(Path::new("./wasm"), &audit, false);
@@ -505,6 +506,7 @@ mod tests {
             ],
             unchecked: 0,
             problems: Vec::new(),
+            ..Default::default()
         };
 
         let lines = lock_age_report_lines(Path::new("."), &audit, true);
@@ -526,6 +528,7 @@ mod tests {
             adjustments: vec![adjustment("tokio", "1.53.1", None, LockAgeStatus::Removed)],
             unchecked: 0,
             problems: Vec::new(),
+            ..Default::default()
         };
 
         let lines = lock_age_report_lines(Path::new("."), &audit, false);
@@ -551,6 +554,7 @@ mod tests {
             )],
             unchecked: 3,
             problems: Vec::new(),
+            ..Default::default()
         };
 
         let lines = lock_age_report_lines(Path::new("."), &audit, false);
@@ -587,6 +591,7 @@ mod tests {
             ],
             unchecked: 0,
             problems: Vec::new(),
+            ..Default::default()
         };
 
         let lines = lock_age_report_lines(Path::new("."), &audit, false);
@@ -618,6 +623,7 @@ mod tests {
             ],
             unchecked: 0,
             problems: Vec::new(),
+            ..Default::default()
         };
         assert!(audit.has_unresolved());
 
@@ -642,6 +648,7 @@ mod tests {
             adjustments: Vec::new(),
             unchecked: 0,
             problems: vec!["restoring the previous Cargo.lock also failed".to_string()],
+            ..Default::default()
         };
 
         let lines = lock_age_report_lines(Path::new("."), &audit, false);

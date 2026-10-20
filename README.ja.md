@@ -47,7 +47,7 @@ depup は、プロジェクトにあるマニフェストを見つけ、レジ�
 - **プロジェクトの age 設定**: pnpm・Bun・mise のポリシーをディレクトリごとに継承し、uv・mise 自身の厳しい cutoff も維持
 - **脆弱性チェック**: 更新先のバージョンを OSV.dev で照会し、既知の脆弱性があるバージョンを避ける（デフォルトで有効）
 - **パッケージマネージャーの実行**: `--install` で更新後に各プロジェクトのパッケージマネージャーを実行し、pnpm・uv・mise には age フィルターの値も渡す
-- **Cargo lock の age 監査**: install で変わった直接・推移依存のクレートを確認。違反・未確認が残ると終了コード `2`
+- **lockfile の age 監査**: install の後に `Cargo.lock` と npm / pnpm の lockfile の直接・推移依存の版を確認。この実行で入った版が条件を満たさないままなら、そのプロジェクトのマニフェストと lockfile を実行前の状態へ戻す（終了コード `2`）
 - **Bun Catalogs 対応**: `package.json` の Bun `catalog` / `catalogs` 定義を更新
 - **モノレポ対応**: `.depup`、Cargo / pnpm / Go のワークスペース、Gradle マルチプロジェクト、入れ子のパッケージごとの install、Tauri プロジェクト
 - **複数出力形式**: 各バージョンの公開日時を添えたテキスト（カラー）、JSON、diff

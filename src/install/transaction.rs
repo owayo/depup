@@ -77,6 +77,12 @@ struct FailedUnit {
     files: BTreeMap<PathBuf, FileOutcome>,
     policy_failure: bool,
 }
+impl FailedUnit {
+    /// Every managed file is back to its state before the run.
+    fn recovered(&self) -> bool {
+        self.files.values().all(FileOutcome::restored)
+    }
+}
 
 #[derive(Default)]
 pub struct RollbackReport {
@@ -653,6 +659,23 @@ impl InstallTransactions {
         out
     }
 
+    /// Whether a file is part of a prepared install unit (an audit-only lock is not).
+    pub(super) fn manages(&self, path: &Path) -> bool {
+        resolved_path(path).is_ok_and(|key| self.files.contains_key(&key))
+    }
+
+    /// Fail the units that hold this lockfile or manifest. Unlike [`Self::fail_verification`],
+    /// an independent install in the same directory (Cargo next to uv or Go) is not affected.
+    pub(super) fn fail_holder(&mut self, path: &Path, reason: String) {
+        let key = identity(path);
+        for unit in &mut self.units {
+            if unit.files.contains(&key) && unit.failure.is_none() {
+                unit.failure = Some(reason.clone());
+                unit.policy_failure = true;
+            }
+        }
+    }
+
     pub(super) fn fail_verification(&mut self, directory: &Path, reason: String) {
         let directory = identity(directory);
         for unit in &mut self.units {
@@ -1132,6 +1155,11 @@ impl RollbackReport {
     }
     pub fn mark_summary(&self, summary: &mut UpdateSummary) {
         for unit in &self.units {
+            let incomplete = if unit.recovered() {
+                ""
+            } else {
+                "; recovery incomplete: some files were kept for manual recovery"
+            };
             for &index in &unit.summaries {
                 let manifest = &mut summary.manifests[index];
                 let key = identity(&manifest.path);
@@ -1141,7 +1169,7 @@ impl RollbackReport {
                 for result in &mut manifest.results {
                     if result.is_update() && result.write_error().is_none() {
                         result.record_write_error(format!(
-                            "{} failed; update canceled: {}",
+                            "{} failed; update canceled: {}{incomplete}",
                             if unit.policy_failure {
                                 "lock verification"
                             } else {
@@ -1203,6 +1231,17 @@ impl RollbackReport {
                         }
                     }
                 }
+            }
+            if unit.recovered() {
+                writeln!(
+                    out,
+                    "  The project files are back to their state before this run."
+                )?;
+            } else {
+                writeln!(
+                    out,
+                    "  Recovery is incomplete: the files kept above need manual recovery."
+                )?;
             }
             writeln!(
                 out,

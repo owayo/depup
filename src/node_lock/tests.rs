@@ -269,8 +269,18 @@ async fn absent_invalid_and_unsupported_locks_report_failure_without_fetching() 
     for manager in ["yarn", "bun"] {
         let result = audit_node_lock(directory.path(), manager, &policy(), None).await;
         assert!(result.has_failures());
-        assert!(result.errors[0].contains("not supported"));
+        assert!(result.errors.is_empty());
+        assert!(result.unsupported[0].contains("not supported"));
     }
+    // npm format 1 is unsupported too, not a lockfile that failed verification.
+    std::fs::write(
+        directory.path().join("package-lock.json"),
+        r#"{"lockfileVersion":1,"dependencies":{}}"#,
+    )
+    .unwrap();
+    let old = audit_node_lock(directory.path(), "npm", &policy(), None).await;
+    assert!(old.has_failures() && old.errors.is_empty());
+    assert!(old.unsupported[0].contains("lockfileVersion 1"), "{old:?}");
 }
 
 #[test]
@@ -870,4 +880,80 @@ async fn pnpm_list_command_failures_and_timeouts_are_not_successes() {
     .await
     .unwrap_err();
     assert!(error.contains("timed out"));
+}
+
+#[tokio::test]
+async fn npm_baseline_reads_the_same_lockfile_as_the_audit() {
+    let directory = tempfile::tempdir().unwrap();
+    // No lockfile before the run: every version is added by it.
+    assert_eq!(
+        read_baseline(directory.path(), "npm").await,
+        NodeBaseline::Known(BTreeSet::new())
+    );
+    let lock = json!({"lockfileVersion":3,"packages":{
+        "":{},
+        "node_modules/young":package("young","1.0.0"),
+        "node_modules/private":{"version":"2.0.0","resolved":"https://registry.example.com/private-2.0.0.tgz"}
+    }});
+    std::fs::write(directory.path().join("package-lock.json"), lock.to_string()).unwrap();
+    assert_eq!(
+        read_baseline(directory.path(), "npm").await,
+        NodeBaseline::Known([("young".to_string(), "1.0.0".to_string())].into())
+    );
+    // The shrinkwrap takes priority, as in the audit, and an unreadable one is not empty.
+    std::fs::write(directory.path().join("npm-shrinkwrap.json"), "invalid JSON").unwrap();
+    assert!(matches!(
+        read_baseline(directory.path(), "npm").await,
+        NodeBaseline::Unknown(reason) if reason.contains("npm-shrinkwrap.json")
+    ));
+    assert!(matches!(
+        read_baseline(directory.path(), "yarn").await,
+        NodeBaseline::Unknown(_)
+    ));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pnpm_baseline_keeps_the_lockfile_graph_despite_warnings_and_stale_manifests() {
+    let directory = tempfile::tempdir().unwrap();
+    // depup has already rewritten the manifest; the lockfile still has the old version.
+    std::fs::write(
+        directory.path().join("package.json"),
+        r#"{"dependencies":{"young":"2.0.0"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join("pnpm-lock.yaml"),
+        "lockfileVersion: '9.0'\n",
+    )
+    .unwrap();
+    let graph = json!([{"dependencies":{"young":package("young","1.0.0")}}]);
+    let program = fake_pnpm(
+        directory.path(),
+        &format!(
+            "printf 'WARN lockfile is outdated' >&2\nprintf '%s' '{}'",
+            graph
+        ),
+    );
+    assert_eq!(
+        baseline_with(directory.path(), "pnpm", &program).await,
+        NodeBaseline::Known([("young".to_string(), "1.0.0".to_string())].into())
+    );
+    let program = fake_pnpm(directory.path(), "printf 'lock parse failed' >&2\nexit 7");
+    assert!(matches!(
+        baseline_with(directory.path(), "pnpm", &program).await,
+        NodeBaseline::Unknown(reason) if reason.contains("lock parse failed")
+    ));
+    // The graph must describe the bytes that were read.
+    let program = fake_pnpm(
+        directory.path(),
+        &format!(
+            "printf 'changed' >> pnpm-lock.yaml\nprintf '%s' '{}'",
+            graph
+        ),
+    );
+    assert!(matches!(
+        baseline_with(directory.path(), "pnpm", &program).await,
+        NodeBaseline::Unknown(reason) if reason.contains("changed while it was read")
+    ));
 }

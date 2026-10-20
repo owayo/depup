@@ -47,7 +47,7 @@ Add `--install` to let each project's package manager refresh its lock file afte
 - **Project Age Policies**: Inherits pnpm, Bun, and mise policies per directory and preserves stricter uv and mise native cutoffs
 - **Vulnerability Check**: Looks up the chosen version on OSV.dev and avoids versions with known vulnerabilities (enabled by default)
 - **Package Manager Install**: `--install` runs each project's package manager after the update and passes the age filter on to pnpm, uv, and mise
-- **Cargo Lock Age Audit**: Checks changed direct and transitive crates after install; unresolved violations or unverified entries exit with code `2`
+- **Lockfile Age Audit**: Checks the direct and transitive versions in `Cargo.lock` and npm/pnpm lockfiles after install; if a version the run added still fails, that project's manifests and lockfiles return to their state before the run (exit code `2`)
 - **Bun Catalogs**: Updates Bun `catalog` / `catalogs` definitions in `package.json`
 - **Monorepo Support**: `.depup`, Cargo/pnpm/Go workspaces, Gradle multi-project builds, nested package installs, and Tauri projects
 - **Multiple Output Formats**: Colored text with the release date of each new version, JSON, and diff

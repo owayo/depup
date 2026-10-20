@@ -96,6 +96,18 @@ pub struct LockAgeAuditResult {
     pub unchecked: usize,
     /// 利用者に必ず知らせるべき問題 (まとめ解きの後に元の Cargo.lock を戻せなかった等)
     pub problems: Vec<String>,
+    /// 最終 lock に残った版 `(crate 名, 版)` のうち、期間を満たさない・確かめられなかったもの。
+    /// 調整の記録 (`from`) ではなく最終状態の証拠なので、差し戻した先の版が残った場合も含む
+    pub remaining: BTreeMap<(String, String), RemainingAge>,
+}
+
+/// 最終 lock に残った版の、期間の検査結果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemainingAge {
+    /// 公開日が期間より新しい
+    TooNew,
+    /// 公開日を確かめられなかった (取得失敗・時間切れ・公開日不明)
+    Unverified,
 }
 
 /// The initial checkpoint and the final bytes owned by audited Cargo operations.
@@ -1365,6 +1377,7 @@ impl<'a> LockAgeAuditor<'a> {
             };
         }
         let mut unchecked = 0;
+        let mut remaining = BTreeMap::new();
         for (name, versions) in targets {
             let known = metadata.get(&name).and_then(Option::as_ref);
             for version in versions {
@@ -1375,6 +1388,14 @@ impl<'a> LockAgeAuditor<'a> {
                     log.entries.remove(&(name.clone(), version.clone()));
                     continue;
                 }
+                remaining.insert(
+                    (name.clone(), version.clone()),
+                    if info.is_some() {
+                        RemainingAge::TooNew
+                    } else {
+                        RemainingAge::Unverified
+                    },
+                );
                 // 差し戻し先の若い版を別件で重複報告しない。
                 if log.entries.values().any(|adjustment| {
                     adjustment.name == name && adjustment.to.as_ref() == Some(&version)
@@ -1414,6 +1435,7 @@ impl<'a> LockAgeAuditor<'a> {
             adjustments: log.into_adjustments(),
             unchecked,
             problems,
+            remaining,
         }
     }
 }
