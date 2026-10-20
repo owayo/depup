@@ -38,6 +38,26 @@ pub struct NodeUnverifiedDependency {
     pub name: String,
     pub version: String,
     pub reason: String,
+    pub kind: UnverifiedKind,
+}
+
+/// 確かめられなかった理由の種類。既定の `--install` が更新前へ戻すかどうかを分ける
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum UnverifiedKind {
+    /// 公開 npm の版として確かめるはずが、公開日や実効 registry を確かめられなかった
+    Unconfirmed,
+    /// 公開 npm と確認できない取得元 (私設 registry、公開 npm の tarball でない取得元)。
+    /// depup の監査の範囲外
+    OutsideScope,
+}
+
+/// install 前の lock にあった公開 npm の版 `(名前, 版)`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeBaseline {
+    /// lock が無ければ空
+    Known(BTreeSet<(String, String)>),
+    /// 読めなかった理由。既存の版と区別できない
+    Unknown(String),
 }
 
 #[derive(Debug, Default)]
@@ -45,12 +65,19 @@ pub struct NodeLockAuditResult {
     pub checked: usize,
     pub violations: Vec<NodeAgeViolation>,
     pub unverified: Vec<NodeUnverifiedDependency>,
+    /// lock を読めない・検証できなかった (対応している形式なのに確かめられない)
     pub errors: Vec<String>,
+    /// 監査に対応していない lock (yarn / bun / npm の形式 1)。失敗として報告するが、
+    /// 既定の `--install` が更新前へ戻す理由にはしない
+    pub unsupported: Vec<String>,
 }
 
 impl NodeLockAuditResult {
     pub fn has_failures(&self) -> bool {
-        !self.violations.is_empty() || !self.unverified.is_empty() || !self.errors.is_empty()
+        !self.violations.is_empty()
+            || !self.unverified.is_empty()
+            || !self.errors.is_empty()
+            || !self.unsupported.is_empty()
     }
 
     /// verbose の有無に関わらず、残った版と確認できなかった理由を表示する。
@@ -59,7 +86,7 @@ impl NodeLockAuditResult {
             .iter()
             .map(|item| {
                 format!(
-                    "{} {} violates --age: published {}, cutoff {} (lockfile was not changed)",
+                    "{} {} violates --age: published {}, cutoff {}",
                     item.name,
                     item.version,
                     item.released_at.to_rfc3339(),
@@ -73,6 +100,7 @@ impl NodeLockAuditResult {
                 )
             }))
             .chain(self.errors.iter().cloned())
+            .chain(self.unsupported.iter().cloned())
             .collect()
     }
 }
@@ -132,7 +160,7 @@ pub async fn audit_node_lock(
         "npm" => npm_lock_name(directory),
         _ => {
             return NodeLockAuditResult {
-                errors: vec![format!(
+                unsupported: vec![format!(
                     "{package_manager} lockfile could not be checked against --age: lockfile audit is not supported"
                 )],
                 ..Default::default()
@@ -158,13 +186,23 @@ pub async fn audit_node_lock(
             }
             .await
         }
-        _ => serde_json::from_slice::<Value>(&original)
-            .map_err(|error| format!("invalid {lock_name}: {error}"))
-            .and_then(|value| {
-                let snapshot = parse_npm_snapshot(&value)?;
+        _ => match serde_json::from_slice::<Value>(&original) {
+            Err(error) => Err(format!("invalid {lock_name}: {error}")),
+            // An older format is unsupported rather than unverifiable.
+            Ok(value) if !npm_lock_format_supported(&value) => {
+                return NodeLockAuditResult {
+                    unsupported: vec![format!(
+                        "{lock_name} could not be checked against --age: lockfileVersion {} is not supported (2 or 3 is required)",
+                        value.get("lockfileVersion").unwrap_or(&Value::Null)
+                    )],
+                    ..Default::default()
+                };
+            }
+            Ok(value) => parse_npm_snapshot(&value).and_then(|snapshot| {
                 verify_npm_manifest_dependencies(directory, &value)?;
                 Ok(snapshot)
             }),
+        },
     };
     let snapshot = match snapshot {
         Ok(snapshot) => snapshot,
@@ -184,6 +222,68 @@ pub async fn audit_node_lock(
         Err(error) => result.errors.push(error),
     }
     result
+}
+
+/// install 前の lock にあった公開 npm の版を読む。既定の `--install` が、この実行で lock に
+/// 入った版を既存の版と区別するために使う。
+///
+/// manifest は depup が書き換えた後なので、lock との照合はしない。pnpm の警告も、版の集合の
+/// 取得を妨げない。lock が無ければ空、読めなければ `Unknown` (空とはみなさない)。
+pub async fn read_baseline(directory: &Path, package_manager: &str) -> NodeBaseline {
+    let program = which::which_in("pnpm", std::env::var_os("PATH"), directory)
+        .unwrap_or_else(|_| PathBuf::from("pnpm"));
+    baseline_with(directory, package_manager, &program).await
+}
+
+async fn baseline_with(directory: &Path, package_manager: &str, program: &Path) -> NodeBaseline {
+    let deadline = Instant::now() + NODE_AUDIT_BUDGET;
+    let lock_name = match package_manager {
+        "pnpm" => "pnpm-lock.yaml",
+        "npm" => npm_lock_name(directory),
+        _ => {
+            return NodeBaseline::Unknown(format!(
+                "{package_manager} lockfiles are not checked against --age"
+            ));
+        }
+    };
+    let path = directory.join(lock_name);
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return NodeBaseline::Known(BTreeSet::new());
+        }
+        Err(error) => return NodeBaseline::Unknown(format!("could not read {lock_name}: {error}")),
+        Ok(_) => {}
+    }
+    let original = match read_lock(&path, deadline).await {
+        Ok(bytes) => bytes,
+        Err(error) => return NodeBaseline::Unknown(error),
+    };
+    let snapshot = match package_manager {
+        "pnpm" => list_pnpm_lockfile(directory, program, deadline)
+            .await
+            .and_then(|(value, _)| parse_pnpm_snapshot(&value)),
+        _ => serde_json::from_slice::<Value>(&original)
+            .map_err(|error| format!("invalid {lock_name}: {error}"))
+            .and_then(|value| parse_npm_snapshot(&value)),
+    };
+    match read_lock(&path, deadline).await {
+        Ok(bytes) if bytes == original => {}
+        Ok(_) => return NodeBaseline::Unknown(format!("{lock_name} changed while it was read")),
+        Err(error) => return NodeBaseline::Unknown(error),
+    }
+    match snapshot {
+        Ok(snapshot) => NodeBaseline::Known(snapshot.packages),
+        Err(error) => NodeBaseline::Unknown(error),
+    }
+}
+
+/// The lockfile [`audit_node_lock`] reads for a supported package manager.
+pub(crate) fn audited_lockfile(directory: &Path, package_manager: &str) -> Option<PathBuf> {
+    match package_manager {
+        "pnpm" => Some(directory.join("pnpm-lock.yaml")),
+        "npm" => Some(directory.join(npm_lock_name(directory))),
+        _ => None,
+    }
 }
 
 fn npm_lock_name(directory: &Path) -> &'static str {
@@ -245,16 +345,19 @@ async fn verify_pnpm_registry_sources(
                     name,
                     version,
                     reason: "effective registry is not the public npm registry".into(),
+                    kind: UnverifiedKind::OutsideScope,
                 });
             }
             Err(error) => {
                 if let Some(sources) = snapshot.sources.get(&(name.clone(), version.clone())) {
                     snapshot.protected.extend(sources.iter().cloned());
                 }
+                // The registry is unknown, so the package may be public; it is not out of scope.
                 snapshot.unverified.insert(NodeUnverifiedDependency {
                     name,
                     version,
                     reason: error.clone(),
+                    kind: UnverifiedKind::Unconfirmed,
                 });
             }
         }
@@ -327,11 +430,12 @@ async fn read_lock(path: &Path, deadline: Instant) -> Result<Vec<u8>, String> {
     }
 }
 
-async fn read_pnpm_graph(
+/// `pnpm list` の lockfile-only graph。成功時の stdout の JSON と stderr を返す
+async fn list_pnpm_lockfile(
     directory: &Path,
     program: &Path,
     deadline: Instant,
-) -> Result<LockSnapshot, String> {
+) -> Result<(Value, Vec<u8>), String> {
     let mut command = tokio::process::Command::new(program);
     command.current_dir(directory).args([
         "list",
@@ -358,6 +462,15 @@ async fn read_pnpm_graph(
     }
     let value: Value = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("invalid pnpm lockfile graph: {error}"))?;
+    Ok((value, output.stderr))
+}
+
+async fn read_pnpm_graph(
+    directory: &Path,
+    program: &Path,
+    deadline: Instant,
+) -> Result<LockSnapshot, String> {
+    let (value, stderr) = list_pnpm_lockfile(directory, program, deadline).await?;
     let mut snapshot = parse_pnpm_snapshot(&value)?;
     verify_pnpm_manifest_dependencies(directory, &value)?;
     for project in value.as_array().expect("validated project graph") {
@@ -408,10 +521,10 @@ async fn read_pnpm_graph(
         }
         snapshot.direct.insert(path, direct);
     }
-    if !output.stderr.is_empty() {
+    if !stderr.is_empty() {
         return Err(format!(
             "pnpm list --lockfile-only emitted a warning; the lockfile is unverified: {}",
-            redact_command_output(&String::from_utf8_lossy(&output.stderr)).trim()
+            redact_command_output(&String::from_utf8_lossy(&stderr)).trim()
         ));
     }
     Ok(snapshot)
@@ -627,11 +740,16 @@ fn parse_pnpm_snapshot(value: &Value) -> Result<LockSnapshot, String> {
     Ok(snapshot)
 }
 
-fn parse_npm_snapshot(value: &Value) -> Result<LockSnapshot, String> {
-    if !matches!(
+/// The npm lockfile formats this audit reads (`packages` table, lockfileVersion 2 or 3).
+fn npm_lock_format_supported(value: &Value) -> bool {
+    matches!(
         value.get("lockfileVersion").and_then(Value::as_u64),
         Some(2 | 3)
-    ) {
+    )
+}
+
+fn parse_npm_snapshot(value: &Value) -> Result<LockSnapshot, String> {
+    if !npm_lock_format_supported(value) {
         return Err("npm lockfile --age audit requires lockfileVersion 2 or 3".into());
     }
     let packages = value
@@ -687,6 +805,7 @@ fn collect_package(snapshot: &mut LockSnapshot, alias: &str, package: &Value) {
             name: alias.to_string(),
             version: version.to_string(),
             reason: "release source is not a verified public npm registry tarball".into(),
+            kind: UnverifiedKind::OutsideScope,
         });
     }
 }
@@ -808,12 +927,14 @@ async fn audit_snapshot(
                         name: name.clone(),
                         version,
                         reason: "release date unavailable".into(),
+                        kind: UnverifiedKind::Unconfirmed,
                     }),
                 },
                 Err(error) => result.unverified.push(NodeUnverifiedDependency {
                     name: name.clone(),
                     version,
                     reason: error.clone(),
+                    kind: UnverifiedKind::Unconfirmed,
                 }),
             }
         }

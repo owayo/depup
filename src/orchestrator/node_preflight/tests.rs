@@ -307,6 +307,7 @@ async fn unverified_or_failed_existing_lock_blocks_without_clean_guidance() {
                 name: "existing-child".into(),
                 version: "1.0.1".into(),
                 reason: "release date unavailable".into(),
+                kind: crate::node_lock::UnverifiedKind::Unconfirmed,
             }],
             ..Default::default()
         },

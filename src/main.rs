@@ -10,19 +10,12 @@
 //! - Java（build.gradle / build.gradle.kts）対応
 
 use clap::Parser;
-use colored::Colorize;
-use depup::cargo_rollback::report::{lock_age_report_lines, lock_mismatch_lines};
 use depup::cli::CliArgs;
 use depup::config::DepupConfig;
-use depup::domain::Language;
 use depup::global_config::{GlobalConfig, resolve_max_change, resolve_osv};
-use depup::install::transaction::{InstallTransactions, RollbackReport};
-use depup::install::{InstallPlan, RustAuditPlan};
-use depup::node_lock::audit_node_lock;
+use depup::install::InstallPlan;
 use depup::orchestrator::Orchestrator;
 use depup::output::{OutputConfig, create_formatter};
-use depup::package_manager::SystemPackageManager;
-use depup::progress::Progress;
 use std::io::{self, Write};
 use std::process::ExitCode;
 
@@ -185,289 +178,38 @@ async fn finish_install(
     stdout: &mut impl Write,
     defer_output: bool,
 ) -> anyhow::Result<bool> {
-    if args.refresh_lock {
-        let outcome = depup::install::refresh::run(args, orchestrator, plan, result).await;
-        if defer_output {
-            formatter.format(result, stdout)?;
-            stdout.flush()?;
-        }
-        if outcome.install_failed {
-            anyhow::bail!("Some package manager installs failed");
-        }
-        return Ok(outcome.audit_failed);
-    }
-    let recovery = run_package_installs(args, plan, result, &orchestrator.rust_lock_boundary());
-    recovery.print(&mut io::stderr())?;
-    recovery.mark_summary(&mut result.summary);
-    let mut audit_plan = plan.rust_audit_plan(orchestrator, result);
-    recovery.exclude_rust_audits(&mut audit_plan);
-    let mut age_audit_failed = enforce_rust_lock_age(args, orchestrator, &audit_plan).await;
-    age_audit_failed |= enforce_node_lock_age(args, plan, &recovery).await;
-    let pm = SystemPackageManager::new();
-    let mut verification_progress = Progress::new(!args.quiet);
-    for job in plan
-        .jobs
-        .iter()
-        .filter(|job| job.language == Language::Node && !recovery.covers_directory(&job.directory))
-    {
-        let manager = recovery
-            .node_manager(&job.directory)
-            .or_else(|| pm.resolve_package_manager(job.language, &job.directory));
-        if let Some((directory, "pnpm")) = manager {
-            verification_progress.spinner("Verifying pnpm update targets in the final lockfile");
-            for message in
-                depup::node_lock::verify_pnpm_update_targets(&directory, &mut result.summary).await
-            {
-                verification_progress
-                    .suspend(|| eprintln!("  {} — {message}", directory.display()));
-                result.errors.push(
-                    depup::orchestrator::OrchestratorError::InstallResolutionError {
-                        directory: directory.clone(),
-                        message,
-                    },
-                );
-                age_audit_failed = true;
-            }
-        }
-    }
-    verification_progress.finish_and_clear();
-    report_rust_lock_mismatches(&audit_plan);
+    let outcome = if args.refresh_lock {
+        depup::install::refresh::run(args, orchestrator, plan, result).await
+    } else {
+        depup::install::ordinary::run(args, orchestrator, plan, result).await
+    };
     if defer_output {
         formatter.format(result, stdout)?;
         stdout.flush()?;
     }
-    if recovery.has_failures() {
+    if outcome.install_failed {
         anyhow::bail!("Some package manager installs failed");
     }
-    Ok(age_audit_failed)
-}
-
-/// 計画されたパッケージマネージャの install を実行する。
-fn run_package_installs(
-    args: &CliArgs,
-    plan: &InstallPlan,
-    result: &depup::orchestrator::OrchestratorResult,
-    boundary: &std::path::Path,
-) -> RollbackReport {
-    let pm_runner = SystemPackageManager::new();
-    let mut transactions = InstallTransactions::begin(plan, result, boundary);
-    if args.verbose
-        && plan.jobs.iter().any(|job| {
-            job.policy
-                .as_ref()
-                .is_ok_and(|policy| policy.min_age.is_some())
-        })
-    {
-        let mut unsupported: Vec<_> = transactions
-            .commands()
-            .filter(|command| {
-                command.language != Language::Node
-                    && !command
-                        .language
-                        .pm_has_native_transitive_age_support(command.package_manager)
-            })
-            .map(|command| command.package_manager)
-            .collect();
-        unsupported.sort();
-        unsupported.dedup();
-        if !unsupported.is_empty() {
-            eprintln!(
-                "  Note: --age applies to direct deps only for: {} (no native transitive-age support)",
-                unsupported.join(", ")
-            );
-        }
+    // Recovery and the final output are complete; a lost recovery report still fails the run.
+    if let Some(error) = outcome.report_error {
+        return Err(error.into());
     }
-    let mut progress = Progress::new(!args.quiet);
-    transactions.execute(|command| {
-        progress.spinner(&format!(
-            "Running {} install...",
-            command.language.display_name()
-        ));
-        let result = pm_runner.run_prepared_install(command);
-        progress.finish_and_clear();
-        if !result.success || args.verbose {
-            eprintln!(
-                "  {} install {}: {} ({})",
-                result.language.display_name(),
-                if result.success {
-                    "completed"
-                } else {
-                    "failed"
-                },
-                result.command,
-                command.directory.display()
-            );
-            if !result.success && !result.stderr.is_empty() {
-                eprintln!("    {}", result.stderr);
-            }
-        }
-        result
-    });
-    transactions.rollback()
-}
-
-/// 計画された共有 lock ごとに、既存版も含め crate の age を監査する。
-async fn enforce_rust_lock_age(
-    args: &CliArgs,
-    orchestrator: &Orchestrator,
-    plan: &RustAuditPlan,
-) -> bool {
-    for directory in &plan.missing_lock_dirs {
-        eprintln!(
-            "  {} — cannot audit --age: Cargo.lock not found",
-            directory.display()
-        );
-    }
-    let mut has_unresolved = !plan.missing_lock_dirs.is_empty();
-    if plan.locks.is_empty() {
-        return has_unresolved;
-    }
-    if args.verbose {
-        eprintln!();
-        eprintln!("Enforcing --age on registry crates in Cargo.lock...");
-    }
-    let mut progress = Progress::new(!args.quiet);
-    progress.start(0, "Auditing Cargo.lock against --age");
-    let bar = progress.bar();
-    for lock in &plan.locks {
-        if lock.policy.min_age.is_none() {
-            continue;
-        }
-        if let Some(problem) = &lock.baseline_problem {
-            has_unresolved = true;
-            progress.suspend(|| {
-                eprintln!(
-                    "  {} — cannot safely roll back --age violations: pre-install {problem}",
-                    lock.directory.display()
-                )
-            });
-            continue;
-        }
-        let audit = orchestrator
-            .enforce_lock_age_rust_with_policy(
-                &lock.directory,
-                &lock.policy,
-                &lock.baseline,
-                &lock.preferred,
-                bar.as_ref(),
-            )
-            .await;
-        has_unresolved |= audit.has_unresolved();
-        let lines = lock_age_report_lines(&lock.directory, &audit, args.verbose);
-        if !lines.is_empty() {
-            progress.suspend(|| {
-                for line in &lines {
-                    if line.warning {
-                        eprintln!("{}", line.text.yellow());
-                    } else {
-                        eprintln!("{}", line.text);
-                    }
-                }
-            });
-        }
-    }
-    progress.finish_and_clear();
-    has_unresolved
-}
-
-/// Node は lock の実際の解決版を検査し、違反・未確認を必ず報告する。
-async fn enforce_node_lock_age(
-    args: &CliArgs,
-    plan: &InstallPlan,
-    recovery: &RollbackReport,
-) -> bool {
-    let pm_runner = SystemPackageManager::new();
-    let mut failed = false;
-    let mut progress = Progress::new(!args.quiet);
-    for job in &plan.node_audits {
-        if recovery.covers_directory(&job.directory) {
-            continue;
-        }
-        let has_lock = [
-            "pnpm-lock.yaml",
-            "package-lock.json",
-            "npm-shrinkwrap.json",
-            "yarn.lock",
-            "bun.lock",
-            "bun.lockb",
-        ]
-        .iter()
-        .any(|filename| job.directory.join(filename).exists());
-        if !has_lock
-            && !plan.jobs.iter().any(|install| {
-                install.language == Language::Node && install.directory == job.directory
-            })
-        {
-            continue;
-        }
-        let policy = match &job.policy {
-            Ok(policy) if policy.min_age.is_some() => policy,
-            Ok(_) => continue,
-            Err(error) => {
-                eprintln!(
-                    "  {} — cannot audit --age: {error}",
-                    job.directory.display()
-                );
-                failed = true;
-                continue;
-            }
-        };
-        let Some((directory, pm)) = recovery
-            .node_manager(&job.directory)
-            .or_else(|| pm_runner.resolve_package_manager(job.language, &job.directory))
-        else {
-            eprintln!(
-                "  {} — cannot audit --age: Node package manager could not be determined",
-                job.directory.display()
-            );
-            failed = true;
-            continue;
-        };
-        progress.start(0, "Auditing Node lockfile against --age");
-        let bar = progress.bar();
-        let audit = audit_node_lock(&directory, pm, policy, bar.as_ref()).await;
-        failed |= audit.has_failures();
-        progress.suspend(|| {
-            for message in audit.failure_messages() {
-                eprintln!(
-                    "{}",
-                    format!("  {} — {message}", directory.display()).yellow()
-                );
-            }
-            if args.verbose && !audit.has_failures() {
-                eprintln!(
-                    "  {} — {} public npm package version(s) verified against --age",
-                    directory.display(),
-                    audit.checked
-                );
-            }
-        });
-        progress.finish_and_clear();
-    }
-    failed
-}
-
-/// 画面に出した更新先と、監査後の lock に入った版の相違を知らせる。
-fn report_rust_lock_mismatches(plan: &RustAuditPlan) {
-    for (manifest, mismatches) in plan.mismatch_reports() {
-        for line in lock_mismatch_lines(&manifest, &mismatches) {
-            eprintln!("{}", line.yellow());
-        }
-    }
+    Ok(outcome.audit_failed)
 }
 
 #[cfg(all(test, unix))]
 mod install_tests {
     use super::*;
     use depup::domain::{
-        Dependency, ManifestUpdateResult, UpdateResult, UpdateSummary, VersionSpec, VersionSpecKind,
+        Dependency, Language, ManifestUpdateResult, UpdateResult, UpdateSummary, VersionSpec,
+        VersionSpecKind,
     };
     use depup::manifest::{GradleParser, ManifestWriter};
     use depup::orchestrator::OrchestratorResult;
     use std::os::unix::fs::PermissionsExt;
 
-    #[test]
-    fn failed_install_restores_the_written_manifest() {
+    #[tokio::test]
+    async fn failed_install_restores_the_written_manifest() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("build.gradle");
         let before = "dependencies { implementation 'org.example:library:1.0.0' }\n";
@@ -491,7 +233,7 @@ mod install_tests {
         assert!(write.file_modified);
         let mut summary = UpdateSummary::new(false);
         summary.add_manifest(manifest);
-        let result = OrchestratorResult {
+        let mut result = OrchestratorResult {
             summary,
             write_results: vec![write],
             errors: vec![],
@@ -500,8 +242,8 @@ mod install_tests {
         args.path = temp.path().into();
         let orchestrator = Orchestrator::new(args.clone()).unwrap();
         let plan = InstallPlan::new(&orchestrator, &result, &None, temp.path());
-        let recovery = run_package_installs(&args, &plan, &result, temp.path());
-        assert!(recovery.has_failures());
+        let outcome = depup::install::ordinary::run(&args, &orchestrator, &plan, &mut result).await;
+        assert!(outcome.install_failed);
         assert_eq!(std::fs::read_to_string(path).unwrap(), before);
     }
 }
@@ -510,7 +252,8 @@ mod install_tests {
 mod final_output_tests {
     use super::*;
     use depup::domain::{
-        Dependency, ManifestUpdateResult, UpdateResult, UpdateSummary, VersionSpec, VersionSpecKind,
+        Dependency, Language, ManifestUpdateResult, UpdateResult, UpdateSummary, VersionSpec,
+        VersionSpecKind,
     };
     use depup::manifest::{ManifestWriter, PackageJsonParser};
     use depup::orchestrator::OrchestratorResult;

@@ -14,11 +14,6 @@ use std::time::Duration;
 
 const VERIFICATION_BUDGET: Duration = Duration::from_secs(180);
 
-pub struct RefreshOutcome {
-    pub install_failed: bool,
-    pub audit_failed: bool,
-}
-
 pub(super) fn plan_jobs(
     jobs: &mut Vec<InstallJob>,
     orchestrator: &Orchestrator,
@@ -254,7 +249,7 @@ pub async fn run(
     orchestrator: &Orchestrator,
     plan: &InstallPlan,
     result: &mut OrchestratorResult,
-) -> RefreshOutcome {
+) -> InstallOutcome {
     let pm = SystemPackageManager::new();
     run_with(
         args,
@@ -274,11 +269,12 @@ async fn run_with(
     result: &mut OrchestratorResult,
     verifier: &impl Verification,
     mut runner: impl FnMut(&PreparedInstall) -> InstallResult,
-) -> RefreshOutcome {
+) -> InstallOutcome {
     if args.dry_run {
-        return RefreshOutcome {
+        return InstallOutcome {
             install_failed: false,
             audit_failed: false,
+            report_error: None,
         };
     }
     let jobs: Vec<_> = plan
@@ -401,7 +397,7 @@ async fn run_with(
     verify_manifests(&manifests, &mut tx, &mut errors);
     progress.finish_and_clear();
     let report = tx.rollback();
-    let _ = report.print(&mut std::io::stderr());
+    let report_error = report.print(&mut std::io::stderr()).err();
     report.mark_summary(&mut result.summary);
     if jobs.is_empty() {
         result.summary.lock_refreshes.push(LockRefreshResult {
@@ -431,7 +427,7 @@ async fn run_with(
             }),
         });
     }
-    RefreshOutcome {
+    InstallOutcome {
         install_failed: report.has_install_failures(),
         audit_failed: !errors.is_empty()
             || result
@@ -439,6 +435,7 @@ async fn run_with(
                 .lock_refreshes
                 .iter()
                 .any(|item| item.status != "completed"),
+        report_error,
     }
 }
 

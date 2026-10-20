@@ -28,6 +28,9 @@ src/
   osv.rs           - OSV.dev API による脆弱性チェック
   orchestrator.rs  - ワークフロー制御 (detect → parse → fetch → judge → write)
   install.rs       - install 実行単位と共有 Cargo.lock の監査計画 (制約・更新先・install 前の版を集約)
+  install/ordinary.rs - 既定の `--install` (復元用の transaction を監査の後まで開いたまま、この実行で入った版が age を満たさない単位を実行前へ戻す)
+  install/refresh.rs  - opt-in の `--install --refresh-lock`
+  install/transaction.rs - install 単位ごとのマニフェスト・lock の保存と復元
   error.rs         - エラー型定義 (thiserror)
   progress.rs      - プログレスバー表示
   package_manager.rs - パッケージマネージャinstall連携
@@ -337,3 +340,4 @@ make ci                # CI と同じ検査 (fmt-check + lint + test、書き換
 
 - age は各マニフェストのディレクトリから実行ルート（メンバー内起動時は workspace ルート）まで継承し、最も厳しい明示値を使う。兄弟の設定は候補選択に混ぜない。共有 install / Cargo.lock は更新がないメンバーも含めて最厳値を採り、公開者の例外は全メンバーの共通部分だけを残す。候補選択・Tauri 同期・監査の基準時刻は実行開始時に固定し、uv / mise に絶対 cutoff、pnpm に切り上げた分数を渡す。
 - Cargo の age 監査は他言語の install が失敗しても行う。lock の読み込み・解析失敗、公開日不明、差し戻し失敗、時間切れが残ると exit 2（install 失敗もあれば exit 1）。既存 lock に戻しても最終版が age を満たさなければ exit 2。無変更の `--install` でも Rust / Node lock を監査し、失敗の名前・要求版・理由は通常出力に表示する。キャッシュにない lock 版は一覧を再取得して確認し、未確認のまま成功扱いしない。
+- **既定の `--install` は、この実行で lock に入った版が age を満たさないとき install 単位を実行前へ戻す** (`install/ordinary.rs`、owayo/depup#54): 以前は install が失敗した単位だけを戻し、監査の結果ではファイルを戻さなかったため、差し戻せない若い版 (更新したマニフェストが要求する推移依存など) が lock に残り、次のビルドで使われていた。`InstallTransactions` を監査の後まで開いたままにし、「begin → (Node の baseline 取得) → execute → install に失敗した単位を除いて Rust 監査 (receipt を `accept_audit_lock` で採用) → Node 監査 → 条件に当たった単位を `fail_verification` → `rollback` → 表示・`mark_summary` → pnpm の更新先照合と lock 食い違いの注記 (戻した単位を除く)」の順で進める。戻す条件は最終 lock の証拠で判定する: Rust は `LockAgeAuditResult::remaining` (最終 lock に残った版のうち期間を満たさない・確かめられなかったもの。調整の `from` ではなく差し戻した先の版も含む) のうち install 前の lock (baseline) に無い版、監査の problems、install 前の lock を読めない、install 後の lock が無い、receipt を採用できない (監査の外で lock が変わった)。Node は install 前に `pnpm list --lockfile-only` / npm の lock から読んだ baseline (`NodeBaseline`。lock が無ければ空、読めなければ `Unknown` で既存の版と区別できない扱い) に無い版の違反と未確認 (`UnverifiedKind::Unconfirmed`)、pnpm/npm の lock を確かめられない errors。baseline にあった版の違反、私設 registry など監査対象外 (`OutsideScope`)、未対応の lock (yarn/bun/npm の形式 1。`NodeLockAuditResult::unsupported` に型で分け、errors の文字列では判定しない) は戻す理由にしない (exit 2 の報告だけ)。pnpm の更新先照合 (#53) の不一致も戻さない。戻す単位は、その lock (Cargo の lock 欠落ならその Cargo.toml) を持つ単位だけにする (`InstallTransactions::fail_holder`)。refresh の `fail_verification` のようにディレクトリで選ぶと、同じディレクトリにある独立した install (Cargo の隣の uv・Go・Bundler) の更新まで戻してしまう。復元の報告を stderr に書けなかった場合は、復元と最終出力を終えてから exit 1 (`InstallOutcome::report_error`)。外部変更のあるファイルは上書きせず復旧用コピーを残し、`RollbackReport::print` は「The project files are back to their state before this run.」か「Recovery is incomplete: ...」を出し、`mark_summary` は理由の末尾に `recovery incomplete` を付ける。exit 1 は `has_install_failures()` (監査による復元は exit 2)。`--refresh-lock` は従来どおり独自の検証

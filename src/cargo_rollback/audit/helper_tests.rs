@@ -937,6 +937,65 @@ mod retry_regressions {
         );
     }
 
+    /// The final evidence names the version a rollback left in the lock, not the one it moved
+    /// from, so a moved-to version without a release date is not mistaken for the original.
+    #[tokio::test]
+    async fn remaining_judges_the_version_a_rollback_left_in_the_lock() {
+        let (_registry, project, baseline, _dates, cargo) = fixture(false);
+        let installed = project.read("Cargo.lock");
+        project.cargo_ok(&["update", "-p", "s-solo@1.1.0", "--precise", "1.0.0"]);
+        let old = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let young = chrono::Utc.with_ymd_and_hms(2026, 1, 29, 0, 0, 0).unwrap();
+        // The release date of s-solo 1.0.0, the version moved to, is unknown.
+        let dates = FakeCratesIo::new()
+            .release("s-solo", "1.1.0", young)
+            .release("z-top", "1.2.0", old)
+            .release("a-dep", "1.2.0", old);
+        let input = LockAgeAudit {
+            project_dir: project.path(),
+            cutoff: cutoff(),
+            exemptions: &Default::default(),
+            baseline: &baseline,
+            preferred: &PreferredVersions::new(),
+            adapter: &dates,
+            cargo: &cargo,
+            budget: Duration::from_secs(60),
+        };
+        let versions = VersionFetcher::new(4, 1);
+        let auditor = LockAgeAuditor::new(&input, &versions, false);
+        let mut state = AuditState::new(input.budget);
+        state.installed_lock = installed;
+        state.log.record(
+            "s-solo",
+            "1.1.0",
+            Some("1.0.0".into()),
+            LockAgeStatus::Downgraded,
+        );
+        let result = auditor.finalize(state, None, &mut None).await;
+        assert_eq!(
+            result.remaining.get(&("s-solo".into(), "1.0.0".into())),
+            Some(&RemainingAge::Unverified),
+            "{result:?}"
+        );
+        assert!(
+            !result
+                .remaining
+                .contains_key(&("s-solo".into(), "1.1.0".into()))
+        );
+        assert!(
+            !result
+                .remaining
+                .contains_key(&("z-top".into(), "1.2.0".into()))
+        );
+        assert!(
+            result
+                .adjustments
+                .iter()
+                .any(|adjustment| adjustment.name == "s-solo"
+                    && adjustment.status == LockAgeStatus::ReleaseDateUnavailable)
+        );
+    }
+
     /// Replace the checksum of one package, as an edit made while Cargo was running.
     fn edit_checksum(lock: &str, name: &str) -> String {
         let mut in_package = false;
