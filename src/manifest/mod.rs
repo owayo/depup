@@ -30,6 +30,7 @@ mod tool_versions;
 mod writer;
 
 pub use bun_settings::{BunSettings, has_bunfig};
+pub(crate) use cargo_lock::parse_dependency_ref;
 pub use cargo_lock::{
     CRATES_IO_LOCK_SOURCE, CRATES_IO_SPARSE_SOURCE, GitLockEntry, LockDependencyRef, LockPackage,
     RegistryLockEntries, find_cargo_lock_upward, is_crates_io_source, parse_git_entries,

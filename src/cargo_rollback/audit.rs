@@ -183,6 +183,9 @@ pub enum LockAgeStatus {
     /// install 前の lock にあった版へ戻した。ただしその版も期間を満たさない
     /// (install 前から期間内の版が入っていた。install で入った変更だけを取り消した)
     Restored,
+    /// install 前の lock から変わっていない版で、期間を満たさない。install 前の版より
+    /// 古くはしないので差し戻さない (この実行が入れた版ではない)
+    LockedBeforeInstall,
     /// A partial rollback was undone to retain the install-time combination.
     Reverted(String),
     /// age 内の代替バージョンが見つからずスキップ (全バージョンが新しい等)
@@ -934,7 +937,7 @@ impl<'a> LockAgeAuditor<'a> {
             state.alone_failures.remove(&key);
             return Ok(());
         }
-        let fingerprint = together_fingerprint(&content, &[]);
+        let mut fingerprint = together_fingerprint(&content, &[]);
         if let Some(failure) = state.alone_failures.get(&key)
             && failure.lock == fingerprint
             && failure.target == *target
@@ -990,11 +993,12 @@ impl<'a> LockAgeAuditor<'a> {
         let status = match status {
             LockAgeStatus::Downgraded => {
                 let (after, locked) = read_audit_lock(&lock_path)?;
+                // What the command wrote is its own change even if the target stayed.
+                state
+                    .changes
+                    .applied(&content, &after, std::slice::from_ref(&key));
                 match locked_after_rollback(&locked, name, current) {
                     Some(moved) => {
-                        state
-                            .changes
-                            .applied(&content, &after, std::slice::from_ref(&key));
                         outcome.any_downgraded = true;
                         outcome.alone_successes += 1;
                         state.alone_failures.remove(&key);
@@ -1007,9 +1011,13 @@ impl<'a> LockAgeAuditor<'a> {
                         state.log.entries.get_mut(&key).unwrap().target = Some(target.clone());
                         return Ok(());
                     }
-                    None => LockAgeStatus::UpdateCommandFailed(format!(
-                        "cargo update --precise {target} exited successfully, but Cargo.lock still has {name} {current}"
-                    )),
+                    None => {
+                        // Retry only after a change other than this command's own.
+                        fingerprint = together_fingerprint(&after, &[]);
+                        LockAgeStatus::UpdateCommandFailed(format!(
+                            "cargo update --precise {target} exited successfully, but Cargo.lock still has {name} {current}"
+                        ))
+                    }
                 }
             }
             other => other,
@@ -1378,10 +1386,16 @@ impl<'a> LockAgeAuditor<'a> {
                 }
                 let status = match info {
                     None => LockAgeStatus::ReleaseDateUnavailable,
-                    Some(_) if baseline.get(&name).is_some_and(|versions| versions.contains(&version)) => LockAgeStatus::NotAttempted(
-                        "the pre-install locked version is the rollback minimum and does not satisfy --age".into()
-                    ),
-                    Some(_) => LockAgeStatus::NotAttempted("the audit ended before rolling it back".into()),
+                    Some(_)
+                        if baseline
+                            .get(&name)
+                            .is_some_and(|versions| versions.contains(&version)) =>
+                    {
+                        LockAgeStatus::LockedBeforeInstall
+                    }
+                    Some(_) => {
+                        LockAgeStatus::NotAttempted("the audit ended before rolling it back".into())
+                    }
                 };
                 log.record_if_absent(&name, &version, None, status);
             }

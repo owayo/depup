@@ -3,7 +3,7 @@
 use super::*;
 use crate::cargo_rollback::batch::{RestorationScope, RestoreCandidate, restore_installed};
 use crate::cargo_rollback::graph::PackageKey;
-use crate::manifest::{is_crates_io_source, parse_lock_packages};
+use crate::manifest::{is_crates_io_source, parse_dependency_ref, parse_lock_packages};
 use std::collections::BTreeSet;
 
 const LOCK_AGE_RESTORE_BUDGET: Duration = Duration::from_secs(60);
@@ -15,6 +15,8 @@ type LockId = (String, String, Option<String>);
 /// A single-crate Cargo command writes the live lock; simultaneous edits in its
 /// dependency scope cannot be distinguished from Cargo's own changes. Checkpoints
 /// preserve changes observed between commands, and scratch commits check originals.
+/// Packages are compared by meaning ([`LockEntry`]), so a dependency reference that
+/// only changes its spelling is not a change.
 #[derive(Clone, Default)]
 pub(super) struct AuditChanges {
     checkpoint: String,
@@ -30,28 +32,137 @@ fn lock_ids(content: &str) -> BTreeSet<LockId> {
         .collect()
 }
 
-fn lock_tables(content: &str) -> BTreeMap<LockId, toml::Value> {
+/// A dependency edge resolved to the package it names. Cargo writes each reference in
+/// its shortest unambiguous form (`"toml"`, `"toml 0.9.8"`, or with a source), so the
+/// text of an unchanged edge changes when another version of that name enters or
+/// leaves the lock. A reference that names no single package keeps its text, and an
+/// element that is not a string keeps its TOML form.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Edge {
+    Package(LockId),
+    Unresolved(String),
+    Invalid(String),
+}
+
+/// A lock package compared by meaning: its other fields, and its dependency edges
+/// as a multiset of the packages they name.
+#[derive(Clone, Debug, PartialEq)]
+struct LockEntry {
+    fields: toml::Value,
+    edges: BTreeMap<Edge, usize>,
+}
+
+impl LockEntry {
+    /// Whether the package changed only because an operation moved its dependencies.
+    /// Each removed edge must name a package the operation `moved`, paired with an
+    /// added edge to the same name, source and semver series inside its `scope`.
+    /// A net addition or removal, or any other field, is not explained this way.
+    fn rewired(
+        &self,
+        after: &Self,
+        moved: &BTreeSet<LockId>,
+        scope: &BTreeSet<PackageKey>,
+    ) -> bool {
+        if self.fields != after.fields {
+            return false;
+        }
+        let mut removed = Vec::new();
+        let mut added = Vec::new();
+        let edges: BTreeSet<_> = self.edges.keys().chain(after.edges.keys()).collect();
+        for edge in edges {
+            let before = self.edges.get(edge).copied().unwrap_or(0);
+            let now = after.edges.get(edge).copied().unwrap_or(0);
+            match edge {
+                Edge::Unresolved(_) | Edge::Invalid(_) if before != now => return false,
+                Edge::Unresolved(_) | Edge::Invalid(_) => {}
+                Edge::Package(id) => {
+                    removed.extend(std::iter::repeat_n(id, before.saturating_sub(now)));
+                    added.extend(std::iter::repeat_n(id, now.saturating_sub(before)));
+                }
+            }
+        }
+        removed.len() == added.len()
+            && removed.into_iter().all(|old| {
+                let pair = added.iter().position(|new| {
+                    same_line(old, new) && scope.contains(&(new.0.clone(), new.1.clone()))
+                });
+                match pair {
+                    Some(index) if moved.contains(old) => {
+                        added.swap_remove(index);
+                        true
+                    }
+                    _ => false,
+                }
+            })
+    }
+}
+
+fn package_id(package: &toml::Value) -> Option<LockId> {
+    Some((
+        package.get("name")?.as_str()?.into(),
+        package.get("version")?.as_str()?.into(),
+        package
+            .get("source")
+            .and_then(toml::Value::as_str)
+            .map(str::to_string),
+    ))
+}
+
+fn resolve_edge(ids: &[LockId], reference: &toml::Value) -> Edge {
+    let Some(text) = reference.as_str() else {
+        return Edge::Invalid(reference.to_string());
+    };
+    let Some(reference) = parse_dependency_ref(text) else {
+        return Edge::Unresolved(text.into());
+    };
+    // References omit a git source's `#<commit>`.
+    let mut matches = ids.iter().filter(|id| {
+        id.0 == reference.name
+            && reference
+                .version
+                .as_ref()
+                .is_none_or(|version| id.1 == *version)
+            && reference.source.as_deref().is_none_or(|source| {
+                id.2.as_deref()
+                    .is_some_and(|own| own.split('#').next() == Some(source))
+            })
+    });
+    match (matches.next(), matches.next()) {
+        (Some(id), None) => Edge::Package(id.clone()),
+        _ => Edge::Unresolved(text.into()),
+    }
+}
+
+fn lock_tables(content: &str) -> BTreeMap<LockId, LockEntry> {
     let document: toml::Value =
         toml::from_str(content).unwrap_or(toml::Value::Table(Default::default()));
-    document
+    let packages: Vec<_> = document
         .get("package")
         .and_then(toml::Value::as_array)
         .into_iter()
         .flatten()
+        .collect();
+    let ids: Vec<_> = packages
+        .iter()
+        .filter_map(|package| package_id(package))
+        .collect();
+    packages
+        .into_iter()
         .filter_map(|package| {
-            Some((
-                (
-                    package.get("name")?.as_str()?.into(),
-                    package.get("version")?.as_str()?.into(),
-                    package
-                        .get("source")
-                        .and_then(toml::Value::as_str)
-                        .map(str::to_string),
-                ),
-                package.clone(),
-            ))
+            let id = package_id(package)?;
+            let mut fields = package.clone();
+            let mut edges = BTreeMap::new();
+            if let Some(table) = fields.as_table_mut()
+                && table.get("dependencies").is_some_and(toml::Value::is_array)
+                && let Some(toml::Value::Array(references)) = table.remove("dependencies")
+            {
+                for reference in &references {
+                    *edges.entry(resolve_edge(&ids, reference)).or_insert(0) += 1;
+                }
+            }
+            Some((id, LockEntry { fields, edges }))
         })
-        .collect::<BTreeMap<LockId, _>>()
+        .collect()
 }
 
 fn same_line(left: &LockId, right: &LockId) -> bool {
@@ -82,8 +193,29 @@ impl AuditChanges {
         self.checkpoint = content.to_string();
     }
 
+    /// Whether the live lock holds only audited changes, so the whole snapshot can replace
+    /// it. A registry or git package changed outside an audited operation's scope is kept,
+    /// as selective restoration keeps it. Path packages follow the workspace manifests,
+    /// which the snapshot checks separately.
     pub(super) fn allows_snapshot_restore(&self, content: Option<&[u8]>) -> bool {
-        !self.between_commands_changed && content == Some(self.checkpoint.as_bytes())
+        !self.between_commands_changed
+            && self.external_packages().is_empty()
+            && content == Some(self.checkpoint.as_bytes())
+    }
+
+    /// Registry and git packages changed outside an audited operation (`name version`).
+    pub(super) fn external_packages(&self) -> Vec<String> {
+        self.external
+            .iter()
+            .filter(|key| {
+                key.2
+                    .as_deref()
+                    .is_some_and(|source| !source.starts_with("path+"))
+            })
+            .map(|key| format!("{} {}", key.0, key.1))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
     }
 
     pub(super) fn applied(&mut self, before: &str, after: &str, selected: &[PackageKey]) {
@@ -138,10 +270,19 @@ impl AuditChanges {
             .filter(|key| related.contains(&(key.0.clone(), key.1.clone())))
             .cloned()
             .collect();
+        // Moving a package also rewrites the edges of its dependents outside the scope.
+        // Such a dependent did not change itself, so it is neither ours nor external,
+        // and what earlier operations recorded about it stays as it was.
+        let rewired = |key: &LockId| {
+            before_tables
+                .get(key)
+                .zip(after_tables.get(key))
+                .is_some_and(|(before, after)| before.rewired(after, &ours, &related))
+        };
         self.disown(
             changed
                 .iter()
-                .filter(|key| !ours.contains(*key))
+                .filter(|key| !ours.contains(*key) && !rewired(key))
                 .cloned()
                 .collect(),
         );
@@ -153,13 +294,13 @@ impl AuditChanges {
         self.checkpoint = after.to_string();
     }
 
-    fn owns(&self, name: &str, version: &str) -> bool {
+    pub(super) fn owns(&self, name: &str, version: &str) -> bool {
         self.owned.iter().any(|key| {
             key.0 == name && key.1 == version && key.2.as_deref().is_some_and(is_crates_io_source)
         })
     }
 
-    fn externally_changed(&self, key: &PackageKey) -> bool {
+    pub(super) fn externally_changed(&self, key: &PackageKey) -> bool {
         self.external.iter().any(|other| {
             other.0 == key.0
                 && same_series(&other.1, &key.1)
@@ -885,6 +1026,255 @@ mod tests {
             .problem
             .unwrap();
         assert!(error.contains("ambiguous source"), "{error}");
+    }
+
+    /// The shape of a Tauri lock: `toml` has two series, so Cargo writes `cargo_toml`'s
+    /// dependency with a version, and moving `toml` rewrites that reference.
+    fn toml_family(version: &str, cargo_toml: &[&str]) -> String {
+        lock(&[
+            ("cargo_toml", "0.22.0", PUBLIC, cargo_toml),
+            ("serde", "1.0.0", PUBLIC, &[]),
+            ("system-deps", "7.0.0", PUBLIC, &["toml 0.8.2"]),
+            ("toml", "0.8.2", PUBLIC, &[]),
+            ("toml", version, PUBLIC, &["serde"]),
+        ])
+    }
+
+    #[test]
+    fn dependents_rewired_by_an_operation_are_neither_ours_nor_external() {
+        let installed = toml_family("0.9.8", &["toml 0.9.8"]);
+        let current = toml_family("0.9.5", &["toml 0.9.5"]);
+        let selected = [("toml".to_string(), "0.9.8".to_string())];
+        let cargo_toml = ("cargo_toml".to_string(), "0.22.0".to_string());
+        let mut changes = AuditChanges::default();
+        changes.applied(&installed, &current, &selected);
+        assert!(!changes.externally_changed(&cargo_toml));
+        assert!(!changes.owns("cargo_toml", "0.22.0"));
+        assert!(changes.owns("toml", "0.9.8") && changes.owns("toml", "0.9.5"));
+        assert!(changes.allows_snapshot_restore(Some(current.as_bytes())));
+
+        // What earlier operations recorded about the dependent stays as it was.
+        let id = (
+            cargo_toml.0.clone(),
+            cargo_toml.1.clone(),
+            Some(PUBLIC.to_string()),
+        );
+        let mut earlier = AuditChanges::default();
+        earlier.owned.insert(id.clone());
+        earlier.applied(&installed, &current, &selected);
+        assert!(earlier.owns("cargo_toml", "0.22.0"));
+        let mut earlier = AuditChanges::default();
+        earlier.external.insert(id);
+        earlier.applied(&installed, &current, &selected);
+        assert!(earlier.externally_changed(&cargo_toml));
+
+        // The same rewrite between audited operations is an external change.
+        let mut between = AuditChanges::default();
+        between.observe(&installed);
+        between.observe(&current);
+        assert!(between.externally_changed(&cargo_toml));
+    }
+
+    #[test]
+    fn reference_spelling_is_not_a_change() {
+        let key = |source: &str| {
+            (
+                "cargo_toml".to_string(),
+                "0.22.0".to_string(),
+                Some(source.to_string()),
+            )
+        };
+        // A second `toml` series makes Cargo add a version to the same edge.
+        let single = lock(&[
+            ("cargo_toml", "0.22.0", PUBLIC, &["toml"]),
+            ("serde", "1.0.0", PUBLIC, &[]),
+            ("toml", "0.9.8", PUBLIC, &["serde"]),
+        ]);
+        let duplicated = toml_family("0.9.8", &["toml 0.9.8"]);
+        assert_eq!(
+            lock_tables(&single)[&key(PUBLIC)],
+            lock_tables(&duplicated)[&key(PUBLIC)]
+        );
+        let mut changes = AuditChanges::default();
+        changes.observe(&single);
+        changes.observe(&duplicated);
+        assert!(!changes.externally_changed(&("cargo_toml".into(), "0.22.0".into())));
+
+        // A source suffix names one of two sources; a git reference omits the commit.
+        let git = "git+https://example.com/toml?branch=main#0123abcd";
+        let sourced = lock(&[
+            (
+                "cargo_toml",
+                "0.22.0",
+                PUBLIC,
+                &[
+                    "toml 0.9.8 (registry+https://github.com/rust-lang/crates.io-index)",
+                    "toml 0.9.8 (git+https://example.com/toml?branch=main)",
+                ],
+            ),
+            ("toml", "0.9.8", PUBLIC, &[]),
+            ("toml", "0.9.8", git, &[]),
+        ]);
+        let edges = &lock_tables(&sourced)[&key(PUBLIC)].edges;
+        for source in [PUBLIC, git] {
+            let edge = Edge::Package(("toml".into(), "0.9.8".into(), Some(source.into())));
+            assert_eq!(edges.get(&edge), Some(&1), "{edges:?}");
+        }
+    }
+
+    #[test]
+    fn unexplained_dependent_changes_stay_external() {
+        let installed = toml_family("0.9.8", &["toml 0.9.8", "ghost 1.0.0"]);
+        let moved_toml = ("toml".to_string(), "0.9.8".to_string());
+        let moved_serde = ("serde".to_string(), "1.0.0".to_string());
+        let retargeted = toml_family("0.9.5", &["toml 0.9.5", "ghost 1.0.0"]);
+        for (after, selected) in [
+            // To another series.
+            (
+                toml_family("0.9.5", &["toml 0.8.2", "ghost 1.0.0"]),
+                &moved_toml,
+            ),
+            // With an edge added to an unchanged package in scope.
+            (
+                toml_family("0.9.5", &["toml 0.9.5", "serde", "ghost 1.0.0"]),
+                &moved_toml,
+            ),
+            // With a reference that names no package changed.
+            (
+                toml_family("0.9.5", &["toml 0.9.5", "ghost 2.0.0"]),
+                &moved_toml,
+            ),
+            // With another field changed.
+            (
+                retargeted.replace(
+                    "dependencies = [\"toml 0.9.5\"",
+                    "checksum = \"changed\"\ndependencies = [\"toml 0.9.5\"",
+                ),
+                &moved_toml,
+            ),
+            // By an operation that did not move the old target.
+            (retargeted.clone(), &moved_serde),
+        ] {
+            let mut changes = AuditChanges::default();
+            changes.applied(&installed, &after, std::slice::from_ref(selected));
+            assert!(
+                changes.externally_changed(&("cargo_toml".into(), "0.22.0".into())),
+                "{after}"
+            );
+            assert!(
+                changes
+                    .external_packages()
+                    .contains(&"cargo_toml 0.22.0".to_string())
+            );
+            assert!(!changes.allows_snapshot_restore(Some(after.as_bytes())));
+        }
+    }
+
+    #[test]
+    fn rewiring_pairs_every_moved_edge_with_one_in_the_same_series() {
+        let id = |name: &str, version: &str| {
+            (
+                name.to_string(),
+                version.to_string(),
+                Some(PUBLIC.to_string()),
+            )
+        };
+        let entry = |edges: &[(&str, &str, usize)]| LockEntry {
+            fields: toml::Value::Table(Default::default()),
+            edges: edges
+                .iter()
+                .map(|(name, version, count)| (Edge::Package(id(name, version)), *count))
+                .collect(),
+        };
+        let moved: BTreeSet<_> = [
+            id("toml", "0.9.8"),
+            id("toml", "0.8.2"),
+            id("syn", "2.0.10"),
+        ]
+        .into_iter()
+        .collect();
+        let scope: BTreeSet<_> = [("toml", "0.9.5"), ("toml", "0.8.1"), ("syn", "2.0.9")]
+            .into_iter()
+            .map(|(name, version)| (name.to_string(), version.to_string()))
+            .collect();
+        let before = entry(&[
+            ("toml", "0.9.8", 2),
+            ("toml", "0.8.2", 1),
+            ("syn", "2.0.10", 1),
+        ]);
+        for (after, explained) in [
+            (
+                entry(&[
+                    ("toml", "0.9.5", 2),
+                    ("toml", "0.8.1", 1),
+                    ("syn", "2.0.9", 1),
+                ]),
+                true,
+            ),
+            // One of two identical edges is left without a partner.
+            (
+                entry(&[
+                    ("toml", "0.9.5", 1),
+                    ("toml", "0.8.1", 1),
+                    ("syn", "2.0.9", 1),
+                ]),
+                false,
+            ),
+            // An edge is added or removed besides the moves.
+            (
+                entry(&[
+                    ("toml", "0.9.5", 3),
+                    ("toml", "0.8.1", 1),
+                    ("syn", "2.0.9", 1),
+                ]),
+                false,
+            ),
+            (entry(&[("toml", "0.9.5", 2), ("toml", "0.8.1", 1)]), false),
+            // The 0.8 edge cannot pair with a version from the 0.9 series.
+            (entry(&[("toml", "0.9.5", 3), ("syn", "2.0.9", 1)]), false),
+        ] {
+            assert_eq!(
+                before.rewired(&after, &moved, &scope),
+                explained,
+                "{after:?}"
+            );
+        }
+        let after = entry(&[
+            ("toml", "0.9.5", 2),
+            ("toml", "0.8.1", 1),
+            ("syn", "2.0.9", 1),
+        ]);
+        assert!(!before.rewired(&after, &BTreeSet::new(), &scope));
+        assert!(!before.rewired(&after, &moved, &BTreeSet::new()));
+    }
+
+    #[test]
+    fn malformed_dependency_lists_are_compared_as_written() {
+        let entry = |dependencies: &str| {
+            let content = format!(
+                "version = 4\n\n[[package]]\nname = \"example\"\nversion = \"0.1.0\"\nsource = \"{PUBLIC}\"\ndependencies = {dependencies}\n"
+            );
+            lock_tables(&content)
+                .remove(&("example".into(), "0.1.0".into(), Some(PUBLIC.into())))
+                .unwrap()
+        };
+        // A string and a non-string element never collapse into one edge.
+        assert_ne!(entry("[\"true\"]"), entry("[true]"));
+        // A list that is not an array stays in the compared fields.
+        assert_ne!(entry("\"toml\""), entry("\"serde\""));
+        assert_eq!(entry("\"toml\""), entry("\"toml\""));
+    }
+
+    #[test]
+    fn path_packages_alone_do_not_prevent_snapshot_restoration() {
+        // Path packages have no source; the snapshot checks their manifests instead.
+        let before = "version = 4\n\n[[package]]\nname = \"example\"\nversion = \"0.1.0\"\n";
+        let after = format!("{before}\n[[package]]\nname = \"member\"\nversion = \"0.1.0\"\n");
+        let mut changes = AuditChanges::default();
+        changes.applied(before, &after, &[]);
+        assert!(changes.external.iter().any(|key| key.0 == "member"));
+        assert!(changes.external_packages().is_empty());
+        assert!(changes.allows_snapshot_restore(Some(after.as_bytes())));
     }
 
     #[test]

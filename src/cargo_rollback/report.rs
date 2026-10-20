@@ -141,10 +141,20 @@ pub fn lock_age_report_lines(
         .iter()
         .filter(|a| a.status.is_restored())
         .collect();
+    let preexisting: Vec<&LockAgeAdjustment> = audit
+        .adjustments
+        .iter()
+        .filter(|a| a.status == LockAgeStatus::LockedBeforeInstall)
+        .collect();
     let remaining: Vec<&LockAgeAdjustment> = audit
         .adjustments
         .iter()
-        .filter(|a| !a.status.is_resolved() && !a.status.is_restored() && !a.status.is_unverified())
+        .filter(|a| {
+            !a.status.is_resolved()
+                && !a.status.is_restored()
+                && !a.status.is_unverified()
+                && a.status != LockAgeStatus::LockedBeforeInstall
+        })
         .collect();
 
     if !rolled_back.is_empty() {
@@ -202,6 +212,21 @@ pub fn lock_age_report_lines(
         }
     }
 
+    // この実行が入れた版ではない。「could not be rolled back」に混ぜると、install で
+    // 持ち込んだ違反に見える
+    if !preexisting.is_empty() {
+        lines.push(ReportLine::warning(format!(
+            "  {dir} — {} crate(s) already locked before the install do not satisfy --age (depup never rolls back below a pre-install version):",
+            preexisting.len()
+        )));
+        for adj in &preexisting {
+            lines.push(ReportLine::warning(format!(
+                "    {} {}",
+                adj.name, adj.from
+            )));
+        }
+    }
+
     if !unverified.is_empty() {
         lines.push(ReportLine::warning(format!(
             "  {dir} — {} crate(s) could not be checked against --age:",
@@ -227,6 +252,9 @@ fn lock_age_status_detail(status: &LockAgeStatus) -> String {
         LockAgeStatus::Removed => "removed from Cargo.lock".to_string(),
         LockAgeStatus::Restored => {
             "returned to the version locked before the install (also newer than --age)".to_string()
+        }
+        LockAgeStatus::LockedBeforeInstall => {
+            "already locked before the install (also newer than --age)".to_string()
         }
         LockAgeStatus::Reverted(reason) => {
             format!("returned to the install-time version: {reason}")
@@ -573,6 +601,38 @@ mod tests {
             ]
         );
         assert!(lines[2].warning);
+    }
+
+    /// install 前から lock にあった違反は、差し戻せなかった違反と分けて出す
+    #[test]
+    fn test_lock_age_report_lines_separates_versions_locked_before_the_install() {
+        let audit = LockAgeAuditResult {
+            adjustments: vec![
+                adjustment(
+                    "toml_datetime",
+                    "1.1.2+spec-1.1.0",
+                    None,
+                    LockAgeStatus::LockedBeforeInstall,
+                ),
+                adjustment("web-sys", "0.3.106", None, LockAgeStatus::NoOlderCandidate),
+            ],
+            unchecked: 0,
+            problems: Vec::new(),
+        };
+        assert!(audit.has_unresolved());
+
+        let lines = lock_age_report_lines(Path::new("."), &audit, false);
+
+        assert_eq!(
+            texts(&lines),
+            vec![
+                "  . — 1 crate(s) could not be rolled back to satisfy --age:",
+                "    web-sys (0.3.106): no older version satisfies --age",
+                "  . — 1 crate(s) already locked before the install do not satisfy --age (depup never rolls back below a pre-install version):",
+                "    toml_datetime 1.1.2+spec-1.1.0",
+            ]
+        );
+        assert!(lines.iter().all(|line| line.warning));
     }
 
     /// 元の Cargo.lock を戻せなかった等の問題は `--verbose` が無くても必ず出す

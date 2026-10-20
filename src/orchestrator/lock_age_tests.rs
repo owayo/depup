@@ -40,9 +40,7 @@ async fn unchanged_lock_detects_a_previously_incomplete_rollback() {
     let failure = adjustment(&result, "library");
     assert_eq!(failure.to, None);
     assert_eq!(failure.target, None);
-    assert!(
-        matches!(&failure.status, LockAgeStatus::NotAttempted(reason) if reason.contains("rollback minimum"))
-    );
+    assert_eq!(failure.status, LockAgeStatus::LockedBeforeInstall);
     assert!(lock_is_accepted(&project));
 }
 
