@@ -24,7 +24,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-/// One audited change to return to its install-time version.
+/// install 時点の版へ戻す、監査済みの変更1件。
 #[derive(Debug, Clone)]
 pub(crate) struct RestoreCandidate {
     pub name: String,
@@ -39,7 +39,7 @@ pub(crate) struct RestorationScope<'a> {
     pub expected_lock: &'a str,
 }
 
-/// Re-resolve the current lock, preserving every package outside the restoration scope.
+/// 復元範囲外のパッケージをすべて保持し、現在の lock を解き直す。
 pub(crate) async fn restore_installed(
     root: &Path,
     scope: RestorationScope<'_>,
@@ -357,7 +357,7 @@ enum RunError {
 ///
 /// 反映した lock は元の manifest が受け入れることを確かめてから確定する。時間予算が
 /// 尽きたら残りの組は `NotAttempted` にする。戻り値は `candidates` と同じ順に並ぶ。
-// Retained public entry point; the auditor uses the tracked variant internally.
+// 公開済みの入口を維持する。監査内部では追跡付きの版を使う。
 // astro-sight:allow-dead
 pub async fn resolve_together(
     root: &Path,
@@ -371,7 +371,7 @@ pub async fn resolve_together(
         .0
 }
 
-/// Exact snapshots around a verified commit, for audit ownership tracking.
+/// 監査による変更を追跡するため、検証済みの反映の前後を正確に保存する。
 pub(crate) struct ResolutionChange {
     pub before: String,
     pub after: String,

@@ -705,7 +705,7 @@ fn workspace_refresh_plans_one_job_per_lock_and_preserves_stricter_unchanged_mem
         std::fs::write(directory.join("package.json"), "{}").unwrap();
     }
     std::fs::write(root.join("b/.npmrc"), "minimum-release-age=4320\n").unwrap();
-    // Start inside one member: the sibling is not itself an update target.
+    // あるメンバー内で起動し、兄弟のメンバー自体は更新対象にしない。
     for (path, language) in [
         (root.join("a/Cargo.toml"), Language::Rust),
         (root.join("a/package.json"), Language::Node),

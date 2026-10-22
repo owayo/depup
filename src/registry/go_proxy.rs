@@ -821,7 +821,7 @@ retract (
     }
 
     /// Go は compatible なプレリリースを `+incompatible` リリースより優先する
-    /// (「we even prefer a compatible pre-release over an incompatible release」)。
+    /// （仕様上も、互換性のない安定版より互換性のあるプレリリースを優先する）。
     #[test]
     fn test_filter_incompatible_prefers_compatible_prerelease() {
         let versions = ["v1.6.0", "v1.7.0-rc.1", "v2.0.0+incompatible"];

@@ -115,7 +115,7 @@ pub(crate) struct LockSnapshot {
     sources: BTreeMap<(String, String), BTreeSet<String>>,
 }
 
-/// Read the graph and verify that it still describes these exact lock bytes.
+/// グラフを読み、この lock の正確なバイト列をまだ表していることを検証する。
 pub(crate) async fn refresh_snapshot(directory: &Path) -> Result<(Vec<u8>, LockSnapshot), String> {
     let deadline = Instant::now() + NODE_AUDIT_BUDGET;
     let path = directory.join("pnpm-lock.yaml");
@@ -188,7 +188,7 @@ pub async fn audit_node_lock(
         }
         _ => match serde_json::from_slice::<Value>(&original) {
             Err(error) => Err(format!("invalid {lock_name}: {error}")),
-            // An older format is unsupported rather than unverifiable.
+            // 古い形式は、検証不能ではなく未対応として扱う。
             Ok(value) if !npm_lock_format_supported(&value) => {
                 return NodeLockAuditResult {
                     unsupported: vec![format!(
@@ -277,7 +277,7 @@ async fn baseline_with(directory: &Path, package_manager: &str, program: &Path) 
     }
 }
 
-/// The lockfile [`audit_node_lock`] reads for a supported package manager.
+/// 対応するパッケージマネージャーについて、[`audit_node_lock`] が読む lockfile。
 pub(crate) fn audited_lockfile(directory: &Path, package_manager: &str) -> Option<PathBuf> {
     match package_manager {
         "pnpm" => Some(directory.join("pnpm-lock.yaml")),
@@ -352,7 +352,7 @@ async fn verify_pnpm_registry_sources(
                 if let Some(sources) = snapshot.sources.get(&(name.clone(), version.clone())) {
                     snapshot.protected.extend(sources.iter().cloned());
                 }
-                // The registry is unknown, so the package may be public; it is not out of scope.
+                // レジストリが不明なため、公開パッケージの可能性がある。監査対象外にはしない。
                 snapshot.unverified.insert(NodeUnverifiedDependency {
                     name,
                     version,
@@ -386,7 +386,7 @@ async fn read_pnpm_registry(
     if !output.status.success() || !output.stderr.is_empty() {
         return Err("effective registry configuration could not be verified".into());
     }
-    // pnpm 11 emits no JSON for unset keys; newer versions emit null.
+    // pnpm 11 は未設定のキーに JSON を出さず、それより新しい版は null を出す。
     if output.stdout.trim_ascii().is_empty() {
         return Ok(None);
     }
@@ -659,15 +659,15 @@ fn verify_npm_required_dependencies(
             resolve_npm_dependency(issuer, name, packages).ok_or_else(|| {
                 format!("npm lockfile omitted required dependency {name} of {issuer}; the lockfile may be stale")
             })?;
-            // npm owns range, override, and alias resolution. The audit checks the
-            // actual lock package identity and version when collecting its source.
+            // 範囲・override・alias の解決は npm に任せる。監査では取得元を集める際に、
+            // lock 内の実際のパッケージの識別情報と版を確認する。
         }
     }
     Ok(())
 }
 
-/// Node resolution searches the closest node_modules first, then its ancestors.
-/// Workspace links refer to another record in the same packages table.
+/// Node の解決は最寄りの node_modules を先に探し、その後に祖先へ進む。
+/// workspace のリンクは、同じ packages テーブル内の別の記録を指す。
 fn resolve_npm_dependency<'a>(
     issuer: &str,
     name: &str,
@@ -740,7 +740,7 @@ fn parse_pnpm_snapshot(value: &Value) -> Result<LockSnapshot, String> {
     Ok(snapshot)
 }
 
-/// The npm lockfile formats this audit reads (`packages` table, lockfileVersion 2 or 3).
+/// この監査が読む npm lockfile の形式（`packages` テーブルを持つ lockfileVersion 2 または3）。
 fn npm_lock_format_supported(value: &Value) -> bool {
     matches!(
         value.get("lockfileVersion").and_then(Value::as_u64),

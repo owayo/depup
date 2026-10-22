@@ -92,7 +92,7 @@ impl LockGraph {
             .unwrap_or_default()
     }
 
-    /// Dependencies reachable through any lock node, including nodes outside a selected group.
+    /// 選択したグループの外も含め、lock の任意の頂点から到達できる依存。
     pub(crate) fn reachable(&self, key: &PackageKey) -> BTreeSet<PackageKey> {
         let mut seen = BTreeSet::new();
         let mut pending = vec![key.clone()];
@@ -106,8 +106,8 @@ impl LockGraph {
         seen
     }
 
-    /// Order package IDs with dependents first. Unrelated IDs are deterministic;
-    /// malformed cycles are broken at the first remaining ID.
+    /// 依存元を先にしてパッケージIDを並べる。無関係なIDの順序も固定し、
+    /// 不正な循環は残りの先頭IDで切る。
     pub(crate) fn dependents_first(&self, keys: &[PackageKey]) -> Vec<PackageKey> {
         let mut remaining: BTreeSet<_> = keys.iter().cloned().collect();
         let below: BTreeMap<_, _> = remaining

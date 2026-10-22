@@ -168,7 +168,7 @@ async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
     }
 }
 
-/// Recovery and verification finish before the final output is flushed.
+/// 復元と検証を終えてから、最終出力を flush する。
 async fn finish_install(
     args: &CliArgs,
     orchestrator: &Orchestrator,
@@ -190,7 +190,7 @@ async fn finish_install(
     if outcome.install_failed {
         anyhow::bail!("Some package manager installs failed");
     }
-    // Recovery and the final output are complete; a lost recovery report still fails the run.
+    // 復元と最終出力は完了しているが、復元の報告に失敗した場合は実行を失敗にする。
     if let Some(error) = outcome.report_error {
         return Err(error.into());
     }

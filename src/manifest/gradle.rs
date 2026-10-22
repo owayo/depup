@@ -2400,7 +2400,7 @@ dependencies {
         assert!(deps.is_empty());
     }
 
-    // --- resolutionStrategy / constraints / dependencySubstitution ---
+    // --- 解決規則: resolutionStrategy / constraints / dependencySubstitution ---
 
     #[test]
     fn test_parse_ignores_resolution_strategy_force() {

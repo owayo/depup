@@ -1,24 +1,23 @@
-# Development tasks for depup. Run `make` with no arguments to list the targets.
+# depup の開発タスク。引数なしの make でターゲット一覧を表示する。
 #
-# Tool versions are pinned in mise.toml. When mise is available, commands run through
-# `mise exec --`, so they use the pinned versions even if mise is not activated in your
-# shell (or make is started from an IDE or GUI). To use the tools on PATH instead,
-# pass SYSTEM_TOOLS=1 (the versions are then not guaranteed to match CI).
+# ツールの版は mise.toml で固定する。mise があれば mise exec -- 経由で実行するため、
+# シェルで mise を有効にしていなくても、IDE や GUI から make を起動しても固定版を使う。
+# PATH 上のツールを使う場合は SYSTEM_TOOLS=1 を渡す（CI と同じ版とは限らない）。
 #
-# Written for the GNU Make 3.81 that ships with macOS
-# (no .ONESHELL / .SHELLFLAGS / $(file ...) / !=).
+# macOS に付属する GNU Make 3.81 に対応する。
+# .ONESHELL・.SHELLFLAGS・$(file ...)・!= は使わない。
 
 .DEFAULT_GOAL := help
 
 BINARY_NAME := depup
 INSTALL_PATH ?= /usr/local/bin
-# Cargo.lock is committed, so resolve dependencies exactly as CI does
+# Cargo.lock を管理しているため、CI と同じ依存を解決する。
 CARGO_FLAGS ?= --locked
 
-# ---- Toolchain ----------------------------------------------------------------
-# Look for mise on PATH, then in common install locations, because make started from
-# a GUI may not inherit the shell's PATH. Override with make MISE=/path/to/mise.
-# To try the behavior without mise, empty the candidates with MISE_CANDIDATES=.
+# ---- ツールチェーン ------------------------------------------------------------
+# GUI から起動した make がシェルの PATH を継承しない場合に備え、PATH の後に
+# 一般的な配置先を探す。make MISE=/path/to/mise で上書きできる。
+# mise がない場合の動作を試すには、MISE_CANDIDATES= で候補を空にする。
 MISE_CANDIDATES ?= $(HOME)/.local/bin/mise /opt/homebrew/bin/mise /usr/local/bin/mise
 ifeq ($(SYSTEM_TOOLS),1)
 RUN :=
@@ -36,67 +35,67 @@ endif
 
 .PHONY: help setup build release run test test-e2e test-integration lint fmt fmt-check check ci install uninstall clean
 
-## Setup
+## 準備
 
-setup: ## Install the toolchain (mise) and dependencies
+setup: ## ツールチェーン（mise）と依存を取得する
 	@if [ -n "$(MISE)" ]; then "$(MISE)" install; fi
 	$(RUN) cargo fetch $(CARGO_FLAGS)
 
-## Build
+## ビルド
 
-build: ## Build a debug binary
+build: ## デバッグ用バイナリをビルドする
 	$(RUN) cargo build $(CARGO_FLAGS)
 
-release: ## Build a release binary
+release: ## リリース用バイナリをビルドする
 	$(RUN) cargo build --release $(CARGO_FLAGS)
 
-run: ## Run the debug binary (arguments via ARGS="...")
+run: ## デバッグ用バイナリを実行する（引数は ARGS="..."）
 	$(RUN) cargo run $(CARGO_FLAGS) -- $(ARGS)
 
-## Checks
+## 検査
 
-test: ## Run the tests
+test: ## テストを実行する
 	$(RUN) cargo test $(CARGO_FLAGS)
 
-test-e2e: ## Run E2E tests only
+test-e2e: ## E2E テストだけを実行する
 	$(RUN) cargo test $(CARGO_FLAGS) --test e2e_tests
 
-test-integration: ## Run integration tests only
+test-integration: ## 統合テストだけを実行する
 	$(RUN) cargo test $(CARGO_FLAGS) --test integration_tests
 
-lint: ## Run clippy with warnings as errors
+lint: ## 警告をエラーとして clippy を実行する
 	$(RUN) cargo clippy $(CARGO_FLAGS) --all-targets -- -D warnings
 
-fmt: ## Format the code (rewrites files)
+fmt: ## コードを整形する（書き換える）
 	$(RUN) cargo fmt --all
 
-fmt-check: ## Check the formatting (no changes)
+fmt-check: ## 書式を検査する（書き換えない）
 	$(RUN) cargo fmt --all -- --check
 
-check: fmt-check lint ## Run fmt-check and lint (no changes)
+check: fmt-check lint ## fmt-check と lint を実行する（書き換えない）
 
-ci: check test ## Run the same checks as CI (no changes)
+ci: check test ## CI と同じ検査を実行する（書き換えない）
 
-## Install
+## インストール
 
-# Replace the binary through a temporary file + rename instead of copying over it.
-# macOS caches code signature validation per inode, so overwriting a recently run
-# binary with cp gets the new one killed with SIGKILL right after launch (exit 137).
-# The temporary file lives in the same directory so that the rename swaps the inode.
-install: release ## Install the release binary to INSTALL_PATH (default /usr/local/bin)
+# 一時ファイルと rename でバイナリを置き換える。
+# macOS は inode ごとにコード署名の検証をキャッシュするため、実行直後のバイナリを
+# cp で上書きすると、次の起動直後に SIGKILL で終了する（exit 137）。
+# 同じディレクトリに一時ファイルを置き、rename で inode を入れ替える。
+install: release ## リリース用バイナリを INSTALL_PATH へ入れる（既定値 /usr/local/bin）
 	@mkdir -p "$(INSTALL_PATH)"
 	cp "target/release/$(BINARY_NAME)" "$(INSTALL_PATH)/$(BINARY_NAME).new"
 	mv -f "$(INSTALL_PATH)/$(BINARY_NAME).new" "$(INSTALL_PATH)/$(BINARY_NAME)"
 
-uninstall: ## Remove the binary from INSTALL_PATH
+uninstall: ## INSTALL_PATH からバイナリを削除する
 	rm -f "$(INSTALL_PATH)/$(BINARY_NAME)"
 
-clean: ## Remove build artifacts
+clean: ## ビルド生成物を削除する
 	$(RUN) cargo clean
 
-## Help
+## ヘルプ
 
-help: ## Show this help
+help: ## このヘルプを表示する
 	@echo "Development tasks for $(BINARY_NAME)"
 	@echo ""
 	@echo "Usage: make <target>"

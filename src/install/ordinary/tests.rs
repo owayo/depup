@@ -26,13 +26,13 @@ fn cutoff() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 1, 15, 0, 0, 0).unwrap()
 }
 
-/// The Cargo audit against a fake crates.io and the real Cargo; the Node results are given.
+/// 偽の crates.io と実物の Cargo で Cargo 監査を行う。Node の結果は指定したものを使う。
 struct Fixed {
     dates: FakeCratesIo,
     cargo: CargoCommand,
     node_baseline: NodeBaseline,
     node_audit: Mutex<Option<NodeLockAuditResult>>,
-    /// Edit Cargo.lock right after the audit, as another process could.
+    /// ほかのプロセスが書き換える状況として、監査の直後に Cargo.lock を編集する。
     edit_after_audit: bool,
 }
 
@@ -100,8 +100,8 @@ fn args(directory: &Path) -> CliArgs {
     args
 }
 
-/// A run that updates `top` from `=1.0.0` to `=1.1.0`, after which `cargo update` resolves
-/// `leaf` for `top 1.1.0`'s requirement. Only `leaf 1.2.0` is newer than the cutoff.
+/// `top` を `=1.0.0` から `=1.1.0` へ更新し、その後 `cargo update` が
+/// `top 1.1.0` の要件に合わせて `leaf` を解決する。cutoff より新しいのは `leaf 1.2.0` だけ。
 struct RustRun {
     _registry: LocalRegistry,
     project: TestProject,
@@ -203,8 +203,8 @@ impl RustRun {
     }
 }
 
-/// Issue #54: a crate the run added stays newer than --age, because the updated manifest
-/// requires it. The unit returns to the manifest and lockfile it had before the run.
+/// Issue #54: 更新したマニフェストが要求するため、この実行で追加したcrateが --age を
+/// 満たさずに残る。該当単位を、実行前のマニフェストと lockfile へ戻す。
 #[tokio::test]
 async fn an_added_version_that_cannot_pass_age_restores_the_unit() {
     let mut run = rust_run("^1.2", "1.0.0");
@@ -216,8 +216,8 @@ async fn an_added_version_that_cannot_pass_age_restores_the_unit() {
     run.project.cargo_ok(&["update", "--workspace", "--locked"]);
 }
 
-/// The restore follows the unit that holds Cargo.lock; an independent install in the same
-/// directory keeps its update.
+/// 復元は Cargo.lock を保持する単位に従い、同じディレクトリの独立した
+/// install の更新は保持する。
 #[tokio::test]
 async fn a_cargo_restore_keeps_an_independent_install_in_the_same_directory() {
     let mut run = rust_run("^1.2", "1.0.0");
@@ -264,7 +264,7 @@ async fn a_lockfile_that_the_audit_brings_within_age_is_kept() {
 async fn a_young_version_locked_before_the_run_does_not_restore_the_unit() {
     let mut run = rust_run("^1.2", "1.2.0");
     let outcome = run.install().await;
-    // Still unresolved (exit 2), but the run did not add the version.
+    // 未解消のまま（exit 2）だが、この実行で追加した版ではない。
     assert!(!outcome.install_failed && outcome.audit_failed);
     assert!(run.project.read("Cargo.toml").contains("'=1.1.0'"));
     assert_eq!(run.project.locked_versions("leaf"), ["1.2.0"]);
@@ -272,8 +272,8 @@ async fn a_young_version_locked_before_the_run_does_not_restore_the_unit() {
     assert!(!run.canceled());
 }
 
-/// A lockfile changed outside the audit cannot be adopted. The manifest is restored, but the
-/// changed lockfile is kept for manual recovery and the result says so.
+/// 監査の外で変わった lockfile は採用しない。マニフェストは戻すが、
+/// 変更された lockfile は手動復元用に残し、結果にもその旨を示す。
 #[tokio::test]
 async fn a_lockfile_changed_after_the_audit_is_kept_and_recovery_is_incomplete() {
     let mut run = rust_run("^1.1", "1.0.0");
@@ -306,10 +306,10 @@ fn rust_restore_reasons_come_from_the_final_lockfile() {
         ..Default::default()
     };
     assert_eq!(rust_restore_reason(&audit(&[], &[]), &baseline), None);
-    // A version locked before the run is reported, but not a reason to restore.
+    // 実行前から lock にあった版は報告するが、復元の理由にはしない。
     let existing = audit(&[("existing", "1.0.0", RemainingAge::TooNew)], &[]);
     assert_eq!(rust_restore_reason(&existing, &baseline), None);
-    // A version the run added, including where a rollback moved, is judged as locked now.
+    // 差し戻し先も含め、この実行で入れた版は現在 lock されている版として判定する。
     let added = audit(
         &[
             ("existing", "1.0.1", RemainingAge::Unverified),
@@ -369,7 +369,7 @@ fn node_restore_reasons_separate_added_existing_and_out_of_scope_versions() {
             ..Default::default()
         }
     };
-    // Versions locked before the run, and sources outside the audit, are only reported.
+    // 実行前から lock にあった版と、監査対象外の取得元は、報告するだけにする。
     assert_eq!(
         node_restore_reason(
             "pnpm",
@@ -391,7 +391,7 @@ fn node_restore_reasons_separate_added_existing_and_out_of_scope_versions() {
         let reason = node_restore_reason("npm", &added, &baseline).unwrap();
         assert!(reason.contains("versions this run added"), "{reason}");
     }
-    // Without the lockfile before the run, existing versions cannot be told apart.
+    // 実行前の lockfile がないと、以前からあった版を区別できない。
     let unknown = NodeBaseline::Unknown("pnpm list failed".into());
     let reason = node_restore_reason(
         "pnpm",
@@ -401,7 +401,7 @@ fn node_restore_reasons_separate_added_existing_and_out_of_scope_versions() {
     .unwrap();
     assert!(reason.contains("cannot be told apart"), "{reason}");
     assert!(reason.contains("pnpm list failed"), "{reason}");
-    // A supported lockfile that could not be checked at all is not a pass.
+    // 対応済み形式の lockfile をまったく確認できなかった場合は、成功としない。
     let failed = NodeLockAuditResult {
         errors: vec!["could not read pnpm-lock.yaml for --age audit".into()],
         ..Default::default()
@@ -411,7 +411,7 @@ fn node_restore_reasons_separate_added_existing_and_out_of_scope_versions() {
             .unwrap()
             .contains("could not be checked")
     );
-    // An unsupported format (npm lockfileVersion 1) is reported only, even with no baseline.
+    // 未対応の形式（npm lockfileVersion 1）は、baseline がなくても報告だけにする。
     let unsupported = NodeLockAuditResult {
         unsupported: vec!["package-lock.json lockfileVersion 1 is not supported".into()],
         ..Default::default()
@@ -427,8 +427,8 @@ fn node_restore_reasons_separate_added_existing_and_out_of_scope_versions() {
     );
 }
 
-/// The read-only Node audit: an added version that fails --age restores package.json and the
-/// lockfile; a failing version locked before the run keeps the update (exit 2 either way).
+/// Node の読み取り専用監査。この実行で追加した版が --age を満たさなければ package.json と
+/// lockfile を戻す。実行前からあった版の違反なら更新を残す（どちらも exit 2）。
 #[tokio::test]
 async fn node_units_are_restored_only_for_versions_the_run_added() {
     for (failing, restored) in [("2.0.0", true), ("1.0.0", false)] {

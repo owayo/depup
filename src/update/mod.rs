@@ -27,7 +27,7 @@ use std::sync::LazyLock;
 /// レンジの上限制約抽出で共通利用するバージョントークン。
 /// PEP 440 の epoch (`1!2.0`) も 1 トークンとして扱う。これがないと
 /// `<1!2.0` の上限が `1` に丸まり、epoch 付きの候補が全滅する。
-const VERSION_TOKEN: &str = r"[vV]?(?:\d+!)?\d+(?:\.\d+)*(?:[-+][0-9A-Za-z.-]+)?";
+const VERSION_TOKEN: &str = r"[vV]?(?:\d+!)?\d+(?:\.\d+)*(?:[A-Za-z._+-][0-9A-Za-z._+-]*)?";
 /// Maven レンジ専用のバージョントークン。
 /// Gradle の順序付け規則に合わせ、`.`, `-`, `_`, `+` 区切りと英数字混在パートを許容する。
 const MAVEN_VERSION_TOKEN: &str = r"[vV]?\d[0-9A-Za-z]*(?:[.\-_+][0-9A-Za-z]+)*";
@@ -42,7 +42,7 @@ const MAVEN_VERSION_TOKEN: &str = r"[vV]?\d[0-9A-Za-z]*(?:[.\-_+][0-9A-Za-z]+)*"
 /// `VERSION_TOKEN` と同じく PEP 440 の epoch (`1!2.0`) も 1 トークンとして扱う。
 /// これを落とすと `<=1!2.0` の上限が `1` に丸まり、epoch 付きの候補が全滅する。
 const WILDCARD_BOUND_TOKEN: &str =
-    r"[vV]?(?:\d+!)?(?:\d+|[xX*])(?:\.(?:\d+|[xX*]))*(?:[-+][0-9A-Za-z.-]+)?";
+    r"[vV]?(?:\d+!)?(?:\d+|[xX*])(?:\.(?:\d+|[xX*]))*(?:[A-Za-z._+-][0-9A-Za-z._+-]*)?";
 
 /// Range 制約から包含上限 (`<=X`) を抽出する正規表現。
 /// ワイルドカードを含む上限 (`<=2.x`) も拾い、`strip_wildcard_tail` で
@@ -51,7 +51,7 @@ static UPPER_BOUND_LTE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&format!(r"<=\s*({WILDCARD_BOUND_TOKEN})")).unwrap());
 /// Range 制約から排他的上限 (`<X`) を抽出する正規表現。
 static UPPER_BOUND_LT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"<\s*({VERSION_TOKEN})")).unwrap());
+    LazyLock::new(|| Regex::new(&format!(r"<\s*({WILDCARD_BOUND_TOKEN})")).unwrap());
 /// Swift の閉区間 (`A...B`) から上限を抽出する正規表現。
 static UPPER_BOUND_SWIFT_CLOSED_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&format!(r"\.\.\.\s*({VERSION_TOKEN})")).unwrap());
@@ -159,32 +159,30 @@ fn normalize_hyphen_upper_bound(version: &str) -> (String, bool) {
         return (normalized, true);
     };
 
-    let segments: Vec<&str> = normalized.split('.').collect();
-    if !(1..=2).contains(&segments.len()) {
+    if !(1..=2).contains(&normalized.split('.').count()) {
         return (normalized, true);
     }
 
-    let mut numeric_segments = Vec::with_capacity(segments.len());
-    for segment in segments {
-        let Ok(value) = segment.parse::<u64>() else {
-            return (normalized, true);
-        };
-        numeric_segments.push(value);
+    match increment_release_prefix(&normalized) {
+        Some(upper) => (upper, false),
+        None => (normalized, true),
     }
+}
 
-    if let Some(last) = numeric_segments.last_mut()
-        && let Some(next) = last.checked_add(1)
-    {
-        *last = next;
-        let upper = numeric_segments
-            .iter()
-            .map(std::string::ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(".");
-        return (upper, false);
+/// 機械整数へ変換せず、検証済みの10進数を桁上がりさせる。
+fn increment_decimal(value: &str) -> Option<String> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
     }
-
-    (normalized, true)
+    let mut digits = value.as_bytes().to_vec();
+    for digit in digits.iter_mut().rev() {
+        if *digit < b'9' {
+            *digit += 1;
+            return String::from_utf8(digits).ok();
+        }
+        *digit = b'0';
+    }
+    Some(format!("1{}", "0".repeat(digits.len())))
 }
 
 /// PEP 440 prefix-match wildcard (`==1.2.*`) のリリース部を +1 して排他的上限を作る。
@@ -197,18 +195,24 @@ fn increment_release_prefix(prefix: &str) -> Option<String> {
     let (epoch, release) = prefix
         .split_once('!')
         .map_or((None, prefix), |(e, r)| (Some(e), r));
-    let mut parts = release
-        .split('.')
-        .map(str::parse::<u64>)
-        .collect::<Result<Vec<_>, _>>()
-        .ok()?;
+    let mut parts = Vec::new();
+    for part in release.split('.') {
+        if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let normalized = part.trim_start_matches('0');
+        parts.push(
+            if normalized.is_empty() {
+                "0"
+            } else {
+                normalized
+            }
+            .to_string(),
+        );
+    }
     let last = parts.last_mut()?;
-    *last = last.checked_add(1)?;
-    let upper = parts
-        .iter()
-        .map(std::string::ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(".");
+    *last = increment_decimal(last)?;
+    let upper = parts.join(".");
     Some(epoch.map_or_else(|| upper.clone(), |e| format!("{e}!{upper}")))
 }
 
@@ -233,10 +237,11 @@ fn compatible_release_upper_bound(release: &str) -> Option<String> {
 fn stricter_upper_bound(
     best: Option<(String, bool)>,
     candidate: (String, bool),
+    language: Language,
 ) -> Option<(String, bool)> {
     match best {
         None => Some(candidate),
-        Some(current) => match version_info::compare_versions(&candidate.0, &current.0) {
+        Some(current) => match compare_language_versions(language, &candidate.0, &current.0) {
             std::cmp::Ordering::Less => Some(candidate),
             std::cmp::Ordering::Equal if current.1 && !candidate.1 => Some(candidate),
             _ => Some(current),
@@ -310,19 +315,26 @@ fn extract_upper_bound(raw: &str, language: Language) -> Option<(String, bool)> 
             // ワイルドカードを書かない部分バージョン (`<=0.61` / `<=2.0`) も Cargo と npm
             // では同じ意味になるため、同じ経路で排他的上限へ展開する
             // (`partial_upper_bound_covers_series` を参照)。
-            let bound = if m.as_str().contains(['x', 'X', '*'])
+            let bound = if (language != Language::Ruby && m.as_str().contains(['x', 'X', '*']))
                 || partial_upper_bound_covers_series(language)
             {
                 normalize_hyphen_upper_bound(m.as_str())
             } else {
                 (normalize_bound_version(m.as_str()), true)
             };
-            best = stricter_upper_bound(best, bound);
+            best = stricter_upper_bound(best, bound, language);
         }
     }
     for caps in UPPER_BOUND_LT_RE.captures_iter(trimmed) {
         if let Some(m) = caps.get(1) {
-            best = stricter_upper_bound(best, (normalize_bound_version(m.as_str()), false));
+            let upper = normalize_bound_version(m.as_str());
+            // npm の `<2.x` は `<2.0.0`。Ruby の `.x` は通常の版識別子なので保持する。
+            let upper = if language == Language::Ruby {
+                upper
+            } else {
+                strip_wildcard_tail(&upper).unwrap_or(upper)
+            };
+            best = stricter_upper_bound(best, (upper, false), language);
         }
     }
     // 複合制約に混ざった PEP 440 の暗黙上限 (`~=1.2` の `<2.0`、`==1.2.*` の `<1.3`) も
@@ -332,7 +344,7 @@ fn extract_upper_bound(raw: &str, language: Language) -> Option<(String, bool)> 
             .get(1)
             .and_then(|m| compatible_release_upper_bound(m.as_str()))
         {
-            best = stricter_upper_bound(best, (upper, false));
+            best = stricter_upper_bound(best, (upper, false), language);
         }
     }
     for caps in PEP440_PREFIX_MATCH_TOKEN_RE.captures_iter(trimmed) {
@@ -340,7 +352,7 @@ fn extract_upper_bound(raw: &str, language: Language) -> Option<(String, bool)> 
             .get(1)
             .and_then(|m| increment_release_prefix(m.as_str()))
         {
-            best = stricter_upper_bound(best, (upper, false));
+            best = stricter_upper_bound(best, (upper, false), language);
         }
     }
     if best.is_some() {
@@ -637,8 +649,8 @@ impl UpdateJudge {
         }
     }
 
-    /// Candidates that satisfy version constraints before the release-age check.
-    /// Used by registries that resolve publication dates lazily.
+    /// 公開期間の検査前に、バージョン制約を満たす候補。
+    /// 公開日を必要になってから解決するレジストリが使う。
     pub(crate) fn candidates_before_age<'a>(
         &self,
         dependency: &Dependency,
@@ -879,7 +891,12 @@ pub fn compare_dependency_versions(
     a: &str,
     b: &str,
 ) -> std::cmp::Ordering {
-    match dependency.language {
+    compare_language_versions(dependency.language, a, b)
+}
+
+/// 候補の比較と複数上限の選択に、同じエコシステムの順序を使う。
+fn compare_language_versions(language: Language, a: &str, b: &str) -> std::cmp::Ordering {
+    match language {
         Language::Node | Language::Rust | Language::Go | Language::Swift => {
             version_info::compare_semver_versions(a, b)
         }
@@ -1093,6 +1110,177 @@ mod tests {
     }
 
     #[test]
+    fn range_audit_preserves_qualified_upper_bounds() {
+        use crate::parser::{
+            PhpVersionParser, PythonVersionParser, RubyVersionParser, VersionParser,
+        };
+
+        let cases = [
+            (
+                Language::Python,
+                ">=1.0rc1,<1.0rc3",
+                vec!["1.0rc1", "1.0rc2", "1.0rc4"],
+                "1.0rc2",
+            ),
+            (
+                Language::Php,
+                ">=2.0.0RC1 <2.0.0RC3",
+                vec!["2.0.0RC1", "2.0.0RC2", "2.0.0RC4"],
+                "2.0.0RC2",
+            ),
+            (
+                Language::Php,
+                ">=1.0.0 <=1.0.0p2",
+                vec!["1.0.0", "1.0.0p1", "1.0.0p2", "1.0.0p3"],
+                "1.0.0p2",
+            ),
+            (
+                Language::Php,
+                ">=0.8.0 <1.0.0p2 <1.0.0",
+                vec!["0.8.0", "0.9.0", "1.0.0", "1.0.0p1"],
+                "0.9.0",
+            ),
+            (
+                Language::Ruby,
+                ">=1.0.a, <=1.0.x",
+                vec!["1.0.a", "1.0.w", "1.0.z", "1.0"],
+                "1.0.w",
+            ),
+        ];
+        for (language, raw, available, expected) in cases {
+            let spec = match language {
+                Language::Python => PythonVersionParser.parse(raw),
+                Language::Php => PhpVersionParser.parse(raw),
+                Language::Ruby => RubyVersionParser.parse(raw),
+                _ => unreachable!(),
+            }
+            .unwrap();
+            let dep = Dependency::production("example", spec, language);
+            let versions: Vec<_> = available
+                .into_iter()
+                .map(|version| make_version_info_at(version, fixed_time()))
+                .collect();
+            let result =
+                UpdateJudge::with_time(UpdateFilter::new(), fixed_time()).judge(&dep, &versions);
+            assert!(
+                matches!(&result, UpdateResult::Update { new_version, .. } if new_version == expected),
+                "{raw}: {result:?}"
+            );
+            assert!(dep.version_spec.format_updated(expected).contains(expected));
+        }
+    }
+
+    #[test]
+    fn range_audit_large_release_prefix_retains_its_upper_bound() {
+        use crate::parser::{PythonVersionParser, VersionParser};
+
+        let raw = "==18446744073709551616.1.*";
+        let spec = PythonVersionParser.parse(raw).unwrap();
+        let dep = Dependency::production("example", spec, Language::Python);
+        let versions: Vec<_> = [
+            "18446744073709551616.1.0",
+            "18446744073709551616.1.9",
+            "18446744073709551617.0.1",
+        ]
+        .into_iter()
+        .map(|version| make_version_info_at(version, fixed_time()))
+        .collect();
+
+        // 同じ prefix 内の版しか許さないため、制約の書き換えは発生しない。
+        let result =
+            UpdateJudge::with_time(UpdateFilter::new(), fixed_time()).judge(&dep, &versions);
+        assert!(
+            matches!(
+                result,
+                UpdateResult::Skip {
+                    reason: SkipReason::AlreadyLatest,
+                    ..
+                }
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn range_audit_upper_bound_keeps_the_entire_version_token() {
+        for (raw, language, expected, inclusive) in [
+            (">=1.0rc1,<1.0rc3", Language::Python, "1.0rc3", false),
+            (">=1.0,<=1.0_post2", Language::Python, "1.0_post2", true),
+            (">=1.0,<1.0.dev3", Language::Python, "1.0.dev3", false),
+            (">=1!1.0,<1!2.0rc1", Language::Python, "1!2.0rc1", false),
+            (">=1.0.0 <=2.0.0p2", Language::Php, "2.0.0p2", true),
+            (">=1.0.0 <2.0.0_beta1", Language::Php, "2.0.0_beta1", false),
+            (">=1.0 <2.x", Language::Node, "2", false),
+            (">=1.0 <2.*", Language::Node, "2", false),
+            (">=1.0.x, <1.0.z", Language::Ruby, "1.0.z", false),
+            (">=1.0.a, <=1.0.x", Language::Ruby, "1.0.x", true),
+            ("1.0.0 - 2.0.0RC1", Language::Php, "2.0.0RC1", true),
+            (
+                "1.0.0 - 2.0.0-rc.1+build.2",
+                Language::Node,
+                "2.0.0-rc.1+build.2",
+                true,
+            ),
+            (
+                "1.0.0..<2.0.0-rc.1+build.2",
+                Language::Swift,
+                "2.0.0-rc.1+build.2",
+                false,
+            ),
+        ] {
+            assert_eq!(
+                super::extract_upper_bound(raw, language),
+                Some((expected.into(), inclusive)),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn range_audit_decimal_carry_and_invalid_prefixes() {
+        for (prefix, expected) in [
+            ("0", "1"),
+            ("009", "10"),
+            ("1.009", "1.10"),
+            ("18446744073709551615", "18446744073709551616"),
+            ("18446744073709551616.9", "18446744073709551616.10"),
+            ("999999999999999999999", "1000000000000000000000"),
+            ("2!999999999999999999999", "2!1000000000000000000000"),
+        ] {
+            assert_eq!(increment_release_prefix(prefix).as_deref(), Some(expected));
+        }
+        for invalid in ["", ".", "1.", "1..2", "1.rc1", "é", "1.２"] {
+            assert_eq!(increment_release_prefix(invalid), None, "{invalid}");
+        }
+        for invalid in ["", "1a", "-1", "1.0", "２"] {
+            assert_eq!(increment_decimal(invalid), None, "{invalid}");
+        }
+        for (raw, language, expected) in [
+            (
+                ">=1.0 <=18446744073709551615",
+                Language::Node,
+                "18446744073709551616",
+            ),
+            (
+                "1.0 - 18446744073709551616.9",
+                Language::Php,
+                "18446744073709551616.10",
+            ),
+            (
+                "~=18446744073709551616.1",
+                Language::Python,
+                "18446744073709551617",
+            ),
+        ] {
+            assert_eq!(
+                super::extract_upper_bound(raw, language),
+                Some((expected.into(), false)),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
     fn current_release_date_is_not_borrowed_from_an_older_candidate() {
         let now = fixed_time();
         let current_date = now - chrono::Duration::days(2);
@@ -1143,7 +1331,7 @@ mod tests {
                     "{language:?} {prefix}"
                 );
             }
-            // An exact spelling wins even when its publication date is unknown.
+            // 公開日が不明でも、表記が完全一致するものを優先する。
             let versions = [dated("v1.0.0"), VersionInfo::undated("1.0.0")];
             assert_eq!(
                 current_version_info(&dep, &versions).unwrap().released_at,
@@ -1344,7 +1532,7 @@ mod tests {
                 ..
             }
         ));
-        // Keeping the pre-existing nonempty-candidate path does not unify all age skips.
+        // 候補が空でない既存の経路を保持しても、age によるすべてのスキップが同じになるわけではない。
         let older = make_version_info_at("0.9.0", now - chrono::Duration::days(30));
         assert!(
             matches!(judge.judge(&dep, &[older, current, newer]), UpdateResult::Skip { reason: SkipReason::CurrentVersionTooRecent, released_at: Some(actual), .. } if actual == date)

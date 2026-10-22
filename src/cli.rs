@@ -172,13 +172,13 @@ pub struct CliArgs {
     #[arg(long)]
     pub install: bool,
 
-    /// Re-resolve pnpm/Cargo lockfiles, including transitive dependencies
+    /// 推移依存も含めて、pnpm・Cargo の lockfile を解き直す。
     #[arg(long, requires = "install", conflicts_with_all = ["only", "exclude", "max_change"])]
     pub refresh_lock: bool,
 }
 
 impl CliArgs {
-    /// Also validate defaults resolved from the global configuration before any writes.
+    /// 書き込む前に、グローバル設定から解決した既定値も検証する。
     pub fn validate_refresh_lock(&self) -> Result<(), String> {
         if self.refresh_lock
             && (!self.install

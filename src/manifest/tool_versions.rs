@@ -412,7 +412,7 @@ mod tests {
         assert!(!looks_like_tool_versions("node=\"26.7.0\"\n"));
         assert!(!looks_like_tool_versions("node =\"26.7.0\"\n"));
         assert!(!looks_like_tool_versions("node= 26.7.0\n"));
-        // dotted key / inline table
+        // ドット付きキー・インラインテーブル
         assert!(!looks_like_tool_versions("tools.node = \"26.7.0\"\n"));
         assert!(!looks_like_tool_versions(
             "[tools]\njava = { version = \"temurin-21\" }\n"

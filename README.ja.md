@@ -41,7 +41,7 @@ depup は、プロジェクトにあるマニフェストを見つけ、レジ�
 
 - **複数言語対応**: Node.js、Python、Rust、Go、Ruby、PHP、Java、Swift の依存関係に加え、`mise.toml` / `.tool-versions` のツールバージョンも同じワークフローで更新
 - **マニフェスト更新**: マニフェストファイル（`package.json` や `Cargo.toml` など）内のバージョン指定を直接更新
-- **範囲指定の維持**: バージョン範囲の形式（`^`、`~`、`>=`）を保ったまま、上限を壊さずに更新
+- **範囲指定の維持**: バージョン範囲の形式（`^`、`~`、`>=`）と、プレリリースやパッチの修飾子を含む上限を維持
 - **固定指定の検出**: 意図的に固定したバージョンはデフォルトでスキップ
 - **age フィルター**: 公開から N 日（または N 週）以上経過したバージョンにのみ更新（デフォルトは 1 週間）
 - **プロジェクトの age 設定**: pnpm・Bun・mise のポリシーをディレクトリごとに継承し、uv・mise 自身の厳しい cutoff も維持
@@ -101,7 +101,7 @@ winget install owayo.depup
 
 ### Cargo
 
-Rust 1.98 以上が必要です。
+Rust 1.99 以上が必要です。
 
 ```bash
 cargo install --git https://github.com/owayo/depup --locked

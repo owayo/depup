@@ -1,9 +1,8 @@
-# Toolchain for this repository. Local development (via the Makefile) and CI both
-# treat this file as the source of truth for tool versions.
+# このリポジトリのツールチェーン。Makefile 経由のローカル開発と CI の両方で、
+# ツールの版はこのファイルを正とする。
 
 [tools]
-# Name the profile and the components explicitly. Otherwise what gets installed depends
-# on rustup's default profile, and the minimal profile on GitHub Actions runners has no
-# rustfmt / clippy, so `make ci` fails there. With the minimal profile plus the two
-# components, local machines and CI install the same set (and skip rust-docs).
-rust = { version = "1.98.1", profile = "minimal", components = ["rustfmt", "clippy"] }
+# プロファイルとコンポーネントを明示する。省略すると rustup の既定プロファイルに依存し、
+# GitHub Actions の minimal プロファイルには rustfmt・clippy がなく make ci が失敗する。
+# minimal にこの2つを加え、ローカルと CI で同じ構成を入れる（rust-docs は省く）。
+rust = { version = "1.99.0", profile = "minimal", components = ["rustfmt", "clippy"] }

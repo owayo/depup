@@ -1765,7 +1765,7 @@ fn rust_lock(directory: &Path, name: &str) {
 async fn stopped_cargo_locks_and_missing_locks_are_not_reintroduced_by_post_install_audit() {
     for existing in [false, true] {
         let fixture = MembershipFixture::new();
-        // A confirmed independent root without updates must retain its audit.
+        // 更新のない確定済みの独立ルートも、監査対象として残す。
         fixture.unchanged(&fixture.other);
         if existing {
             rust_lock(&fixture.workspace, "young-child");
@@ -1879,7 +1879,7 @@ async fn independent_full_cargo_install_associates_only_its_actual_new_lock_and_
             std::fs::canonicalize(&missing.missing_lock_dirs[0]).unwrap(),
             std::fs::canonicalize(temp.path()).unwrap()
         );
-        // Simulate only the new lock file that this confirmed install can create.
+        // この確定した install が作成しうる、新しい lock ファイルだけを再現する。
         rust_lock(temp.path(), "example");
         let audit = plan.rust_audit_plan(&orchestrator, &result);
         assert_eq!(audit.locks.len(), 1);
@@ -2290,7 +2290,7 @@ async fn tauri_preflight_stops_both_sides_and_shared_cargo_members_but_keeps_ind
             .failed_updates()
             .find(|update| update.package_name() == "@tauri-apps/api")
             .unwrap();
-        // Node's judge chose 2.3.0; synchronization already chose the common 2.2.0 before the preflight stopped it.
+        // Node の judge は2.3.0を選んだが、事前検査で停止する前に同期処理が共通の2.2.0を選んでいる。
         assert!(
             matches!(failed_api, crate::domain::UpdateResult::Update { new_version, .. } if new_version == "2.2.0")
         );

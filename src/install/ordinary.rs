@@ -1,8 +1,8 @@
-//! The default `--install`. Package managers run inside recovery transactions that stay
-//! open through the `--age` audits. An install unit whose lockfile keeps a version this
-//! run added that does not pass `--age`, or whose lockfile could not be verified, is
-//! restored to its state before the run. Versions already locked before the run are
-//! reported but never cause a restore.
+//! 既定の `--install`。パッケージマネージャーは、`--age` 監査の完了まで開いたままの
+//! 復元用トランザクション内で動く。この実行で追加した版が lockfile に残って
+//! `--age` を満たさない場合、または lockfile を検証できなかった場合は、install 単位を
+//! 実行前の状態へ戻す。実行前から lock にあった版の違反は報告するが、
+//! 復元の理由にはしない。
 use super::transaction::InstallTransactions;
 use super::*;
 use crate::cargo_rollback::audit::{AuditReceipt, LockAgeAuditResult, RemainingAge};
@@ -16,10 +16,10 @@ use async_trait::async_trait;
 use colored::Colorize;
 use indicatif::ProgressBar;
 
-/// How many versions a restore reason names before summarizing the rest.
+/// 復元理由に版を何件まで列挙し、残りを件数でまとめるか。
 const NAMED_VERSIONS: usize = 5;
 
-/// The audits of the default install. Tests replace the registry and Cargo access.
+/// 既定の install の監査。テストではレジストリと Cargo へのアクセスを差し替える。
 #[async_trait(?Send)]
 pub(crate) trait Checks {
     async fn rust_lock(
@@ -74,7 +74,7 @@ impl Checks for SystemChecks<'_> {
     }
 }
 
-/// Run the planned installs, audit the lockfiles, and restore the units that did not pass.
+/// 予定した install を実行して lockfile を監査し、検証に失敗した単位を復元する。
 pub async fn run(
     args: &CliArgs,
     orchestrator: &Orchestrator,
@@ -103,7 +103,7 @@ pub(crate) async fn run_with(
 ) -> InstallOutcome {
     let mut tx = InstallTransactions::begin(plan, result, &orchestrator.rust_lock_boundary());
     note_direct_only_age(args, plan, &tx);
-    // Read before any package manager rewrites the lockfiles.
+    // パッケージマネージャーが lockfile を書き換える前に読む。
     let baselines = node_baselines(plan, &tx, checks).await;
     let mut progress = Progress::new(!args.quiet);
     tx.execute(|command| {
@@ -138,7 +138,7 @@ pub(crate) async fn run_with(
     let recovery = tx.rollback();
     let report_error = recovery.print(&mut std::io::stderr()).err();
     recovery.mark_summary(&mut result.summary);
-    // A pnpm target mismatch keeps the files for inspection (it is not an age failure).
+    // pnpm の更新先の不一致は調査用にファイルを残す（age 違反ではない）。
     let mut verification = Progress::new(!args.quiet);
     for job in plan
         .jobs
@@ -163,7 +163,7 @@ pub(crate) async fn run_with(
         }
     }
     verification.finish_and_clear();
-    // A restored unit's lockfile no longer describes the updates that were shown.
+    // 復元した単位の lockfile は、表示した更新内容を表さなくなる。
     recovery.exclude_rust_audits(&mut audit_plan);
     for (manifest, mismatches) in audit_plan.mismatch_reports() {
         for line in lock_mismatch_lines(&manifest, &mismatches) {
@@ -207,7 +207,7 @@ fn note_direct_only_age(args: &CliArgs, plan: &InstallPlan, tx: &InstallTransact
     }
 }
 
-/// The public npm versions locked before the run, for Node installs whose lockfile is audited.
+/// lockfile を監査する Node install について、実行前から lock された公開 npm の版。
 async fn node_baselines(
     plan: &InstallPlan,
     tx: &InstallTransactions,
@@ -245,7 +245,7 @@ async fn node_baselines(
     baselines
 }
 
-/// Audit each shared Cargo.lock, adopt the audit's own rollbacks, and fail the units to restore.
+/// 共有 Cargo.lock ごとに監査し、監査自身の差し戻しを採用して、復元する単位を失敗にする。
 async fn audit_rust_locks(
     args: &CliArgs,
     plan: &RustAuditPlan,
@@ -257,7 +257,7 @@ async fn audit_rust_locks(
             "  {} — cannot audit --age: Cargo.lock not found",
             directory.display()
         );
-        // The unit that installed this manifest, not a neighbor in the same directory.
+        // このマニフェストを install した単位を選び、同じディレクトリの別の単位は選ばない。
         tx.fail_holder(
             &directory.join("Cargo.toml"),
             "Cargo.lock was not found after the install, so --age could not be checked".into(),
@@ -310,7 +310,7 @@ async fn audit_rust_locks(
         }
         let mut reason = rust_restore_reason(&audit, &lock.baseline);
         let path = lock.directory.join("Cargo.lock");
-        // Only bytes the audit attests are adopted; a lockfile outside every unit is audit-only.
+        // 監査が保証したバイト列だけを採用する。どの単位にも含まれない lockfile は監査だけの対象。
         if let Some(receipt) = receipt
             && tx.manages(&path)
             && let Err(error) = tx.accept_audit_lock(&path, &receipt.before, &receipt.after)
@@ -328,7 +328,7 @@ async fn audit_rust_locks(
     has_unresolved
 }
 
-/// Why a unit must return to its state before the run, judged from the final lockfile.
+/// 最終の lockfile に基づき、単位を実行前の状態へ戻す理由を判定する。
 fn rust_restore_reason(
     audit: &LockAgeAuditResult,
     baseline: &RegistryLockEntries,
@@ -365,7 +365,7 @@ fn rust_restore_reason(
     })
 }
 
-/// Audit each Node lockfile (read-only) and fail the units to restore.
+/// Node の lockfile を読み取り専用で監査し、復元する単位を失敗にする。
 async fn audit_node_locks(
     args: &CliArgs,
     plan: &InstallPlan,
@@ -377,7 +377,7 @@ async fn audit_node_locks(
     let mut failed = false;
     let mut progress = Progress::new(!args.quiet);
     for job in &plan.node_audits {
-        // A unit already failed by its install or by a Tauri Cargo.lock is restored anyway.
+        // install 自体や Tauri の Cargo.lock ですでに失敗した単位も、どのみち復元される。
         let pending = tx.pending_report();
         if pending.covers_directory(&job.directory) {
             continue;
@@ -454,8 +454,8 @@ async fn audit_node_locks(
     failed
 }
 
-/// Why a Node unit must return to its state before the run. Sources outside the public npm
-/// registry are outside the audit; an unsupported package manager has no baseline.
+/// Node の単位を実行前へ戻す理由。公開 npm レジストリ以外の取得元は監査対象外であり、
+/// 未対応のパッケージマネージャーには baseline がない。
 fn node_restore_reason(
     manager: &str,
     audit: &NodeLockAuditResult,

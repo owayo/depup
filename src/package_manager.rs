@@ -10,20 +10,20 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
 
-/// A package-manager update may refresh everything or only the applied updates.
+/// パッケージマネージャーの更新は、全体を解き直す場合と適用した依存だけを更新する場合がある。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallScope {
     Full,
-    /// Explicit lock refresh; only supported by pnpm and Cargo.
+    /// 明示的な lock の再解決。pnpm と Cargo だけが対応する。
     Refresh,
-    /// Full Cargo update at a root already confirmed by the planner.
+    /// 計画側がすでに確定したルートで、Cargo の全体更新を行う。
     CargoFull,
     Packages(Vec<String>),
-    /// Reconcile changed requirements without unlocking unrelated Cargo packages.
+    /// 無関係な Cargo パッケージの固定を外さず、変更した要件を整合させる。
     CargoWorkspace,
 }
 
-/// One resolved command is shared by snapshot preparation and execution.
+/// 保存の準備と実行で、解決済みの同じコマンドを共有する。
 #[derive(Debug, Clone)]
 pub struct PreparedInstall {
     pub language: Language,
@@ -417,7 +417,7 @@ pub(crate) fn pnpm_age_minutes(age: Duration) -> u64 {
 }
 
 impl SystemPackageManager {
-    /// Run the Wrapper task twice so the distribution, scripts, and JAR agree.
+    /// 配布物・スクリプト・JAR を揃えるため、Wrapper タスクを2回実行する。
     pub fn update_gradle_wrapper(&self, project_dir: &Path, version: &str) -> Result<(), String> {
         if version.is_empty()
             || !version
@@ -525,7 +525,7 @@ impl SystemPackageManager {
         self.run_install_scoped(language, working_dir, policy, &InstallScope::Full)
     }
 
-    /// Run an install with selectors planned from successfully applied updates.
+    /// 適用に成功した更新から計画した選択引数を使い、install を実行する。
     pub fn run_install_scoped(
         &self,
         language: Language,
@@ -557,7 +557,7 @@ impl SystemPackageManager {
         self.prepare_resolved_install(language, &effective_dir, pm, policy, scope)
     }
 
-    /// Build argv from the same manager selection used to determine file ownership.
+    /// ファイルの所有関係を決めたときと同じマネージャーの選択結果から、引数を組み立てる。
     pub(crate) fn prepare_resolved_install(
         &self,
         language: Language,
@@ -710,8 +710,8 @@ impl SystemPackageManager {
             return Some((working_dir.to_path_buf(), "pnpm"));
         }
         if language == Language::Rust && *scope != InstallScope::Full {
-            // The planner has already obtained this root from Cargo itself.
-            // Re-detecting a Tauri subdirectory can select a different workspace.
+            // 計画側がすでに Cargo 自身からこのルートを取得している。
+            // Tauri のサブディレクトリを再検出すると、別の workspace を選ぶ場合がある。
             Some((working_dir.to_path_buf(), "cargo"))
         } else {
             self.resolve_package_manager(language, working_dir)
@@ -758,8 +758,8 @@ pub(crate) fn redact_install_output(text: &str, args: &[String]) -> String {
     static URLS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r#"(?i)\b(?:https?|ssh|git)://[^\s<>"'`]+"#).unwrap()
     });
-    // Tags and full updates have no source selector in argv. Cargo can still
-    // echo an authenticated manifest URL in its output, so scan every URL.
+    // タグ更新と全体更新の引数には取得元の指定がない。それでも Cargo が認証情報付きの
+    // マニフェストURLを出力する場合があるため、すべてのURLを検査する。
     let mut text = URLS
         .replace_all(text, |captures: &regex::Captures<'_>| {
             let url = &captures[0];
@@ -1068,7 +1068,7 @@ mod tests {
         let branch = TestProject::new(&registry, &manifest("branch = 'main'"));
         let tag = TestProject::new(&registry, &manifest("tag = 'v1.0.0'"));
         let local_cargo = |project: &TestProject, args: &[String]| {
-            // All sources are local: file:// git and the fake local registry.
+            // 取得元はすべてローカルで、file:// の git と偽のローカルレジストリを使う。
             let output = Command::new(TestProject::cargo_program())
                 .args(args)
                 .current_dir(project.path())

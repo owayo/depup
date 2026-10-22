@@ -1,4 +1,4 @@
-//! Install failure recovery, scoped to jobs that share managed files.
+//! 管理するファイルを共有するジョブの単位で、install の失敗から復元する。
 use super::{InstallPlan, RustAuditPlan};
 use crate::domain::{Language, UpdateSummary};
 use crate::file_snapshot::{
@@ -41,7 +41,7 @@ struct Unit {
     policy_failure: bool,
 }
 
-/// Prepared commands and snapshots are created once, before any PM is run.
+/// コマンドの準備とスナップショットの作成は、PM の実行前に一度だけ行う。
 pub struct InstallTransactions {
     tasks: Vec<Task>,
     units: Vec<Unit>,
@@ -78,7 +78,7 @@ struct FailedUnit {
     policy_failure: bool,
 }
 impl FailedUnit {
-    /// Every managed file is back to its state before the run.
+    /// 管理するファイルがすべて実行前の状態へ戻ったかを表す。
     fn recovered(&self) -> bool {
         self.files.values().all(FileOutcome::restored)
     }
@@ -106,7 +106,7 @@ impl InstallTransactions {
                 tx.node_managers.insert(identity(&job.directory), manager);
             }
         }
-        // Journals override the already-updated manifest snapshots taken below.
+        // 後で保存する更新済みのマニフェストの状態を、書き込み記録で上書きする。
         for write in &result.write_results {
             if let Some(journal) = &write.journal {
                 let before = FileState {
@@ -136,7 +136,7 @@ impl InstallTransactions {
             }
         }
         for (directory, version) in &plan.wrapper_updates {
-            // Each pass has its own observation boundary, while both share one unit.
+            // 単位は共有しつつ、各回で個別に観測の境界を置く。
             for _ in 0..2 {
                 let command = pm.prepare_gradle_wrapper(directory, version).map(Some);
                 let mut task = Task::new(directory, command);
@@ -166,7 +166,7 @@ impl InstallTransactions {
         let mut cargo_roots = BTreeMap::new();
         let mut uv_roots = BTreeMap::new();
         for job in &plan.jobs {
-            // Selection and confirmed file relationships do not depend on valid policy/argv.
+            // 選択結果と確定したファイルの関係は、ポリシーや引数の妥当性に依存しない。
             let selection = match &job.scope {
                 Ok(scope) => pm.resolve_scoped_package_manager(job.language, &job.directory, scope),
                 Err(_) if job.language != Language::Rust => {
@@ -257,8 +257,8 @@ impl InstallTransactions {
                             for name in ["pyproject.toml", "uv.lock"] {
                                 tx.add_scoped_path(&mut task, &scope.root.join(name));
                             }
-                            // uv resolves every confirmed member's requirements, even when
-                            // that member's own selected command is pip or failed to prepare.
+                            // uv は、各メンバーで選ばれたコマンドが pip である場合や準備に失敗した場合も含め、
+                            // 確定したすべてのメンバーの要件を解決する。
                             for (index, manifest) in result
                                 .summary
                                 .manifests
@@ -269,7 +269,7 @@ impl InstallTransactions {
                                 let Some(parent) = manifest.path.parent() else {
                                     continue;
                                 };
-                                // Confirmed exclusion/non-membership needs no child parsing.
+                                // 除外や非メンバーと確定した場合、子の設定を解析する必要はない。
                                 if !scope.members.contains(&identity(parent)) {
                                     continue;
                                 }
@@ -305,8 +305,8 @@ impl InstallTransactions {
                                     Some(&identity(boundary)),
                                 );
                             }
-                            // A peer can confirm which configs the shared command reads,
-                            // even when this manifest's own job failed during preparation.
+                            // このマニフェスト自身のジョブの準備に失敗しても、別のジョブによって、
+                            // 共有コマンドが読む設定を確定できる場合がある。
                             for (index, manifest) in result.summary.manifests.iter().enumerate() {
                                 if manifest.language == Language::Mise
                                     && scope.configs.contains(&identity(&manifest.path))
@@ -372,7 +372,7 @@ impl InstallTransactions {
                     tx.add_path(&mut task, &path, true);
                 }
                 if job.language == Language::Node {
-                    // Include actual pnpm members, including unchanged manifests.
+                    // 変更のないマニフェストも含め、実際の pnpm メンバーを対象にする。
                     for manifest in detect_manifests(&directory).into_iter().filter(|manifest| {
                         manifest.language == Language::Node
                             && node_resolution_directory(&manifest.path) == directory
@@ -437,7 +437,7 @@ impl InstallTransactions {
             }
             Err(error) => {
                 task.command = Err(format!("Cannot snapshot {}: {error}", path.display()));
-                // A journal can still be restored when another managed snapshot fails.
+                // ほかの管理対象の保存が失敗しても、書き込み記録から復元できる場合がある。
                 if let Ok(key) = resolved_path(path)
                     && self.files.contains_key(&key)
                 {
@@ -466,7 +466,7 @@ impl InstallTransactions {
             task.command = Err("Managed scope is outside the permitted recovery boundary".into());
             return false;
         }
-        // A confirmed relation survives failure to locate or snapshot this lock.
+        // lock の場所の特定や保存に失敗しても、確定した関係は保持する。
         task.scope_paths.insert(logical);
         self.add_guarded_path(task, path, true, Some(&boundary))
     }
@@ -543,7 +543,7 @@ impl InstallTransactions {
         }
     }
 
-    /// Commands in a failed unit are skipped; independent units continue.
+    /// 失敗した単位のコマンドは飛ばし、独立した単位の処理は続ける。
     pub fn commands(&self) -> impl Iterator<Item = &PreparedInstall> {
         self.tasks
             .iter()
@@ -566,7 +566,7 @@ impl InstallTransactions {
         if self.units[unit].failure.is_some() {
             return;
         }
-        // Ownership still matters when no package-manager command is needed.
+        // パッケージマネージャーの実行が不要でも、変更の所有関係は確認する必要がある。
         self.observe_trees(index, false);
         self.observe(unit, &BTreeSet::new());
         if self.units[unit].failure.is_some() {
@@ -659,13 +659,13 @@ impl InstallTransactions {
         out
     }
 
-    /// Whether a file is part of a prepared install unit (an audit-only lock is not).
+    /// ファイルが準備済みの install 単位に含まれるか。監査だけの lock は含まれない。
     pub(super) fn manages(&self, path: &Path) -> bool {
         resolved_path(path).is_ok_and(|key| self.files.contains_key(&key))
     }
 
-    /// Fail the units that hold this lockfile or manifest. Unlike [`Self::fail_verification`],
-    /// an independent install in the same directory (Cargo next to uv or Go) is not affected.
+    /// この lockfile またはマニフェストを保持する単位を失敗にする。[`Self::fail_verification`] と違い、
+    /// 同じディレクトリの独立した install（Cargo の隣の uv や Go）には影響しない。
     pub(super) fn fail_holder(&mut self, path: &Path, reason: String) {
         let key = identity(path);
         for unit in &mut self.units {
@@ -686,7 +686,7 @@ impl InstallTransactions {
         }
     }
 
-    /// Only bytes attested by the auditor are adopted; a later disk read is never ownership evidence.
+    /// 監査が保証したバイト列だけを採用する。後からディスクを読んだ内容は所有関係の証拠にならない。
     pub(super) fn accept_audit_lock(
         &mut self,
         path: &Path,

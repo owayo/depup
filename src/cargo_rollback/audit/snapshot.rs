@@ -1,4 +1,4 @@
-//! Last-resort recovery when selective age restoration cannot finish safely.
+//! age の選択的復元を安全に完了できない場合の最終的な復元手段。
 use super::*;
 use crate::cargo_rollback::scratch::workspace_manifest_paths;
 use crate::file_snapshot::{FileGuard, FileState, save_recovery_copy, write_checked};
@@ -11,9 +11,9 @@ pub(super) struct AuditSnapshot {
     inventory: Vec<PathBuf>,
 }
 
-// Inventory every Cargo.toml below each glob's fixed prefix. This conservative
-// superset also covers nested/repeated globs without depending on the detector's
-// limited pattern expansion or running Cargo again during emergency recovery.
+// 各 glob の固定接頭辞の配下にある Cargo.toml をすべて列挙する。この広めの集合なら、
+// 入れ子や繰り返しの glob も対象になり、検出器の限定的なパターン展開に頼らず、
+// 緊急復元中に Cargo を再実行せずに済む。
 fn manifest_inventory(root: &Path) -> Result<Vec<PathBuf>, String> {
     use std::fs;
     let root = fs::canonicalize(root).map_err(|error| error.to_string())?;
@@ -104,7 +104,7 @@ impl AuditSnapshot {
             let root = FileGuard::capture(&input.project_dir.join("Cargo.toml"))
                 .map_err(|error| error.to_string())?;
             let before = root.read().map_err(|error| error.to_string())?;
-            // Read-only audits can also inspect a lock without a manifest.
+            // 読み取り専用の監査では、マニフェストのない lock も確認できる。
             let paths = if before.bytes.is_some() {
                 workspace_manifest_paths(
                     input.project_dir,
@@ -190,7 +190,7 @@ impl AuditSnapshot {
             Ok(restored) => {
                 let reason = "the age audit failed; restored the install-time Cargo.lock snapshot";
                 let installed = parse_registry_entries(&state.installed_lock);
-                // Entries introduced only by the failed audit no longer describe this lock.
+                // 失敗した監査だけが追加した記録は、復元後の lock を表さない。
                 state.log.entries.retain(|(name, from), _| {
                     installed
                         .get(name)

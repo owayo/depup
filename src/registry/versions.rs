@@ -111,7 +111,7 @@ impl VersionFetcher {
         Ok(result)
     }
 
-    /// Share resolved publication dates across manifests in the same run.
+    /// 同じ実行内のマニフェスト間で、解決済みの公開日を共有する。
     pub(crate) async fn release_date(
         &self,
         adapter: &(dyn RegistryAdapter + Send + Sync),

@@ -1,4 +1,4 @@
-//! Official Gradle release listing for Wrapper updates.
+//! Wrapper 更新に使う、Gradle 公式のリリース一覧。
 
 use crate::error::RegistryError;
 use crate::registry::HttpClient;

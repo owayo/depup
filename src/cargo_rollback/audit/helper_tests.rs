@@ -219,8 +219,8 @@ mod retry_regressions {
         let mut new_dep = IndexDep::normal("new-only", "1");
         new_dep.optional = true;
         registry.publish_with("middle", "1.0.0", &[old_dep, new_dep]);
-        // Add the feature definitions to this fixture's index, without changing the
-        // shared registry builder or requiring any downloadable crate contents.
+        // 共有のレジストリ構築器を変えず、ダウンロード可能なcrate本体も要求せずに、
+        // このfixtureのインデックスへ feature の定義を追加する。
         let index_path = registry.path().join("index/mi/dd/middle");
         let mut entry: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&index_path).unwrap()).unwrap();
@@ -420,8 +420,8 @@ mod retry_regressions {
         assert_eq!(project.locked_versions("old-only"), ["1.0.0"]);
         assert_eq!(project.locked_versions("z-top"), ["1.1.0"]);
         assert_eq!(project.locked_versions("s-solo"), ["1.0.0"]);
-        // Between audited commands, the edge of middle that the update moved is also an
-        // external change, and middle is the first required dependency reached.
+        // 監査したコマンド間に更新された middle の辺も外部変更であり、
+        // middle は最初に到達する必須の依存先になる。
         assert!(
             state
                 .problems
@@ -726,7 +726,7 @@ mod retry_regressions {
             "{result:?}"
         );
         assert!(!result.has_unresolved(), "{result:?}");
-        // Multiple locked versions of a name share one metadata request.
+        // 同名の複数の lock 版は、メタデータ取得を1回にまとめる。
         assert_eq!(dates.fetch_count(), 3);
         project.cargo_ok(&["update", "--workspace", "--locked"]);
     }
@@ -765,11 +765,11 @@ mod retry_regressions {
         }
     }
 
-    /// Issue #54: with two series of a crate in the lock (`toml` in a Tauri app), rolling
-    /// one back rewrites the versioned reference of a dependent (`cargo_toml`). The
-    /// dependent was recorded as an external change, which stopped the selective
-    /// restoration and returned the whole lock, independent rollbacks included, to the
-    /// install-time snapshot.
+    /// Issue #54: lock にcrateの2系列（Tauri アプリの `toml`）があると、片方の
+    /// 差し戻しに伴って依存元（`cargo_toml`）の版付き参照が書き換わる。
+    /// この依存元を外部変更として記録したため、選択的復元が止まり、
+    /// 独立した差し戻しを含め lock 全体が、
+    /// install 時点のスナップショットへ戻っていた。
     #[tokio::test]
     async fn rewritten_references_of_dependents_do_not_stop_selective_restoration() {
         let registry = LocalRegistry::new();
@@ -848,9 +848,9 @@ mod retry_regressions {
             .run(None)
             .await;
         assert!(result.problems.is_empty(), "{result:?}");
-        // The rollback independent of the unresolved a-dep stays.
+        // 未解消の a-dep と独立した差し戻しは保持する。
         assert_eq!(project.locked_versions("s-solo"), ["1.0.0"], "{result:?}");
-        // Only the rollbacks related to a-dep return to the install-time combination.
+        // a-dep と関係する差し戻しだけ、install 時点の組み合わせへ戻す。
         assert_eq!(project.locked_versions("z-top"), ["1.2.0"]);
         assert_eq!(project.locked_versions("d-dup"), ["0.8.0", "0.9.1"]);
         assert_eq!(project.locked_versions("a-dep"), ["1.2.0"]);
@@ -868,14 +868,14 @@ mod retry_regressions {
         project.cargo_ok(&["update", "--workspace", "--locked"]);
     }
 
-    /// A command that exits successfully without moving its target still wrote the lock,
-    /// so its changes must not count as an edit between audited commands.
+    /// 対象の版を動かさずに成功終了したコマンドも lock を書いているため、
+    /// その変更をコマンド間の編集として数えてはならない。
     #[cfg(unix)]
     #[tokio::test]
     async fn successful_commands_that_leave_the_target_record_their_changes() {
         use std::os::unix::fs::PermissionsExt;
         let (_registry, project, baseline, dates, _cargo) = fixture(false);
-        // Leaves z-top in place but moves its dependency and rewrites the file.
+        // z-top はそのままで依存先を動かし、ファイルを書き換える。
         let script = project.path().join("rewrite-lock");
         std::fs::write(
             &script,
@@ -918,7 +918,7 @@ mod retry_regressions {
             state.log.entries[&key].status,
             LockAgeStatus::UpdateCommandFailed(_)
         ));
-        // The moved dependency belongs to the command, not to an external edit.
+        // 動いた依存先は、外部編集ではなくそのコマンドの変更とする。
         assert!(state.changes.owns("a-dep", "1.1.0"));
         assert!(
             !state
@@ -930,15 +930,15 @@ mod retry_regressions {
                 .changes
                 .allows_snapshot_restore(Some(after.as_bytes()))
         );
-        // The same lock and target are not tried again because of its own write.
+        // そのコマンド自身の書き込みだけでは、同じ lock と対象を再試行しない。
         assert_eq!(
             state.alone_failures[&key].lock,
             together_fingerprint(&after, &[])
         );
     }
 
-    /// The final evidence names the version a rollback left in the lock, not the one it moved
-    /// from, so a moved-to version without a release date is not mistaken for the original.
+    /// 最終の証拠には差し戻す前の版ではなく、差し戻した後で lock に残った版を記録し、
+    /// 公開日不明の移動先を元の版と取り違えないようにする。
     #[tokio::test]
     async fn remaining_judges_the_version_a_rollback_left_in_the_lock() {
         let (_registry, project, baseline, _dates, cargo) = fixture(false);
@@ -946,7 +946,7 @@ mod retry_regressions {
         project.cargo_ok(&["update", "-p", "s-solo@1.1.0", "--precise", "1.0.0"]);
         let old = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
         let young = chrono::Utc.with_ymd_and_hms(2026, 1, 29, 0, 0, 0).unwrap();
-        // The release date of s-solo 1.0.0, the version moved to, is unknown.
+        // 移動先である s-solo 1.0.0 の公開日は不明。
         let dates = FakeCratesIo::new()
             .release("s-solo", "1.1.0", young)
             .release("z-top", "1.2.0", old)
@@ -996,7 +996,7 @@ mod retry_regressions {
         );
     }
 
-    /// Replace the checksum of one package, as an edit made while Cargo was running.
+    /// Cargo の実行中に編集された状況として、1パッケージのチェックサムを置換する。
     fn edit_checksum(lock: &str, name: &str) -> String {
         let mut in_package = false;
         let mut edited: Vec<String> = Vec::new();
@@ -1037,7 +1037,7 @@ mod retry_regressions {
             project.cargo_ok(&["update", "-p", "s-solo@1.1.0", "--precise", "1.0.0"]);
             let mut after = project.read("Cargo.lock");
             if external {
-                // a-dep is outside the scope of the s-solo command.
+                // a-dep は s-solo コマンドの範囲外にある。
                 after = edit_checksum(&after, "a-dep");
                 project.write("Cargo.lock", &after);
             }
@@ -1431,7 +1431,7 @@ mod retry_regressions {
                 state.changes.observe(&partial);
             }
             RecoveryEdit::DuringCommand => {
-                // y-pin changed outside the scope of an audited s-solo command.
+                // y-pin は監査した s-solo コマンドの範囲外で変わった。
                 let edited = edit_checksum(&partial, "y-pin");
                 project.write("Cargo.lock", &edited);
                 state
@@ -1456,7 +1456,7 @@ mod retry_regressions {
                 project.write(&format!("{new_member}/src/lib.rs"), "");
                 project.cargo_ok(&["update", "--workspace"]);
                 let after = project.read("Cargo.lock");
-                // Model an audited Cargo command noticing the new glob member.
+                // 監査した Cargo コマンドが新しい glob メンバーを検出する状況を再現する。
                 state.changes.applied(&partial, &after, &[]);
                 assert!(
                     state
@@ -1485,7 +1485,7 @@ mod retry_regressions {
         let expected_lock = FileState::read(&project.path().join("Cargo.lock")).unwrap();
         let expected_manifest = project.read("Cargo.toml");
 
-        // The actual rollbacks used Cargo; only the subsequent recovery is broken.
+        // 実際の差し戻しには Cargo を使い、その後の復元だけを失敗させる。
         let unavailable = CargoCommand::new().program(project.path().join("missing-cargo"));
         let input = LockAgeAudit {
             cargo: &unavailable,

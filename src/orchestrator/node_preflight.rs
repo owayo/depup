@@ -114,8 +114,8 @@ pub(super) async fn preflight(
         .iter()
         .filter(|manifest| manifest.language == Language::Node)
     {
-        // Parse/check failures omit their result. Keep selected failed Node projects
-        // in the scope without reintroducing languages excluded by CLI flags.
+        // parse・check の失敗は結果に載らない。選択対象の Node プロジェクトが失敗しても範囲に残し、
+        // CLI のフラグで除外した言語は再導入しない。
         if !inventory.iter().any(|result| result.path == manifest.path)
             && errors.iter().any(|error| {
                 matches!(error,
@@ -408,8 +408,8 @@ impl ScopeGraph {
                 let mut next_path = path.clone();
                 next_path.used.insert(manifest.clone());
                 next_path.reason = next_path.reason.or_else(|| Some(reason.clone()));
-                // Aliases share this single unknown membership. Visit all their
-                // Node installs together without assigning it another root.
+                // 別名はこの1つの不明な所属を共有する。それらすべての
+                // Node の install をまとめて辿り、別のルートを割り当てない。
                 for (_, alias_node, _) in self
                     .unknown
                     .iter()
@@ -447,8 +447,8 @@ impl ScopeGraph {
         path: ReachPath,
     ) {
         let alternatives = paths.entry(vertex.clone()).or_default();
-        // A smaller consumed set can take every continuation of a larger one.
-        // Keep confirmed paths over uncertain ones. This also closes cycles.
+        // 消費済みの集合が小さい状態なら、大きい状態で可能な後続処理をすべて辿れる。
+        // 不確かなパスより確定済みのパスを優先する。これで循環も打ち切れる。
         let dominates = |a: &ReachPath, b: &ReachPath| {
             a.used.is_subset(&b.used) && (a.reason.is_none() || b.reason.is_some())
         };
@@ -510,8 +510,8 @@ fn linked_scopes(
         .keys()
         .any(|vertex| !matches!(vertex, ScopeVertex::Node(_)));
     if reached_cargo {
-        // Preserve stops for original Rust manifests omitted by parse/check and
-        // for aliases, even when they have no actual update to record as failed.
+        // parse・check で結果から抜けた元の Rust マニフェストや別名についても、
+        // 失敗として記録できる実際の更新がない場合を含め、停止状態を維持する。
         for (manifest, root) in roots {
             let cause = match root {
                 CargoRoot::Known(root) => reached.get(&ScopeVertex::Root(root.clone())).cloned(),

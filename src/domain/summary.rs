@@ -119,7 +119,7 @@ pub struct UpdateSummary {
     pub manifests: Vec<ManifestUpdateResult>,
     /// ドライランかどうか
     pub dry_run: bool,
-    /// Lock refresh results are separate from direct dependency update counts.
+    /// lock の再解決の結果は、直接依存の更新件数と分けて集計する。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lock_refreshes: Vec<LockRefreshResult>,
 }
