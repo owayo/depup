@@ -242,6 +242,10 @@ When a dependency has a range with an upper bound (e.g., `>=3.5.0,<4.0.0`, `>=1.
 
 For npm/Composer hyphen ranges, a partial right-hand side like `1.0 - 2.0` is interpreted as a wildcard-expanded exclusive upper bound, so `2.0.x` versions remain candidates while `2.1.0` and later do not.
 
+Upper bounds retain their full version, including Python's `rc`, `post`, and `dev` suffixes and Composer's `RC` and patch aliases (`p`, `pl`, `patch`). For example, `>=1.0rc1,<1.0rc3` can advance to `>=1.0rc2,<1.0rc3`, but never to `1.0rc4`. Composer's `>=1.0.0 <=1.0.0p2` can advance to `>=1.0.0p2 <=1.0.0p2`. Multiple upper bounds use the same ecosystem-specific ordering as candidate selection; when equal, an exclusive limit wins. Ruby alphabetic segments remain literal versions: `<=1.0.x` never becomes the npm-style wildcard limit `<1.1`.
+
+Derived bounds use decimal string arithmetic. Large numeric release segments cannot disable Python prefix or compatible-release limits: `==18446744073709551616.1.*` still excludes `18446744073709551617.0.1`. Epochs are preserved too. The [Python version specification](https://packaging.python.org/en/latest/specifications/version-specifiers/) and [Composer version constraints](https://getcomposer.org/doc/articles/versions.md) describe these version forms.
+
 ### Preserving the Original Format
 
 depup preserves the original version range format. For specifiers whose width depends on how many segments are written, such as tilde (`~`), the segment count is kept too. The examples in the last group are exact versions, so they change only with `--include-pinned`:

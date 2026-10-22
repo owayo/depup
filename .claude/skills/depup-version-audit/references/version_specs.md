@@ -39,7 +39,7 @@
 | OR range | `^1 \|\| ^2` | OR 結合 | Range |
 | Comparator set | `>=1.0.0 <2.0.0` | AND 結合 | Range |
 | Partial range | `1.2` | 部分バージョン（暗黙range） | Range |
-| Dist-tag | `latest`, `next`, `canary` | タグ | Wildcard |
+| Dist-tag | `latest`, `next`, `canary` | タグ | スキップ（浮動参照） |
 | npm alias | `npm:@scope/pkg@^1.0` | npm エイリアス（右側制約を解釈） | 内部制約に準拠 |
 | Protocol | `workspace:*`, `file:`, `git://`, `github:`, `https://` | プロトコル参照 | スキップ |
 
@@ -68,9 +68,9 @@
 |------|---|------|-----------|
 | Exact (PEP 440) | `==1.2.3` | 完全一致 | Exact |
 | Exact wildcard | `==1.2.*` | メジャー.マイナー一致 | Range |
-| Arbitrary equality | `===v1.2-custom` | arbitrary equality (`===`) | Exact（比較時は数値部） |
-| Compatible release | `~=1.2.3` | `>=1.2.3, <1.3.0` 相当 | Tilde |
-| Compatible release (2-part) | `~=1.2` | `>=1.2, <2.0` 相当 | Tilde |
+| Arbitrary equality | `===v1.2-custom` | arbitrary equality (`===`) | Exact（比較時も識別子を保持） |
+| Compatible release | `~=1.2.3` | `>=1.2.3, <1.3.0` 相当 | Range |
+| Compatible release (2-part) | `~=1.2` | `>=1.2, <2.0` 相当 | Range |
 | Greater or equal | `>=1.2.3` | 以上 | GreaterOrEqual |
 | Greater | `>1.2.3` | 超過 | Greater |
 | Less or equal | `<=1.2.3` | 以下 | LessOrEqual |
@@ -79,15 +79,15 @@
 | Not equal wildcard | `!=1.2.*` | メジャー.マイナー除外 | Range |
 | Wildcard | `*`, `1.*` | 任意バージョン | Wildcard |
 | Range (comma) | `>=1.0,<2.0` | AND 結合 | Range |
-| Epoch | `>=1!2.0` | エポック接頭辞 | 演算子付きで対応（比較時除去） |
+| Epoch | `>=1!2.0` | エポック接頭辞 | 演算子付きで対応（比較時も保持） |
 | Caret (Poetry) | `^1.2.3` | Poetry 互換（caret） | Caret |
 | Tilde (Poetry) | `~1.2.3` | Poetry 互換（tilde） | Tilde |
 | Environment markers | `; python_version>="3.8"` | 環境マーカー | パース後除去 |
 | Extras | `package[extra]>=1.0` | extras 指定 | extras保持 |
-| Local version | `==1.0+local1` | ローカル版 | Exact（比較時は数値部） |
-| Pre-release | `==1.0a1`, `==1.0b1`, `==1.0rc1` | PEP 440 プレリリース | Exact（比較時は数値部） |
-| Post-release | `==1.0.post1` | ポストリリース | Exact（比較時は数値部） |
-| Dev release | `==1.0.dev1` | 開発リリース | Exact（比較時は数値部） |
+| Local version | `==1.0+local1` | ローカル版 | Range（local を保持し、自動書き換えはスキップ） |
+| Pre-release | `==1.0a1`, `==1.0b1`, `==1.0rc1` | PEP 440 プレリリース | Exact（比較時も識別子を保持） |
+| Post-release | `==1.0.post1` | ポストリリース | Exact（比較時も識別子を保持） |
+| Dev release | `==1.0.dev1` | 開発リリース | Exact（比較時も識別子を保持） |
 
 ### PEP 440 の特殊ケース
 
@@ -156,8 +156,8 @@
 - go.mod ではバージョン範囲指定が存在しない（常にピン留め）
 - Minimal Version Selection (MVS) アルゴリズムでバージョン解決
 - `replace` ディレクティブはスキップ
-- `exclude` ディレクティブはスキップ
-- `retract` ディレクティブはスキップ（`retract [v1.0, v1.9]` のレンジ形式あり）
+- `exclude` ディレクティブ自体は書き換えず、指定版を更新候補から除外する
+- `retract` は情報源の `go.mod` から読み、単一版・包含範囲を更新候補から除外する
 
 ### pseudo-version の3形式
 
@@ -221,7 +221,7 @@
 | AND (space) | `>=1.0 <2.0` | AND 結合 | Range |
 | AND (comma) | `>=1.0,<2.0` | AND 結合 | Range |
 | Hyphen range | `1.0 - 2.0` | ハイフン範囲 | Range |
-| Stability flag | `1.0@dev` | 安定性フラグ | @以降除去 |
+| Stability flag | `1.0@dev` | 安定性フラグ | 本体と分けて保持し、更新後も再付与 |
 | v-prefix | `v1.2.3` | v 接頭辞 | Exact |
 | Platform | `php`, `ext-*`, `lib-*` | プラットフォーム | スキップ |
 
@@ -286,7 +286,7 @@
 
 ## Swift (SPM)
 
-**公式仕様**: [Swift Package Manager](https://developer.apple.com/documentation/packagedescription/package/dependency)
+**公式仕様**: [Swift Package Manager](https://docs.swift.org/package-manager/PackageDescription/PackageDescription.html)
 
 | 構文 | 例 | 説明 | depup 分類 |
 |------|---|------|-----------|
@@ -328,3 +328,28 @@
 | Hyphen range | `1.0.0 - 2.0.0` | `2.0.0` 以下 |
 | Maven range | `[1.0,2.0)`, `(,2.0]` | 末尾 `)` は未満、`]` は以下 |
 | v-prefix | `<v4.0.0`, `[v1,v2)` | 比較時に `v` を除去 |
+
+
+## 2026-10-22 の仕様監査
+
+各言語の公式仕様と parser・manifest・更新判定を突き合わせた。通常形式と、解析するが安全に書き換えない形式を区別する。
+
+| 言語・公式仕様 | 対応済みの主な構文 | 自動更新から外す形式・制限 |
+|---|---|---|
+| [Node](https://github.com/npm/node-semver) | exact、caret、tilde、部分指定、x-range、比較の組、hyphen、alias | protocol・dist-tag は対象外。OR は解析するが書き換えない。単独の比較付き x-range と `~>` 付き x-range は未対応（軽微な取りこぼし） |
+| [Python](https://packaging.python.org/en/latest/specifications/version-specifiers/) | 比較、compatible release、prefix matching、epoch、pre/post/dev、Poetry の bare pin、extras・marker | local 固定・除外は書き換えない。Poetry の複数条件配列は対象外 |
+| [Cargo](https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html) | 暗黙・明示 caret、tilde、exact、wildcard、複数要件、pre/build | path・別レジストリは対象外。上限のない混合要件は安全のため書き換えない |
+| [Go](https://go.dev/ref/mod) | SemVer、pseudo-version、`+incompatible`、pinned、exclude・retract の候補除外 | replace に該当する require は更新しない。範囲指定は Go 自体に存在しない |
+| [Ruby](https://guides.rubygems.org/patterns/#pessimistic-version-constraint) | exact、pessimistic、比較、複合制約、ドット区切りのプレリリース | 除外制約・非レジストリのブロック・動的な DSL は自動書き換えしない |
+| [Composer](https://getcomposer.org/doc/articles/versions.md) | exact、caret、tilde、wildcard、比較、hyphen、stability flag、4セグメント、patch alias | OR・除外・inline alias・開発ブランチは書き換えない。`~>` は本家が拒否する |
+| [Gradle](https://docs.gradle.org/current/userguide/dependency_versions.html) | exact、prefix、Maven range、strict/prefer/reject、version catalog、変数参照 | latest・SNAPSHOT は浮動参照として保持。解決できない計算値・plugin ID は対象外 |
+| [Swift](https://docs.swift.org/package-manager/PackageDescription/PackageDescription.html) | from、exact、upToNextMajor/Minor、開・閉範囲、pre/build、追加引数 | branch・revision・path・registry の id は対象外。GitHub URL の版付き依存を扱う |
+
+### 実害を再現して修正した箇所
+
+- 修飾子付き上限の読み落とし: `>=1.0rc1,<1.0rc3` で上限を `1.0` と読んで `1.0rc4` を選んでいた。上限の版全体を取り、6言語で解析から書き戻し・再解析まで検証する。
+- Ruby の `x` 識別子: `>=1.0.a, <=1.0.x` の `.x` を npm の wildcard と誤認し、上限を `<1.1` へ広げていた。Ruby では通常の文字列セグメントとして比較し、安定版 `1.0` を選ばないようにする。
+- 複数上限の順序: Composer の `<1.0.0p2 <1.0.0` を汎用の順序で選ぶと、patch alias の上限を誤る。候補選択と同じ言語別比較を使い、同値なら排他を優先する。
+- 大きな release segment: `==18446744073709551616.1.*` の上限計算が `u64` への変換に失敗し、別majorを選んでいた。prefix・compatible release・部分上限の加算を10進文字列で共有し、epoch と桁上がりも検証する。
+
+Node の上記の軽微な未対応は、安全に書き換える新規実装の対象にせず、現状の検出範囲として記録する。各言語で意図的に除外する参照を、レジストリの版へ変換する変更は行っていない。
