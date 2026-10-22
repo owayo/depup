@@ -49,7 +49,7 @@ pub trait RegistryAdapter: Send + Sync {
     /// レジストリ名を取得
     fn registry_name(&self) -> &'static str;
 
-    /// Separate cached versions when a project resolves the same coordinate from other repositories.
+    /// 同じ座標でも別のリポジトリから解決するプロジェクトでは、版のキャッシュを分ける。
     fn cache_scope(&self) -> String {
         String::new()
     }
@@ -57,14 +57,14 @@ pub trait RegistryAdapter: Send + Sync {
     /// パッケージの利用可能なバージョンを取得
     async fn fetch_versions(&self, package: &str) -> Result<Vec<VersionInfo>, RegistryError>;
 
-    /// Whether `fetch_versions` returned placeholder dates that must be resolved
-    /// before an update can be reported.
+    /// `fetch_versions` が仮の日時を返し、更新を報告する前に
+    /// 本当の日時を解決する必要があるかどうか。
     fn release_dates_deferred(&self) -> bool {
         false
     }
 
-    /// A release date that must be checked before selecting a version. Registries that
-    /// return dates with their version listing can use the default implementation.
+    /// 版を選ぶ前に確認する公開日。版の一覧と一緒に日時を返すレジストリでは、
+    /// 既定の実装を使える。
     async fn fetch_release_date(
         &self,
         _package: &str,

@@ -31,16 +31,16 @@ pub struct InstallJob {
     pub language: Language,
     /// 解釈できない native 設定は実行時にエラーとして扱う。
     pub policy: Result<AgePolicy, String>,
-    /// Scope preparation errors must never fall back to a full update.
+    /// scope の準備エラーを、全体更新へのフォールバックで回避してはならない。
     pub scope: Result<InstallScope, String>,
-    /// The planned manifests, including lock-only Git updates.
+    /// lock だけを更新する Git 依存も含め、処理を計画したマニフェスト。
     pub manifests: Vec<PathBuf>,
 }
 
 /// install 前に確定する実行単位と、変更を判定するための lock の保存。
 pub struct InstallPlan {
     pub jobs: Vec<InstallJob>,
-    /// Wrapper distributions whose properties file was actually written.
+    /// properties ファイルの書き込みに成功した Wrapper の配布物。
     pub wrapper_updates: Vec<(PathBuf, String)>,
     /// Node lock の監査は、マニフェストの更新がない実行でも計画する。
     pub node_audits: Vec<InstallJob>,

@@ -1,4 +1,4 @@
-//! Undo only partial audited changes that remain related to unresolved install-time versions.
+//! install 時点の未解消の版と関係が残る、監査の部分的な変更だけを取り消す。
 
 use super::*;
 use crate::cargo_rollback::batch::{RestorationScope, RestoreCandidate, restore_installed};
@@ -10,13 +10,13 @@ const LOCK_AGE_RESTORE_BUDGET: Duration = Duration::from_secs(60);
 
 type LockId = (String, String, Option<String>);
 
-/// Changes observed immediately around an audited Cargo operation. An unexplained
-/// checkpoint change revokes ownership of that source/semver series permanently.
-/// A single-crate Cargo command writes the live lock; simultaneous edits in its
-/// dependency scope cannot be distinguished from Cargo's own changes. Checkpoints
-/// preserve changes observed between commands, and scratch commits check originals.
-/// Packages are compared by meaning ([`LockEntry`]), so a dependency reference that
-/// only changes its spelling is not a change.
+/// 監査した Cargo 操作の直前と直後で観測した変更。説明できない
+/// チェックポイントの変化があれば、その取得元と semver 系列を監査の所有対象から永久に外す。
+/// 単一crateの Cargo コマンドは実際の lock に書く。その依存範囲内の同時編集は
+/// Cargo 自身の変更と区別できない。チェックポイントではコマンド間に観測した変更を
+/// 保持し、一時 workspace からの反映では元ファイルを確認する。
+/// パッケージは意味で比較する（[`LockEntry`]）ため、依存参照の
+/// 表記だけが変わっても変更とはみなさない。
 #[derive(Clone, Default)]
 pub(super) struct AuditChanges {
     checkpoint: String,
@@ -32,11 +32,11 @@ fn lock_ids(content: &str) -> BTreeSet<LockId> {
         .collect()
 }
 
-/// A dependency edge resolved to the package it names. Cargo writes each reference in
-/// its shortest unambiguous form (`"toml"`, `"toml 0.9.8"`, or with a source), so the
-/// text of an unchanged edge changes when another version of that name enters or
-/// leaves the lock. A reference that names no single package keeps its text, and an
-/// element that is not a string keeps its TOML form.
+/// 参照先のパッケージへ解決した依存辺。Cargo は曖昧でない最短の形
+/// （`"toml"`、`"toml 0.9.8"`、または取得元付き）で参照を書くため、
+/// 同名の別バージョンが lock に入る、または抜けるだけでも、変わっていない辺の
+/// 表記が変わる。一意のパッケージを指さない参照は元の文字列を保持し、
+/// 文字列でない要素は TOML 表現を保持する。
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Edge {
     Package(LockId),
@@ -44,8 +44,8 @@ enum Edge {
     Invalid(String),
 }
 
-/// A lock package compared by meaning: its other fields, and its dependency edges
-/// as a multiset of the packages they name.
+/// lock のパッケージを、そのほかのフィールドと、参照先パッケージの多重集合としての
+/// 依存辺で意味的に比較する。
 #[derive(Clone, Debug, PartialEq)]
 struct LockEntry {
     fields: toml::Value,
@@ -53,10 +53,10 @@ struct LockEntry {
 }
 
 impl LockEntry {
-    /// Whether the package changed only because an operation moved its dependencies.
-    /// Each removed edge must name a package the operation `moved`, paired with an
-    /// added edge to the same name, source and semver series inside its `scope`.
-    /// A net addition or removal, or any other field, is not explained this way.
+    /// 操作が依存先を移動したことだけで、このパッケージが変わったかどうか。
+    /// 消えた辺は、操作が `moved` としたパッケージを指し、同じ名前・取得元・semver 系列の
+    /// `scope` 内のパッケージへの追加辺と対にならなければならない。
+    /// 辺の純増・純減や、そのほかのフィールドの変化は、この規則では説明できない。
     fn rewired(
         &self,
         after: &Self,
@@ -115,7 +115,7 @@ fn resolve_edge(ids: &[LockId], reference: &toml::Value) -> Edge {
     let Some(reference) = parse_dependency_ref(text) else {
         return Edge::Unresolved(text.into());
     };
-    // References omit a git source's `#<commit>`.
+    // git の取得元の `#<commit>` は参照には含まれない。
     let mut matches = ids.iter().filter(|id| {
         id.0 == reference.name
             && reference
@@ -193,17 +193,17 @@ impl AuditChanges {
         self.checkpoint = content.to_string();
     }
 
-    /// Whether the live lock holds only audited changes, so the whole snapshot can replace
-    /// it. A registry or git package changed outside an audited operation's scope is kept,
-    /// as selective restoration keeps it. Path packages follow the workspace manifests,
-    /// which the snapshot checks separately.
+    /// 実際の lock に監査済みの変更だけがあり、スナップショット全体で置換できるかを返す。
+    /// 監査した操作の範囲外で変わったレジストリ・git のパッケージは、選択的復元と
+    /// 同様に保持する。path パッケージは workspace のマニフェストに従うため、
+    /// スナップショット側で別途確認する。
     pub(super) fn allows_snapshot_restore(&self, content: Option<&[u8]>) -> bool {
         !self.between_commands_changed
             && self.external_packages().is_empty()
             && content == Some(self.checkpoint.as_bytes())
     }
 
-    /// Registry and git packages changed outside an audited operation (`name version`).
+    /// 監査した操作の範囲外で変わったレジストリ・git のパッケージ（`name version`）。
     pub(super) fn external_packages(&self) -> Vec<String> {
         self.external
             .iter()
@@ -244,8 +244,8 @@ impl AuditChanges {
             .map(|key| (key.0.clone(), key.1.clone()))
             .collect();
         let mut related = BTreeSet::new();
-        // Reachability and paired source/series endpoints form one fixed point.
-        // An endpoint discovered in either graph can expose further old or new dependencies.
+        // 到達可能性と、取得元・系列が対になる端点を、変化がなくなるまで一緒に展開する。
+        // どちらのグラフで見つけた端点からも、変更前後の依存がさらに見つかりうる。
         while let Some(key) = pending.pop() {
             if !related.insert(key.clone()) {
                 continue;
@@ -270,9 +270,9 @@ impl AuditChanges {
             .filter(|key| related.contains(&(key.0.clone(), key.1.clone())))
             .cloned()
             .collect();
-        // Moving a package also rewrites the edges of its dependents outside the scope.
-        // Such a dependent did not change itself, so it is neither ours nor external,
-        // and what earlier operations recorded about it stays as it was.
+        // パッケージを移動すると、範囲外の依存元の辺も書き換わる。
+        // その依存元自体は変わっていないため、監査の所有対象にも外部変更にも追加せず、
+        // 以前の操作による記録をそのまま残す。
         let rewired = |key: &LockId| {
             before_tables
                 .get(key)
@@ -365,7 +365,7 @@ fn restore_plans(
             continue;
         }
         if installed.contains(&from) && current.contains(&from) {
-            // It has already returned to its original registry package ID.
+            // すでに元のレジストリのパッケージIDへ戻っている。
             continue;
         }
         if now.is_none()
@@ -472,8 +472,8 @@ fn restore_plans(
             continue;
         }
         let result = (|| -> Result<_, String> {
-            // LockGraph merges equal name/version IDs. A duplicate source on a connecting
-            // path makes that relationship uncertain, so do not infer a restoration scope.
+            // LockGraph は同名・同版のIDをまとめる。接続経路に重複する取得元があると
+            // 関係を確定できないため、復元範囲を推定しない。
             for (graph, packages, selected) in [
                 (
                     &original_graph,
@@ -527,7 +527,7 @@ fn restore_plans(
                         installed: node.installed.1.clone(),
                     },
                 );
-                // Reintroduced dependencies are pinned to I as well, never to a third version.
+                // 再導入する依存も I に固定し、別の第3の版にはしない。
                 for key in original_graph
                     .reachable(&node.installed)
                     .intersection(&installed)
@@ -648,9 +648,9 @@ impl LockAgeAuditor<'_> {
                 return;
             }
         };
-        // Later audited commands can move an earlier explicit rollback again.
+        // 後続の監査済みコマンドが、以前に明示的に差し戻した版を再び動かすこともある。
         state.log.reconcile_with_lock(&current);
-        // Cached release metadata may already establish that an unvisited I version is safe.
+        // 未訪問の I の版が安全だと、キャッシュ済みの公開情報から判断できる場合もある。
         for (name, versions) in &current {
             if let Some(cached) = self.versions.cached(self.input.adapter, name).await {
                 for version in versions {
@@ -1028,8 +1028,8 @@ mod tests {
         assert!(error.contains("ambiguous source"), "{error}");
     }
 
-    /// The shape of a Tauri lock: `toml` has two series, so Cargo writes `cargo_toml`'s
-    /// dependency with a version, and moving `toml` rewrites that reference.
+    /// Tauri の lock に相当する構成。`toml` が2系列あるため、Cargo は `cargo_toml` の
+    /// 依存参照に版を付け、`toml` の移動に伴ってその参照を書き換える。
     fn toml_family(version: &str, cargo_toml: &[&str]) -> String {
         lock(&[
             ("cargo_toml", "0.22.0", PUBLIC, cargo_toml),
@@ -1053,7 +1053,7 @@ mod tests {
         assert!(changes.owns("toml", "0.9.8") && changes.owns("toml", "0.9.5"));
         assert!(changes.allows_snapshot_restore(Some(current.as_bytes())));
 
-        // What earlier operations recorded about the dependent stays as it was.
+        // 依存元について以前の操作が記録した内容は、そのまま残す。
         let id = (
             cargo_toml.0.clone(),
             cargo_toml.1.clone(),
@@ -1068,7 +1068,7 @@ mod tests {
         earlier.applied(&installed, &current, &selected);
         assert!(earlier.externally_changed(&cargo_toml));
 
-        // The same rewrite between audited operations is an external change.
+        // 同じ書き換えでも、監査した操作の間に起きた場合は外部変更とする。
         let mut between = AuditChanges::default();
         between.observe(&installed);
         between.observe(&current);
@@ -1084,7 +1084,7 @@ mod tests {
                 Some(source.to_string()),
             )
         };
-        // A second `toml` series makes Cargo add a version to the same edge.
+        // 別系列の `toml` があると、Cargo は同じ辺の表記に版を追加する。
         let single = lock(&[
             ("cargo_toml", "0.22.0", PUBLIC, &["toml"]),
             ("serde", "1.0.0", PUBLIC, &[]),
@@ -1100,7 +1100,7 @@ mod tests {
         changes.observe(&duplicated);
         assert!(!changes.externally_changed(&("cargo_toml".into(), "0.22.0".into())));
 
-        // A source suffix names one of two sources; a git reference omits the commit.
+        // 取得元の接尾辞は2つの取得元を区別する。git の参照には commit が含まれない。
         let git = "git+https://example.com/toml?branch=main#0123abcd";
         let sourced = lock(&[
             (
@@ -1129,22 +1129,22 @@ mod tests {
         let moved_serde = ("serde".to_string(), "1.0.0".to_string());
         let retargeted = toml_family("0.9.5", &["toml 0.9.5", "ghost 1.0.0"]);
         for (after, selected) in [
-            // To another series.
+            // 別の系列へ付け替える場合。
             (
                 toml_family("0.9.5", &["toml 0.8.2", "ghost 1.0.0"]),
                 &moved_toml,
             ),
-            // With an edge added to an unchanged package in scope.
+            // 範囲内の変わっていないパッケージへの辺を追加する場合。
             (
                 toml_family("0.9.5", &["toml 0.9.5", "serde", "ghost 1.0.0"]),
                 &moved_toml,
             ),
-            // With a reference that names no package changed.
+            // 変更したパッケージを指さない参照を使う場合。
             (
                 toml_family("0.9.5", &["toml 0.9.5", "ghost 2.0.0"]),
                 &moved_toml,
             ),
-            // With another field changed.
+            // 別のフィールドも変わった場合。
             (
                 retargeted.replace(
                     "dependencies = [\"toml 0.9.5\"",
@@ -1152,7 +1152,7 @@ mod tests {
                 ),
                 &moved_toml,
             ),
-            // By an operation that did not move the old target.
+            // 元の対象を動かしていない操作の場合。
             (retargeted.clone(), &moved_serde),
         ] {
             let mut changes = AuditChanges::default();
@@ -1211,7 +1211,7 @@ mod tests {
                 ]),
                 true,
             ),
-            // One of two identical edges is left without a partner.
+            // 同じ2本の辺の一方に、対応する辺が残らない場合。
             (
                 entry(&[
                     ("toml", "0.9.5", 1),
@@ -1220,7 +1220,7 @@ mod tests {
                 ]),
                 false,
             ),
-            // An edge is added or removed besides the moves.
+            // 移動に加えて、別の辺が追加または削除される場合。
             (
                 entry(&[
                     ("toml", "0.9.5", 3),
@@ -1230,7 +1230,7 @@ mod tests {
                 false,
             ),
             (entry(&[("toml", "0.9.5", 2), ("toml", "0.8.1", 1)]), false),
-            // The 0.8 edge cannot pair with a version from the 0.9 series.
+            // 0.8系列への辺は、0.9系列の版と対にできない。
             (entry(&[("toml", "0.9.5", 3), ("syn", "2.0.9", 1)]), false),
         ] {
             assert_eq!(
@@ -1258,16 +1258,16 @@ mod tests {
                 .remove(&("example".into(), "0.1.0".into(), Some(PUBLIC.into())))
                 .unwrap()
         };
-        // A string and a non-string element never collapse into one edge.
+        // 文字列の要素と文字列でない要素は、同じ辺にはまとめない。
         assert_ne!(entry("[\"true\"]"), entry("[true]"));
-        // A list that is not an array stays in the compared fields.
+        // 配列でないリスト値は、比較対象のフィールド側に残す。
         assert_ne!(entry("\"toml\""), entry("\"serde\""));
         assert_eq!(entry("\"toml\""), entry("\"toml\""));
     }
 
     #[test]
     fn path_packages_alone_do_not_prevent_snapshot_restoration() {
-        // Path packages have no source; the snapshot checks their manifests instead.
+        // path パッケージには取得元がないため、スナップショットがマニフェストを確認する。
         let before = "version = 4\n\n[[package]]\nname = \"example\"\nversion = \"0.1.0\"\n";
         let after = format!("{before}\n[[package]]\nname = \"member\"\nversion = \"0.1.0\"\n");
         let mut changes = AuditChanges::default();

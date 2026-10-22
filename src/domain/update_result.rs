@@ -19,7 +19,7 @@ pub enum SkipReason {
     Excluded,
     /// --only リストに含まれていない
     NotInOnlyList,
-    /// An effective pnpm override controls this declaration; overrides remain unchanged.
+    /// 実効的な pnpm override がこの宣言を制御している。override 自体は変更しない。
     PnpmOverride(String),
     /// レジストリからのバージョン情報取得に失敗
     FetchFailed(String),

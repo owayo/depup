@@ -272,7 +272,7 @@ async fn absent_invalid_and_unsupported_locks_report_failure_without_fetching() 
         assert!(result.errors.is_empty());
         assert!(result.unsupported[0].contains("not supported"));
     }
-    // npm format 1 is unsupported too, not a lockfile that failed verification.
+    // npm の形式1も未対応であり、検証に失敗した lockfile とは区別する。
     std::fs::write(
         directory.path().join("package-lock.json"),
         r#"{"lockfileVersion":1,"dependencies":{}}"#,
@@ -885,7 +885,7 @@ async fn pnpm_list_command_failures_and_timeouts_are_not_successes() {
 #[tokio::test]
 async fn npm_baseline_reads_the_same_lockfile_as_the_audit() {
     let directory = tempfile::tempdir().unwrap();
-    // No lockfile before the run: every version is added by it.
+    // 実行前に lockfile がない場合、すべての版がこの実行で追加されたものになる。
     assert_eq!(
         read_baseline(directory.path(), "npm").await,
         NodeBaseline::Known(BTreeSet::new())
@@ -900,7 +900,7 @@ async fn npm_baseline_reads_the_same_lockfile_as_the_audit() {
         read_baseline(directory.path(), "npm").await,
         NodeBaseline::Known([("young".to_string(), "1.0.0".to_string())].into())
     );
-    // The shrinkwrap takes priority, as in the audit, and an unreadable one is not empty.
+    // 監査と同じく shrinkwrap を優先する。読めない場合は空とみなさない。
     std::fs::write(directory.path().join("npm-shrinkwrap.json"), "invalid JSON").unwrap();
     assert!(matches!(
         read_baseline(directory.path(), "npm").await,
@@ -916,7 +916,7 @@ async fn npm_baseline_reads_the_same_lockfile_as_the_audit() {
 #[tokio::test]
 async fn pnpm_baseline_keeps_the_lockfile_graph_despite_warnings_and_stale_manifests() {
     let directory = tempfile::tempdir().unwrap();
-    // depup has already rewritten the manifest; the lockfile still has the old version.
+    // depup はマニフェストを書き換えたが、lockfile には古い版が残っている。
     std::fs::write(
         directory.path().join("package.json"),
         r#"{"dependencies":{"young":"2.0.0"}}"#,
@@ -944,7 +944,7 @@ async fn pnpm_baseline_keeps_the_lockfile_graph_despite_warnings_and_stale_manif
         baseline_with(directory.path(), "pnpm", &program).await,
         NodeBaseline::Unknown(reason) if reason.contains("lock parse failed")
     ));
-    // The graph must describe the bytes that were read.
+    // グラフは、読み取ったバイト列を表していなければならない。
     let program = fake_pnpm(
         directory.path(),
         &format!(

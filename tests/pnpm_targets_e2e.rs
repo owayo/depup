@@ -1,4 +1,4 @@
-//! A successful pnpm process must not hide an unresolved direct update.
+//! pnpm が成功終了しても、直接依存の未達の更新を見逃さない。
 #![cfg(unix)]
 
 use serde_json::{Value, json};

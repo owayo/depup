@@ -1,11 +1,11 @@
-//! Plan selective updates from the applied dependencies and the old lockfile.
+//! 適用した依存更新と変更前の lockfile から、選択的な更新を計画する。
 
 use super::*;
 use crate::cargo_scope::rust_resolution_directory;
 use crate::domain::{Dependency, GitReference, ManifestUpdateResult};
 use crate::manifest::{LockPackage, is_crates_io_source, parse_lock_packages};
 
-/// Keep full refresh semantics while preventing detection from reviving a stopped root.
+/// 全体を解き直す意味を保ちつつ、検出によって停止済みのルートを復活させない。
 pub(super) fn replace_full_rust_jobs(
     jobs: &mut Vec<InstallJob>,
     orchestrator: &Orchestrator,
@@ -189,7 +189,7 @@ fn cargo_scope(
     for manifest in manifests {
         for update in manifest.updates() {
             let dependency = update.dependency();
-            // A tag change creates a new source ID. Reconcile it without unlocking the old source.
+            // タグの変更で新しい取得元IDができる。古い取得元の固定を外さず整合させる。
             if dependency
                 .git_source
                 .as_ref()
@@ -236,7 +236,7 @@ fn cargo_scope(
                     selectors.insert(format!("{source}#{}@{}", package.name, package.version));
                 }
                 [] if dependency.git_source.is_none() => {
-                    // A changed manifest may refer to a dependency that has never been locked.
+                    // 変更後のマニフェストが、まだ lock に入ったことのない依存を参照する場合もある。
                 }
                 _ => {
                     return Err(format!(

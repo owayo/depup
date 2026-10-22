@@ -31,7 +31,7 @@ pub struct PhpVersionParser;
 // 末尾の修飾子は 2 通り受け付ける:
 //  1. `(?:-[\w.-]+)?` — ハイフン区切りの汎用 suffix (`-rc.1` / `-beta1`)。従来からの形。
 //  2. composer/semver の modifier regex 相当
-//     (`[._-]?(stable|beta|b|RC|alpha|a|patch|pl|p)((?:[.-]?\d+)*)?([.-]?dev)?`)。
+// 修飾子の形式: (`[._-]?(stable|beta|b|RC|alpha|a|patch|pl|p)((?:[.-]?\d+)*)?([.-]?dev)?`)。
 //     本家は**区切り文字を省略でき `.` / `_` も使える**ため、`2.2.1p2` (laminas/laminas-diactoros の
 //     セキュリティパッチ) / `^1.0.0beta1` / `1.0.0.RC1` / `1.0.0_beta1` はいずれも正当な制約。
 //     ハイフンを必須にしていたせいでこれらは parse が None を返し、依存ごと (スキップ理由にも

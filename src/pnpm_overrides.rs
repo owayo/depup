@@ -1,4 +1,4 @@
-//! Effective pnpm overrides protect direct declarations from misleading updates.
+//! pnpm の実効 override によって、直接依存の宣言に対する誤解を招く更新を防ぐ。
 use crate::domain::Dependency;
 use crate::parser::{NodeVersionParser, VersionParser};
 use std::path::Path;
@@ -19,7 +19,7 @@ impl PnpmOverrides {
 
     pub(crate) fn reason(&self, dependency: &Dependency) -> Option<String> {
         self.0.iter().find_map(|(selector, source)| {
-            // A scoped package's first @ belongs to its name, not a version suffix.
+            // スコープ付きパッケージの最初の @ は、版の区切りではなく名前の一部。
             let suffix = selector
                 .char_indices()
                 .skip(1)
@@ -31,8 +31,8 @@ impl PnpmOverrides {
             }
             if let Some(offset) = suffix {
                 let version = &selector[offset + 1..];
-                // Comparator sets separate tokens with whitespace. An unspaced > after
-                // a version token is pnpm's parent separator, including numeric child names.
+                // comparator set は空白でトークンを分ける。版トークンの後で空白なしに続く > は、
+                // 子の名前が数字の場合も含め、pnpm の親子の区切りになる。
                 let parent_separator = version.char_indices().any(|(index, ch)| {
                     ch == '>'
                         && index > 0

@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
-/// Exact file state at a successful manifest write, before any install begins.
+/// マニフェストの書き込み成功時、install 開始前の正確なファイル状態。
 #[derive(Debug, Clone)]
 pub struct ManifestJournal {
     pub target: std::path::PathBuf,
@@ -208,8 +208,8 @@ impl ManifestWriter {
                 if count <= 1 {
                     return None;
                 }
-                // Every alias sharing this catalog version must select the same target.
-                // A skipped alias or different target keeps the write ambiguous.
+                // この catalog の版を共有するすべての alias が、同じ更新先を選ぶ必要がある。
+                // スキップされた alias や異なる更新先がある場合、書き込み先は曖昧なままにする。
                 let targets: Vec<&str> = manifest_result
                     .results
                     .iter()

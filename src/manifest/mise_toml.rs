@@ -9,7 +9,7 @@
 //! ```toml
 //! [tools]
 //! node = "26.7.0"                                   # 文字列
-//! java = { version = "temurin-21", postinstall = "" } # inline table
+//! java = { version = "temurin-21", postinstall = "" } # インラインテーブル
 //! "npm:prettier" = "3.9.6"                          # クォート付きキー
 //! python = ["3.12", "3.13"]                         # 配列 (更新対象外)
 //!
@@ -102,7 +102,7 @@ fn match_key_len(text: &str, key: &str) -> Option<usize> {
 /// 受け付ける形:
 /// - `node = "26.7.0"` (生キー)
 /// - `"npm:prettier" = "3.9.6"` (クォート付きキー。`:` や `.` を含む名前は必須)
-/// - `node.version = "26.7.0"` (dotted key)
+/// - `node.version = "26.7.0"` （ドット付きキー）
 ///
 /// dotted key は toml クレートが inline table と同じ構造へ畳むため、parse 側は
 /// 依存として surface する。書き換え側が対応していないと「更新あり」と報告した

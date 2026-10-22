@@ -230,7 +230,7 @@ fn has_non_registry_source(line: &str, custom_git_sources: &[String]) -> bool {
 enum GlobalSourceIssue {
     /// rubygems.org 以外の global source (`source "https://gems.internal.example.com"`)
     NonRubygemsSource,
-    /// global path source (`path "vendor/gems"`)
+    /// グローバルの path 取得元（`path "vendor/gems"`）
     GlobalPathSource,
 }
 

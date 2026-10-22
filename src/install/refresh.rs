@@ -1,4 +1,4 @@
-//! Opt-in lock refresh. Resolution is provisional until all final-lock checks pass.
+//! 明示指定による lock の再解決。最終 lock のすべての検証が通るまで、解決結果は仮のものとする。
 use super::transaction::InstallTransactions;
 use super::*;
 use crate::cargo_rollback::audit::{AuditReceipt, LockAgeAuditResult};
@@ -108,7 +108,7 @@ fn blocked_reason(
 }
 
 fn in_scope(path: &Path, directory: &Path) -> bool {
-    // Unreadable identities cannot establish that a failed declaration is independent.
+    // 識別情報を読めないと、失敗した宣言が独立しているとは断定できない。
     crate::file_snapshot::resolved_path(path)
         .and_then(|path| {
             crate::file_snapshot::resolved_path(directory)
@@ -243,7 +243,7 @@ impl Verification for SystemVerification<'_> {
     }
 }
 
-/// Execute the opt-in path while keeping the recovery snapshots alive through verification.
+/// 復元用スナップショットを検証完了まで保持したまま、明示指定の処理を実行する。
 pub async fn run(
     args: &CliArgs,
     orchestrator: &Orchestrator,
@@ -356,7 +356,7 @@ async fn run_with(
             }
             if snapshot.protected != before.protected { return Err("lock refresh changed an external dependency whose registry policy cannot be verified".into()); }
             check_osv(verifier, job.language, &before.packages, &snapshot.packages, &progress).await?;
-            // Recheck the admitted bytes after network operations.
+            // ネットワーク処理の後、採用したバイト列を再確認する。
             tx.check_lock(&lock_path(job), snapshot.bytes.as_deref())?;
             Ok::<_,String>(snapshot)
         }.await;
@@ -367,7 +367,7 @@ async fn run_with(
             Err(error) => reject(&mut tx, &mut errors, job, error),
         }
     }
-    // Match the app's direct importer and Cargo root edges, never every copy in a shared lock.
+    // 共有 lock の全コピーではなく、アプリの直接の importer と Cargo root の辺を照合する。
     for job in &jobs {
         if tx.pending_report().covers_directory(&job.directory) {
             continue;
@@ -383,7 +383,7 @@ async fn run_with(
         progress.spinner("Installing verified pnpm lockfile");
         runner(command)
     });
-    // Lifecycle scripts must not substitute a different resolution after verification.
+    // lifecycle script が検証後に別の解決結果へ差し替えることを許さない。
     for job in &jobs {
         if tx.pending_report().covers_directory(&job.directory) {
             continue;

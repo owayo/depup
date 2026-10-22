@@ -110,7 +110,7 @@ pub enum RemainingAge {
     Unverified,
 }
 
-/// The initial checkpoint and the final bytes owned by audited Cargo operations.
+/// 最初のチェックポイントと、監査した Cargo 操作が書いた最後のバイト列。
 pub(crate) struct AuditReceipt {
     pub(crate) before: Vec<u8>,
     pub(crate) after: Vec<u8>,
@@ -198,7 +198,7 @@ pub enum LockAgeStatus {
     /// install 前の lock から変わっていない版で、期間を満たさない。install 前の版より
     /// 古くはしないので差し戻さない (この実行が入れた版ではない)
     LockedBeforeInstall,
-    /// A partial rollback was undone to retain the install-time combination.
+    /// install 時点の組み合わせを保つため、部分的な差し戻しを取り消した。
     Reverted(String),
     /// age 内の代替バージョンが見つからずスキップ (全バージョンが新しい等)
     NoOlderCandidate,
@@ -908,7 +908,7 @@ impl<'a> LockAgeAuditor<'a> {
         Ok(outcome)
     }
 
-    /// Retry a single rollback only when its lock or target changed.
+    /// lock または対象が変わったときだけ、単独の差し戻しを再試行する。
     async fn rollback_one(
         &self,
         candidate: RollbackCandidate,
@@ -973,8 +973,8 @@ impl<'a> LockAgeAuditor<'a> {
         };
         if remaining < MIN_CARGO_UPDATE_SLICE + reserve {
             if reserve != Duration::ZERO && remaining >= MIN_CARGO_UPDATE_SLICE {
-                // End the scan without consuming more metadata budget; pending singles
-                // can use the remaining slice before deciding whether to resolve together.
+                // メタデータ取得の予算をさらに使わず走査を終える。保留中の単独処理には、
+                // まとめて解くか決める前に残りの時間を使わせる。
                 outcome.together.push(candidate.clone());
                 outcome.paused_for_reserve = true;
                 return Ok(());
@@ -1005,7 +1005,7 @@ impl<'a> LockAgeAuditor<'a> {
         let status = match status {
             LockAgeStatus::Downgraded => {
                 let (after, locked) = read_audit_lock(&lock_path)?;
-                // What the command wrote is its own change even if the target stayed.
+                // 対象の版が動かなくても、コマンドが書いた内容はそのコマンドの変更とする。
                 state
                     .changes
                     .applied(&content, &after, std::slice::from_ref(&key));
@@ -1024,7 +1024,7 @@ impl<'a> LockAgeAuditor<'a> {
                         return Ok(());
                     }
                     None => {
-                        // Retry only after a change other than this command's own.
+                        // このコマンド自身の書き込み以外の変更があったときだけ再試行する。
                         fingerprint = together_fingerprint(&after, &[]);
                         LockAgeStatus::UpdateCommandFailed(format!(
                             "cargo update --precise {target} exited successfully, but Cargo.lock still has {name} {current}"
@@ -1054,8 +1054,8 @@ impl<'a> LockAgeAuditor<'a> {
                 );
             }
             LockAgeStatus::NotAttempted(message) => {
-                // A timeout does not establish a resolver conflict, but must not restart
-                // against the same lock and target on a later pass.
+                // タイムアウトだけでは解決の衝突と断定できないが、後の走査で同じ lock と
+                // 対象を再試行してはならない。
                 state.alone_failures.insert(
                     key,
                     AloneFailure {
@@ -1095,9 +1095,9 @@ impl<'a> LockAgeAuditor<'a> {
                     )
                 })
                 .collect();
-            // Every changed-lock retry gets priority over the together reserve,
-            // including retries after an earlier candidate failed again.
-            // It can finish a simple dependency chain even when fewer than 20 seconds remain.
+            // lock が変わった後の再試行は、まとめ解き用の予約時間より常に優先する。
+            // 以前に失敗した候補が再び失敗した後の再試行も含む。
+            // 残り20秒未満でも、単純な依存の連鎖なら処理を完了できる。
             let order = LockGraph::from_lock_content(&content)
                 .dependents_first(&pending.keys().cloned().collect::<Vec<_>>());
             let successes = outcome.alone_successes;

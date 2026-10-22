@@ -1,7 +1,7 @@
-//! Maven Central repository metadata adapter.
+//! Maven Central のリポジトリメタデータを取得するアダプタ。
 //!
-//! The search index can lag behind the repository. Artifact-level Maven metadata is the
-//! authoritative version list; individual POM responses provide release dates.
+//! 検索インデックスはリポジトリに遅れる場合がある。artifact 単位の Maven メタデータを
+//! 正式な版の一覧とし、各 POM のレスポンスから公開日を取得する。
 
 use crate::domain::Language;
 use crate::error::RegistryError;
@@ -124,8 +124,8 @@ impl MavenCentralAdapter {
         None
     }
 
-    /// Respect built-in repository declarations in the nearest Gradle settings file.
-    /// In projects without one, try the public repositories in their usual order.
+    /// 最寄りの Gradle settings ファイルにある組み込みリポジトリの宣言を尊重する。
+    /// 宣言のないプロジェクトでは、公開リポジトリを通常の順序で試す。
     pub fn for_manifest(client: HttpClient, manifest: &Path) -> Self {
         let mut adapter = Self::new(client);
         let settings = manifest.ancestors().find_map(|directory| {
@@ -287,7 +287,7 @@ impl RegistryAdapter for MavenCentralAdapter {
             }
             found_metadata = true;
             for version in metadata.versioning.versions.version {
-                // The first configured repository listing a version owns its POM date.
+                // 設定順で最初にその版を列挙したリポジトリの POM 日時を使う。
                 sources.entry(version).or_insert_with(|| base_url.clone());
             }
         }
@@ -298,15 +298,15 @@ impl RegistryAdapter for MavenCentralAdapter {
             });
         }
 
-        // The listing has no per-version timestamps. Resolve selected candidates
-        // from their POMs before the judge makes a final decision.
+        // 一覧には版ごとの日時がないため、judge が最終判断をする前に、選んだ候補の
+        // 公開日を POM から取得する。
         let mut versions = sources
             .keys()
             .cloned()
             .map(VersionInfo::undated)
             .collect::<Vec<_>>();
         versions.sort();
-        // Commit only a complete, validated listing, replacing any older source map.
+        // 検証済みの完全な一覧だけを反映し、古い取得元の対応表を置き換える。
         self.package_sources
             .lock()
             .await
@@ -741,7 +741,7 @@ mod tests {
         let mut adapter = MavenCentralAdapter::new(HttpClient::new().unwrap());
         adapter.base_url = base;
         adapter.fallback_urls.clear();
-        // A stale package map must not stand in for the requested version's source.
+        // 要求した版の取得元として、古いパッケージの対応表を代用しない。
         adapter.package_sources.lock().await.insert(
             "example:library".into(),
             HashMap::from([("old".into(), "http://example.invalid/old".into())]),

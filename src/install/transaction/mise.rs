@@ -1,4 +1,4 @@
-//! Project-local mise locks and their dependency metadata.
+//! プロジェクト内の mise の lock と依存メタデータ。
 use super::*;
 
 pub(super) struct MiseScope {
@@ -21,8 +21,8 @@ pub(super) fn managed_paths(
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .collect();
-    // Explicitly selected environment configs must bring their local and parent
-    // layers into the same recovery scope before a repair enables that env.
+    // 環境用の設定を明示的に選んだ場合、修復でその環境を有効にする前に、
+    // ローカル設定と親の設定も同じ復元範囲へ含める。
     for manifest in manifests {
         let Some(environment) = manifest
             .file_name()
@@ -99,7 +99,7 @@ pub(super) fn managed_paths(
                 Err(error) => return Err(format!("Cannot read mise config: {error}")),
             }
         }
-        // Same-root layers are low to high; the nearest effective true root wins.
+        // 同じルートの設定は優先度順に重なる。root が実効的に true の最寄りの場所を採る。
         if monorepo.is_some()
             && layers
                 .iter()
@@ -209,7 +209,7 @@ pub(super) fn managed_paths(
             .or_else(|| stem.strip_prefix("config"))
             .ok_or("Unsupported mise config filename")?;
         let name = format!("mise{suffix}.lock");
-        // Save both the destination and old colocated locks migrated by mise.
+        // mise が移行する先の lock と、以前の同じ場所の lock を両方保存する。
         let colocated = parent.join(&name);
         let destination = if let Some((root, true, _)) = &monorepo {
             root.join(&name)
@@ -218,7 +218,7 @@ pub(super) fn managed_paths(
         };
         paths.insert(colocated.clone());
         paths.insert(destination.clone());
-        // Alternate containers load the config from the enclosing project.
+        // 別の設定用ディレクトリは、それを含むプロジェクトの設定を読む。
         let project = [
             ".config/mise/config.toml",
             "mise/config.toml",
@@ -252,8 +252,8 @@ pub(super) fn managed_paths(
                 .map(str::to_string),
         });
     }
-    // Return confirmed logical paths independently of individual snapshot failures.
-    // The transaction validates each target against its recovery boundary.
+    // 個々のスナップショットの失敗とは独立して、確定した論理パスを返す。
+    // トランザクションは、それぞれの対象を復元の境界に照らして検証する。
     Ok(MiseScope {
         paths: paths.into_iter().collect(),
         configs: configs
@@ -264,7 +264,7 @@ pub(super) fn managed_paths(
     })
 }
 
-/// mise may load parent project configs above a Cargo-derived permission boundary.
+/// mise は、Cargo から得た許可境界より上の親プロジェクト設定を読むことがある。
 fn check_parent_scope(
     directory: &Path,
     boundary: &Path,
@@ -322,7 +322,7 @@ fn check_parent_scope(
                     .map(|value| value.as_bool().ok_or("Invalid parent mise lockfile scope"))
                     .transpose()?
                     == Some(true);
-            // The standard home config is global; its installed outputs are excluded.
+            // 標準のホーム設定はグローバルなので、その install 生成物は対象外にする。
             let global = home.as_deref() == Some(ancestor) && name.starts_with(".config/mise");
             let stem = config
                 .file_stem()
@@ -484,7 +484,7 @@ fn visit(
     for tool in directories(directory, scan, boundary, known_links) {
         for version in directories(&tool, scan, boundary, known_links) {
             let path = version.alias;
-            // Save each known NativeGraph path, including absence and partial metadata.
+            // 不在や一部だけのメタデータも含め、判明した NativeGraph の各パスを保存する。
             for name in [
                 "uv.lock",
                 "pyproject.toml",

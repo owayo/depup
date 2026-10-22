@@ -1,4 +1,4 @@
-//! Preserve existing lock coverage without changing the install's resolution.
+//! install の解決結果を変えず、既存の lock の対象範囲を維持する。
 use super::*;
 
 pub(super) struct LockContext {
@@ -335,7 +335,7 @@ impl Preservation {
         let mut entries = BTreeMap::new();
         for path in &self.paths {
             let (lock, versions) = snapshot(files, path)?;
-            // A colocated lock can disappear only when its destination is confirmed.
+            // 同じ場所の lock を削除してよいのは、移動先が確定したときだけ。
             let migrated = self
                 .migrations
                 .get(path)
@@ -357,8 +357,8 @@ impl Preservation {
         let mut required_entries = Vec::new();
         let mut matched = BTreeSet::new();
         let mut assignments = BTreeMap::new();
-        // Reserve unchanged entries before matching changed requests. This keeps
-        // several versions of the same backend from stealing each other's match.
+        // 変更した要求を照合する前に、変更していない記録の対応先を予約する。
+        // これにより、同じバックエンドの複数版が互いの対応先を奪わないようにする。
         for phase in 0..3 {
             for (index, required) in self.required.iter().enumerate() {
                 if assignments.contains_key(&index) {
@@ -399,9 +399,9 @@ impl Preservation {
             let entry_index = if let Some(&entry_index) = assignments.get(&index) {
                 entry_index
             } else {
-                // Several old requests can legitimately converge on one version.
-                // Only a single candidate across the entire matching identity
-                // permits sharing a match already reserved by another request.
+                // 複数の古い要求が同じ版へまとまること自体は正当。
+                // 一致する識別情報の全体で候補が1つだけの場合に限り、
+                // 別の要求が予約した対応先を共有できる。
                 let candidates: Vec<_> = entries[&required.destination]
                     .iter()
                     .enumerate()
@@ -487,8 +487,8 @@ impl Repair {
     pub fn checkpoint(&mut self, files: &BTreeMap<PathBuf, FileRecord>) -> Result<(), String> {
         self.validate_resolutions(files)?;
         for (path, baseline) in &mut self.baseline {
-            // Keep the install's resolution fixed while protecting metadata
-            // restored by every successful repair from subsequent commands.
+            // install の解決結果を固定したまま、修復に成功するたびに復元したメタデータを、
+            // 後続のコマンドから保護する。
             baseline.metadata = snapshot(files, path)?.0.metadata;
         }
         Ok(())

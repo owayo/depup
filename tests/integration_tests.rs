@@ -1418,7 +1418,7 @@ mod registry_response_parsing {
         let versions = vec![
             ("7.1.0", false), // not yanked
             ("7.0.8", false), // not yanked
-            ("7.0.7", true),  // yanked - should be excluded
+            ("7.0.7", true),  // yanked のため候補から外す
         ];
 
         let active_versions: Vec<_> = versions

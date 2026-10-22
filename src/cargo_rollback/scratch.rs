@@ -417,7 +417,7 @@ fn workspace_members(metadata: &Metadata) -> impl Iterator<Item = &MetadataPacka
         .filter(move |package| ids.contains(package.id.as_str()))
 }
 
-/// Use the same root/member inventory for audit recovery and scratch resolution.
+/// 監査の復元と一時 workspace の解決には、同じ root/member 一覧を使う。
 pub(super) async fn workspace_manifest_paths(
     root: &Path,
     cargo: &CargoCommand,

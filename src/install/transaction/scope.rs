@@ -1,4 +1,4 @@
-//! Static membership for managers whose command resolves a shared project lock.
+//! 共有するプロジェクトの lock を解決するパッケージマネージャーの静的なメンバー一覧。
 use super::*;
 use std::path::Component;
 
@@ -96,7 +96,7 @@ impl UvScope {
 pub(super) fn uv_root(directory: &Path, boundary: &Path) -> Result<UvScope, String> {
     let directory = identity(directory);
     let boundary = identity(boundary);
-    // This permission boundary is not evidence that uv stops searching above it.
+    // この許可境界は、uv がそれより上を探索しない証拠にはならない。
     for ancestor in directory.ancestors() {
         let content = match fs::read_to_string(ancestor.join("pyproject.toml")) {
             Ok(content) => content,

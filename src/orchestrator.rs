@@ -113,11 +113,11 @@ pub enum OrchestratorError {
     RegistryError { package: String, message: String },
     /// マニフェストの書き込みに失敗
     WriteError { path: String, message: String },
-    /// The final pnpm resolution did not reach an announced update target.
+    /// pnpm の最終的な解決結果が、表示した更新先へ到達しなかった。
     InstallResolutionError { directory: PathBuf, message: String },
     /// 書き込み前に停止した共有 pnpm scope。事後に同じ lock を再監査しない。
     NodePreflightError { directory: PathBuf, message: String },
-    /// Stop a Cargo manifest and its confirmed install/audit root, if known.
+    /// 判明していれば、Cargo マニフェストと確定した install・監査ルートを停止する。
     CargoPreflightError {
         manifest: PathBuf,
         root: Option<PathBuf>,
@@ -1093,8 +1093,8 @@ impl Orchestrator {
         self.versions.fetch(adapter, package).await
     }
 
-    /// Maven metadata has no per-version date. Resolve only versions the judge would
-    /// actually select, then re-run the age filter with the POM's Last-Modified date.
+    /// Maven のメタデータには版ごとの日時がない。judge が実際に選ぶ候補だけを解決し、
+    /// POM の Last-Modified 日時で age フィルタを再評価する。
     async fn resolve_java_release_dates(
         &self,
         dep: &Dependency,
@@ -1117,8 +1117,8 @@ impl Orchestrator {
             ));
         }
 
-        // Each pass resolves one new candidate. A candidate too young for min_age is
-        // excluded by the next pass; older candidates remain available as fallbacks.
+        // 各周回で新しい候補を1つ解決する。min_age を満たさない候補は
+        // 次の周回で除外し、古い候補をフォールバック先として残す。
         let mut confirmed_limited = false;
         for _ in 0..=versions.len() {
             let (selected, checking_limit) = match judge.judge(dep, &versions) {
@@ -2560,7 +2560,7 @@ mod tests {
                 matches!(&result, UpdateResult::Skip { reason, released_at, .. } if *reason == expected && *released_at == verbose.then_some(now - chrono::Duration::days(1))),
                 "verbose={verbose}: {result:?}"
             );
-            // Gradle ordering may equate spellings without identifying one release.
+            // Gradle の順序では、単一のリリースと断定できない別表記が同値になる場合がある。
             let alias = Dependency::new(
                 "example:library",
                 VersionSpec::new(VersionSpecKind::Exact, "3-0-0", "3-0-0"),
@@ -2674,7 +2674,7 @@ mod tests {
             }
         }
 
-        // Verbose output alone does not fetch the current date for non-exact specs.
+        // exact 以外の指定では、verbose 表示だけを理由に現在版の公開日を取得しない。
         let orchestrator =
             Orchestrator::new(make_args_with_path(dir.path(), &["--java", "--verbose"])).unwrap();
         let adapter = DatedMavenAdapter {
@@ -2738,7 +2738,7 @@ mod tests {
         assert!(
             matches!(judge.judge(&dep, &versions), UpdateResult::Update { new_version, .. } if new_version == "3.0.1")
         );
-        // The fallback loop removes a rejected candidate before judging again.
+        // フォールバックのループでは、拒否した候補を外してから再判定する。
         versions.retain(|info| {
             compare_dependency_versions(&dep, &info.version, "3.0.1") != std::cmp::Ordering::Equal
         });

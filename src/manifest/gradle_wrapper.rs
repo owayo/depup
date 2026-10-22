@@ -1,4 +1,4 @@
-//! Gradle Wrapper distribution URL parsing and format-preserving updates.
+//! Gradle Wrapper の配布URLを解析し、元の形式を保って更新する。
 
 use crate::domain::{Dependency, Language, VersionSpec, VersionSpecKind};
 use crate::error::ManifestError;

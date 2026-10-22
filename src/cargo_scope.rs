@@ -81,8 +81,8 @@ fn run_locate(
     manifest_arg: &Path,
     boundary: &Path,
 ) -> Result<PathBuf, String> {
-    // Cargo accounts for exclusions, implicit path members and package.workspace.
-    // locate-project only reads manifests; it never resolves or writes a lock.
+    // Cargo が除外指定・暗黙の path メンバー・package.workspace を考慮する。
+    // locate-project はマニフェストを読むだけで、lock を解決したり書いたりしない。
     let output = std::process::Command::new(&anchor.program)
         .args([
             "locate-project",
@@ -91,8 +91,8 @@ fn run_locate(
             "json",
             "--manifest-path",
         ])
-        // Keep canonical Windows prefixes out of argv. Rechecks keep the exact
-        // program and cwd that succeeded, including their toolchain selection.
+        // Windows の正規化された接頭辞を引数へ入れない。再確認でも、成功したときと
+        // 同じ実行ファイル・作業ディレクトリ・ツールチェーンの選択を使う。
         .arg(manifest_arg)
         .current_dir(&anchor.cwd)
         .env("CARGO_NET_OFFLINE", "true")
@@ -125,7 +125,7 @@ fn run_locate(
     Ok(directory.to_path_buf())
 }
 
-/// Both paths are canonical. Different drives or prefix kinds cannot be retried.
+/// 両パスは正規化済み。ドライブや接頭辞の種類が違う場合は再試行できない。
 fn relative_manifest_arg(cwd: &Path, manifest: &Path) -> Option<PathBuf> {
     if !cwd.is_absolute() || !manifest.is_absolute() {
         return None;
@@ -159,7 +159,7 @@ pub(crate) enum CargoRoot {
     Unknown(String),
 }
 
-/// One lazy snapshot serves the preflight gate and its write/install exclusions.
+/// 事前検査の入口と、書き込み・install の除外に、1つの遅延スナップショットを使う。
 pub(crate) struct CargoMembership<'a> {
     manifests: BTreeMap<PathBuf, PathBuf>,
     boundary: &'a Path,

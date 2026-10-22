@@ -1,4 +1,4 @@
-//! Verify each updated declaration against its exact final pnpm importer edge.
+//! 更新した各宣言を、最終的な pnpm importer の対応する辺と正確に照合する。
 use super::*;
 use crate::domain::{Language, UpdateResult, UpdateSummary};
 
@@ -48,7 +48,7 @@ fn evaluate_targets(
                 continue;
             };
             let key = dependency.manifest_name();
-            // A peer-only requirement does not require a local installation.
+            // peer 要件しかない場合は、ローカルへの install を要求しない。
             let peer_only = declaration.as_ref().is_some_and(|value| {
                 value
                     .get("peerDependencies")

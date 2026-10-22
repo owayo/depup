@@ -1,4 +1,4 @@
-//! File identity and checked atomic writes shared by the writer and install recovery.
+//! writer と install 復元で共有する、ファイルの識別情報と検証付きアトミック書き込み。
 use std::fs::{self, Permissions};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
@@ -25,7 +25,7 @@ impl FileState {
                 permissions: Some(fs::metadata(path)?.permissions()),
             }),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                // A dangling link is not an absent file.
+                // 切れた symlink は、不在のファイルとは異なる。
                 match fs::symlink_metadata(path) {
                     Ok(_) => return Err(error),
                     Err(missing) if missing.kind() == io::ErrorKind::NotFound => {}
@@ -76,7 +76,7 @@ fn link_paths(path: &Path) -> impl Iterator<Item = PathBuf> + '_ {
     let mut prefix = PathBuf::new();
     path.components().filter_map(move |part| {
         prefix.push(part);
-        // A Windows Prefix is incomplete until its root separator is appended.
+        // Windows の Prefix は、ルート区切りを加えるまで完全なパスにならない。
         (!matches!(part, Component::Prefix(_))).then(|| prefix.clone())
     })
 }
@@ -133,7 +133,7 @@ impl FileGuard {
     }
 }
 
-/// The guard and expected state are rechecked immediately before the rename.
+/// rename の直前に、guard と期待する状態を再確認する。
 pub(crate) fn write_checked(
     guard: &FileGuard,
     expected: &FileState,
@@ -182,7 +182,7 @@ pub(crate) fn write_checked(
     result
 }
 
-/// Save original bytes and permissions without replacing any existing file.
+/// 既存のファイルを置き換えず、元のバイト列と権限を保存する。
 pub(crate) fn save_recovery_copy(state: &FileState) -> Result<PathBuf, String> {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)

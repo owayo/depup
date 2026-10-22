@@ -1083,8 +1083,8 @@ fn tauri_node_and_lock_only_rust_updates_fail_together_in_either_direction() {
     }
 }
 
-/// A lock verification failure follows the unit that holds the lockfile: the Tauri pair returns
-/// together, while an independent install in the same directory keeps its update.
+/// lock 検証の失敗は、その lockfile を保持する単位に従う。Tauri の組は一緒に戻し、
+/// 同じディレクトリの独立した install の更新は保持する。
 #[test]
 fn lock_verification_failures_follow_the_lockfile_holder() {
     let temp = tempfile::tempdir().unwrap();
@@ -1410,7 +1410,7 @@ fn a_real_spawn_failure_rolls_back_and_uses_the_prepared_manager_after_new_locks
     let prepared = tx.tasks[0].command.as_mut().unwrap().as_mut().unwrap();
     assert_eq!(prepared.package_manager, "npm");
     prepared.program = temp.path().join("missing-program");
-    // A new lock is an external change, so it must stop execution rather than re-detect pnpm.
+    // 新しい lock は外部変更なので、pnpm を再検出せず実行を止める。
     let mut calls = 0;
     tx.execute(|command| {
         calls += 1;
@@ -1705,7 +1705,7 @@ fn parent_symlink_replacement_after_pm_preserves_both_locations() {
     fs::create_dir(&foreign).unwrap();
     fs::write(foreign.join("package.json"), "external data").unwrap();
     symlink(&original, &alias).unwrap();
-    // Keep the writer's logical alias rather than only the canonical project path.
+    // プロジェクトの正規化済みパスだけでなく、writer が使った論理的な別名も保持する。
     let mut aliased = self::result();
     update(
         &mut aliased,
@@ -1939,7 +1939,7 @@ fn member_execution_boundary_does_not_prove_uv_or_mise_recovery_is_local() {
             language,
             std::slice::from_ref(&manifest),
         )]);
-        // This is the Cargo boundary obtained by main when started inside the member.
+        // メンバー内で起動した main が取得する Cargo の境界を使う。
         let mut tx = InstallTransactions::begin(&plan, &result, &member);
         let mut calls = 0;
         tx.execute(|command| {

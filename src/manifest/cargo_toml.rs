@@ -66,7 +66,7 @@ fn is_cargo_package_git_tag_table(section: &str, package: &str) -> bool {
     })
 }
 
-/// inline table 形式の git tag を更新してよい親セクションかどうかを返す。
+/// インラインテーブル 形式の git tag を更新してよい親セクションかどうかを返す。
 /// 通常の依存セクションに加えて `[patch.<registry>]` の inline table も対象にする。
 fn is_cargo_git_tag_inline_section(section: &str) -> bool {
     is_cargo_dependency_section(section)
@@ -100,7 +100,7 @@ enum SourceKeyScope {
     /// 複数行テーブル (`[dependencies.<pkg>]`) の本文行。行頭のキーは依存オプション名。
     TableBody,
     /// 依存セクション (`[dependencies]`) の宣言行。行頭のキーはパッケージ名なので、
-    /// inline table の内側 (`{` / `,` の後ろ) に現れたキーだけをオプションとして解釈する。
+    /// インラインテーブル の内側 (`{` / `,` の後ろ) に現れたキーだけをオプションとして解釈する。
     /// 区別しないと `path = "0.1.1"` (crates.io に実在するクレート `path` の通常宣言。
     /// `registry` も同様) を path 依存と誤認し、writer が行ごとスキップして
     /// 「更新あり」と報告した後に書き込みが失敗する (report/apply の矛盾)。
@@ -333,9 +333,9 @@ impl ManifestParser for CargoTomlParser {
                     rebuilt.push_str(segment);
                     continue;
                 }
-                // inline table が path / 別レジストリを指す場合は parse も依存として
+                // インラインテーブル が path / 別レジストリを指す場合は parse も依存として
                 // 拾わないため、writer も触らない。行頭のキーはパッケージ名なので
-                // inline table の内側だけを見る (`path` / `registry` という名前の
+                // インラインテーブル の内側だけを見る (`path` / `registry` という名前の
                 // クレートの通常宣言を path 依存と誤認しない)
                 if declares_non_crates_io_source(line, SourceKeyScope::DeclarationLine) {
                     rebuilt.push_str(segment);
@@ -454,7 +454,7 @@ impl ManifestParser for CargoTomlParser {
                 message: format!("invalid regex pattern: {}", e),
             })?;
 
-        // inline table・dotted key・複数行テーブルをセクション追跡しながら更新する。
+        // インラインテーブル・dotted key・複数行テーブルをセクション追跡しながら更新する。
         // 依存セクション外の同名キーを誤って書き換えず、TOML の単一引用符も保持する。
         let mut section = String::new();
         let mut rebuilt = String::new();
@@ -479,7 +479,7 @@ impl ManifestParser for CargoTomlParser {
                 continue;
             }
 
-            // dotted key は inline table と同じく依存セクション直下に書かれるため、
+            // ドット付きキー は inline table と同じく依存セクション直下に書かれるため、
             // 対象セクションの判定も inline table と同じものを使う
             if is_cargo_git_tag_inline_section(&section)
                 && let Some(caps) = dotted_re.captures(line)
@@ -532,7 +532,7 @@ fn parse_cargo_dependencies(
                     output.push(new_dependency(name, spec, is_dev, None, None), None);
                 }
             }
-            // inline table 形式: `package = { version = "1.0.0", features = [...] }`
+            // インラインテーブル 形式: `package = { version = "1.0.0", features = [...] }`
             Value::Table(t) => {
                 let package_name = t.get("package").and_then(|v| v.as_str()).unwrap_or(name);
                 let manifest_name = (package_name != name).then_some(name.as_str());
@@ -658,7 +658,7 @@ impl CargoDeclarations {
     }
 }
 
-/// inline table から git 依存を検出して `GitSource` を組み立てる
+/// インラインテーブル から git 依存を検出して `GitSource` を組み立てる
 fn try_parse_git_source(table: &toml::map::Map<String, Value>) -> Option<GitSource> {
     let url = table.get("git").and_then(|v| v.as_str())?;
     let reference = if let Some(branch) = table.get("branch").and_then(|v| v.as_str()) {
@@ -1104,11 +1104,11 @@ public-crate = { version = "2.0" }
     #[test]
     fn test_update_does_not_touch_registry_index_dependency() {
         for content in [
-            // inline table
+            // インラインテーブル
             "[dependencies]\ninternal-crate = { version = \"1.0\", registry-index = \"https://intranet.example/index\" }\n",
             // 複数行テーブル (version より後ろに registry-index)
             "[dependencies.internal-crate]\nversion = \"1.0\"\nregistry-index = \"https://intranet.example/index\"\n",
-            // dotted key
+            // ドット付きキー
             "[dependencies]\ninternal-crate.version = \"1.0\"\ninternal-crate.registry-index = \"https://intranet.example/index\"\n",
         ] {
             let result = CargoTomlParser.update_version(content, "internal-crate", "9.9.9");
@@ -1504,7 +1504,7 @@ serde = { version = "1.0.0", features = ["derive"] }
 
     #[test]
     fn test_update_inline_table_single_quotes() {
-        // inline table の version 値でも単一引用符を維持する
+        // インラインテーブル の version 値でも単一引用符を維持する
         let content = r#"
 [dependencies]
 serde = { version = '1.0.0', features = ["derive"] }
@@ -1900,7 +1900,7 @@ ast-parser = ["ts-parser", "ts-bash"]
             .unwrap();
         assert!(result.contains("serde_json = \"1.0.140\""));
 
-        // inline table 形式の更新
+        // インラインテーブル 形式の更新
         let result = CargoTomlParser
             .update_version(&result, "clap", "4.5.0")
             .unwrap();
@@ -2120,7 +2120,7 @@ serde = { version = "1", features = ["derive"] }
             .unwrap();
         assert!(result.contains("portable-pty = \"0.10.0\""));
 
-        // inline table 形式を更新する
+        // インラインテーブル 形式を更新する
         let result = CargoTomlParser
             .update_version(&result, "tokio", "1.45.0")
             .unwrap();
@@ -2242,7 +2242,7 @@ toml = { version = "0.8.0", features = ["derive"] }
     #[test]
     fn test_update_git_tag_preserves_crlf() {
         // 回帰: CRLF の Cargo.toml を update_git_tag しても改行コードを保持し、
-        // inline table・複数行テーブルの両タグ書き換え経路でも正しく更新する。
+        // インラインテーブル・複数行テーブルの両タグ書き換え経路でも正しく更新する。
         let inline_content = "[dependencies]\r\nbar = { git = \"https://github.com/owner/bar.git\", tag = \"v1.2.3\" }\r\n";
         let inline = CargoTomlParser
             .update_git_tag(inline_content, "bar", "v1.3.0")
