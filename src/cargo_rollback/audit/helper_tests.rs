@@ -1050,6 +1050,148 @@ mod retry_regressions {
         }
     }
 
+    /// `wide` は `shared` を系列をまたぐ範囲 (`>=0.1, <0.3`) で要求し、`pinned-old` が
+    /// `shared 0.1.0` を、`switcher` が `shared 0.2.0` を lock に残す。Cargo が lock から外した
+    /// `shared` の版への辺は、版要求の許す別の版へ付け替わる (Windows 向けの依存で
+    /// `windows-sys >=0.52, <0.62` を要求する crate と同じ形)。
+    fn repointing_project() -> (LocalRegistry, TestProject, CargoCommand) {
+        let registry = LocalRegistry::new();
+        registry
+            .publish("shared", "0.1.0", &[])
+            .publish("shared", "0.2.0", &[])
+            .publish("switcher", "1.0.0", &[("shared", "^0.2")])
+            .publish("switcher", "1.1.0", &[("shared", "^0.2")])
+            .publish("wide", "1.0.0", &[("shared", ">=0.1, <0.3")])
+            .publish("pinned-old", "1.0.0", &[("shared", "=0.1.0")])
+            .publish("s-solo", "1.0.0", &[])
+            .publish("s-solo", "1.1.0", &[]);
+        let project = TestProject::new(
+            &registry,
+            "[package]\nname = 'example'\nversion = '0.1.0'\nedition = '2024'\n[dependencies]\nswitcher = '1'\nwide = '1'\npinned-old = '1'\ns-solo = '1'\n",
+        );
+        project.cargo_ok(&["generate-lockfile"]);
+        let mut cargo = CargoCommand::new().program(TestProject::cargo_program());
+        for (key, value) in project.cargo_envs() {
+            cargo = cargo.env(key, value);
+        }
+        (registry, project, cargo)
+    }
+
+    /// lock の `wide` の依存参照
+    fn wide_dependencies(content: &str) -> toml::Value {
+        let lock: toml::Value = toml::from_str(content).unwrap();
+        lock["package"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|package| package["name"].as_str() == Some("wide"))
+            .unwrap()["dependencies"]
+            .clone()
+    }
+
+    /// Issue #58: まとめ解きの固定用の依存は lock に無い版を指すので、Cargo は crates.io の
+    /// パッケージをすべて lock から外して解き直し、選んだ crate と無関係な `wide` の辺も
+    /// 付け替える。一時 workspace からの反映は元の lock を確かめてから書くので、
+    /// 外部変更とせず、受領書を出せる。
+    #[tokio::test]
+    async fn joint_resolutions_that_repoint_unrelated_dependents_record_no_external_change() {
+        let (_registry, project, cargo) = repointing_project();
+        project.cargo_ok(&["update", "-p", "switcher@1.1.0", "--precise", "1.0.0"]);
+        let before = project.read("Cargo.lock");
+        assert_eq!(
+            wide_dependencies(&before),
+            toml::Value::from(vec!["shared 0.1.0"])
+        );
+        let (report, changes) = resolve_together_tracked(
+            project.path(),
+            &[RollbackCandidate {
+                name: "s-solo".into(),
+                current: "1.1.0".into(),
+                target: "1.0.0".into(),
+                minimum: None,
+            }],
+            &cargo,
+            Instant::now() + Duration::from_secs(60),
+            CARGO_UPDATE_TIMEOUT,
+        )
+        .await;
+        assert!(report.problems.is_empty(), "{report:?}");
+        assert_eq!(
+            report.outcomes[0].1,
+            TogetherOutcome::Resolved("1.0.0".into()),
+            "{report:?}"
+        );
+        let after = project.read("Cargo.lock");
+        // Cargo 自身が付け替えたことを先に確かめる (付け替えが起きないなら、この検査は無意味)
+        assert_eq!(
+            wide_dependencies(&after),
+            toml::Value::from(vec!["shared 0.2.0"])
+        );
+        let mut tracked = restore::AuditChanges::default();
+        tracked.observe(&before);
+        for change in changes {
+            tracked.committed(&change.before, &change.after, &change.selected);
+        }
+        assert!(
+            tracked.external_packages().is_empty(),
+            "{:?}",
+            tracked.external_packages()
+        );
+        assert!(tracked.allows_snapshot_restore(Some(after.as_bytes())));
+        project.cargo_ok(&["update", "--workspace", "--locked"]);
+    }
+
+    /// Issue #58: `cargo update -p switcher@1.1.0 --precise 1.0.0` は `switcher` と、その依存の
+    /// `shared 0.2.0` を lock から外すので、範囲外の `wide` の辺を lock に残る `shared 0.1.0` へ
+    /// 付け替える。監査自身の変更なので受領書を出す。
+    #[tokio::test]
+    async fn a_dependent_repointed_across_series_by_a_rollback_keeps_the_receipt() {
+        let (_registry, project, cargo) = repointing_project();
+        project.cargo_ok(&["update", "-p", "switcher", "--precise", "1.0.0"]);
+        let baseline = parse_registry_entries(&project.read("Cargo.lock"));
+        project.cargo_ok(&["update"]);
+        assert_eq!(
+            wide_dependencies(&project.read("Cargo.lock")),
+            toml::Value::from(vec!["shared 0.2.0"])
+        );
+        let old = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let young = chrono::Utc.with_ymd_and_hms(2026, 1, 29, 0, 0, 0).unwrap();
+        let dates = FakeCratesIo::new()
+            .release("shared", "0.1.0", old)
+            .release("shared", "0.2.0", old)
+            .release("switcher", "1.0.0", old)
+            .release("switcher", "1.1.0", young)
+            .release("wide", "1.0.0", old)
+            .release("pinned-old", "1.0.0", old)
+            .release("s-solo", "1.0.0", old)
+            .release("s-solo", "1.1.0", old);
+        let input = LockAgeAudit {
+            project_dir: project.path(),
+            cutoff: cutoff(),
+            exemptions: &Default::default(),
+            baseline: &baseline,
+            preferred: &PreferredVersions::new(),
+            adapter: &dates,
+            cargo: &cargo,
+            budget: Duration::from_secs(60),
+        };
+        let versions = VersionFetcher::new(4, 1);
+        let mut receipt = None;
+        let result = LockAgeAuditor::new(&input, &versions, false)
+            .run_tracked(None, &mut receipt)
+            .await;
+        assert!(!result.has_unresolved(), "{result:?}");
+        assert_eq!(project.locked_versions("switcher"), ["1.0.0"]);
+        // Cargo 自身が付け替えたことを先に確かめる (付け替えが起きないなら、この検査は無意味)
+        assert_eq!(
+            wide_dependencies(&project.read("Cargo.lock")),
+            toml::Value::from(vec!["shared 0.1.0"])
+        );
+        let receipt = receipt.expect("the audit's own repointing must not withhold the receipt");
+        assert_eq!(receipt.after, project.read("Cargo.lock").into_bytes());
+        project.cargo_ok(&["update", "--workspace", "--locked"]);
+    }
+
     #[tokio::test]
     async fn singles_retry_only_after_the_lock_changes() {
         let (_registry, project, baseline, dates, cargo) = fixture(false);
