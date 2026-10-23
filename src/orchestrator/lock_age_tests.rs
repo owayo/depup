@@ -739,8 +739,6 @@ async fn test_crate_without_older_mature_version_is_reported() {
 #[cfg(unix)]
 #[tokio::test]
 async fn test_precise_that_changes_nothing_is_not_reported_as_rollback() {
-    use std::os::unix::fs::PermissionsExt;
-
     let registry = LocalRegistry::new();
     for version in ["1.0.0", "1.0.1", "1.0.2"] {
         registry.publish("solo", version, &[]);
@@ -752,12 +750,11 @@ async fn test_precise_that_changes_nothing_is_not_reported_as_rollback() {
     // `--precise` を含む起動だけ何もせずに exit 0 を返し、それ以外は本物の cargo へ渡す
     let stand_in = tempfile::TempDir::new().unwrap();
     let script = stand_in.path().join("cargo");
-    std::fs::write(
+    crate::test_support::exec::write_script(
         &script,
         "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"--precise\" ]; then exit 0; fi\ndone\nexec \"$DEPUP_TEST_REAL_CARGO\" \"$@\"\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        0o755,
+    );
     let cargo = project
         .cargo_envs()
         .into_iter()
@@ -825,12 +822,11 @@ async fn test_failed_restore_is_reported_with_backup() {
     // 書き込み禁止にして、元へ戻す書き込みも失敗させる
     let stand_in = tempfile::TempDir::new().unwrap();
     let script = stand_in.path().join("cargo");
-    std::fs::write(
+    crate::test_support::exec::write_script(
         &script,
         "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"--locked\" ]; then\n    chmod a-w Cargo.lock\n    echo 'error: simulated rejection' >&2\n    exit 1\n  fi\ndone\nexec \"$DEPUP_TEST_REAL_CARGO\" \"$@\"\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        0o755,
+    );
     let cargo = project
         .cargo_envs()
         .into_iter()

@@ -168,7 +168,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn pnpm_final_verification_marks_failures_and_keeps_written_files_without_age() {
-        use std::os::unix::fs::PermissionsExt;
         for graph in [
             r#"[{"dependencies":{"example":{"version":"1.1.0"}}}]"#,
             r#"[{"dependencies":{}}]"#,
@@ -181,8 +180,11 @@ mod tests {
             std::fs::write(&path, content).unwrap();
             std::fs::write(root.join("pnpm-lock.yaml"), "lock bytes").unwrap();
             let program = root.join("fake-pnpm");
-            std::fs::write(&program, format!("#!/bin/sh\nprintf '%s' '{graph}'\n")).unwrap();
-            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::test_support::exec::write_script(
+                &program,
+                &format!("#!/bin/sh\nprintf '%s' '{graph}'\n"),
+                0o755,
+            );
             let mut manifest = ManifestUpdateResult::new(&path, Language::Node);
             manifest.add_result(UpdateResult::update(
                 Dependency::new(

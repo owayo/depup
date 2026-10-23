@@ -390,15 +390,13 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn project_scope_and_cutoff_reach_the_mise_subprocess() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("mise-test");
-        std::fs::write(
+        crate::test_support::exec::write_script(
             &script,
             "#!/bin/sh\nprintf '%s\\n' \"$PWD\" \"$@\" > invocation\nprintf '[]'\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+            0o700,
+        );
         let cutoff = "2026-09-17T00:00:00Z".parse().unwrap();
         let adapter = MiseAdapter {
             program: script.to_string_lossy().into(),

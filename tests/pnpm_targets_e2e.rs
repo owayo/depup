@@ -1,9 +1,10 @@
 //! pnpm が成功終了しても、直接依存の未達の更新を見逃さない。
 #![cfg(unix)]
 
+mod support;
+
 use serde_json::{Value, json};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 #[test]
@@ -24,14 +25,13 @@ fn pnpm_stale_final_lock_reports_failure_in_every_output_format() {
     let graph = serde_json::to_string(&graph)
         .unwrap()
         .replace('\'', "'\\''");
-    fs::write(
+    support::write_script(
         &program,
-        format!(
+        &format!(
             "#!/bin/sh\ncase \"$1\" in\nconfig) printf null;;\ninstall|update) exit 0;;\nlist) printf '%s' '{graph}';;\n--version) printf '12.9.1';;\n*) exit 1;;\nesac\n"
         ),
-    )
-    .unwrap();
-    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        0o755,
+    );
     let mut paths = vec![commands.path().to_path_buf()];
     paths.extend(std::env::split_paths(
         &std::env::var_os("PATH").unwrap_or_default(),
