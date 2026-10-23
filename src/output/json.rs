@@ -172,6 +172,9 @@ impl JsonFormatter {
             SkipReason::ReleaseDateUnknown(version) => {
                 format!("release_date_unknown: {version}")
             }
+            SkipReason::ReleaseDateUnchecked(version) => {
+                format!("release_date_unchecked: {version}")
+            }
             SkipReason::ParseError(msg) => format!("parse_error: {}", msg),
             SkipReason::ChangeLevelLimited(level) => format!("change_level_limited: {}", level),
         }

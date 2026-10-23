@@ -206,7 +206,29 @@ mod install_tests {
     };
     use depup::manifest::{GradleParser, ManifestWriter};
     use depup::orchestrator::OrchestratorResult;
-    use std::os::unix::fs::PermissionsExt;
+
+    /// 実行権限 `mode` を付けて `content` を書く。書いた直後のファイルを exec すると、並列に走る
+    /// ほかのテストの fork が書き込み用の fd の写しを持っていることがあり、Linux は `ETXTBSY`
+    /// で拒否する。子プロセスに書かせる (ライブラリの `test_support::exec` はバイナリのテストから
+    /// 使えないので写す)。
+    fn write_script(path: &std::path::Path, content: &str, mode: u32) {
+        use std::io::Write;
+        let mut writer = std::process::Command::new("sh")
+            .args(["-c", "cat > \"$1\" && chmod \"$2\" \"$1\"", "sh"])
+            .arg(path)
+            .arg(format!("{mode:o}"))
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // 標準入力は書き終えたら閉じる (閉じないと cat が終わらない)。書き込みに失敗しても、子を待ってから報告する
+        let sent = {
+            let mut stdin = writer.stdin.take().unwrap();
+            stdin.write_all(content.as_bytes())
+        };
+        let status = writer.wait().unwrap();
+        assert!(status.success(), "cannot write {}", path.display());
+        sent.unwrap();
+    }
 
     #[tokio::test]
     async fn failed_install_restores_the_written_manifest() {
@@ -215,8 +237,7 @@ mod install_tests {
         let before = "dependencies { implementation 'org.example:library:1.0.0' }\n";
         std::fs::write(&path, before).unwrap();
         let script = temp.path().join("gradlew");
-        std::fs::write(&script, "#!/bin/sh\nexit 1\n").unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_script(&script, "#!/bin/sh\nexit 1\n", 0o755);
         let mut manifest = ManifestUpdateResult::new(&path, Language::Java);
         manifest.add_result(UpdateResult::update(
             Dependency::new(

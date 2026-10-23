@@ -1233,18 +1233,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn gradle_wrapper_update_runs_both_passes_in_project() {
-        use std::os::unix::fs::PermissionsExt;
-
         let project = tempfile::TempDir::new().unwrap();
         let script = project.path().join("gradlew");
-        std::fs::write(
+        crate::test_support::exec::write_script(
             &script,
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> wrapper-invocations\n",
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&script, permissions).unwrap();
+            0o755,
+        );
 
         SystemPackageManager::new()
             .update_gradle_wrapper(project.path(), "9.8.0")

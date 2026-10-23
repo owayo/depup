@@ -1,8 +1,9 @@
 //! mise の age 設定と公開日不明の候補を、ネットワークなしで CLI 全体から検証する。
 #![cfg(unix)]
 
+mod support;
+
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -27,7 +28,7 @@ impl MiseProject {
         fs::write(config.join("mise/config.toml"), "").unwrap();
         fs::write(config.join("custom.toml"), "").unwrap();
         let script = bin.join("mise");
-        fs::write(
+        support::write_script(
             &script,
             r#"#!/bin/sh
 case "$1" in
@@ -39,9 +40,8 @@ case "$1" in
     *) exit 1 ;;
 esac
 "#,
-        )
-        .unwrap();
-        fs::set_permissions(script, fs::Permissions::from_mode(0o700)).unwrap();
+            0o700,
+        );
         Self {
             _root: root,
             project,

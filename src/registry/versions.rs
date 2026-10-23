@@ -11,12 +11,15 @@ use tokio::sync::{Mutex, Semaphore};
 /// バージョン情報のキャッシュ (言語, パッケージ名) をキーとする。
 pub type VersionCache = Arc<Mutex<HashMap<(Language, String), Vec<VersionInfo>>>>;
 type VersionFetchLocks = Arc<Mutex<HashMap<(Language, String), Arc<Mutex<()>>>>>;
+/// (言語, パッケージのキャッシュキー, 版) → 公開日 (公開日が無いと分かった版は `None`)
+type ReleaseDates = Mutex<HashMap<(Language, String, String), Option<DateTime<Utc>>>>;
 
 /// 通常チェック・同期・lock 監査で同じ取得状態を共有する。
 pub(crate) struct VersionFetcher {
     pub(crate) cache: VersionCache,
     fetch_locks: VersionFetchLocks,
-    release_dates: Mutex<HashMap<(Language, String, String), DateTime<Utc>>>,
+    /// 解決した公開日。レジストリが公開日を持たないと答えた版 (`None`) も覚え、問い合わせ直さない
+    release_dates: ReleaseDates,
     general_semaphore: Semaphore,
     crates_io_semaphore: Semaphore,
 }
@@ -111,6 +114,19 @@ impl VersionFetcher {
         Ok(result)
     }
 
+    /// この実行で既に解決した公開日。まだ問い合わせていなければ `None`、
+    /// 公開日が無いと分かっていれば `Some(None)`。
+    pub(crate) async fn cached_release_date(
+        &self,
+        adapter: &(dyn RegistryAdapter + Send + Sync),
+        package: &str,
+        version: &str,
+    ) -> Option<Option<DateTime<Utc>>> {
+        let package_key = Self::cache_key(adapter, package);
+        let key = (package_key.0, package_key.1, version.to_string());
+        self.release_dates.lock().await.get(&key).copied()
+    }
+
     /// 同じ実行内のマニフェスト間で、解決済みの公開日を共有する。
     pub(crate) async fn release_date(
         &self,
@@ -121,7 +137,7 @@ impl VersionFetcher {
         let package_key = Self::cache_key(adapter, package);
         let key = (package_key.0, package_key.1.clone(), version.to_string());
         if let Some(date) = self.release_dates.lock().await.get(&key) {
-            return Ok(Some(*date));
+            return Ok(*date);
         }
         let fetch_lock = {
             let mut locks = self.fetch_locks.lock().await;
@@ -133,15 +149,13 @@ impl VersionFetcher {
         };
         let _guard = fetch_lock.lock().await;
         if let Some(date) = self.release_dates.lock().await.get(&key) {
-            return Ok(Some(*date));
+            return Ok(*date);
         }
         let date = adapter
             .fetch_release_date(package, version)
             .await
             .map_err(|error| error.to_string())?;
-        if let Some(date) = date {
-            self.release_dates.lock().await.insert(key, date);
-        }
+        self.release_dates.lock().await.insert(key, date);
         Ok(date)
     }
 

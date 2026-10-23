@@ -873,16 +873,14 @@ mod retry_regressions {
     #[cfg(unix)]
     #[tokio::test]
     async fn successful_commands_that_leave_the_target_record_their_changes() {
-        use std::os::unix::fs::PermissionsExt;
         let (_registry, project, baseline, dates, _cargo) = fixture(false);
         // z-top はそのままで依存先を動かし、ファイルを書き換える。
         let script = project.path().join("rewrite-lock");
-        std::fs::write(
+        crate::test_support::exec::write_script(
             &script,
             "#!/bin/sh\nperl -0pi -e 's/name = \"a-dep\"\\nversion = \"1.2.0\"/name = \"a-dep\"\\nversion = \"1.1.0\"/' Cargo.lock\nprintf '\\n# rewritten\\n' >> Cargo.lock\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            0o755,
+        );
         let cargo = CargoCommand::new().program(&script);
         let input = LockAgeAudit {
             project_dir: project.path(),

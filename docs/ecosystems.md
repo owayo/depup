@@ -188,6 +188,7 @@ Only dependencies on GitHub URLs with a version requirement are processed. Non-G
 
 - URLs: HTTPS, scp-style SSH (`git@github.com:owner/repo.git`), standard SSH (`ssh://git@github.com/owner/repo.git`), and GitHub's SSH over port 443 (`ssh://git@ssh.github.com:443/owner/repo.git`) are accepted.
 - Tags: both `v1.2.3` and `V1.2.3` are recognized. `Package.swift` version requirement strings are validated as strict SemVer (`X.Y.Z`, no leading zeroes).
+- Release dates: the tag list has no dates, so the age filter looks up the `published_at` of the tag's GitHub Release, or the creation time of an annotated tag that has no Release. Lightweight tags have no date. When several tags name the same version (`1.2`, `v1.2.0`, `1.2.0`), depup uses the tag SwiftPM would pick: the one with more dot-separated parts, then the one without a `v` prefix. If two tags still rank equally (`1.2.0` and `V1.2.0`), the version has no date. See [Age Filter](usage.md#age-filter).
 - Because SwiftPM follows Semantic Versioning 2.0.0, depup parses and updates versions with prerelease identifiers (`1.0.0-beta.1`), build metadata (`1.0.0+build.123`), or both (`1.0.0-rc.1+sha.abc`).
 - `.package(...)` declarations with trailing arguments such as `traits: [...]` (SPM 6.1) or `moduleAliases: [...]` are parsed; only the version requirement is replaced, and the other arguments are preserved.
 - Dependencies that appear inside `//` line comments or `/* ... */` block comments are ignored.

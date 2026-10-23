@@ -57,7 +57,7 @@ The list is empty by default. Logins are matched as complete names, without case
 
 Supported evidence is version-specific crates.io publisher information (`published_by` with a confirmed GitHub login, or GitHub Trusted Publishing), and GitHub source paths for Go and Swift. A package name, a registry account with the same name, a current list of crate owners, or a self-declared repository URL does not establish a GitHub identity. Other registries keep the normal age filter; depup prints a notice when they are selected.
 
-Swift tags currently have no release-date metadata, so their age filter already has no practical effect.
+For an exempted Swift owner, depup does not look up tag release dates at all.
 
 Exemptions affect only release age. Pinned dependencies, version ranges, prerelease rules, `--max-change`, and OSV checks still apply. An explicit project `minimumReleaseAge` takes precedence and disables global exemptions. Git dependencies already bypass release-age filtering.
 

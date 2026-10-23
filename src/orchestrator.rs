@@ -379,6 +379,31 @@ impl Orchestrator {
                         };
                     }
                 };
+                let versions = match self
+                    .resolve_tag_release_dates(&dep, adapter, judge, versions)
+                    .await
+                {
+                    Ok(versions) => versions,
+                    Err(TagDateError::Unchecked(version)) => {
+                        return OnePassResult {
+                            name: dep.name.clone(),
+                            outcome: UpdateResult::skip(
+                                dep,
+                                SkipReason::ReleaseDateUnchecked(version),
+                            ),
+                            fetch_error: None,
+                            osv_warnings: Vec::new(),
+                        };
+                    }
+                    Err(TagDateError::Failed(error)) => {
+                        return OnePassResult {
+                            name: dep.name.clone(),
+                            outcome: UpdateResult::skip_fetch_failed(dep, error.clone()),
+                            fetch_error: Some(error),
+                            osv_warnings: Vec::new(),
+                        };
+                    }
+                };
                 // OSV チェック: judge で採用しようとした候補だけを問い合わせる。
                 // 脆弱なら、その候補を除外して再 judge するループで安全な候補に
                 // 自然にフォールバックする (1 依存あたり通常 1〜2 API call で済む)。
@@ -1093,6 +1118,92 @@ impl Orchestrator {
         self.versions.fetch(adapter, package).await
     }
 
+    /// GitHub のタグの一覧には公開日がない。age が有効なら、judge が選ぶ順 (新しい順) に
+    /// 候補の公開日を取得し、age を満たす版に当たったら止める。公開日の無い版 (軽量タグ) は
+    /// 日付のないまま残り、judge が候補から外す。問い合わせは 1 依存
+    /// [`MAX_TAG_DATE_LOOKUPS`] 回まで (未認証の GitHub API は 1 時間 60 回。この実行で
+    /// 解決済みの版は数えない)。上限に達したら、まだ確かめていない版を返す。
+    async fn resolve_tag_release_dates(
+        &self,
+        dep: &Dependency,
+        adapter: &(dyn RegistryAdapter + Send + Sync),
+        judge: &UpdateJudge,
+        mut versions: Vec<VersionInfo>,
+    ) -> Result<Vec<VersionInfo>, TagDateError> {
+        if dep.language != Language::Swift || judge.age_cutoff().is_none() {
+            return Ok(versions);
+        }
+        let candidates = judge.release_date_candidates(dep, &versions);
+        let names = |list: Vec<&VersionInfo>| -> Vec<String> {
+            list.into_iter().map(|info| info.version.clone()).collect()
+        };
+        let (within, beyond) = (names(candidates.within), names(candidates.beyond));
+        let mut lookups = 0;
+        for version in within {
+            match self
+                .check_tag_date(dep, adapter, judge, &mut versions, &version, &mut lookups)
+                .await?
+            {
+                TagCheck::Admitted => return Ok(versions),
+                TagCheck::Rejected => {}
+                TagCheck::OutOfLookups => return Err(TagDateError::Unchecked(version)),
+            }
+        }
+        // `--max-change` の内側に期間を満たす版が無い。外側に期間を満たす版があれば、judge は
+        // ほかの言語と同じく `--max-change` で止まったと報告する (どちらでも更新はしない)
+        for version in beyond {
+            match self
+                .check_tag_date(dep, adapter, judge, &mut versions, &version, &mut lookups)
+                .await?
+            {
+                TagCheck::Admitted | TagCheck::OutOfLookups => break,
+                TagCheck::Rejected => {}
+            }
+        }
+        Ok(versions)
+    }
+
+    /// 候補 1 件の公開日を確かめる。この実行で解決していなければ問い合わせ、`lookups` を数える
+    async fn check_tag_date(
+        &self,
+        dep: &Dependency,
+        adapter: &(dyn RegistryAdapter + Send + Sync),
+        judge: &UpdateJudge,
+        versions: &mut [VersionInfo],
+        version: &str,
+        lookups: &mut usize,
+    ) -> Result<TagCheck, TagDateError> {
+        let Some(info) = versions.iter_mut().find(|info| info.version == version) else {
+            return Ok(TagCheck::Rejected);
+        };
+        // 公開者の例外なら、公開日を取らずに judge がこの版を選ぶ
+        if judge.admits_age(dep, info) {
+            return Ok(TagCheck::Admitted);
+        }
+        if info.released_at.is_none() {
+            info.released_at = match self
+                .versions
+                .cached_release_date(adapter, &dep.name, version)
+                .await
+            {
+                Some(date) => date,
+                None if *lookups == MAX_TAG_DATE_LOOKUPS => return Ok(TagCheck::OutOfLookups),
+                None => {
+                    *lookups += 1;
+                    self.versions
+                        .release_date(adapter, &dep.name, version)
+                        .await
+                        .map_err(TagDateError::Failed)?
+                }
+            };
+        }
+        Ok(if judge.admits_age(dep, info) {
+            TagCheck::Admitted
+        } else {
+            TagCheck::Rejected
+        })
+    }
+
     /// Maven のメタデータには版ごとの日時がない。judge が実際に選ぶ候補だけを解決し、
     /// POM の Last-Modified 日時で age フィルタを再評価する。
     async fn resolve_java_release_dates(
@@ -1460,6 +1571,28 @@ fn tauri_project_directory<'a>(
                     && candidate.path == project.join("package.json")
             })))
     .then_some(project)
+}
+
+/// 1 依存で、age の判定のためにタグの公開日を取得する回数の上限。
+/// 1 回は Release、無ければタグの参照と注釈付きタグの最大 3 リクエストになる。
+const MAX_TAG_DATE_LOOKUPS: usize = 5;
+
+/// タグの公開日を揃えられなかった理由
+enum TagDateError {
+    /// 取得の上限に達し、この版とそれより古い候補の公開日を確かめていない
+    Unchecked(String),
+    /// 取得に失敗した (通信・レート制限・応答の誤り)
+    Failed(String),
+}
+
+/// 候補 1 件の公開日を確かめた結果
+enum TagCheck {
+    /// 期間を満たす (または公開者の例外)。judge はこの版を選びうる
+    Admitted,
+    /// 期間内か、公開日が無い
+    Rejected,
+    /// 取得の上限に達し、確かめていない
+    OutOfLookups,
 }
 
 /// バージョンチェック並列処理で 1 件の依存から得られた結果
@@ -2469,6 +2602,311 @@ mod tests {
                 .unwrap_err()
                 .contains("absent from Maven metadata")
         );
+    }
+
+    /// GitHub のタグの代わり。一覧には日付が無く、公開日は版ごとに返す
+    /// (`None` は Release も注釈付きタグも無い版)。問い合わせた版を記録する。
+    struct DatedTagsAdapter {
+        dates: Vec<(&'static str, Option<i64>)>,
+        now: chrono::DateTime<chrono::Utc>,
+        lookups: std::sync::Mutex<Vec<String>>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl RegistryAdapter for DatedTagsAdapter {
+        fn language(&self) -> Language {
+            Language::Swift
+        }
+
+        fn registry_name(&self) -> &'static str {
+            "GitHub Tags"
+        }
+
+        async fn fetch_versions(
+            &self,
+            _package: &str,
+        ) -> Result<Vec<VersionInfo>, crate::error::RegistryError> {
+            Ok(self
+                .dates
+                .iter()
+                .map(|(version, _)| VersionInfo::undated(*version))
+                .collect())
+        }
+
+        async fn fetch_release_date(
+            &self,
+            _package: &str,
+            version: &str,
+        ) -> Result<Option<chrono::DateTime<chrono::Utc>>, crate::error::RegistryError> {
+            self.lookups.lock().unwrap().push(version.to_string());
+            if self.fail {
+                return Err(crate::error::RegistryError::RateLimitExceeded {
+                    registry: "GitHub Tags".into(),
+                });
+            }
+            Ok(self
+                .dates
+                .iter()
+                .find(|(candidate, _)| *candidate == version)
+                .and_then(|(_, days)| *days)
+                .map(|days| self.now - chrono::Duration::days(days)))
+        }
+    }
+
+    /// `from: "1.0.0"` で宣言した GitHub の Swift の依存
+    fn swift_dependency(name: &str) -> Dependency {
+        Dependency::production(
+            name,
+            crate::domain::VersionSpec::new(
+                crate::domain::VersionSpecKind::Caret,
+                "1.0.0",
+                "1.0.0",
+            ),
+            Language::Swift,
+        )
+    }
+
+    /// Swift の公開日の取得の 1 組
+    struct SwiftDateCase {
+        /// 版と公開からの日数 (`None` は公開日の無い版)
+        dates: Vec<(&'static str, Option<i64>)>,
+        exempt: bool,
+        age: bool,
+        max_change: Option<crate::domain::ChangeLevel>,
+        expected: &'static str,
+        /// 問い合わせる版 (順)
+        lookups: Vec<&'static str>,
+    }
+
+    impl SwiftDateCase {
+        fn new(dates: &[(&'static str, Option<i64>)], expected: &'static str) -> Self {
+            Self {
+                dates: dates.to_vec(),
+                exempt: false,
+                age: true,
+                max_change: None,
+                expected,
+                lookups: Vec::new(),
+            }
+        }
+
+        fn lookups(mut self, lookups: &[&'static str]) -> Self {
+            self.lookups = lookups.to_vec();
+            self
+        }
+    }
+
+    /// Issue #59: Swift の依存は、age が有効なら judge が選ぶ順に公開日を取得し、
+    /// 期間を満たす版に当たったら止める。公開日の無い版は候補にしない。
+    #[tokio::test]
+    async fn swift_release_dates_are_fetched_newest_first_until_one_passes_age() {
+        let unknown: Vec<(&str, Option<i64>)> = ["1.1.0", "1.2.0", "1.3.0", "1.4.0", "1.5.0"]
+            .into_iter()
+            .map(|version| (version, None))
+            .collect();
+        let cases = vec![
+            // 最新は 3 日前なので、期間を満たす次の版で止まる (それより古い版は問い合わせない)
+            SwiftDateCase::new(
+                &[("1.0.0", Some(90)), ("1.1.0", Some(30)), ("1.2.0", Some(3))],
+                "update 1.1.0",
+            )
+            .lookups(&["1.2.0", "1.1.0"]),
+            // 最新の公開日が分からなくても、期間を満たす次の版へ進む
+            SwiftDateCase::new(
+                &[("1.0.0", Some(90)), ("1.1.0", Some(30)), ("1.2.0", None)],
+                "update 1.1.0",
+            )
+            .lookups(&["1.2.0", "1.1.0"]),
+            // どれも公開日が分からない
+            SwiftDateCase::new(
+                &[("1.0.0", Some(90)), ("1.1.0", None), ("1.2.0", None)],
+                "release date unavailable for 1.2.0",
+            )
+            .lookups(&["1.2.0", "1.1.0"]),
+            // どれも期間内
+            SwiftDateCase::new(
+                &[("1.0.0", Some(90)), ("1.1.0", Some(2)), ("1.2.0", Some(1))],
+                "no suitable version",
+            )
+            .lookups(&["1.2.0", "1.1.0"]),
+            // 公開者の例外と age の無効では、公開日を取りに行かない
+            SwiftDateCase {
+                exempt: true,
+                ..SwiftDateCase::new(&[("1.0.0", Some(90)), ("1.2.0", Some(1))], "update 1.2.0")
+            },
+            SwiftDateCase {
+                age: false,
+                ..SwiftDateCase::new(&[("1.0.0", Some(90)), ("1.2.0", Some(1))], "update 1.2.0")
+            },
+            // 上限の 5 回目で期間を満たす版に当たる
+            SwiftDateCase::new(
+                &[
+                    ("1.0.0", Some(90)),
+                    ("1.1.0", Some(30)),
+                    ("1.2.0", None),
+                    ("1.3.0", None),
+                    ("1.4.0", None),
+                    ("1.5.0", None),
+                ],
+                "update 1.1.0",
+            )
+            .lookups(&["1.5.0", "1.4.0", "1.3.0", "1.2.0", "1.1.0"]),
+            // ちょうど 5 件の候補をすべて確かめ、どれも公開日が分からない
+            SwiftDateCase::new(
+                &[&[("1.0.0", Some(90))][..], &unknown].concat(),
+                "release date unavailable for 1.5.0",
+            )
+            .lookups(&["1.5.0", "1.4.0", "1.3.0", "1.2.0", "1.1.0"]),
+            // 取得の上限に達したら、確かめていない版を示して止める
+            SwiftDateCase::new(
+                &[
+                    ("1.0.0", Some(90)),
+                    ("1.1.0", Some(30)),
+                    ("1.2.0", None),
+                    ("1.3.0", None),
+                    ("1.4.0", None),
+                    ("1.5.0", None),
+                    ("1.6.0", None),
+                ],
+                "release date lookup limit reached; 1.1.0 and older not checked",
+            )
+            .lookups(&["1.6.0", "1.5.0", "1.4.0", "1.3.0", "1.2.0"]),
+            // `--max-change` の内側が期間内なら、外側の版を現在版に近い順に確かめ、
+            // 期間を満たす版があれば `--max-change` で止まったと報告する
+            SwiftDateCase {
+                max_change: Some(crate::domain::ChangeLevel::Patch),
+                ..SwiftDateCase::new(
+                    &[
+                        ("1.0.0", Some(90)),
+                        ("1.0.1", Some(2)),
+                        ("1.1.0", Some(30)),
+                        ("2.0.0", Some(1)),
+                    ],
+                    "limited by --max-change=patch",
+                )
+                .lookups(&["1.0.1", "1.1.0"])
+            },
+        ];
+        let dir = TempDir::new().unwrap();
+        let orchestrator =
+            Orchestrator::new(make_args_with_path(dir.path(), &["--swift"])).unwrap();
+        let now = chrono::Utc::now();
+        for (index, case) in cases.into_iter().enumerate() {
+            let adapter = DatedTagsAdapter {
+                dates: case.dates.clone(),
+                now,
+                lookups: std::sync::Mutex::new(Vec::new()),
+                fail: false,
+            };
+            let mut filter = UpdateFilter::new();
+            if case.age {
+                filter = filter.with_min_age(Duration::from_secs(14 * 86400));
+            }
+            if case.exempt {
+                filter.age_exempt.github = vec!["owner".into()];
+            }
+            if let Some(level) = case.max_change {
+                filter = filter.with_max_change(level);
+            }
+            let judge = UpdateJudge::with_time(filter, now);
+            // 版と公開日のキャッシュは実行全体で共有されるので、組ごとに名前を変える
+            let dep = swift_dependency(&format!("owner/library{index}"));
+            let result = orchestrator
+                .process_one_dependency(dep, &adapter, &judge, None)
+                .await
+                .outcome;
+            let outcome = match &result {
+                UpdateResult::Update { new_version, .. } => format!("update {new_version}"),
+                UpdateResult::Skip { reason, .. } => reason.to_string(),
+            };
+            assert_eq!(outcome, case.expected, "{:?}", case.dates);
+            assert_eq!(
+                *adapter.lookups.lock().unwrap(),
+                case.lookups,
+                "{:?} {}",
+                case.dates,
+                case.expected
+            );
+            // 選んだ版の公開日を表示に使う
+            if let UpdateResult::Update {
+                released_at,
+                new_version,
+                ..
+            } = &result
+                && case.age
+                && !case.exempt
+            {
+                let days = case
+                    .dates
+                    .iter()
+                    .find(|(version, _)| version == new_version)
+                    .and_then(|(_, days)| *days)
+                    .unwrap();
+                assert_eq!(*released_at, Some(now - chrono::Duration::days(days)));
+            }
+        }
+
+        // この実行で既に分かった公開日は問い合わせの回数に数えない。上限より多くの版が
+        // 解決済みでも、期間を満たす版まで進める
+        let adapter = DatedTagsAdapter {
+            dates: vec![
+                ("1.0.0", Some(90)),
+                ("1.1.0", Some(30)),
+                ("1.2.0", None),
+                ("1.3.0", None),
+                ("1.4.0", None),
+                ("1.5.0", None),
+                ("1.6.0", None),
+            ],
+            now,
+            lookups: std::sync::Mutex::new(Vec::new()),
+            fail: false,
+        };
+        for version in ["1.1.0", "1.2.0", "1.3.0", "1.4.0", "1.5.0", "1.6.0"] {
+            orchestrator
+                .versions
+                .release_date(&adapter, "owner/cached", version)
+                .await
+                .unwrap();
+        }
+        adapter.lookups.lock().unwrap().clear();
+        let judge = UpdateJudge::with_time(
+            UpdateFilter::new().with_min_age(Duration::from_secs(14 * 86400)),
+            now,
+        );
+        let result = orchestrator
+            .process_one_dependency(swift_dependency("owner/cached"), &adapter, &judge, None)
+            .await;
+        assert!(
+            matches!(&result.outcome, UpdateResult::Update { new_version, .. } if new_version == "1.1.0"),
+            "{:?}",
+            result.outcome
+        );
+        assert!(adapter.lookups.lock().unwrap().is_empty());
+
+        // 取得の失敗は公開日不明にせず、取得の失敗として報告する
+        let adapter = DatedTagsAdapter {
+            dates: vec![("1.0.0", Some(90)), ("1.1.0", Some(30))],
+            now,
+            lookups: std::sync::Mutex::new(Vec::new()),
+            fail: true,
+        };
+        let judge = UpdateJudge::with_time(
+            UpdateFilter::new().with_min_age(Duration::from_secs(14 * 86400)),
+            now,
+        );
+        let result = orchestrator
+            .process_one_dependency(swift_dependency("owner/failing"), &adapter, &judge, None)
+            .await;
+        assert!(result.fetch_error.is_some());
+        assert!(matches!(
+            result.outcome,
+            UpdateResult::Skip {
+                reason: SkipReason::FetchFailed(_),
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

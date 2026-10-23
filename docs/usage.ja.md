@@ -45,9 +45,11 @@ depup --age 1m
 depup --no-age
 ```
 
-age フィルターを適用するのは、depup がマニフェストに書き込むバージョンです。`--install` で解決される推移的依存の扱いは、[推移的依存と age フィルター](#推移的依存と-age-フィルター)を参照してください。Swift パッケージには age フィルターが実質的に効きません。GitHub Tags API はタグの公開日時を返さないため、`--age` の値にかかわらず、すべてのタグが条件を満たします。Cargo の git 依存にも age フィルターは適用しません。
+age フィルターを適用するのは、depup がマニフェストに書き込むバージョンです。`--install` で解決される推移的依存の扱いは、[推移的依存と age フィルター](#推移的依存と-age-フィルター)を参照してください。Cargo の git 依存には age フィルターを適用しません。
 
-取得できない公開日を「古い日付」として扱いません。age フィルターが有効なとき、通常は公開日を返すレジストリで日時が欠けた版は候補から外します。これにより更新できない場合は `release date unavailable for <version>` と表示します。age が無効なら日時不明の版も候補になります。GitHub Tags や一部の mise ツールのように、全版で日時を返さないバックエンドは age が有効でも候補に残します。更新行には `release date unknown` と表示され、その版の age は検証できません。
+Swift パッケージの版は GitHub Tags API から取得しますが、タグの一覧には日付がありません。age フィルターが有効なとき、depup は選ぶ順 (新しい順) に候補の公開日を取得し、期間を満たす版に当たった時点で止めます。タグの公開日は、そのタグの GitHub Release の `published_at` です。Release の無いタグは、注釈付きタグの作成日時 (`tagger.date`) をタグを作った時期の近似として使います。軽量タグには日付がありません。指すコミットの日時は、タグを打った日より古いことがあるためです。SwiftPM の順位が同じタグ (`1.2.0` と `V1.2.0` など) で表される版も、SwiftPM がどちらのタグを使うか分からないので日付なしとします。取得は 1 依存につき 5 回までで、この実行で既に分かった公開日は数えません (未認証の GitHub API は 1 時間に 60 回までです。`GITHUB_TOKEN` か `GH_TOKEN` を設定すると上限が上がります)。期間を満たす版が見つかる前に上限に達したら、古い版へは更新せず、まだ確かめていない最も新しい版を `release date lookup limit reached; <version> and older not checked` と示してスキップします。`--max-change` の範囲内に期間を満たす版が無いときは、範囲外の版も現在版に近い順に確かめます。期間を満たす版があれば、ほかのエコシステムと同じく `max-change=<LEVEL>` と報告するためです。レート制限の応答など取得の失敗は、公開日不明ではなく `fetch failed` と報告します。age が無効なときと、`[age_exempt]` で例外にした owner では、公開日を取得しません。
+
+取得できない公開日を「古い日付」として扱いません。age フィルターが有効なとき、通常は公開日を返すレジストリで日時が欠けた版は候補から外します。これにより更新できない場合は `release date unavailable for <version>` と表示します。age が無効なら日時不明の版も候補になります。公開日を確かめられない Swift のタグも同じ扱いです。一部の mise ツールのように、全版で日時を返さないバックエンドは age が有効でも候補に残します。更新行には `release date unknown` と表示され、その版の age は検証できません。
 
 #### 適用される age の優先順位
 
@@ -592,7 +594,7 @@ Python プロジェクトで `--install` が `uv sync` を呼び出すとき、d
 | `parse error: ...` | 制約は読み取れたが、安全に書き換えられない（例: `parse error: constraint cannot be updated safely`）。ラベルに反してマニフェスト自体は正しく解析できており、終了コードも変わらない | [自動更新しない制約](#自動更新しない制約) |
 | `fetch failed: ...` | バージョンの取得に失敗した（レジストリのエラーや `git ls-remote` の失敗など）。終了コードが変わるかどうかは原因による | [終了コード](cli-reference.ja.md#終了コード) |
 
-表の理由はテキスト出力の表記です。`--verbose` を付けた `--json` の出力では、同じ理由が `already_latest`、`current_version_too_recent`、`pinned`、`change_level_limited: <LEVEL>`、`excluded`、`not_in_only_list`、`no_suitable_version`、`parse_error: ...`、`fetch_failed: ...` と表記されます。条件に合う新しい候補の公開日が不明な場合は `release_date_unknown: <VERSION>` です。日付付きの古い候補だけが残り、それらが `--max-change` の許容範囲から外れる場合にも、日付不明の新しい候補をこの理由で報告します。
+表の理由はテキスト出力の表記です。`--verbose` を付けた `--json` の出力では、同じ理由が `already_latest`、`current_version_too_recent`、`pinned`、`change_level_limited: <LEVEL>`、`excluded`、`not_in_only_list`、`no_suitable_version`、`parse_error: ...`、`fetch_failed: ...` と表記されます。条件に合う新しい候補の公開日が不明な場合は `release_date_unknown: <VERSION>` です。日付付きの古い候補だけが残り、それらが `--max-change` の許容範囲から外れる場合にも、日付不明の新しい候補をこの理由で報告します。Swift の依存で公開日の取得が上限に達した場合は `release_date_unchecked: <VERSION>` (テキスト出力では `release date lookup limit reached; <VERSION> and older not checked`) です。
 
 verbose のスキップ一覧に付く日付は、現在版自身の公開日です。古い候補の日付は使いません。現在版の日付が不明、別表記の対応が曖昧、または wildcard・prefix の浮動指定の場合は、日付を表示しません。
 

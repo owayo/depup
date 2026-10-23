@@ -559,10 +559,8 @@ async fn metadata_wait_is_bounded_by_the_remaining_audit_budget() {
 
 #[cfg(unix)]
 fn fake_pnpm(directory: &Path, script: &str) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let program = directory.join("fake-pnpm");
-    std::fs::write(&program, format!("#!/bin/sh\n{script}\n")).unwrap();
-    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::test_support::exec::write_script(&program, &format!("#!/bin/sh\n{script}\n"), 0o755);
     program
 }
 
