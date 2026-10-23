@@ -1142,6 +1142,150 @@ fn lock_verification_failures_follow_the_lockfile_holder() {
     assert_eq!(result.summary.total_failed(), 2);
 }
 
+/// Issue #58: lock 検証の失敗で、外部の変更のため lockfile を戻せないなら、マニフェストも
+/// 戻さない (パッケージマネージャーが成功して書いた組を崩さず、どちらも写しを残す)。
+/// install の失敗では実行前の組が合っているので、戻せるファイルは戻し、残したファイルが
+/// 合わない可能性を示す。
+#[test]
+fn a_kept_lockfile_keeps_its_manifest_only_after_a_lock_verification_failure() {
+    for policy_failure in [true, false] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut result = result();
+        let manifest = temp.path().join("Cargo.toml");
+        cargo(&mut result, &manifest, "app");
+        let lock = temp.path().join("Cargo.lock");
+        fs::write(&lock, "original lock").unwrap();
+        let written = fs::read_to_string(&manifest).unwrap();
+        let before = result.write_results[0]
+            .journal
+            .as_ref()
+            .unwrap()
+            .before
+            .clone();
+        let plan = plan(vec![job(
+            temp.path(),
+            Language::Rust,
+            std::slice::from_ref(&manifest),
+        )]);
+        let mut tx = InstallTransactions::begin(&plan, &result, temp.path());
+        tx.execute(|command| {
+            fs::write(&lock, "installed lock").unwrap();
+            if policy_failure {
+                success(command)
+            } else {
+                failure(command)
+            }
+        });
+        // install の後に、depup の操作の外で lockfile が書き換わる
+        fs::write(&lock, "external edit").unwrap();
+        if policy_failure {
+            tx.fail_holder(&lock, "simulated age failure".into());
+        }
+        let report = tx.rollback();
+        report.mark_summary(&mut result.summary);
+        let mut output = vec![];
+        report.print(&mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        let error = result.summary.manifests[0].results[0]
+            .write_error()
+            .unwrap()
+            .to_string();
+        let unit = &report.units[0];
+        assert_eq!(fs::read_to_string(&lock).unwrap(), "external edit");
+        assert!(matches!(
+            unit.files[&identity(&lock)],
+            FileOutcome::Conflict { .. }
+        ));
+        if policy_failure {
+            assert_eq!(fs::read_to_string(&manifest).unwrap(), written);
+            let FileOutcome::Kept { backup: Ok(backup) } = &unit.files[&identity(&manifest)] else {
+                panic!("{:?}", unit.files)
+            };
+            assert_eq!(fs::read(backup).unwrap(), before);
+            assert!(result.summary.manifests[0].modified);
+            assert!(output.contains("Recovery was skipped"), "{output}");
+            assert!(
+                error.contains("no file of this install was restored"),
+                "{error}"
+            );
+        } else {
+            assert_eq!(fs::read(&manifest).unwrap(), before);
+            assert!(!result.summary.manifests[0].modified);
+            assert!(
+                output.contains("they may not match the restored files"),
+                "{output}"
+            );
+            assert!(
+                error.contains("some files were kept for manual recovery"),
+                "{error}"
+            );
+        }
+        for outcome in unit.files.values() {
+            if let FileOutcome::Conflict {
+                backup: Ok(path), ..
+            }
+            | FileOutcome::Kept { backup: Ok(path) } = outcome
+            {
+                let _ = fs::remove_dir_all(path.parent().unwrap());
+            }
+        }
+    }
+}
+
+/// 外部の変更を受けたのがマニフェストでも、lock 検証の失敗では lockfile を戻さない。
+#[test]
+fn an_edited_manifest_keeps_its_lockfile_after_a_lock_verification_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut result = result();
+    let manifest = temp.path().join("Cargo.toml");
+    cargo(&mut result, &manifest, "app");
+    let lock = temp.path().join("Cargo.lock");
+    fs::write(&lock, "original lock").unwrap();
+    let before = result.write_results[0]
+        .journal
+        .as_ref()
+        .unwrap()
+        .before
+        .clone();
+    let plan = plan(vec![job(
+        temp.path(),
+        Language::Rust,
+        std::slice::from_ref(&manifest),
+    )]);
+    let mut tx = InstallTransactions::begin(&plan, &result, temp.path());
+    tx.execute(|command| {
+        fs::write(&lock, "installed lock").unwrap();
+        success(command)
+    });
+    fs::write(&manifest, "external manifest edit").unwrap();
+    tx.fail_holder(&lock, "simulated age failure".into());
+    let report = tx.rollback();
+    let unit = &report.units[0];
+    assert_eq!(
+        fs::read_to_string(&manifest).unwrap(),
+        "external manifest edit"
+    );
+    assert_eq!(fs::read_to_string(&lock).unwrap(), "installed lock");
+    let FileOutcome::Conflict {
+        backup: Ok(manifest_copy),
+        ..
+    } = &unit.files[&identity(&manifest)]
+    else {
+        panic!("{:?}", unit.files)
+    };
+    assert_eq!(fs::read(manifest_copy).unwrap(), before);
+    let FileOutcome::Kept {
+        backup: Ok(lock_copy),
+    } = &unit.files[&identity(&lock)]
+    else {
+        panic!("{:?}", unit.files)
+    };
+    assert_eq!(fs::read_to_string(lock_copy).unwrap(), "original lock");
+    for copy in [manifest_copy, lock_copy] {
+        let _ = fs::remove_dir_all(copy.parent().unwrap());
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn symlink_and_permissions_survive_recovery_and_replaced_links_are_kept() {

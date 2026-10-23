@@ -112,6 +112,15 @@ struct RustRun {
 }
 
 fn rust_run(requirement: &str, locked_leaf: &str) -> RustRun {
+    rust_run_with(requirement, locked_leaf, false)
+}
+
+/// `repointing` なら、監査が差し戻す `switcher` と、`shared` を系列をまたぐ範囲
+/// (`>=0.1, <0.3`) で要求する `wide` を足す。`pinned-old` が `shared 0.1.0` を lock に残すので、
+/// `switcher` を差し戻すと、Cargo は `switcher` の依存の `shared 0.2.0` を lock から外し、
+/// `wide` の辺を lock に残る `shared 0.1.0` へ付け替える (`windows-sys >=0.52, <0.62` を
+/// 要求する crate が、tokio の差し戻しで付け替えられたのと同じ形)。
+fn rust_run_with(requirement: &str, locked_leaf: &str, repointing: bool) -> RustRun {
     let registry = LocalRegistry::new();
     for version in ["1.0.0", "1.1.0", "1.2.0"] {
         registry.publish("leaf", version, &[]);
@@ -119,13 +128,32 @@ fn rust_run(requirement: &str, locked_leaf: &str) -> RustRun {
     registry
         .publish("top", "1.0.0", &[("leaf", "^1.0")])
         .publish("top", "1.1.0", &[("leaf", requirement)]);
-    let manifest = "[package]\nname = 'app'\nversion = '0.1.0'\nedition = '2024'\n[dependencies]\ntop = '=1.0.0'\n";
-    let project = TestProject::new(&registry, manifest);
+    if repointing {
+        registry
+            .publish("shared", "0.1.0", &[])
+            .publish("shared", "0.2.0", &[])
+            .publish("switcher", "1.0.0", &[("shared", "^0.2")])
+            .publish("switcher", "1.1.0", &[("shared", "^0.2")])
+            .publish("wide", "1.0.0", &[("shared", ">=0.1, <0.3")])
+            .publish("pinned-old", "1.0.0", &[("shared", "=0.1.0")]);
+    }
+    let manifest = format!(
+        "[package]\nname = 'app'\nversion = '0.1.0'\nedition = '2024'\n[dependencies]\ntop = '=1.0.0'\n{}",
+        if repointing {
+            "switcher = '1'\nwide = '1'\npinned-old = '1'\n"
+        } else {
+            ""
+        }
+    );
+    let project = TestProject::new(&registry, &manifest);
     project.cargo_ok(&["generate-lockfile"]);
     project.cargo_ok(&["update", "-p", "leaf", "--precise", locked_leaf]);
+    if repointing {
+        project.cargo_ok(&["update", "-p", "switcher", "--precise", "1.0.0"]);
+    }
     let lock = project.read("Cargo.lock");
     let top = CargoTomlParser
-        .parse(manifest)
+        .parse(&manifest)
         .unwrap()
         .into_iter()
         .find(|dependency| dependency.name == "top")
@@ -147,11 +175,17 @@ fn rust_run(requirement: &str, locked_leaf: &str) -> RustRun {
         .release("leaf", "1.1.0", old())
         .release("leaf", "1.2.0", young())
         .release("top", "1.0.0", old())
-        .release("top", "1.1.0", old());
+        .release("top", "1.1.0", old())
+        .release("shared", "0.1.0", old())
+        .release("shared", "0.2.0", old())
+        .release("switcher", "1.0.0", old())
+        .release("switcher", "1.1.0", young())
+        .release("wide", "1.0.0", old())
+        .release("pinned-old", "1.0.0", old());
     RustRun {
         _registry: registry,
         project,
-        manifest: manifest.into(),
+        manifest,
         lock,
         result: OrchestratorResult {
             summary,
@@ -216,6 +250,20 @@ async fn an_added_version_that_cannot_pass_age_restores_the_unit() {
     run.project.cargo_ok(&["update", "--workspace", "--locked"]);
 }
 
+/// Issue #58: 監査の差し戻し (`switcher`) で Cargo が範囲外の依存元 (`wide`) の辺を別の
+/// 系列の版へ付け替えても、それは監査自身の変更。外部変更とみなさず、マニフェストと
+/// lockfile の両方を実行前へ戻す (以前は Cargo.toml だけが戻り、lockfile と食い違った)。
+#[tokio::test]
+async fn a_rollback_that_repoints_another_dependent_still_restores_the_lockfile() {
+    let mut run = rust_run_with("^1.2", "1.0.0", true);
+    let outcome = run.install().await;
+    assert!(!outcome.install_failed && outcome.audit_failed);
+    assert_eq!(run.project.read("Cargo.toml"), run.manifest);
+    assert_eq!(run.project.read("Cargo.lock"), run.lock);
+    assert!(run.canceled());
+    run.project.cargo_ok(&["update", "--workspace", "--locked"]);
+}
+
 /// 復元は Cargo.lock を保持する単位に従い、同じディレクトリの独立した
 /// install の更新は保持する。
 #[tokio::test]
@@ -272,24 +320,27 @@ async fn a_young_version_locked_before_the_run_does_not_restore_the_unit() {
     assert!(!run.canceled());
 }
 
-/// 監査の外で変わった lockfile は採用しない。マニフェストは戻すが、
-/// 変更された lockfile は手動復元用に残し、結果にもその旨を示す。
+/// 監査の外で変わった lockfile は採用せず、上書きもしない。マニフェストだけを戻すと
+/// lockfile と食い違うので、単位のどのファイルも戻さずに手動復元用に残し、結果にも
+/// その旨を示す (Issue #58)。
 #[tokio::test]
-async fn a_lockfile_changed_after_the_audit_is_kept_and_recovery_is_incomplete() {
+async fn a_lockfile_changed_after_the_audit_keeps_the_whole_unit_for_manual_recovery() {
     let mut run = rust_run("^1.1", "1.0.0");
     run.checks.edit_after_audit = true;
     let outcome = run.install().await;
     assert!(!outcome.install_failed && outcome.audit_failed);
-    assert_eq!(run.project.read("Cargo.toml"), run.manifest);
+    assert!(run.project.read("Cargo.toml").contains("'=1.1.0'"));
     assert!(
         run.project
             .read("Cargo.lock")
             .ends_with("# edited after the audit\n")
     );
+    assert!(run.result.summary.manifests[0].modified);
     assert!(run.result.summary.manifests[0].results.iter().any(|item| {
         item.write_error().is_some_and(|error| {
             error.contains("Cargo.lock changed outside the --age audit")
                 && error.contains("recovery incomplete")
+                && error.contains("no file of this install was restored")
         })
     }));
 }
