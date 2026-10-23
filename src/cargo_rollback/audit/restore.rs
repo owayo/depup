@@ -53,16 +53,14 @@ struct LockEntry {
 }
 
 impl LockEntry {
-    /// 操作が依存先を移動したことだけで、このパッケージが変わったかどうか。
-    /// 消えた辺は、操作が `moved` としたパッケージを指し、同じ名前・取得元・semver 系列の
-    /// `scope` 内のパッケージへの追加辺と対にならなければならない。
-    /// 辺の純増・純減や、そのほかのフィールドの変化は、この規則では説明できない。
-    fn rewired(
-        &self,
-        after: &Self,
-        moved: &BTreeSet<LockId>,
-        scope: &BTreeSet<PackageKey>,
-    ) -> bool {
+    /// 操作が lock から外したパッケージへの辺を Cargo が付け替えただけで、このパッケージが
+    /// 変わったかどうか。`cargo update -p X` は X と、前の lock で X から到達できるパッケージを
+    /// lock から外す。範囲外の依存元でも、その中を指す辺は、版要求が許す同じ名前・取得元の
+    /// 別の版へ付け替わる。版要求が系列をまたぐ範囲 (`windows-sys >=0.52, <0.62` など) なら、
+    /// 別の系列の版にもなる。消えた辺は `unlocked` の中を指し、同じ名前・取得元の追加辺と
+    /// 対にならなければならない。辺の純増・純減や、そのほかのフィールドの変化は、
+    /// この規則では説明できない。
+    fn rewired(&self, after: &Self, unlocked: &BTreeSet<LockId>) -> bool {
         if self.fields != after.fields {
             return false;
         }
@@ -83,11 +81,11 @@ impl LockEntry {
         }
         removed.len() == added.len()
             && removed.into_iter().all(|old| {
-                let pair = added.iter().position(|new| {
-                    same_line(old, new) && scope.contains(&(new.0.clone(), new.1.clone()))
-                });
+                let pair = added
+                    .iter()
+                    .position(|new| new.0 == old.0 && new.2 == old.2);
                 match pair {
-                    Some(index) if moved.contains(old) => {
+                    Some(index) if unlocked.contains(old) => {
                         added.swap_remove(index);
                         true
                     }
@@ -218,7 +216,23 @@ impl AuditChanges {
             .collect()
     }
 
+    /// 実際の lock に書く単一 crate の Cargo コマンド (`cargo update -p name@ver --precise`) の前後。
+    /// コマンドの実行中に外から書かれた変更も同じ差分に入りうるので、Cargo が書き換えうる範囲
+    /// ([`LockEntry::rewired`]) の外の変化は外部変更とする。
     pub(super) fn applied(&mut self, before: &str, after: &str, selected: &[PackageKey]) {
+        self.record(before, after, selected, true);
+    }
+
+    /// 一時 workspace で解いた lock を、元の lock が変わっていないことを確かめてから反映した前後。
+    /// 差分はすべて depup が書いたものなので、外部変更を含まない。固定用の別名依存が lock に
+    /// 無い版を指すと、Cargo は取得元のパッケージをすべて lock から外して解き直すため、選んだ
+    /// 範囲の外の依存元の辺も付け替わる。選んだ範囲の変更だけを所有し、範囲外の変化は
+    /// 所有も外部変更もせず、以前の操作による記録をそのまま残す。
+    pub(super) fn committed(&mut self, before: &str, after: &str, selected: &[PackageKey]) {
+        self.record(before, after, selected, false);
+    }
+
+    fn record(&mut self, before: &str, after: &str, selected: &[PackageKey], in_place: bool) {
         self.observe(before);
         let before_ids = lock_ids(before);
         let after_ids = lock_ids(after);
@@ -270,22 +284,43 @@ impl AuditChanges {
             .filter(|key| related.contains(&(key.0.clone(), key.1.clone())))
             .cloned()
             .collect();
-        // パッケージを移動すると、範囲外の依存元の辺も書き換わる。
-        // その依存元自体は変わっていないため、監査の所有対象にも外部変更にも追加せず、
-        // 以前の操作による記録をそのまま残す。
-        let rewired = |key: &LockId| {
-            before_tables
-                .get(key)
-                .zip(after_tables.get(key))
-                .is_some_and(|(before, after)| before.rewired(after, &ours, &related))
-        };
-        self.disown(
-            changed
+        if in_place {
+            // Cargo が lock から外すのは、選んだパッケージと、前の lock でそこから到達できる
+            // パッケージ。範囲外の依存元でも、その中を指す辺は付け替わる。依存元自体は
+            // 変わっていないため、監査の所有対象にも外部変更にも追加せず、以前の操作による
+            // 記録をそのまま残す。到達は取得元込みの辺で辿る (同じ名前・版の別の取得元の
+            // パッケージは、Cargo が外していない)。
+            let mut unlocked = BTreeSet::new();
+            let mut pending: Vec<LockId> = before_ids
                 .iter()
-                .filter(|key| !ours.contains(*key) && !rewired(key))
+                .filter(|id| selected.iter().any(|root| id.0 == root.0 && id.1 == root.1))
                 .cloned()
-                .collect(),
-        );
+                .collect();
+            while let Some(id) = pending.pop() {
+                if !unlocked.insert(id.clone()) {
+                    continue;
+                }
+                if let Some(entry) = before_tables.get(&id) {
+                    pending.extend(entry.edges.keys().filter_map(|edge| match edge {
+                        Edge::Package(dependency) => Some(dependency.clone()),
+                        Edge::Unresolved(_) | Edge::Invalid(_) => None,
+                    }));
+                }
+            }
+            let rewired = |key: &LockId| {
+                before_tables
+                    .get(key)
+                    .zip(after_tables.get(key))
+                    .is_some_and(|(before, after)| before.rewired(after, &unlocked))
+            };
+            self.disown(
+                changed
+                    .iter()
+                    .filter(|key| !ours.contains(*key) && !rewired(key))
+                    .cloned()
+                    .collect(),
+            );
+        }
         for key in ours {
             if !self.external.iter().any(|other| same_line(&key, other)) {
                 self.owned.insert(key);
@@ -701,7 +736,7 @@ impl LockAgeAuditor<'_> {
                     let selected: Vec<_> = plan.members.iter().map(|member| {
                         (member.name.clone(), member.installed.clone())
                     }).collect();
-                    state.changes.applied(&expected_lock, &committed, &selected);
+                    state.changes.committed(&expected_lock, &committed, &selected);
                     expected_lock = committed;
                     for member in &plan.members {
                         let key = (member.name.clone(), member.installed.clone());
@@ -1129,11 +1164,6 @@ mod tests {
         let moved_serde = ("serde".to_string(), "1.0.0".to_string());
         let retargeted = toml_family("0.9.5", &["toml 0.9.5", "ghost 1.0.0"]);
         for (after, selected) in [
-            // 別の系列へ付け替える場合。
-            (
-                toml_family("0.9.5", &["toml 0.8.2", "ghost 1.0.0"]),
-                &moved_toml,
-            ),
             // 範囲内の変わっていないパッケージへの辺を追加する場合。
             (
                 toml_family("0.9.5", &["toml 0.9.5", "serde", "ghost 1.0.0"]),
@@ -1154,6 +1184,11 @@ mod tests {
             ),
             // 元の対象を動かしていない操作の場合。
             (retargeted.clone(), &moved_serde),
+            // 操作が lock から外していないパッケージへの辺を、別の系列へ付け替える場合。
+            (
+                toml_family("0.9.8", &["toml 0.8.2", "ghost 1.0.0"]),
+                &moved_serde,
+            ),
         ] {
             let mut changes = AuditChanges::default();
             changes.applied(&installed, &after, std::slice::from_ref(selected));
@@ -1170,8 +1205,110 @@ mod tests {
         }
     }
 
+    /// Issue #58: `cargo update -p user@1.1.0 --precise 1.0.0` は `user` と、前の lock で
+    /// そこから到達できる `toml 0.9.8` を lock から外す。`toml 0.9.8` は残って表も
+    /// 変わらないが、範囲外の `cargo_toml` の辺は、版要求 (`toml >=0.8, <0.10` のような
+    /// 系列をまたぐ範囲) が許す `toml 0.8.2` へ付け替わる。これは Cargo 自身の変更。
     #[test]
-    fn rewiring_pairs_every_moved_edge_with_one_in_the_same_series() {
+    fn repointing_into_the_unlocked_scope_is_cargos_own_change() {
+        let family = |user: &str, cargo_toml: &str| {
+            lock(&[
+                ("cargo_toml", "0.22.0", PUBLIC, &[cargo_toml]),
+                ("system-deps", "7.0.0", PUBLIC, &["toml 0.8.2"]),
+                ("toml", "0.8.2", PUBLIC, &[]),
+                ("toml", "0.9.8", PUBLIC, &[]),
+                ("user", user, PUBLIC, &["toml 0.9.8"]),
+            ])
+        };
+        let installed = family("1.1.0", "toml 0.9.8");
+        let after = family("1.0.0", "toml 0.8.2");
+        let cargo_toml = ("cargo_toml".to_string(), "0.22.0".to_string());
+        let mut changes = AuditChanges::default();
+        changes.applied(&installed, &after, &[("user".into(), "1.1.0".into())]);
+        assert!(!changes.externally_changed(&cargo_toml));
+        assert!(!changes.owns("cargo_toml", "0.22.0"));
+        assert!(changes.owns("user", "1.1.0") && changes.owns("user", "1.0.0"));
+        assert!(changes.allows_snapshot_restore(Some(after.as_bytes())));
+
+        // `system-deps` を選んだ操作は `toml 0.9.8` を lock から外さないので、Cargo はその辺を
+        // 付け替えない (`user` の変化も範囲外)。
+        let mut changes = AuditChanges::default();
+        changes.applied(
+            &installed,
+            &after,
+            &[("system-deps".into(), "7.0.0".into())],
+        );
+        assert!(changes.externally_changed(&cargo_toml));
+        assert!(!changes.allows_snapshot_restore(Some(after.as_bytes())));
+
+        // 同じ名前・版でも、別の取得元のパッケージは Cargo が lock から外していない。
+        let public = format!("toml 0.9.8 ({PUBLIC})");
+        let private = format!("toml 0.9.8 ({PRIVATE})");
+        let sources = |user: &str, cargo_toml: &str| {
+            lock(&[
+                ("cargo_toml", "0.22.0", PUBLIC, &[cargo_toml]),
+                ("toml", "0.8.2", PRIVATE, &[]),
+                ("toml", "0.9.8", PRIVATE, &[]),
+                ("toml", "0.9.8", PUBLIC, &[]),
+                ("user", user, PUBLIC, &[public.as_str()]),
+            ])
+        };
+        let installed = sources("1.1.0", &private);
+        let after = sources("1.0.0", "toml 0.8.2");
+        let mut changes = AuditChanges::default();
+        changes.applied(&installed, &after, &[("user".into(), "1.1.0".into())]);
+        assert!(
+            changes
+                .external_packages()
+                .contains(&"cargo_toml 0.22.0".to_string()),
+            "{:?}",
+            changes.external_packages()
+        );
+        assert!(!changes.allows_snapshot_restore(Some(after.as_bytes())));
+    }
+
+    /// 一時 workspace からの反映は、元の lock が変わっていないことを確かめてから書くので、
+    /// 差分に外部変更は入らない。固定用の依存が取得元を丸ごと lock から外すため、選んだ範囲の
+    /// 外の依存元 (`cargo_toml`) の辺も付け替わるが、所有も外部変更もしない。
+    #[test]
+    fn committed_resolutions_never_record_external_changes() {
+        let installed = toml_family("0.9.8", &["toml 0.8.2"]);
+        let after = toml_family("0.9.5", &["toml 0.9.5"]);
+        let cargo_toml = ("cargo_toml".to_string(), "0.22.0".to_string());
+        let selected = [("toml".to_string(), "0.9.8".to_string())];
+        let mut changes = AuditChanges::default();
+        changes.committed(&installed, &after, &selected);
+        assert!(!changes.externally_changed(&cargo_toml));
+        assert!(!changes.owns("cargo_toml", "0.22.0"));
+        assert!(changes.owns("toml", "0.9.8") && changes.owns("toml", "0.9.5"));
+        assert!(changes.allows_snapshot_restore(Some(after.as_bytes())));
+
+        // 範囲外の依存元について、以前の操作が記録した内容はそのまま残す。
+        let id = (
+            cargo_toml.0.clone(),
+            cargo_toml.1.clone(),
+            Some(PUBLIC.to_string()),
+        );
+        let mut earlier = AuditChanges::default();
+        earlier.owned.insert(id.clone());
+        earlier.committed(&installed, &after, &selected);
+        assert!(earlier.owns("cargo_toml", "0.22.0"));
+        let mut earlier = AuditChanges::default();
+        earlier.external.insert(id);
+        earlier.committed(&installed, &after, &selected);
+        assert!(earlier.externally_changed(&cargo_toml));
+
+        // 反映の前にコマンドの間で変わっていれば、従来どおり外部変更とする。
+        let edited = installed.replace("version = \"7.0.0\"", "version = \"7.0.1\"");
+        let mut changes = AuditChanges::default();
+        changes.observe(&installed);
+        changes.committed(&edited, &after, &selected);
+        assert!(changes.externally_changed(&("system-deps".into(), "7.0.0".into())));
+        assert!(!changes.allows_snapshot_restore(Some(after.as_bytes())));
+    }
+
+    #[test]
+    fn rewiring_pairs_every_unlocked_edge_with_one_of_the_same_package() {
         let id = |name: &str, version: &str| {
             (
                 name.to_string(),
@@ -1186,17 +1323,13 @@ mod tests {
                 .map(|(name, version, count)| (Edge::Package(id(name, version)), *count))
                 .collect(),
         };
-        let moved: BTreeSet<_> = [
+        let unlocked: BTreeSet<_> = [
             id("toml", "0.9.8"),
             id("toml", "0.8.2"),
             id("syn", "2.0.10"),
         ]
         .into_iter()
         .collect();
-        let scope: BTreeSet<_> = [("toml", "0.9.5"), ("toml", "0.8.1"), ("syn", "2.0.9")]
-            .into_iter()
-            .map(|(name, version)| (name.to_string(), version.to_string()))
-            .collect();
         let before = entry(&[
             ("toml", "0.9.8", 2),
             ("toml", "0.8.2", 1),
@@ -1211,6 +1344,8 @@ mod tests {
                 ]),
                 true,
             ),
+            // 版要求が系列をまたぐ範囲なら、別の系列の版へも付け替わる。
+            (entry(&[("toml", "0.9.5", 3), ("syn", "2.0.9", 1)]), true),
             // 同じ2本の辺の一方に、対応する辺が残らない場合。
             (
                 entry(&[
@@ -1220,7 +1355,7 @@ mod tests {
                 ]),
                 false,
             ),
-            // 移動に加えて、別の辺が追加または削除される場合。
+            // 付け替えに加えて、別の辺が追加または削除される場合。
             (
                 entry(&[
                     ("toml", "0.9.5", 3),
@@ -1230,22 +1365,40 @@ mod tests {
                 false,
             ),
             (entry(&[("toml", "0.9.5", 2), ("toml", "0.8.1", 1)]), false),
-            // 0.8系列への辺は、0.9系列の版と対にできない。
-            (entry(&[("toml", "0.9.5", 3), ("syn", "2.0.9", 1)]), false),
+            // 別の名前のパッケージへは付け替わらない。
+            (
+                entry(&[
+                    ("toml", "0.9.5", 2),
+                    ("toml", "0.8.1", 1),
+                    ("serde", "1.0.0", 1),
+                ]),
+                false,
+            ),
         ] {
-            assert_eq!(
-                before.rewired(&after, &moved, &scope),
-                explained,
-                "{after:?}"
-            );
+            assert_eq!(before.rewired(&after, &unlocked), explained, "{after:?}");
         }
         let after = entry(&[
             ("toml", "0.9.5", 2),
             ("toml", "0.8.1", 1),
             ("syn", "2.0.9", 1),
         ]);
-        assert!(!before.rewired(&after, &BTreeSet::new(), &scope));
-        assert!(!before.rewired(&after, &moved, &BTreeSet::new()));
+        // lock から外れていないパッケージへの辺は、Cargo が付け替えない。
+        assert!(!before.rewired(&after, &BTreeSet::new()));
+        let mut partial = unlocked.clone();
+        partial.remove(&id("toml", "0.8.2"));
+        assert!(!before.rewired(&after, &partial));
+        // 別の取得元の同じ名前へは付け替わらない。
+        let mut elsewhere = after.clone();
+        elsewhere.edges.remove(&Edge::Package(id("syn", "2.0.9")));
+        elsewhere.edges.insert(
+            Edge::Package((
+                "syn".into(),
+                "2.0.9".into(),
+                Some("git+https://example.com/syn?branch=main#0123abcd".into()),
+            )),
+            1,
+        );
+        assert!(!before.rewired(&elsewhere, &unlocked));
     }
 
     #[test]

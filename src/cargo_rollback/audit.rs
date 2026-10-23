@@ -1168,7 +1168,7 @@ impl<'a> LockAgeAuditor<'a> {
             for change in changes {
                 state
                     .changes
-                    .applied(&change.before, &change.after, &change.selected);
+                    .committed(&change.before, &change.after, &change.selected);
             }
             let (after, _) = read_audit_lock(&lock_path)?;
             state.changes.observe(&after);

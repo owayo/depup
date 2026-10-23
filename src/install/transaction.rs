@@ -64,6 +64,10 @@ pub enum FileOutcome {
         reason: String,
         backup: Result<PathBuf, String>,
     },
+    /// 同じ単位のほかのファイルを戻せないため、この実行の変更を残したファイル。
+    Kept {
+        backup: Result<PathBuf, String>,
+    },
 }
 impl FileOutcome {
     fn restored(&self) -> bool {
@@ -76,6 +80,8 @@ struct FailedUnit {
     reason: String,
     files: BTreeMap<PathBuf, FileOutcome>,
     policy_failure: bool,
+    /// 外部の変更を検出したため、どのファイルも戻さなかった。
+    skipped: bool,
 }
 impl FailedUnit {
     /// 管理するファイルがすべて実行前の状態へ戻ったかを表す。
@@ -631,6 +637,7 @@ impl InstallTransactions {
                         reason: reason.clone(),
                         files: BTreeMap::new(),
                         policy_failure: unit.policy_failure,
+                        skipped: false,
                     })
                 })
                 .collect(),
@@ -908,12 +915,31 @@ impl InstallTransactions {
             }
             self.observe(index, &BTreeSet::new());
             let unit = &self.units[index];
+            // 外部の変更を上書きしないため、そのファイルは戻せない。lock の検証の失敗では
+            // パッケージマネージャーが成功しており、残ったファイルは互いに合っている。一部だけ
+            // 戻すと、戻したマニフェストと残した lockfile が食い違うので、どのファイルも戻さない。
+            // install の失敗では実行前の組が合っているので、戻せるファイルは戻す。
+            let skipped = unit.policy_failure
+                && unit
+                    .files
+                    .iter()
+                    .any(|key| self.files[key].conflict.is_some());
             let files = unit
                 .files
                 .iter()
                 .map(|key| {
                     let record = &self.files[key];
-                    let outcome = restore(key, record);
+                    let outcome = match &record.conflict {
+                        _ if !skipped => restore(key, record),
+                        Some(reason) => FileOutcome::Conflict {
+                            reason: reason.clone(),
+                            backup: recovery_copy(record),
+                        },
+                        None if record.expected.matches(&record.before) => FileOutcome::Unchanged,
+                        None => FileOutcome::Kept {
+                            backup: recovery_copy(record),
+                        },
+                    };
                     (key.clone(), outcome)
                 })
                 .collect();
@@ -923,6 +949,7 @@ impl InstallTransactions {
                 summaries: unit.summaries.clone(),
                 files,
                 policy_failure: unit.policy_failure,
+                skipped,
             });
         }
         report.node_managers = self.node_managers;
@@ -1157,6 +1184,8 @@ impl RollbackReport {
         for unit in &self.units {
             let incomplete = if unit.recovered() {
                 ""
+            } else if unit.skipped {
+                "; recovery incomplete: a file changed outside depup, so no file of this install was restored and all were kept for manual recovery"
             } else {
                 "; recovery incomplete: some files were kept for manual recovery"
             };
@@ -1208,27 +1237,15 @@ impl RollbackReport {
                             "  recovery failed for {}: {reason}; current file kept",
                             path.display()
                         )?;
-                        match backup {
-                            Ok(backup)
-                                if backup
-                                    .file_name()
-                                    .is_some_and(|name| name == "originally-absent") =>
-                            {
-                                writeln!(
-                                    out,
-                                    "    Original file was absent (receipt: {}). Review and remove {} after resolving the conflict.",
-                                    backup.display(),
-                                    path.display()
-                                )?
-                            }
-                            Ok(backup) => writeln!(
-                                out,
-                                "    Pre-write copy: {}. Restore it to {} after resolving the conflict.",
-                                backup.display(),
-                                path.display()
-                            )?,
-                            Err(error) => writeln!(out, "    Recovery copy failed: {error}")?,
-                        }
+                        print_backup(out, path, backup)?;
+                    }
+                    FileOutcome::Kept { backup } => {
+                        writeln!(
+                            out,
+                            "  kept {} unrestored: another file of this install could not be restored",
+                            path.display()
+                        )?;
+                        print_backup(out, path, backup)?;
                     }
                 }
             }
@@ -1237,10 +1254,15 @@ impl RollbackReport {
                     out,
                     "  The project files are back to their state before this run."
                 )?;
+            } else if unit.skipped {
+                writeln!(
+                    out,
+                    "  Recovery was skipped: a file of this install changed outside depup, so none of its files were restored. The files listed above keep this run's changes, and whether they still match each other was not checked. Review the external change and the recovery information above before restoring them."
+                )?;
             } else {
                 writeln!(
                     out,
-                    "  Recovery is incomplete: the files kept above need manual recovery."
+                    "  Recovery is incomplete: the files kept above need manual recovery. Until then, they may not match the restored files."
                 )?;
             }
             writeln!(
@@ -1254,6 +1276,34 @@ impl RollbackReport {
             )?;
         }
         Ok(())
+    }
+}
+
+fn print_backup(
+    out: &mut impl Write,
+    path: &Path,
+    backup: &Result<PathBuf, String>,
+) -> io::Result<()> {
+    match backup {
+        Ok(backup)
+            if backup
+                .file_name()
+                .is_some_and(|name| name == "originally-absent") =>
+        {
+            writeln!(
+                out,
+                "    Original file was absent (receipt: {}). Review and remove {} after resolving the conflict.",
+                backup.display(),
+                path.display()
+            )
+        }
+        Ok(backup) => writeln!(
+            out,
+            "    Pre-write copy: {}. Restore it to {} after resolving the conflict.",
+            backup.display(),
+            path.display()
+        ),
+        Err(error) => writeln!(out, "    Recovery copy failed: {error}"),
     }
 }
 
