@@ -90,7 +90,7 @@ src/
     report.rs        - 監査結果の表示と lock の突き合わせ (表示した更新先と Cargo.lock に入った版の食い違いの注記)
     scratch.rs       - workspace の一時写しと cargo の起動設定
     series.rs        - semver 互換系列の判定
-  test_support/    - テスト専用: local-registry 形式の偽 crates.io と公開日を固定する偽 adapter
+  test_support/    - テスト専用: local-registry 形式の偽 crates.io と公開日を固定する偽 adapter、決めた応答を順に返す HTTP サーバ (`http::serve_responses`。Maven と GitHub のアダプタのテストが使う)、偽のコマンドを書く関数 (`exec::write_script`)
 tests/
   integration_tests.rs - 統合テスト (マニフェスト検出・パース・パイプライン)
   e2e_tests.rs         - E2Eテスト (バイナリ実行)
@@ -147,6 +147,7 @@ make ci                # CI と同じ検査 (fmt-check + lint + test、書き換
 - ネットワークアクセスを伴うテストは E2E テストに限定
 - E2E テストは Cargo が提供する `CARGO_BIN_EXE_depup` のコンパイル済みバイナリを使う。テストプロセス内から `cargo build` を起動すると、親の `cargo test` が保持する Cargo ロックと循環待ちになり全テストが停止するため、独自ビルドを行わない
 - Cargo.lock の差し戻し (`cargo_rollback/`) は、local-registry 形式の偽 crates.io と公開日を固定する偽 adapter (`src/test_support/`) に実物の cargo を組み合わせて検証する。cargo にはテスト専用の `CARGO_HOME` を与えてオフラインで動かすので、crates.io の状態にも実行日にも左右されない (公開日を固定しないと、age を満たすかどうかが実行日によって変わる)。偽 crates.io に directory source (`cargo vendor` の形式) は使えない — directory source では `cargo update --precise` が何もせずに exit 0 で終わるため、差し戻しが効いたかどうかを確かめられない
+- テストで偽のコマンド (pnpm・mise・cargo・gradlew の代わりのシェルスクリプト) を書いて実行させるときは、`std::fs::write` ではなく `test_support::exec::write_script` で書く (統合テストは `tests/support/mod.rs`、`src/main.rs` のテストは同じ形の関数を使う)。書いた直後に exec すると、Linux の CI でまれに `Text file busy (os error 26)` で落ちる。並列に走るほかのテストが子プロセスを起動すると、fork から exec までの間、このプロセスの書き込み用の fd の写しが子プロセスに残るため。`write_script` は子プロセスに書かせるので、テストのプロセスは書き込み用の fd を持たない。macOS では起きない
 
 ## Important Notes
 
@@ -204,7 +205,7 @@ make ci                # CI と同じ検査 (fmt-check + lint + test、書き換
 - Cargo.toml の path 依存 (`{ path = "../common" }`) は、publish 用に `version` を併記していても更新対象から除外する。ローカルクレートで解決されるため crates.io の最新版へ引き上げると実バージョンが要求を満たさなくなり `cargo build` が壊れる (crates.io に同名クレートが実在する場合は無関係なクレートの版で上書きされる)
 - Cargo.toml の `registry = "..."` 付き依存は、`crates-io` 以外のレジストリであれば crates.io の候補で誤更新しないよう更新対象から除外する。インデックス URL を直接指す `registry-index = "..."` も同様に除外する (値に関わらず crates.io 以外を指す。Cargo は `registry` との同時指定を拒否する)。`registry` 用のパターンは `registry\s*=` を要求するため `registry-index` にはマッチせず、parse・writer とも素通りして社内 private registry の依存が同名の公開クレート (typosquat を含む) の版で書き換えられていた。inline table / 複数行テーブル / dotted key の 3 形式すべてで除外する
 - Tauriプロジェクトでは npm/crate のバージョンを自動同期
-- Swift は GitHub Tags API を使用 (`GITHUB_TOKEN`/`GH_TOKEN` で認証可能)。GitHub Tags API はリリース日を返さないため、各バージョンの `released_at` には UNIX_EPOCH を使う (= 「十分古い」として扱う)。これにより `--age` 指定時でも Swift パッケージの更新が抑制されない
+- Swift は GitHub Tags API を使用 (`GITHUB_TOKEN`/`GH_TOKEN` で認証可能)。タグの一覧には公開日が無いので、`VersionInfo::undated` を積み、judge は Swift でもほかのレジストリと同じく日付の無い版を age の候補にしない (`allow_undated` は Java と全版が日付なしの mise だけ)。age が有効なら、orchestrator の `resolve_tag_release_dates` が judge と同じ絞り込みの候補 (`UpdateJudge::release_date_candidates` の `within`: 安定版・範囲の上限・reject・現在版より新しい・`--max-change` の内側) を新しい順に見て、`GitHubTagsAdapter::fetch_release_date` で公開日を取得し、期間を満たす版 (または `[age_exempt]` の例外) に当たったら止める。内側に期間を満たす版が無ければ、`--max-change` の外側 (`beyond`、現在版に近い順) も確かめる。外側に期間を満たす版があれば judge は `ChangeLevelLimited` を返し、ほかの言語と同じ報告になる。公開日は SPM が使うタグ (区切りの多い方、同じなら小文字の `v` の無い方。`spm_tag_rank`) の Release の `published_at`、Release が無い (404、または `published_at` が null) 注釈付きタグは `git/ref/tags/{tag}` → `git/tags/{sha}` の `tagger.date`。軽量タグと、SPM の順位が同じ別のタグがある版 (`1.2.0` と `V1.2.0`。SPM がどちらを使うか決まらない) は公開日不明 (`None`)。別名のタグの Release、Release の `created_at` (元のコミットの日時)、コミットの日時は使わない。タグ名の `+` は `%2B` に符号化する。問い合わせは 1 依存 5 回まで (`MAX_TAG_DATE_LOOKUPS`。未認証の GitHub API は 60 回/時。この実行で解決済みの版 (`VersionFetcher::cached_release_date`) は数えない) で、内側の候補の途中で上限に達したら古い版へ更新せず `SkipReason::ReleaseDateUnchecked` (まだ確かめていない最も新しい版。表示は `release date lookup limit reached; <版> and older not checked`)。通信・レート制限・壊れた応答は不明にせず FetchFailed。age が無効なら取得しない。以前は Swift の日付の無い版を常に通していたため、age が `2w` でも公開から 3 日の版へ更新していた (#59)。公開日のキャッシュ (`VersionFetcher::release_date`) は公開日が無いという答え (`None`) も覚える
 - Swift の GitHub タグは `v1.2.3` と `V1.2.3` の両方を認識する
 - Swift の GitHub URL は HTTPS、scp 形式 (`git@github.com:owner/repo.git`)、標準 SSH (`ssh://git@github.com/owner/repo.git`)、GitHub の SSH over 443 (`ssh://git@ssh.github.com:443/owner/repo.git`) を owner/repo へ正規化する。`github.com.evil` 等の類似ホストは拒否する。**書き換え側の URL 正規表現も同じ形式を受理する必要がある** — parse は正規化ベース、update は生 URL の正規表現という二重定義のため、ホスト部に `ssh.` 接頭辞とポート番号 (`(?:ssh\.)?github\.com(?::\d+)?`) を許さないと SSH over 443 だけ parse は通るのに書き換え先が見つからず report/apply が矛盾する
 - Swift の非 GitHub URL はスキップされる (警告なし)
@@ -328,7 +329,7 @@ make ci                # CI と同じ検査 (fmt-check + lint + test、書き換
 - GitHub Tags の semver 受理判定は `SwiftVersionParser` へ委譲して `Package.swift` 側と一元化する。取得側だけが数値識別子の先頭ゼロを許していたため、`2024.01.15` のような CalVer タグが (semver タグと混在すると `2024 > 1` で必ず) 最新候補に選ばれ、SPM の `Version` が読めない `Package.swift` を書き込んでいた。書き込み側でも `new_version` の妥当性を検証する。タグが 1000 件 (10 ページ) を超えて打ち切られた場合は警告を出す (無言で切ると古い系列が候補から静かに落ちる)
 - `GITHUB_TOKEN` / `GH_TOKEN` は空文字を「未設定」として読み飛ばす。`std::env::var` は「セット済みだが空文字」に対して `Ok("")` を返すため、空値をそのまま採用すると `Authorization: Bearer ` (トークン部が空) を送って GitHub に 401 で拒否され、ヘッダを付けなければ未認証で成功していた取得が全滅する。空の `GITHUB_TOKEN` が置かれた環境で `GH_TOKEN` へフォールバックできない問題も同時に防ぐ
 - レジストリのパッケージ名は URL へ埋め込む前に文字種を検証する (npm / PyPI / crates.io / RubyGems / Packagist / Maven Central / GitHub Tags)。`reqwest` が使う `url` crate は WHATWG URL 仕様どおりドットセグメントを正規化するため、`"a/../lodash": "^1.0.0"` のようなキーがあると lodash の版を取得して元のキーへ書き戻す。`?` / `#` はクエリ・フラグメントとして解釈される。npm alias の実名はマニフェストの**値**から切り出されるため、名前の出所はキーだけではない
-- RubyGems の `created_at`、PyPI の `upload_time_iso_8601`、Packagist の `time`、Go proxy の `.info` の `Time` が欠落・不正な場合は公開日不明として保持する。age が有効なら日時不明の版を候補から外し、実在しない 1970 年を公開日として表示しない。mise は同じツール・ベンダーの他の版に日時があれば欠落版を除外し、全版に日時がなければ選択を許すが公開日不明と表示する。GitHub Tags は日時を返さないため Swift の age は検証できない
+- RubyGems の `created_at`、PyPI の `upload_time_iso_8601`、Packagist の `time`、Go proxy の `.info` の `Time` が欠落・不正な場合は公開日不明として保持する。age が有効なら日時不明の版を候補から外し、実在しない 1970 年を公開日として表示しない。mise は同じツール・ベンダーの他の版に日時があれば欠落版を除外し、全版に日時がなければ選択を許すが公開日不明と表示する。GitHub Tags は一覧に日時が無いので、Swift は age の判定に要る候補だけ公開日を後から取得する (Swift の項を参照)
 - `--diff` の値には npm alias の `npm:<real>@` 接頭辞も含める。`version_spec.raw` は制約部分 (`^17.0.0`) しか持たないため、接頭辞を落とすと diff が「alias 宣言が外れて素の `^18.0.0` になる」ように見え、実書き込み (`"npm:@preact/compat@^18.0.0"`) と食い違う。接頭辞は `Dependency::value_prefix` に保持する
 - テキスト / JSON 出力の「現在のバージョン」は `VersionSpec::display_version()` を使い、`v` / `V` 接頭辞を復元する。更新先はレジストリが返す生の値なので、Go では `1.3.0 → v1.6.0` という不揃いな表示になり JSON の `from` / `to` も書式が食い違っていた。`^` / `~` / `>=` は制約を表す演算子であってバージョンの一部ではないため含めない
 - `--age` の transitive 対応可否の通知は**言語単位ではなく実際に選ばれる PM 単位**で判定する (`Language::native_transitive_age_package_managers`)。Node の transitive age は pnpm、Python は uv だけの機能なので、言語で判定すると npm / yarn / bun / pip / poetry / rye / pipenv のプロジェクトで通知が出ず、「transitive にも cooldown が効いた」と誤解させる

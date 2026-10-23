@@ -184,6 +184,7 @@ Swift で対象になるのは、GitHub の URL で指定し、バージョン�
 
 - URL は、HTTPS、scp 形式の SSH（`git@github.com:owner/repo.git`）、標準の SSH（`ssh://git@github.com/owner/repo.git`）、GitHub の SSH over 443（`ssh://git@ssh.github.com:443/owner/repo.git`）を解析します。
 - GitHub のタグは `v1.2.3` と `V1.2.3` の両方を認識します。`Package.swift` の version requirement 文字列は、厳格な SemVer（`X.Y.Z`、先頭ゼロなし）として検証します。
+- タグの一覧には日付がないので、age フィルターはタグの GitHub Release の `published_at` を取得します。Release の無いタグは、注釈付きタグの作成日時を使います。軽量タグには日付がありません。同じ版を表すタグが複数ある場合 (`1.2`、`v1.2.0`、`1.2.0`) は、SwiftPM が選ぶタグ (`.` で区切った数が多いもの、同じなら `v` の無いもの) を使います。それでも順位が同じタグが残る場合 (`1.2.0` と `V1.2.0`) は、その版を日付なしとします。[age フィルター](usage.ja.md#age-フィルター)を参照してください。
 - SwiftPM が Semantic Versioning 2.0.0 に従うのに合わせて、プレリリース識別子（`1.0.0-beta.1`）、ビルドメタデータ（`1.0.0+build.123`）、その両方を含む形式（`1.0.0-rc.1+sha.abc`）も解析・更新します。
 - `.package(...)` の末尾に `traits: [...]`（SPM 6.1 の Package Traits）や `moduleAliases: [...]` のような引数があっても、version requirement だけを置き換え、ほかの引数は保ちます。
 - `//` の行コメントや `/* ... */` のブロックコメントの中にある依存宣言は無視します。

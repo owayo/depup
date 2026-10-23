@@ -3,6 +3,10 @@
 //! GitHub Tags API からパッケージバージョン情報を取得する。
 //! API エンドポイント: https://api.github.com/repos/{owner}/{repo}/tags
 //!
+//! タグの一覧には公開日が無い。age の判定に要る版だけ、Release の公開日
+//! (`/releases/tags/{tag}`) か、Release の無い注釈付きタグの日時 (`/git/tags/{sha}`) を
+//! 取得する (`fetch_release_date`)。
+//!
 //! 認証: GITHUB_TOKEN または GH_TOKEN 環境変数による任意認証。
 //! 非 GitHub URL はマニフェストパーサレベルでスキップされる。
 
@@ -13,8 +17,11 @@ use crate::registry::client::map_status_error;
 use crate::registry::{HttpClient, RegistryAdapter, is_valid_registry_id_segment};
 use crate::update::VersionInfo;
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use std::collections::HashSet;
+use serde::de::DeserializeOwned;
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 /// GitHub API のベース URL
 const GITHUB_API_URL: &str = "https://api.github.com";
@@ -108,15 +115,23 @@ fn page_limit_warning(package: &str) -> String {
     )
 }
 
-/// タグ名の一覧を候補リストへ積む。
+/// ある版に対して SPM が使うタグ
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceTag {
+    name: String,
+    /// SPM の規則で順位の同じ別のタグがあり、SPM がどちらを使うか決まらない
+    ambiguous: bool,
+}
+
+/// タグ名の一覧を候補リストへ積み、版ごとに SPM が使うタグ (`tags`) を記録する。
 ///
-/// 重複排除の状態 (`seen`) は呼び出し側が持つ。ページをまたいで同じバージョンへ
+/// 重複排除の状態 (`tags`) は呼び出し側が持つ。ページをまたいで同じバージョンへ
 /// 正規化されるタグ (`1.2` と `1.2.0`) が現れうるため、ページ単位では判定できない。
 /// SPM も `Git.convertTagsToVersionMap` で `[Version: [String]]` としてタグを束ねており、
 /// 同じ `Version` に解決される複数のタグを 1 つの候補として扱う。
 fn collect_tag_versions<I>(
     tag_names: I,
-    seen: &mut HashSet<String>,
+    tags: &mut HashMap<String, SourceTag>,
     versions: &mut Vec<VersionInfo>,
 ) where
     I: IntoIterator<Item = String>,
@@ -126,25 +141,87 @@ fn collect_tag_versions<I>(
         let Some(version) = extract_semver_tag(&name) else {
             continue;
         };
-        if !seen.insert(version.clone()) {
-            continue;
+        match tags.get_mut(&version) {
+            Some(tag) => match spm_tag_rank(&name).cmp(&spm_tag_rank(&tag.name)) {
+                std::cmp::Ordering::Greater => {
+                    *tag = SourceTag {
+                        name,
+                        ambiguous: false,
+                    }
+                }
+                std::cmp::Ordering::Equal if name != tag.name => tag.ambiguous = true,
+                _ => {}
+            },
+            None => {
+                tags.insert(
+                    version.clone(),
+                    SourceTag {
+                        name,
+                        ambiguous: false,
+                    },
+                );
+                // GitHub Tags API はリリース日を返さない。
+                // 日付不明を実在する公開日時として表示しない。
+                versions.push(VersionInfo::undated(version));
+            }
         }
-        // GitHub Tags API はリリース日を返さない。
-        // 日付不明を実在する公開日時として表示しない。
-        versions.push(VersionInfo::undated(version));
     }
+}
+
+/// 同じ版になるタグの中で SPM が使うタグの順位 (大きい方を使う)。SPM は `.` で区切った
+/// 数の多いタグを選び、同じなら小文字の `v` で始まらないタグを選ぶ
+/// (`SourceControlPackageContainer`)。順位が同じ組 (`V1.0.0` と `1.0.0` など) は、
+/// SPM がどちらを使うか決まらない。
+fn spm_tag_rank(tag: &str) -> (usize, bool) {
+    (tag.split('.').count(), !tag.starts_with('v'))
 }
 
 /// GitHub Tags API アダプタ
 pub struct GitHubTagsAdapter {
     client: HttpClient,
     token: Option<String>,
+    /// API の起点 (テストではローカルのサーバへ差し替える)
+    api_url: String,
+    /// パッケージ → 正規化した版 → SPM が使うタグ。公開日はタグ名で問い合わせる
+    source_tags: Mutex<HashMap<String, HashMap<String, SourceTag>>>,
 }
 
 /// GitHub API レスポンスのタグ情報
 #[derive(Debug, Deserialize)]
 struct GitHubTag {
     name: String,
+}
+
+/// `GET /repos/{owner}/{repo}/releases/tags/{tag}` のうち使う部分。公開前の Release
+/// (draft) は返らず、`published_at` が無いこともある
+#[derive(Debug, Deserialize)]
+struct GitHubRelease {
+    published_at: Option<String>,
+}
+
+/// `GET /repos/{owner}/{repo}/git/ref/tags/{tag}` のうち使う部分
+#[derive(Debug, Deserialize)]
+struct GitHubReference {
+    object: GitHubObject,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubObject {
+    /// `tag` (注釈付きタグ) か `commit` (軽量タグ)
+    #[serde(rename = "type")]
+    kind: String,
+    sha: String,
+}
+
+/// `GET /repos/{owner}/{repo}/git/tags/{sha}` のうち使う部分
+#[derive(Debug, Deserialize)]
+struct GitHubTagObject {
+    tagger: Option<GitHubTagger>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubTagger {
+    date: String,
 }
 
 /// 環境変数の候補列から実際に使うトークンを選ぶ。
@@ -171,15 +248,107 @@ impl GitHubTagsAdapter {
                 .map(|key| std::env::var(key).ok()),
         );
 
-        Self { client, token }
+        Self {
+            client,
+            token,
+            api_url: GITHUB_API_URL.to_string(),
+            source_tags: Mutex::new(HashMap::new()),
+        }
     }
 
     /// リポジトリ用のタグ URL を構築
     fn build_url(&self, owner_repo: &str) -> String {
         format!(
             "{}/repos/{}/tags?per_page={}",
-            GITHUB_API_URL, owner_repo, TAGS_PER_PAGE
+            self.api_url, owner_repo, TAGS_PER_PAGE
         )
+    }
+
+    /// `owner/repo` (検証済み) の下の API の URL
+    fn repo_url(&self, owner_repo: &str, path: &str) -> String {
+        format!("{}/repos/{owner_repo}/{path}", self.api_url)
+    }
+
+    /// `version` に対して SPM が使うタグ (一覧を取得した後だけ分かる)
+    fn source_tag(&self, package: &str, version: &str) -> Option<SourceTag> {
+        self.source_tags
+            .lock()
+            .unwrap()
+            .get(package)
+            .and_then(|tags| tags.get(version))
+            .cloned()
+    }
+
+    /// GitHub API へ 1 回問い合わせる。共通のリトライ経路 (429/5xx の再試行、
+    /// Retry-After) を通し、GitHub が独自の意味で返す 401 / 403 だけをここでエラーにする。
+    /// 404 などほかのステータスの扱いは呼び出し側が決める。
+    async fn send(&self, url: &str, package: &str) -> Result<reqwest::Response, RegistryError> {
+        let response = self
+            .client
+            .get_response_with_retry(
+                || {
+                    let mut request = self.client.inner().get(url);
+                    request = request.header("Accept", "application/vnd.github+json");
+                    if let Some(ref token) = self.token {
+                        request = request.header("Authorization", format!("Bearer {}", token));
+                    }
+                    request
+                },
+                package,
+                self.registry_name(),
+            )
+            .await?;
+        let status = response.status();
+        if status == reqwest::StatusCode::FORBIDDEN {
+            // GitHub はレート制限超過を 403 + X-RateLimit-Remaining: 0 で返す。
+            // 認証エラーと区別して報告する (classify_forbidden を参照)。
+            let remaining = response
+                .headers()
+                .get("x-ratelimit-remaining")
+                .and_then(|v| v.to_str().ok());
+            return Err(classify_forbidden(remaining));
+        }
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(RegistryError::AuthenticationError {
+                registry: self.registry_name().to_string(),
+                message: format!("HTTP {}", status),
+            });
+        }
+        Ok(response)
+    }
+
+    /// JSON を返す API を問い合わせる。404 (Release もタグも無い) なら `None`
+    async fn get_json<T: DeserializeOwned>(
+        &self,
+        url: &str,
+        package: &str,
+    ) -> Result<Option<T>, RegistryError> {
+        let response = self.send(url, package).await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if let Some(error) = map_status_error(response.status(), package, self.registry_name()) {
+            return Err(error);
+        }
+        response
+            .json()
+            .await
+            .map(Some)
+            .map_err(|e| self.invalid_response(package, format!("failed to parse JSON: {e}")))
+    }
+
+    fn invalid_response(&self, package: &str, message: String) -> RegistryError {
+        RegistryError::InvalidResponse {
+            package: package.to_string(),
+            registry: self.registry_name().to_string(),
+            message,
+        }
+    }
+
+    fn parse_date(&self, package: &str, date: &str) -> Result<DateTime<Utc>, RegistryError> {
+        DateTime::parse_from_rfc3339(date)
+            .map(|date| date.with_timezone(&Utc))
+            .map_err(|e| self.invalid_response(package, format!("invalid date {date:?}: {e}")))
     }
 
     /// パッケージ名が "owner/repo" 形式かつ GitHub の許容文字のみであることを検証する。
@@ -259,8 +428,8 @@ impl RegistryAdapter for GitHubTagsAdapter {
         self.validate_package_name(package)?;
 
         let mut versions = Vec::new();
-        // 正規化後のバージョン文字列の重複排除用 (`1.2` と `1.2.0` の同居に備える)
-        let mut seen_versions: HashSet<String> = HashSet::new();
+        // 正規化後のバージョン → SPM が使うタグ (`1.2` と `1.2.0` の同居に備える)
+        let mut tags_by_version: HashMap<String, SourceTag> = HashMap::new();
         let mut url = self.build_url(package);
 
         // 次ページが残ったままページ上限に達したか (取りこぼしの通知用)
@@ -270,46 +439,9 @@ impl RegistryAdapter for GitHubTagsAdapter {
         // (per_page=100 の 1 ページのみだと 100 タグ超のリポジトリで最新タグを取り逃す)。
         // 安全弁として最大 MAX_TAG_PAGES ページ (= 1000 タグ) まで。
         for page in 0..MAX_TAG_PAGES {
-            // 適切なヘッダ付きでリクエストを構築し、client.rs の共通リトライ経路
-            // (429/5xx の再試行 + Retry-After 尊重 + 送信エラー変換) で実行する。
-            // 403 / 401 は GitHub 固有の解釈が必要なため、リトライ経路では変換せず
-            // 生の Response を受け取ってこちらでステータスを最終判定する。
-            let response = self
-                .client
-                .get_response_with_retry(
-                    || {
-                        let mut request = self.client.inner().get(&url);
-                        request = request.header("Accept", "application/vnd.github+json");
-                        if let Some(ref token) = self.token {
-                            request = request.header("Authorization", format!("Bearer {}", token));
-                        }
-                        request
-                    },
-                    package,
-                    self.registry_name(),
-                )
-                .await?;
-
-            // HTTP ステータスコードを処理。
-            // GitHub 固有の解釈が必要な 403 / 401 を先に処理し、
-            // 404 / 429 / その他の非成功ステータスは client.rs の共通マッピングへ委ねる。
-            let status = response.status();
-            if status == reqwest::StatusCode::FORBIDDEN {
-                // GitHub はレート制限超過を 403 + X-RateLimit-Remaining: 0 で返す。
-                // 認証エラーと区別して報告する (classify_forbidden を参照)。
-                let remaining = response
-                    .headers()
-                    .get("x-ratelimit-remaining")
-                    .and_then(|v| v.to_str().ok());
-                return Err(classify_forbidden(remaining));
-            }
-            if status == reqwest::StatusCode::UNAUTHORIZED {
-                return Err(RegistryError::AuthenticationError {
-                    registry: self.registry_name().to_string(),
-                    message: format!("HTTP {}", status),
-                });
-            }
-            if let Some(error) = map_status_error(status, package, self.registry_name()) {
+            let response = self.send(&url, package).await?;
+            if let Some(error) = map_status_error(response.status(), package, self.registry_name())
+            {
                 return Err(error);
             }
 
@@ -332,7 +464,7 @@ impl RegistryAdapter for GitHubTagsAdapter {
 
             collect_tag_versions(
                 tags.into_iter().map(|tag| tag.name),
-                &mut seen_versions,
+                &mut tags_by_version,
                 &mut versions,
             );
 
@@ -350,8 +482,88 @@ impl RegistryAdapter for GitHubTagsAdapter {
 
         // バージョンでソート
         versions.sort();
+        self.source_tags
+            .lock()
+            .unwrap()
+            .insert(package.to_string(), tags_by_version);
 
         Ok(versions)
+    }
+
+    /// `version` に SPM が使うタグの公開日。Release の `published_at` を使い、Release の
+    /// 無い注釈付きタグはタグを作った日時 (`tagger.date`) で代える。別名のタグの Release は
+    /// 使わない (指すコミットが違いうる)。SPM がどのタグを使うか決まらない版も公開日不明
+    /// (`None`) にする。Release の `created_at` は元のコミットの日時なので使わない。
+    /// 軽量タグはコミットを直接指し、コミットの日時はタグを打った日より古いことがあるので
+    /// 公開日不明にする。通信やレート制限の失敗は不明にせずエラーにする。
+    async fn fetch_release_date(
+        &self,
+        package: &str,
+        version: &str,
+    ) -> Result<Option<DateTime<Utc>>, RegistryError> {
+        self.validate_package_name(package)?;
+        let tag = match self.source_tag(package, version) {
+            Some(tag) => tag,
+            // 一覧を別のアダプタが取得していた (共有キャッシュ) ので、タグ名を知らない
+            None => {
+                self.fetch_versions(package).await?;
+                self.source_tag(package, version).ok_or_else(|| {
+                    self.invalid_response(package, format!("no tag for version {version}"))
+                })?
+            }
+        };
+        if tag.ambiguous {
+            return Ok(None);
+        }
+        let tag = tag.name;
+        // タグ名は SPM の版として読めたもの (英数字・`.`・`-`・`+`) だけ。パスに置くと `+` の
+        // 解釈が揺れるので符号化する
+        if !tag
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
+        {
+            return Err(self.invalid_response(package, format!("unexpected tag name {tag:?}")));
+        }
+        let tag = tag.replace('+', "%2B");
+        let release: Option<GitHubRelease> = self
+            .get_json(
+                &self.repo_url(package, &format!("releases/tags/{tag}")),
+                package,
+            )
+            .await?;
+        if let Some(published_at) = release.and_then(|release| release.published_at) {
+            return self.parse_date(package, &published_at).map(Some);
+        }
+        let Some(reference) = self
+            .get_json::<GitHubReference>(
+                &self.repo_url(package, &format!("git/ref/tags/{tag}")),
+                package,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        if reference.object.kind != "tag" {
+            return Ok(None);
+        }
+        if reference.object.sha.is_empty()
+            || !reference.object.sha.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return Err(self.invalid_response(
+                package,
+                format!("unexpected tag object {:?}", reference.object.sha),
+            ));
+        }
+        let object: Option<GitHubTagObject> = self
+            .get_json(
+                &self.repo_url(package, &format!("git/tags/{}", reference.object.sha)),
+                package,
+            )
+            .await?;
+        object
+            .and_then(|object| object.tagger)
+            .map(|tagger| self.parse_date(package, &tagger.date))
+            .transpose()
     }
 }
 
@@ -584,32 +796,204 @@ mod tests {
     /// SPM も同じ `Version` に解決されるタグを 1 つに束ねている。
     #[test]
     fn test_collect_tag_versions_dedupes_normalized_tags() {
-        let mut seen = HashSet::new();
+        let mut tags = HashMap::new();
         let mut versions = Vec::new();
         collect_tag_versions(
             ["v1.2", "1.2.0", "1.2", "v2.5", "not-a-version", "2.5.0"]
                 .into_iter()
                 .map(str::to_string),
-            &mut seen,
+            &mut tags,
             &mut versions,
         );
         let names: Vec<&str> = versions.iter().map(|v| v.version.as_str()).collect();
         assert_eq!(names, vec!["1.2.0", "2.5.0"]);
+        // 公開日は SPM が使うタグ (区切りの多い方、同じなら `v` の無い方) で問い合わせる
+        assert_eq!(tags["1.2.0"].name, "1.2.0");
+        assert_eq!(tags["2.5.0"].name, "2.5.0");
+        assert!(!tags["1.2.0"].ambiguous && !tags["2.5.0"].ambiguous);
     }
 
-    /// ページをまたいで同じバージョンが現れても重複しない
+    /// ページをまたいで同じバージョンが現れても重複せず、どのページの順でも同じタグを選ぶ
     #[test]
     fn test_collect_tag_versions_dedupes_across_pages() {
-        let mut seen = HashSet::new();
-        let mut versions = Vec::new();
-        collect_tag_versions(["1.2".to_string()], &mut seen, &mut versions);
-        collect_tag_versions(
-            ["1.2.0".to_string(), "1.3".to_string()],
-            &mut seen,
-            &mut versions,
+        for pages in [
+            [vec!["1.2"], vec!["v1.2.0", "1.3"]],
+            [vec!["v1.2.0", "1.3"], vec!["1.2"]],
+        ] {
+            let mut tags = HashMap::new();
+            let mut versions = Vec::new();
+            for page in pages {
+                collect_tag_versions(
+                    page.into_iter().map(str::to_string),
+                    &mut tags,
+                    &mut versions,
+                );
+            }
+            let mut names: Vec<&str> = versions.iter().map(|v| v.version.as_str()).collect();
+            names.sort();
+            assert_eq!(names, vec!["1.2.0", "1.3.0"]);
+            assert_eq!(tags["1.2.0"].name, "v1.2.0");
+        }
+    }
+
+    /// SPM の順位が同じタグの組 (`1.2.0` と `V1.2.0`) は、SPM がどちらを使うか決まらない。
+    /// 順位の高いタグが加わると決まる。
+    #[test]
+    fn tags_of_equal_spm_rank_are_ambiguous() {
+        let collect = |names: &[&str]| {
+            let mut tags = HashMap::new();
+            collect_tag_versions(
+                names.iter().map(|name| name.to_string()),
+                &mut tags,
+                &mut Vec::new(),
+            );
+            tags.remove("1.2.0").unwrap()
+        };
+        for (names, expected, ambiguous) in [
+            (&["1.2", "v1.2.0"][..], "v1.2.0", false),
+            (&["v1.2.0", "1.2.0"][..], "1.2.0", false),
+            (&["v1.2.0", "V1.2.0"][..], "V1.2.0", false),
+            (&["1.2.0", "V1.2.0"][..], "1.2.0", true),
+            (&["V1.2", "1.2", "v1.2.0"][..], "v1.2.0", false),
+        ] {
+            let tag = collect(names);
+            assert_eq!(
+                (tag.name.as_str(), tag.ambiguous),
+                (expected, ambiguous),
+                "{names:?}"
+            );
+        }
+    }
+
+    fn local_adapter(api_url: String) -> GitHubTagsAdapter {
+        let mut adapter = GitHubTagsAdapter::new(HttpClient::new().unwrap());
+        adapter.api_url = api_url;
+        adapter
+    }
+
+    const JSON: &str = "200 OK\r\nContent-Type: application/json\r\n";
+
+    /// Issue #59: タグの一覧に公開日は無い。Release があればその公開日を使い、無ければ
+    /// 注釈付きタグの日時で代える。軽量タグと公開前の Release は公開日不明にする。
+    #[tokio::test]
+    async fn release_dates_come_from_releases_then_annotated_tags() {
+        let (api, handle) = crate::test_support::http::serve_responses(vec![
+            (
+                "GET /repos/o/r/tags?per_page=100 ",
+                JSON,
+                r#"[{"name":"v1.0.0"},{"name":"1.1.0"},{"name":"1.2.0"},{"name":"1.3.0+build.1"}]"#,
+            ),
+            (
+                "GET /repos/o/r/releases/tags/v1.0.0 ",
+                JSON,
+                r#"{"tag_name":"v1.0.0","published_at":"2026-10-20T16:31:06Z","created_at":"2026-01-01T00:00:00Z"}"#,
+            ),
+            (
+                "GET /repos/o/r/releases/tags/1.1.0 ",
+                "404 Not Found\r\n",
+                r#"{"message":"Not Found"}"#,
+            ),
+            (
+                "GET /repos/o/r/git/ref/tags/1.1.0 ",
+                JSON,
+                r#"{"ref":"refs/tags/1.1.0","object":{"type":"tag","sha":"0123abcd"}}"#,
+            ),
+            (
+                "GET /repos/o/r/git/tags/0123abcd ",
+                JSON,
+                r#"{"tagger":{"name":"example","date":"2026-09-01T00:00:00Z"}}"#,
+            ),
+            (
+                "GET /repos/o/r/releases/tags/1.2.0 ",
+                JSON,
+                r#"{"published_at":null}"#,
+            ),
+            (
+                "GET /repos/o/r/git/ref/tags/1.2.0 ",
+                JSON,
+                r#"{"object":{"type":"commit","sha":"89ab"}}"#,
+            ),
+            // `+` はパスで揺れなく読まれるよう符号化する
+            (
+                "GET /repos/o/r/releases/tags/1.3.0%2Bbuild.1 ",
+                JSON,
+                r#"{"published_at":"2026-10-01T00:00:00Z"}"#,
+            ),
+        ]);
+        let adapter = local_adapter(api);
+        adapter.fetch_versions("o/r").await.unwrap();
+        let date = |version: &'static str| adapter.fetch_release_date("o/r", version);
+        assert_eq!(
+            date("1.0.0").await.unwrap().unwrap().to_rfc3339(),
+            "2026-10-20T16:31:06+00:00"
         );
-        let names: Vec<&str> = versions.iter().map(|v| v.version.as_str()).collect();
-        assert_eq!(names, vec!["1.2.0", "1.3.0"]);
+        assert_eq!(
+            date("1.1.0").await.unwrap().unwrap().to_rfc3339(),
+            "2026-09-01T00:00:00+00:00"
+        );
+        assert_eq!(date("1.2.0").await.unwrap(), None);
+        assert_eq!(
+            date("1.3.0+build.1").await.unwrap().unwrap().to_rfc3339(),
+            "2026-10-01T00:00:00+00:00"
+        );
+        handle.join().unwrap();
+    }
+
+    /// レート制限や壊れた応答は公開日不明にせず、エラーにする。一覧を別のアダプタが
+    /// 取得していた (共有キャッシュ) 場合は、タグ名を知るために一覧を取り直す。
+    #[tokio::test]
+    async fn release_date_failures_are_errors_not_unknown_dates() {
+        let (api, handle) = crate::test_support::http::serve_responses(vec![
+            (
+                "GET /repos/o/r/tags?per_page=100 ",
+                JSON,
+                r#"[{"name":"1.0.0"},{"name":"1.1.0"}]"#,
+            ),
+            (
+                "GET /repos/o/r/releases/tags/1.0.0 ",
+                "403 Forbidden\r\nX-RateLimit-Remaining: 0\r\n",
+                r#"{"message":"API rate limit exceeded"}"#,
+            ),
+            (
+                "GET /repos/o/r/releases/tags/1.1.0 ",
+                JSON,
+                r#"{"published_at":"yesterday"}"#,
+            ),
+        ]);
+        let adapter = local_adapter(api);
+        let error = adapter
+            .fetch_release_date("o/r", "1.0.0")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, RegistryError::RateLimitExceeded { .. }),
+            "{error:?}"
+        );
+        let error = adapter
+            .fetch_release_date("o/r", "1.1.0")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, RegistryError::InvalidResponse { .. }),
+            "{error:?}"
+        );
+        handle.join().unwrap();
+    }
+
+    /// SPM がどのタグを使うか決まらない版は、公開日を問い合わせずに不明とする
+    #[tokio::test]
+    async fn ambiguous_tags_have_no_release_date() {
+        let (api, handle) = crate::test_support::http::serve_responses(vec![(
+            "GET /repos/o/r/tags?per_page=100 ",
+            JSON,
+            r#"[{"name":"1.2.0"},{"name":"V1.2.0"}]"#,
+        )]);
+        let adapter = local_adapter(api);
+        assert_eq!(
+            adapter.fetch_release_date("o/r", "1.2.0").await.unwrap(),
+            None
+        );
+        handle.join().unwrap();
     }
 
     #[test]

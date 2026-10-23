@@ -57,7 +57,7 @@ github = ["example-dev", "example-org"]
 
 対応する根拠は、crates.io の版ごとの公開者情報（GitHub ログイン名の一致が確認された `published_by`、または GitHub Trusted Publishing）と、Go・Swift の GitHub 取得元です。パッケージ名、別レジストリの同名アカウント、現在のクレート所有者一覧、自己申告の repository URL からは GitHub の身元を判断しません。他のレジストリには通常の age 制限を適用し、対象に含まれる場合は通知します。
 
-Swift のタグには現状公開日の情報がなく、age フィルターはもともと実質適用されません。
+例外にした owner の Swift の依存では、タグの公開日を取得しません。
 
 例外が外すのは公開期間の制限だけです。ピン留め、バージョン範囲、プレリリースの扱い、`--max-change`、OSV チェックは引き続き適用します。プロジェクトに明示された `minimumReleaseAge` は優先され、グローバルの例外を無効にします。Git 依存は従来から公開期間の制限対象外です。
 

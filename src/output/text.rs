@@ -161,6 +161,9 @@ impl TextFormatter {
             SkipReason::ReleaseDateUnknown(version) => {
                 format!("release date unavailable for {version}")
             }
+            SkipReason::ReleaseDateUnchecked(version) => {
+                format!("release date lookup limit reached; {version} and older not checked")
+            }
             SkipReason::ParseError(msg) => format!("parse error: {}", msg),
             SkipReason::ChangeLevelLimited(level) => format!("max-change={}", level),
         }

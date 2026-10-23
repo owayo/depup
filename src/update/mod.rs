@@ -382,6 +382,16 @@ pub struct UpdateJudge {
     now: DateTime<Utc>,
 }
 
+/// [`UpdateJudge::release_date_candidates`] の結果。どちらも age の前の絞り込み
+/// (安定版・範囲の上限・reject) を通った、現在版より新しい版
+pub(crate) struct ReleaseDateCandidates<'a> {
+    /// `--max-change` を超えない版。judge が選ぶ順 (新しい順)
+    pub(crate) within: Vec<&'a VersionInfo>,
+    /// `--max-change` を超える版。現在版に近い順。この中に期間を満たす版があると、
+    /// judge は `--max-change` で止まったと報告する
+    pub(crate) beyond: Vec<&'a VersionInfo>,
+}
+
 impl UpdateJudge {
     /// 指定されたフィルタで `UpdateJudge` を作る
     pub fn new(filter: UpdateFilter) -> Self {
@@ -474,11 +484,12 @@ impl UpdateJudge {
 
         // mise はバックエンドによって公開日を一切返さない。同じツール・同じ
         // flavor に日付付きの版が一つでもあれば、日付欠落を age の対象にする。
-        // Swift の tag と Java の Maven metadata は一覧に日付がない。
-        // Java は選択後に POM の日時を取得して判定し直す。
+        // Java の Maven metadata は一覧に日付がなく、選択後に POM の日時を取得して
+        // 判定し直す。Swift の tag も一覧に日付がないが、orchestrator が age の判定の前に
+        // 候補の公開日を取得するので、ほかのレジストリと同じく日付のない版は候補にしない。
         let allow_undated = match dependency.language {
             Language::Mise => available_versions.iter().all(|v| v.released_at.is_none()),
-            Language::Swift | Language::Java => true,
+            Language::Java => true,
             _ => false,
         };
         let stable = self.stable_candidates(dependency, available_versions);
@@ -660,6 +671,38 @@ impl UpdateJudge {
         let flavored = apply_java_flavor_filter(dependency, stable);
         let ranged = apply_range_upper_bound(dependency, flavored);
         apply_rejected_versions(dependency, ranged)
+    }
+
+    /// age の判定の前に公開日が要る、現在版より新しい候補。公開日を必要になってから取得する
+    /// レジストリ (GitHub のタグ) が、judge の判定に要る版の公開日だけを取得するために使う。
+    pub(crate) fn release_date_candidates<'a>(
+        &self,
+        dependency: &Dependency,
+        available_versions: &'a [VersionInfo],
+    ) -> ReleaseDateCandidates<'a> {
+        let newer: Vec<_> = self
+            .candidates_before_age(dependency, available_versions)
+            .into_iter()
+            .filter(|info| {
+                compare_dependency_versions(dependency, &info.version, dependency.version())
+                    == std::cmp::Ordering::Greater
+            })
+            .collect();
+        let mut within = apply_max_change_filter(dependency, &newer, self.filter.max_change);
+        let mut beyond: Vec<_> = newer
+            .into_iter()
+            .filter(|info| !within.iter().any(|kept| std::ptr::eq(*kept, *info)))
+            .collect();
+        within.sort_by(|a, b| compare_dependency_versions(dependency, &b.version, &a.version));
+        beyond.sort_by(|a, b| compare_dependency_versions(dependency, &a.version, &b.version));
+        ReleaseDateCandidates { within, beyond }
+    }
+
+    /// age が有効なら、これより後に公開された版を候補にしない境界。
+    pub(crate) fn age_cutoff(&self) -> Option<DateTime<Utc>> {
+        self.filter
+            .min_age
+            .and_then(|age| crate::domain::cutoff_from(self.now, age))
     }
 
     pub(crate) fn admits_age(&self, dependency: &Dependency, version: &VersionInfo) -> bool {
@@ -1817,6 +1860,46 @@ mod tests {
             // 現在版自身の日時を使う
             assert_eq!(released_at, versions[1].released_at);
         }
+    }
+
+    /// Issue #59: 公開日を後から取るレジストリが問い合わせる候補は、judge が選ぶ順
+    /// (新しい順) に並び、現在版より新しく、`--max-change`・プレリリース・範囲の上限で
+    /// 外れる版を含まない (外れる版の公開日は取りに行かない)。
+    #[test]
+    fn release_date_candidates_follow_the_judge_order_and_filters() {
+        let versions: Vec<_> = ["0.9.0", "1.0.0", "1.1.0", "1.3.0-beta.1", "1.2.0", "2.0.0"]
+            .map(VersionInfo::undated)
+            .to_vec();
+        let names = |judge: &UpdateJudge, dep: &Dependency| -> (Vec<String>, Vec<String>) {
+            let candidates = judge.release_date_candidates(dep, &versions);
+            let names = |list: Vec<&VersionInfo>| -> Vec<String> {
+                list.into_iter().map(|info| info.version.clone()).collect()
+            };
+            (names(candidates.within), names(candidates.beyond))
+        };
+        let dep = make_dependency("owner/library", "1.0.0", Language::Swift, false);
+        let judge = UpdateJudge::new(UpdateFilter::new());
+        assert_eq!(
+            names(&judge, &dep),
+            (vec!["2.0.0".into(), "1.2.0".into(), "1.1.0".into()], vec![])
+        );
+        let judge = UpdateJudge::new(
+            UpdateFilter::new().with_max_change(crate::domain::ChangeLevel::Patch),
+        );
+        assert_eq!(
+            names(&judge, &dep),
+            (vec![], vec!["1.1.0".into(), "1.2.0".into(), "2.0.0".into()])
+        );
+        let judge = UpdateJudge::new(
+            UpdateFilter::new().with_max_change(crate::domain::ChangeLevel::Minor),
+        );
+        assert_eq!(
+            names(&judge, &dep),
+            (vec!["1.2.0".into(), "1.1.0".into()], vec!["2.0.0".into()])
+        );
+        let dep = make_range_dependency("owner/library", "1.0.0..<1.2.0", "1.0.0", Language::Swift);
+        let judge = UpdateJudge::new(UpdateFilter::new());
+        assert_eq!(names(&judge, &dep), (vec!["1.1.0".into()], vec![]));
     }
 
     #[test]

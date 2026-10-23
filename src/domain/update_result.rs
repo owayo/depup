@@ -27,6 +27,9 @@ pub enum SkipReason {
     NoSuitableVersion,
     /// 更新候補の公開日が不明で、age 制約を確認できない
     ReleaseDateUnknown(String),
+    /// 公開日を個別に取得するレジストリで、取得の上限に達し、この版とそれより古い候補の
+    /// 公開日を確かめていない (公開日不明とは確かめていない)
+    ReleaseDateUnchecked(String),
     /// バージョンのパースに失敗
     ParseError(String),
     /// 言語フィルタで除外された
@@ -49,6 +52,12 @@ impl fmt::Display for SkipReason {
             SkipReason::NoSuitableVersion => write!(f, "no suitable version"),
             SkipReason::ReleaseDateUnknown(version) => {
                 write!(f, "release date unavailable for {version}")
+            }
+            SkipReason::ReleaseDateUnchecked(version) => {
+                write!(
+                    f,
+                    "release date lookup limit reached; {version} and older not checked"
+                )
             }
             SkipReason::ParseError(msg) => write!(f, "parse error: {}", msg),
             SkipReason::LanguageFiltered => write!(f, "language filtered"),
