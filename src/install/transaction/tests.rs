@@ -86,6 +86,192 @@ fn success(command: &PreparedInstall) -> InstallResult {
     )
 }
 
+#[test]
+fn line_ending_write_failure_is_reported_and_keeps_the_adopted_bytes() {
+    for audit in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path();
+        let mut result = result();
+        node(&mut result, directory);
+        let manifest = directory.join("package.json");
+        let lock = directory.join("package-lock.json");
+        fs::write(&lock, "old lock\n").unwrap();
+        let writable = fs::metadata(&lock).unwrap().permissions();
+        let mut readonly = writable.clone();
+        readonly.set_readonly(true);
+        fs::set_permissions(&lock, readonly.clone()).unwrap();
+        // Privileged Unix processes can write through read-only permissions.
+        let protected = fs::OpenOptions::new().write(true).open(&lock).is_err();
+        if !audit {
+            fs::set_permissions(&lock, writable.clone()).unwrap();
+        }
+        if !protected {
+            fs::set_permissions(&lock, writable).unwrap();
+            continue;
+        }
+        let plan = plan(vec![job(
+            directory,
+            Language::Node,
+            std::slice::from_ref(&manifest),
+        )]);
+        let mut tx = InstallTransactions::begin(&plan, &result, directory);
+        let after = b"new lock\r\n";
+        if audit {
+            tx.execute(success);
+            fs::set_permissions(&lock, writable.clone()).unwrap();
+            fs::write(&lock, after).unwrap();
+            fs::set_permissions(&lock, readonly).unwrap();
+            let error = tx
+                .accept_audit_lock(&lock, b"old lock\n", after)
+                .unwrap_err();
+            assert!(
+                error.contains("Cannot preserve lockfile line endings"),
+                "{error}"
+            );
+        } else {
+            tx.execute(|command| {
+                fs::write(&lock, after).unwrap();
+                fs::set_permissions(&lock, readonly.clone()).unwrap();
+                success(command)
+            });
+            assert!(tx.pending_report().has_install_failures());
+        }
+        assert_eq!(fs::read(&lock).unwrap(), after);
+        assert_eq!(
+            tx.files[&identity(&lock)].expected.bytes.as_deref(),
+            Some(after.as_slice())
+        );
+        // Restore permissions so the temporary directory can be removed on Windows.
+        fs::set_permissions(&lock, writable).unwrap();
+    }
+}
+
+#[test]
+fn failed_install_restores_original_bytes_after_newline_preservation() {
+    let temp = tempfile::tempdir().unwrap();
+    let directory = temp.path();
+    let mut result = result();
+    node(&mut result, directory);
+    let manifest = directory.join("package.json");
+    let lock = directory.join("package-lock.json");
+    fs::write(&lock, "old lock\n").unwrap();
+    let original = result.write_results[0]
+        .journal
+        .as_ref()
+        .unwrap()
+        .before
+        .clone();
+    let plan = plan(vec![job(
+        directory,
+        Language::Node,
+        std::slice::from_ref(&manifest),
+    )]);
+    let mut tx = InstallTransactions::begin(&plan, &result, directory);
+    tx.execute(|command| {
+        fs::write(
+            &manifest,
+            "{\r\n  \"dependencies\": {\"example\":\"2.0.0\"}\r\n}\r\n",
+        )
+        .unwrap();
+        fs::write(&lock, "new lock\r\n").unwrap();
+        failure(command)
+    });
+    assert_eq!(fs::read(&lock).unwrap(), b"new lock\n");
+    let report = tx.rollback();
+    assert!(report.has_install_failures());
+    assert_eq!(fs::read(&lock).unwrap(), b"old lock\n");
+    assert_eq!(fs::read(&manifest).unwrap(), original);
+}
+
+#[test]
+fn cargo_install_and_age_audit_preserve_each_files_line_endings() {
+    for newline in ["\n", "\r\n"] {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path();
+        let manifest = directory.join("Cargo.toml");
+        let lock = directory.join("Cargo.lock");
+        let mut result = result();
+        let original = "[package]\nname = \"example\"\nversion = \"0.1.0\"\n[dependencies]\nexample = \"=1.0.0\"\n".replace('\n', newline);
+        update(&mut result, &manifest, Language::Rust, &original, "example");
+        let written = original.replace("=1.0.0", "=2.0.0");
+        assert_eq!(fs::read(&manifest).unwrap(), written.as_bytes());
+        fs::create_dir(directory.join("src")).unwrap();
+        fs::write(directory.join("src/lib.rs"), "").unwrap();
+        fs::write(&lock, "version = 4\n".replace('\n', newline)).unwrap();
+        let plan = plan(vec![job(
+            directory,
+            Language::Rust,
+            std::slice::from_ref(&manifest),
+        )]);
+        let mut tx = InstallTransactions::begin(&plan, &result, directory);
+        let other = if newline == "\n" { "\r\n" } else { "\n" };
+        let installed = format!("# installed{other}version = 4{other}");
+        assert_eq!(tx.commands().count(), 1);
+        tx.execute(|command| {
+            fs::write(&lock, &installed).unwrap();
+            success(command)
+        });
+        let expected = format!("# installed{newline}version = 4{newline}");
+        assert_eq!(fs::read(&lock).unwrap(), expected.as_bytes());
+        tx.check_lock(&lock, Some(expected.as_bytes())).unwrap();
+        // The audited Cargo operation may rewrite the lock a second time.
+        let audited = format!("# audited{other}version = 4{other}");
+        fs::write(&lock, &audited).unwrap();
+        tx.accept_audit_lock(&lock, expected.as_bytes(), audited.as_bytes())
+            .unwrap();
+        let expected = format!("# audited{newline}version = 4{newline}");
+        assert_eq!(fs::read(&lock).unwrap(), expected.as_bytes());
+        tx.check_lock(&lock, Some(expected.as_bytes())).unwrap();
+        assert!(!tx.rollback().has_failures());
+        assert_eq!(fs::read(&manifest).unwrap(), written.as_bytes());
+    }
+}
+
+#[test]
+fn mise_platform_repair_preserves_manifest_and_lock_line_endings_independently() {
+    for (manifest_newline, lock_newline) in [("\n", "\r\n"), ("\r\n", "\n")] {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path();
+        let manifest = directory.join("mise.toml");
+        let lock = directory.join("mise.lock");
+        let mut result = result();
+        let original = "[tools]\nnode = \"1.0.0\"\n".replace('\n', manifest_newline);
+        update(&mut result, &manifest, Language::Mise, &original, "node");
+        let platforms = ["linux-x64", "windows-x64"];
+        fs::write(
+            &lock,
+            platform_lock("1.0.0", &platforms).replace('\n', lock_newline),
+        )
+        .unwrap();
+        let plan = plan(vec![job(
+            directory,
+            Language::Mise,
+            std::slice::from_ref(&manifest),
+        )]);
+        let mut tx = InstallTransactions::begin(&plan, &result, directory);
+        let other = if lock_newline == "\n" { "\r\n" } else { "\n" };
+        let mut calls = 0;
+        tx.execute(|command| {
+            calls += 1;
+            let targets = if calls == 1 { &[][..] } else { &platforms[..] };
+            fs::write(&lock, platform_lock("2.0.0", targets).replace('\n', other)).unwrap();
+            success(command)
+        });
+        assert_eq!(calls, 2);
+        assert!(!tx.rollback().has_failures());
+        assert_eq!(
+            fs::read(&manifest).unwrap(),
+            original.replace("1.0.0", "2.0.0").as_bytes()
+        );
+        assert_eq!(
+            fs::read(&lock).unwrap(),
+            platform_lock("2.0.0", &platforms)
+                .replace('\n', lock_newline)
+                .as_bytes()
+        );
+    }
+}
+
 fn platform_lock(version: &str, platforms: &[&str]) -> String {
     let mut lock = format!(
         "lockfile_version = 2\n[[tools.node]]\nversion = \"{version}\"\nbackend = \"core:node\"\nspecifiers = [\"{version}\"]\n"

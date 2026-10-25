@@ -718,6 +718,8 @@ impl InstallTransactions {
             return Err("lockfile changed after the tracked audit".into());
         }
         record.expected = expected;
+        line_endings::preserve(record)
+            .map_err(|error| format!("Cannot preserve lockfile line endings: {error}"))?;
         Ok(())
     }
 
@@ -878,7 +880,14 @@ impl InstallTransactions {
                 continue;
             }
             match read_record(record) {
-                Ok(state) if owned.contains(key) => record.expected = state,
+                Ok(state) if owned.contains(key) => {
+                    record.expected = state;
+                    if let Err(error) = line_endings::preserve(record) {
+                        self.units[unit].failure.get_or_insert_with(|| {
+                            format!("Cannot preserve line endings in {}: {error}", key.display())
+                        });
+                    }
+                }
                 Ok(state) if record.expected.matches(&state) => {}
                 Ok(_) => {
                     record.conflict = Some("File changed outside a package-manager command".into());
@@ -1307,6 +1316,7 @@ fn print_backup(
     }
 }
 
+mod line_endings;
 mod mise;
 mod mise_lock;
 mod scope;

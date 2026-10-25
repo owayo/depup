@@ -357,6 +357,8 @@ Cargo は `cargo update` のあと、既存の age 差し戻しと最終検証�
 - Node は pnpm workspace の共有ルート、またはマニフェストのあるディレクトリで install を実行します。`--only` があると、Rust は共有 Cargo.lock のディレクトリ（lock の新規生成時は workspace ルート）へまとめ、PHP は更新した composer.json のディレクトリで実行します。それ以外は [`.depup`](configuration.ja.md#depup-設定ファイル) がなければ対象ディレクトリ（PATH 引数）を使い、あれば更新したマニフェストを含む対象のうち最も深いディレクトリを使います。
 - install は 1 つずつ、ディレクトリのパス順に実行します。同じディレクトリでは、言語ごとに 1 回だけです。パッケージマネージャーの出力は画面に流さずに depup が受け取り、標準エラー出力は install が失敗したときだけ表示します。
 
+既存のテキスト形式のマニフェストと lock は、Windows でも元の LF または CRLF をファイルごとに保持します。パッケージマネージャーの実行後と、追跡対象の Cargo age 調整後に元の改行形式へ戻します。解決したバージョンや、書き込み後の末尾改行の有無は変えません。新規ファイルはパッケージマネージャーの改行形式を使います。元から改行が混在するファイル、改行のないファイル、バイナリ、mise の sidecar メタデータは改行を変換しません。
+
 mise では、`mise install` が成功しても既存の platform 情報が欠けていれば、対象のツールの lock を再生成します。元の platform 集合と lock の形式を保てない場合は、install 失敗と同じ復元処理を行います。詳しくは「[lock の platform 情報](ecosystems.ja.md#lock-の-platform-情報)」を参照してください。
 
 install が失敗すると、そのプロジェクトのマニフェストと既知のパッケージマネージャー管理ファイルを復元します。最後に `Error: Some package manager installs failed` を出し、終了コード 1 で終わります。起動不能、ポリシーや実行範囲の準備エラー、保存用コピーの取得失敗、Gradle Wrapper の更新失敗も対象です。Cargo.lock、pnpm workspace、Tauri プロジェクト、Gradle Wrapper を共有する処理は、まとめて成功か復元にします。失敗した単位の残りの処理は実行しません。独立したプロジェクトの処理は続け、成功した変更を残します。
