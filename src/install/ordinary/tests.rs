@@ -1,5 +1,5 @@
 use super::*;
-use crate::cargo_rollback::audit::{LockAgeAudit, LockAgeAuditor};
+use crate::cargo_rollback::audit::{LockAgeAudit, LockAgeAuditor, RemainingAge};
 use crate::cargo_rollback::scratch::CargoCommand;
 use crate::domain::{Dependency, ManifestUpdateResult, UpdateResult, VersionSpec, VersionSpecKind};
 use crate::manifest::{

@@ -345,7 +345,11 @@ depup が書き換えるのは、解析した依存宣言だけです。依存�
 
 pnpm は、先に `update --no-save --lockfile-only --ignore-scripts --no-include-github-actions --no-changeset` を実行します。workspace では全メンバーとルートを含めます。検査を通ったあと、`pnpm install --frozen-lockfile` で実体化します。この段階の script 実行はプロジェクトの通常の許可設定に従い、両コマンドに同じ age 設定を渡します。オプションに対応しない pnpm は明示的に失敗し、制限を外して再実行しません。ほかの Node パッケージマネージャーは再解決の対象外です。lock がまだない場合は、`pnpm-workspace.yaml` または `packageManager` フィールドで pnpm と判定できる必要があります。
 
-Cargo は `cargo update` のあと、既存の age 差し戻しと最終検証を行います。どちらの言語でも、age 検証後の lock に新しく入った公開レジストリ版を OSV で調べます。OSV の通信・解析失敗や未解消の age 違反があれば、その共有 install 単位を復元します。外部 git・私設レジストリ・リモート tarball の取得元や版の変更、Tauri の直接依存の npm/Cargo 版の不整合も復元の対象です。独立したプロジェクトは続行します。ローカルの workspace/path 依存は公開レジストリの監査対象にしません。変更がない既存版の安全性を証明する検査ではありません。`--no-age` と `--no-osv` の設定の優先順位は従来どおりです。
+Cargo は `cargo update` のあと、既存の age 差し戻しと最終検証を行います。どちらの言語でも、age 検証後の lock に新しく入った公開レジストリ版を OSV で調べます。OSV の通信・解析失敗や age 検証の失敗があれば、その共有 install 単位を復元します。
+
+Cargo の age 検証では、最終 lock に残った違反・未確認の版のうち、この実行で新しく入った版と、監査を完了できなかった問題を復元の理由にします。実行前からあった若い版や、差し戻しで実行前の若い版に戻ったものは警告と終了コード 2 で報告し、ほかの更新を保持します。この場合も再解決は `completed` と表示し、差し戻しの結果 lock が実行前と同じなら `changed` は `false` です。
+
+外部 git・私設レジストリ・リモート tarball の取得元や版の変更、Tauri の直接依存の npm/Cargo 版の不整合も復元の対象です。独立したプロジェクトは続行します。ローカルの workspace/path 依存は公開レジストリの監査対象にしません。変更がない既存版の安全性を証明する検査ではありません。`--no-age` と `--no-osv` の設定の優先順位は従来どおりです。
 
 `--only`、`--exclude`、`--max-change` とは併用できません。グローバル設定の `max-change` も対象で、ファイルを変更する前にエラーにします。言語フィルターは維持し、dry-run ではパッケージマネージャーを起動しません。通常出力の `Lock refresh` と JSON の `lock_refreshes` 配列で実行結果を示し、間接依存の変更を直接依存の更新件数へ足しません。PM の失敗は終了コード 1、検証の失敗は 2 です。両方あれば 1 を優先します。復元では後述のとおり、インストール成果物と外部の編集を保持します。
 
@@ -397,7 +401,7 @@ Lock verification failed; recovering project changes (Cargo.lock keeps versions 
   Install artifacts are retained. Re-run the package manager after recovery.
 ```
 
-pnpm の更新先の不一致 (override や解決の結果、直接依存が別の版のまま残った) は age の失敗ではありません。調べられるようにファイルを残し、終了コード 2 にします。`--install --refresh-lock` は独自の検証を使い、未解消の監査結果があれば lock の再解決を戻します。
+pnpm の更新先の不一致 (override や解決の結果、直接依存が別の版のまま残った) は age の失敗ではありません。調べられるようにファイルを残し、終了コード 2 にします。`--install --refresh-lock` の Cargo も、実行前からある版の age 違反だけでは再解決を戻しません。OSV など、追加の検証と復元の条件は[ロックファイルの再解決](#ロックファイルの再解決--install---refresh-lock)を参照してください。
 
 ### パッケージマネージャーごとのコマンド
 

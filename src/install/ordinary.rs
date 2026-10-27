@@ -3,10 +3,11 @@
 //! `--age` を満たさない場合、または lockfile を検証できなかった場合は、install 単位を
 //! 実行前の状態へ戻す。実行前から lock にあった版の違反は報告するが、
 //! 復元の理由にはしない。
+use super::age::{named, print_rust_audit, rust_restore_reason};
 use super::transaction::InstallTransactions;
 use super::*;
-use crate::cargo_rollback::audit::{AuditReceipt, LockAgeAuditResult, RemainingAge};
-use crate::cargo_rollback::report::{lock_age_report_lines, lock_mismatch_lines};
+use crate::cargo_rollback::audit::{AuditReceipt, LockAgeAuditResult};
+use crate::cargo_rollback::report::lock_mismatch_lines;
 use crate::cli::CliArgs;
 use crate::domain::UpdateSummary;
 use crate::node_lock::{NodeBaseline, NodeLockAuditResult, UnverifiedKind};
@@ -15,9 +16,6 @@ use crate::progress::Progress;
 use async_trait::async_trait;
 use colored::Colorize;
 use indicatif::ProgressBar;
-
-/// 復元理由に版を何件まで列挙し、残りを件数でまとめるか。
-const NAMED_VERSIONS: usize = 5;
 
 /// 既定の install の監査。テストではレジストリと Cargo へのアクセスを差し替える。
 #[async_trait(?Send)]
@@ -296,18 +294,7 @@ async fn audit_rust_locks(
         }
         let (audit, receipt) = checks.rust_lock(lock, bar.as_ref()).await;
         has_unresolved |= audit.has_unresolved();
-        let lines = lock_age_report_lines(&lock.directory, &audit, args.verbose);
-        if !lines.is_empty() {
-            progress.suspend(|| {
-                for line in &lines {
-                    if line.warning {
-                        eprintln!("{}", line.text.yellow());
-                    } else {
-                        eprintln!("{}", line.text);
-                    }
-                }
-            });
-        }
+        print_rust_audit(&lock.directory, &audit, args.verbose, &progress);
         let mut reason = rust_restore_reason(&audit, &lock.baseline);
         let path = lock.directory.join("Cargo.lock");
         // 監査が保証したバイト列だけを採用する。どの単位にも含まれない lockfile は監査だけの対象。
@@ -326,43 +313,6 @@ async fn audit_rust_locks(
     }
     progress.finish_and_clear();
     has_unresolved
-}
-
-/// 最終の lockfile に基づき、単位を実行前の状態へ戻す理由を判定する。
-fn rust_restore_reason(
-    audit: &LockAgeAuditResult,
-    baseline: &RegistryLockEntries,
-) -> Option<String> {
-    let added: Vec<String> = audit
-        .remaining
-        .iter()
-        .filter(|((name, version), _)| {
-            !baseline
-                .get(name)
-                .is_some_and(|versions| versions.contains(version))
-        })
-        .map(|((name, version), age)| {
-            format!(
-                "{name} {version} ({})",
-                match age {
-                    RemainingAge::TooNew => "newer than --age",
-                    RemainingAge::Unverified => "release date not verified",
-                }
-            )
-        })
-        .collect();
-    if !added.is_empty() {
-        return Some(format!(
-            "Cargo.lock keeps versions this run added that do not pass --age: {}",
-            named(&added)
-        ));
-    }
-    (!audit.problems.is_empty()).then(|| {
-        format!(
-            "the Cargo.lock --age audit did not finish: {}",
-            audit.problems.join("; ")
-        )
-    })
 }
 
 /// Node の lockfile を読み取り専用で監査し、復元する単位を失敗にする。
@@ -506,17 +456,6 @@ fn node_restore_reason(
             named(&failing)
         ),
     })
-}
-
-fn named(items: &[String]) -> String {
-    match items.len() {
-        count if count > NAMED_VERSIONS => format!(
-            "{}, and {} more",
-            items[..NAMED_VERSIONS].join(", "),
-            count - NAMED_VERSIONS
-        ),
-        _ => items.join(", "),
-    }
 }
 
 #[cfg(test)]

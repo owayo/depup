@@ -106,7 +106,7 @@ depup --cd ./projects/myapp -n
 
 ### JSON Output
 
-With `--refresh-lock`, `lock_refreshes` reports each lock scope's `directory`, `language`, `status` (`completed`, `failed`, or `unsupported`), `changed`, and `error`. `changed` means an accepted refresh changed the lock; a failed refresh has `changed: false`, including when an external edit prevents recovery. If no eligible scope exists, `language` is `null`. Direct dependency counts retain their existing meaning. See [Refreshing Lockfiles](usage.md#refreshing-lockfiles---install---refresh-lock) for verification and recovery.
+With `--refresh-lock`, `lock_refreshes` reports each lock scope's `directory`, `language`, `status` (`completed`, `failed`, or `unsupported`), `changed`, and `error`. `changed` means an accepted refresh changed the lock; a failed refresh has `changed: false`, including when an external edit prevents recovery. If no eligible scope exists, `language` is `null`. Direct dependency counts retain their existing meaning. A Cargo refresh can be `completed` while the command exits with code 2 when only pre-run versions remain outside the age policy. See [Refreshing Lockfiles](usage.md#refreshing-lockfiles---install---refresh-lock) for verification and recovery.
 
 With `--json --install`, output is deferred until install recovery and age audits finish, then one JSON value is flushed even if install fails. Updates canceled by a failed project, including recovery conflicts and lock-only Git updates, move from `updates` to `failed` with a reason. Successful independent projects remain in `updates`. Recovery details and copy locations go to stderr.
 
