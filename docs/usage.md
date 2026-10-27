@@ -344,7 +344,11 @@ Use `depup --install --refresh-lock` to re-resolve pnpm and Cargo lockfiles with
 
 pnpm first runs `update --no-save --lockfile-only --ignore-scripts --no-include-github-actions --no-changeset`. Workspace resolution includes all members and the root. After verification succeeds, `pnpm install --frozen-lockfile` installs the verified resolution with the project's normal script permissions. The same effective age setting is passed to both commands. A pnpm version that rejects these options fails explicitly; depup does not retry with weaker options. Other Node package managers are unsupported for refresh. With no existing lock, pnpm must be identified by `pnpm-workspace.yaml` or the `packageManager` field.
 
-Cargo runs `cargo update`, then applies its existing age rollback and final verification. Both ecosystems check newly introduced public registry versions against OSV after age verification. An OSV error, an unresolved age violation, a changed external git/private-registry/remote-tarball identity, or inconsistent direct Tauri npm/Cargo versions causes the affected shared install unit to be restored. Unrelated projects continue. Local workspace/path packages are not public-registry audit targets. This incremental OSV check does not certify unchanged versions already in the lock. `--no-age` and `--no-osv` retain their existing configuration precedence.
+Cargo runs `cargo update`, then applies its existing age rollback and final verification. Both ecosystems check newly introduced public registry versions against OSV after age verification. An OSV error, failed age verification, a changed external git/private-registry/remote-tarball identity, or inconsistent direct Tauri npm/Cargo versions causes the affected shared install unit to be restored.
+
+For Cargo age verification, restoration depends on violating or unverified versions still in the final lock that this run introduced, or problems that prevented the audit from completing. Young versions already in the pre-run lock, including a rollback to a young pre-run version, produce warnings and exit code 2 while retaining other updates. The refresh is still reported as `completed`; `changed` is `false` if the rollbacks leave the lock unchanged from before the run. Unrelated projects continue.
+
+Local workspace/path packages are not public-registry audit targets. This incremental OSV check does not certify unchanged versions already in the lock. `--no-age` and `--no-osv` retain their existing configuration precedence.
 
 Refresh cannot be combined with `--only`, `--exclude`, or `--max-change`, including a global `max-change` default; depup rejects the combination before changing files. Language filters still apply. A dry run never starts the package manager. The `Lock refresh` result and JSON `lock_refreshes` array report each scope separately; transitive changes do not increase direct update counts. PM failures return exit code 1; verification failures return 2, with 1 taking precedence when both occur. Recovery retains install artifacts and preserves external file edits, as described below.
 
@@ -396,7 +400,7 @@ Lock verification failed; recovering project changes (Cargo.lock keeps versions 
   Install artifacts are retained. Re-run the package manager after recovery.
 ```
 
-A pnpm update-target mismatch (an override or resolution that left a direct dependency at another version) is not an age failure; it keeps the files for inspection and exits with code 2. `--install --refresh-lock` keeps its own verification, which restores the lock refresh on any unresolved audit result.
+A pnpm update-target mismatch (an override or resolution that left a direct dependency at another version) is not an age failure; it keeps the files for inspection and exits with code 2. Cargo `--install --refresh-lock` also retains the refresh when age violations involve only pre-run versions. See [Refreshing Lockfiles](#refreshing-lockfiles---install---refresh-lock) for its additional verification and recovery conditions, including OSV.
 
 ### Commands per Package Manager
 

@@ -1,4 +1,5 @@
 //! 明示指定による lock の再解決。最終 lock のすべての検証が通るまで、解決結果は仮のものとする。
+use super::age::{print_rust_audit, rust_restore_reason};
 use super::transaction::InstallTransactions;
 use super::*;
 use crate::cargo_rollback::audit::{AuditReceipt, LockAgeAuditResult};
@@ -287,6 +288,7 @@ async fn run_with(
     let mut baselines = BTreeMap::new();
     let mut admitted = BTreeMap::new();
     let mut errors = BTreeMap::new();
+    let mut audit_failed = false;
     let manifests = tx.declaration_snapshots();
     for job in &jobs {
         if tx.pending_report().covers_directory(&job.directory) {
@@ -339,7 +341,18 @@ async fn run_with(
             let ownership = receipt.map_or(Ok(()), |receipt| {
                 tx.accept_audit_lock(&lock_path(job), &receipt.before, &receipt.after)
             });
-            ownership.and_then(|_| if audit.has_unresolved() { Err(format!("Cargo.lock did not pass --age: {} unresolved adjustment(s), {} unchecked; {}", audit.adjustments.iter().filter(|item| !item.status.is_resolved()).count(), audit.unchecked, audit.problems.join("; "))) } else { Ok(()) })
+            // 既存版の違反も終了コードに反映するが、復元は今回入った版で判定する。
+            audit_failed |= audit.has_unresolved();
+            if job
+                .policy
+                .as_ref()
+                .expect("prepared policy")
+                .min_age
+                .is_some()
+            {
+                print_rust_audit(&job.directory, &audit, args.verbose, &progress);
+            }
+            ownership.and_then(|_| rust_restore_reason(&audit, &baseline).map_or(Ok(()), Err))
         } else {
             verifier.node_age(job, &progress).await
         };
@@ -429,7 +442,8 @@ async fn run_with(
     }
     InstallOutcome {
         install_failed: report.has_install_failures(),
-        audit_failed: !errors.is_empty()
+        audit_failed: audit_failed
+            || !errors.is_empty()
             || result
                 .summary
                 .lock_refreshes

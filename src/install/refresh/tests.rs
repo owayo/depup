@@ -92,6 +92,7 @@ struct FakeVerification {
     osv_error: Option<String>,
     age_error: bool,
     rollback: Option<String>,
+    cargo_audit: Option<LockAgeAuditResult>,
     external: Option<PathBuf>,
 }
 
@@ -153,14 +154,16 @@ impl Verification for FakeVerification {
             );
         }
         (
-            LockAgeAuditResult {
-                problems: if self.age_error {
-                    vec!["release date unavailable".into()]
-                } else {
-                    Vec::new()
-                },
-                ..Default::default()
-            },
+            self.cargo_audit
+                .clone()
+                .unwrap_or_else(|| LockAgeAuditResult {
+                    problems: if self.age_error {
+                        vec!["release date unavailable".into()]
+                    } else {
+                        Vec::new()
+                    },
+                    ..Default::default()
+                }),
             None,
         )
     }
@@ -351,6 +354,72 @@ async fn young_vulnerable_and_unverified_versions_restore_without_installing() {
 }
 
 #[tokio::test]
+async fn cargo_refresh_rejects_added_age_failures_and_unfinished_audits() {
+    use crate::cargo_rollback::audit::{LockAgeAdjustment, LockAgeStatus, RemainingAge};
+    for (case, remaining, problems) in [
+        ("added young version", Some(RemainingAge::TooNew), vec![]),
+        (
+            "added unverified version",
+            Some(RemainingAge::Unverified),
+            vec![],
+        ),
+        (
+            "unfinished audit",
+            None,
+            vec!["audit interrupted".to_string()],
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut result, plan) = fixture(temp.path(), &[(temp.path().into(), Language::Rust)]);
+        let args = args(temp.path());
+        let orchestrator = Orchestrator::new(args.clone()).unwrap();
+        let verifier = FakeVerification {
+            cargo_audit: Some(LockAgeAuditResult {
+                adjustments: remaining
+                    .into_iter()
+                    .map(|age| LockAgeAdjustment {
+                        name: "example".into(),
+                        from: "1.2.0".into(),
+                        to: None,
+                        target: None,
+                        status: match age {
+                            RemainingAge::TooNew => LockAgeStatus::NoOlderCandidate,
+                            RemainingAge::Unverified => LockAgeStatus::ReleaseDateUnavailable,
+                        },
+                    })
+                    .collect(),
+                remaining: remaining
+                    .into_iter()
+                    .map(|age| (("example".into(), "1.2.0".into()), age))
+                    .collect(),
+                problems,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let outcome = run_with(
+            &args,
+            &orchestrator,
+            &plan,
+            &mut result,
+            &verifier,
+            resolved,
+        )
+        .await;
+        assert!(outcome.audit_failed && !outcome.install_failed, "{case}");
+        let refresh = &result.summary.lock_refreshes[0];
+        assert_eq!(refresh.status, "failed", "{case}");
+        assert!(!refresh.changed, "{case}");
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("Cargo.lock")).unwrap(),
+            lock("1.0.0"),
+            "{case}"
+        );
+        assert!(verifier.seen.lock().unwrap().is_empty(), "{case}");
+    }
+}
+
+#[tokio::test]
 async fn osv_uses_final_cargo_age_rollback_version_and_restores_on_failure() {
     let temp = tempfile::tempdir().unwrap();
     let (mut result, plan) = fixture(temp.path(), &[(temp.path().into(), Language::Rust)]);
@@ -491,6 +560,20 @@ fn tauri_workspace_inheritance_uses_only_the_apps_root_edge() {
 
 #[tokio::test]
 async fn real_cargo_refresh_keeps_mature_transitives_after_young_versions_are_rolled_back() {
+    real_cargo_refresh("all mature after rollback", false, false).await;
+}
+
+#[tokio::test]
+async fn real_cargo_refresh_keeps_mature_updates_with_preexisting_young_versions() {
+    real_cargo_refresh("existing young version keeps mature updates", true, false).await;
+}
+
+#[tokio::test]
+async fn real_cargo_refresh_to_young_baseline_completes_with_unchanged_lock() {
+    real_cargo_refresh("restored young baseline completes unchanged", false, true).await;
+}
+
+async fn real_cargo_refresh(case: &str, existing_young: bool, restored_young: bool) {
     use crate::cargo_rollback::audit::{LockAgeAudit, LockAgeAuditor};
     use crate::cargo_rollback::scratch::CargoCommand;
     use crate::test_support::{
@@ -509,13 +592,15 @@ async fn real_cargo_refresh_keeps_mature_transitives_after_young_versions_are_ro
         "[package]\nname='app'\nversion='0.1.0'\nedition='2024'\n[dependencies]\ntop='=1.0.0'\n",
     );
     project.cargo_ok(&["generate-lockfile"]);
-    project.cargo_ok(&["update", "-p", "leaf", "--precise", "1.0.0"]);
+    let initial = if restored_young { "1.1.0" } else { "1.0.0" };
+    project.cargo_ok(&["update", "-p", "leaf", "--precise", initial]);
+    let before = std::fs::read(project.path().join("Cargo.lock")).unwrap();
     let old = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
     let young = chrono::Utc.with_ymd_and_hms(2026, 1, 28, 0, 0, 0).unwrap();
     let dates = FakeCratesIo::new()
-        .release("top", "1.0.0", old)
+        .release("top", "1.0.0", if existing_young { young } else { old })
         .release("leaf", "1.0.0", old)
-        .release("leaf", "1.1.0", old)
+        .release("leaf", "1.1.0", if restored_young { young } else { old })
         .release("leaf", "1.2.0", young);
     let mut cargo = CargoCommand::new().program(TestProject::cargo_program());
     for (key, value) in project.cargo_envs() {
@@ -526,6 +611,7 @@ async fn real_cargo_refresh_keeps_mature_transitives_after_young_versions_are_ro
         dates: FakeCratesIo,
         cargo: CargoCommand,
         seen: Mutex<Vec<String>>,
+        audits: Mutex<Vec<LockAgeAuditResult>>,
     }
     #[async_trait(?Send)]
     impl Verification for Local<'_> {
@@ -559,6 +645,7 @@ async fn real_cargo_refresh_keeps_mature_transitives_after_young_versions_are_ro
                 receipt.is_some(),
                 "the real audit must attest its final bytes"
             );
+            self.audits.lock().unwrap().push(result.clone());
             (result, receipt)
         }
         async fn node_age(&self, _: &InstallJob, _: &Progress) -> Result<(), String> {
@@ -590,6 +677,7 @@ async fn real_cargo_refresh_keeps_mature_transitives_after_young_versions_are_ro
         dates,
         cargo,
         seen: Mutex::new(Vec::new()),
+        audits: Mutex::new(Vec::new()),
     };
     let outcome = run_with(
         &args,
@@ -608,18 +696,65 @@ async fn real_cargo_refresh_keeps_mature_transitives_after_young_versions_are_ro
         },
     )
     .await;
-    assert!(
-        !outcome.audit_failed && !outcome.install_failed,
-        "{:?}",
-        result.summary.lock_refreshes
+    assert!(!outcome.install_failed, "{case}");
+    assert_eq!(
+        outcome.audit_failed,
+        existing_young || restored_young,
+        "{case}"
     );
+    let refresh = &result.summary.lock_refreshes[0];
+    assert_eq!(refresh.status, "completed", "{case}: {refresh:?}");
+    assert_eq!(refresh.changed, !restored_young, "{case}");
+    assert!(refresh.error.is_none(), "{case}");
+    let audit = verifier.audits.lock().unwrap();
+    let lines =
+        crate::cargo_rollback::report::lock_age_report_lines(project.path(), &audit[0], false);
+    if existing_young {
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.warning
+                    && line.text.contains("already locked before the install")),
+            "{lines:?}"
+        );
+    }
+    if restored_young {
+        assert!(
+            lines.iter().any(|line| line.warning
+                && line
+                    .text
+                    .contains("returned to the version locked before the install")),
+            "{lines:?}"
+        );
+        assert_eq!(
+            std::fs::read(project.path().join("Cargo.lock")).unwrap(),
+            before
+        );
+    }
     assert_eq!(
         read_audit_lock(&project.path().join("Cargo.lock"))
             .unwrap()
             .1["leaf"],
         ["1.1.0"]
     );
-    assert_eq!(verifier.seen.lock().unwrap().as_slice(), ["leaf@1.1.0"]);
+    let expected_osv: &[&str] = if restored_young { &[] } else { &["leaf@1.1.0"] };
+    assert_eq!(
+        verifier.seen.lock().unwrap().as_slice(),
+        expected_osv,
+        "{case}"
+    );
+    let mut json = Vec::new();
+    crate::output::create_formatter(crate::output::OutputConfig::from_cli(
+        true, false, false, false, false,
+    ))
+    .format(&result, &mut json)
+    .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&json).unwrap();
+    assert_eq!(json["lock_refreshes"][0]["status"], "completed", "{case}");
+    assert_eq!(
+        json["lock_refreshes"][0]["changed"], !restored_young,
+        "{case}"
+    );
     assert_eq!(result.summary.total_updates(), 0);
 }
 
