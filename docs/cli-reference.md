@@ -98,6 +98,7 @@ depup --cd ./projects/myapp -n
 - Known release dates are shown in `(yyyy/mm/dd HH:MM)` format; unavailable dates appear as `(release date unknown)`
 - Change type: `[major]`, `[minor]`, `[patch]`
 - `✓ OSV` marks versions that passed the vulnerability check. A `↳ OSV skipped:` line below an update lists the vulnerable versions that were removed from the candidates; the dependency itself was still updated
+- When OSV excludes every eligible update, the reason is `no eligible update without known vulnerabilities`. Normal output includes the manifest baseline's vulnerability status and, when confirmed, a safe newer version with its age eligibility time. JSON includes this skip with reason `known_vulnerabilities` and structured `osv` details even without `--verbose`. Cargo age rollback notices also flag vulnerable destinations remaining in the final lockfile; these notices do not change the exit code
 - Skipped dependencies are counted in each manifest heading (`— N updates, M skips`) and in the summary; a manifest with no updates also shows the count per reason
 - An update that could not be written to the manifest (for example, a write refused as ambiguous) ends with `✗ failed` and is not counted as an update: the heading becomes `— N updates, K failed, M skips`, and the summary adds `K package(s) failed to update`. The reason is listed in the `Errors:` section
 - With `--verbose`, every skipped dependency is listed under its reason, and the summary is broken down by reason and language

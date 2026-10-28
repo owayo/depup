@@ -29,6 +29,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone)]
 pub struct OsvChecker {
     client: Arc<Client>,
+    #[cfg(test)]
+    mock_versions: Option<Arc<std::collections::HashMap<String, Result<OsvCheck, String>>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -77,7 +79,21 @@ impl OsvChecker {
             .map_err(|e| format!("failed to build OSV HTTP client: {}", e))?;
         Ok(Self {
             client: Arc::new(client),
+            #[cfg(test)]
+            mock_versions: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mock(versions: &[(&str, Result<OsvCheck, String>)]) -> Self {
+        let mut checker = Self::new().unwrap();
+        checker.mock_versions = Some(Arc::new(
+            versions
+                .iter()
+                .map(|(v, answer)| (v.to_string(), answer.clone()))
+                .collect(),
+        ));
+        checker
     }
 
     /// `name @ version` が `ecosystem` 上で脆弱と判定されるかを返す。
@@ -90,6 +106,14 @@ impl OsvChecker {
         name: &str,
         version: &str,
     ) -> Result<OsvCheck, String> {
+        #[cfg(test)]
+        if let Some(versions) = &self.mock_versions {
+            return versions.get(version).cloned().unwrap_or_else(|| {
+                Err(format!(
+                    "unexpected OSV query: {ecosystem}/{name}@{version}"
+                ))
+            });
+        }
         let query = OsvQuery {
             package: OsvPackageRef { name, ecosystem },
             version,

@@ -79,7 +79,7 @@ struct JsonManifest {
     updates: Vec<JsonUpdate>,
     /// 書き込めなかった更新のリスト。各要素の `error` に理由が入る
     failed: Vec<JsonUpdate>,
-    /// スキップのリスト (verbose モードのみ)
+    /// スキップのリスト (OSV の候補枯渇は常時、それ以外は verbose のみ)
     #[serde(skip_serializing_if = "Vec::is_empty")]
     skips: Vec<JsonSkip>,
 }
@@ -154,6 +154,8 @@ struct JsonSkip {
     /// 現在版自身の公開日時 (ISO 8601)。不明な場合と浮動指定では省略
     #[serde(skip_serializing_if = "Option::is_none")]
     released_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    osv: Option<crate::domain::OsvBlocked>,
 }
 
 impl JsonFormatter {
@@ -169,6 +171,7 @@ impl JsonFormatter {
             SkipReason::FetchFailed(msg) => format!("fetch_failed: {}", msg),
             SkipReason::LanguageFiltered => "language_filtered".to_string(),
             SkipReason::NoSuitableVersion => "no_suitable_version".to_string(),
+            SkipReason::KnownVulnerabilities(_) => "known_vulnerabilities".to_string(),
             SkipReason::ReleaseDateUnknown(version) => {
                 format!("release_date_unknown: {version}")
             }
@@ -240,30 +243,42 @@ impl JsonFormatter {
             .filter_map(Self::update_to_json)
             .collect();
 
-        let skips: Vec<JsonSkip> = if self.verbosity == Verbosity::Verbose {
-            manifest
-                .skips()
-                .filter_map(|result| {
-                    if let UpdateResult::Skip {
-                        dependency,
-                        reason,
-                        released_at,
-                    } = result
-                    {
-                        Some(JsonSkip {
-                            name: dependency.name.clone(),
-                            version: dependency.version_spec.version.clone(),
-                            reason: Self::skip_reason_to_string(reason),
-                            released_at: released_at.map(|d| d.to_rfc3339()),
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let skips: Vec<JsonSkip> = manifest
+            .skips()
+            .filter(|result| {
+                self.verbosity == Verbosity::Verbose
+                    || matches!(
+                        result,
+                        UpdateResult::Skip {
+                            reason: SkipReason::KnownVulnerabilities(_),
+                            ..
+                        }
+                    )
+            })
+            .filter_map(|result| {
+                if let UpdateResult::Skip {
+                    dependency,
+                    reason,
+                    released_at,
+                } = result
+                {
+                    Some(JsonSkip {
+                        name: dependency.name.clone(),
+                        version: dependency.version_spec.version.clone(),
+                        reason: Self::skip_reason_to_string(reason),
+                        released_at: released_at.map(|d| d.to_rfc3339()),
+                        osv: match reason {
+                            SkipReason::KnownVulnerabilities(diagnostic) => {
+                                Some(diagnostic.clone())
+                            }
+                            _ => None,
+                        },
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         JsonManifest {
             path: manifest.path.display().to_string(),

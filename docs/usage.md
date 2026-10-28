@@ -122,6 +122,12 @@ depup --no-osv
 - Cargo git dependencies are not checked either.
 - A failed OSV lookup does not block the update: the version is adopted without a vulnerability check, so it does not get the `✓ OSV` mark. The failure is listed in the `Errors:` section (the `errors` array in JSON) and does not change the exit code.
 
+If OSV removes every eligible update, the skip reason is `no eligible update without known vulnerabilities`, rather than `latest`. The normal text report lists the rejected versions and checks the manifest's baseline version for advisory IDs. This baseline is the version used to compare the manifest constraint; it is not a claim about the version installed in a lockfile. If the baseline cannot be matched to a published version, or its OSV lookup fails, the report says it is unconfirmed.
+
+In this case depup also checks up to five newer versions excluded only by `--age`, newest first. If one has no known vulnerabilities, the report shows that version and the exact UTC time when it satisfies the effective age policy. Range bounds, prerelease rules, rejected versions, and `--max-change` still apply. The waiting version is not installed early. Failed or incomplete lookups are reported without calling an unchecked version safe. JSON includes these skips even without `--verbose`, using reason `known_vulnerabilities` and an `osv` object (`skipped_versions`, `current_version`, `current_vulnerable`, `current_advisories`, optional lookup errors, and optional `safe_after_age` with `version` and `eligible_at`).
+
+After a Cargo.lock age rollback, depup also checks rollback destinations that remain in the final lockfile, after any install recovery. A vulnerable destination is reported with its advisory IDs; an unsuccessful check is reported as unconfirmed. These notices do not change rollback selection or the exit code. `--no-osv` disables these additional checks too.
+
 **Priority order (highest first):**
 1. CLI `--osv` or `--no-osv` (the two cannot be combined)
 2. `osv` in `~/.config/depup/config.toml`
@@ -584,11 +590,12 @@ When `--install` triggers `uv sync` for a Python project, depup always sets `UV_
 
 ## When a Dependency Is Not Updated
 
-By default, the text output only counts skipped dependencies. Run with `--verbose` to list each one under its reason:
+By default, the text output counts skipped dependencies and shows details for updates blocked by OSV. Run with `--verbose` to list every skipped dependency under its reason:
 
 | Reason | Meaning | See |
 |--------|---------|-----|
-| `latest` | No version newer than the current one passes the filters. A newer release may exist but be too recent, vulnerable, a prerelease, or above the range's upper bound. | [Filtering Candidates](#filtering-candidates), [Upper and Lower Bounds of Ranges](#upper-and-lower-bounds-of-ranges) |
+| `latest` | No version newer than the current one passes the filters. A newer release may exist but be too recent, a prerelease, or above the range's upper bound. | [Filtering Candidates](#filtering-candidates), [Upper and Lower Bounds of Ranges](#upper-and-lower-bounds-of-ranges) |
+| `no eligible update without known vulnerabilities` | OSV excluded every eligible update. The report includes rejected versions, the manifest baseline's vulnerability status, and a confirmed safe version waiting for age when found. | [Vulnerability Check](#vulnerability-check-osvdev) |
 | `newer than --age` | The confirmed current release is newer than the effective age cutoff and has no publisher exemption. No update is selected. | [Age Filter](#age-filter) |
 | `pinned` | The version is pinned, so depup did not query the registry. | [Pinned Versions and `--include-pinned`](#pinned-versions-and---include-pinned) |
 | `max-change=<LEVEL>` | Newer versions exist, but all of them exceed the `--max-change` cap. | [Limiting Bumps](#limiting-bumps---max-change) |

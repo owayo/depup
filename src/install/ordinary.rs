@@ -11,6 +11,7 @@ use crate::cargo_rollback::report::lock_mismatch_lines;
 use crate::cli::CliArgs;
 use crate::domain::UpdateSummary;
 use crate::node_lock::{NodeBaseline, NodeLockAuditResult, UnverifiedKind};
+use crate::orchestrator::osv_report::RollbackOsvChecks;
 use crate::package_manager::{InstallResult, PreparedInstall, SystemPackageManager};
 use crate::progress::Progress;
 use async_trait::async_trait;
@@ -131,11 +132,14 @@ pub(crate) async fn run_with(
     });
     let mut audit_plan = plan.rust_audit_plan(orchestrator, result);
     tx.pending_report().exclude_rust_audits(&mut audit_plan);
-    let mut audit_failed = audit_rust_locks(args, &audit_plan, &mut tx, checks).await;
+    let mut rollback_osv = RollbackOsvChecks::default();
+    let mut audit_failed =
+        audit_rust_locks(args, &audit_plan, &mut tx, checks, &mut rollback_osv).await;
     audit_failed |= audit_node_locks(args, plan, &baselines, &mut tx, checks).await;
     let recovery = tx.rollback();
     let report_error = recovery.print(&mut std::io::stderr()).err();
     recovery.mark_summary(&mut result.summary);
+    rollback_osv.warn(orchestrator, result, args.quiet).await;
     // pnpm の更新先の不一致は調査用にファイルを残す（age 違反ではない）。
     let mut verification = Progress::new(!args.quiet);
     for job in plan
@@ -249,6 +253,7 @@ async fn audit_rust_locks(
     plan: &RustAuditPlan,
     tx: &mut InstallTransactions,
     checks: &impl Checks,
+    rollback_osv: &mut RollbackOsvChecks,
 ) -> bool {
     for directory in &plan.missing_lock_dirs {
         eprintln!(
@@ -293,6 +298,7 @@ async fn audit_rust_locks(
             continue;
         }
         let (audit, receipt) = checks.rust_lock(lock, bar.as_ref()).await;
+        rollback_osv.record(&lock.directory, &audit);
         has_unresolved |= audit.has_unresolved();
         print_rust_audit(&lock.directory, &audit, args.verbose, &progress);
         let mut reason = rust_restore_reason(&audit, &lock.baseline);

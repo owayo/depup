@@ -20,6 +20,7 @@ use crate::global_config::GlobalConfig;
 
 mod age;
 mod node_preflight;
+pub(crate) mod osv_report;
 use crate::manifest::{
     ManifestInfo, ManifestWriter, MiseSettings, RegistryLockEntries, WriteResult, detect_manifests,
     find_cargo_lock_upward, get_parser, has_mise_config, read_git_entries,
@@ -1615,7 +1616,8 @@ struct OnePassResult {
 ///    - Safe → そのまま採用
 ///    - Vulnerable → versions から該当を除き、警告を残してループ再開
 ///    - API エラー → 元の候補を採用し、警告を残して終了 (チェック不能は安全側)
-/// 3. `UpdateResult::Skip` (= 更新不要) はそのまま返す
+/// 3. 候補を OSV で除外した後の `Skip` は、残した基準版と age 待ちの版を診断する。
+///    OSV による除外が無ければ、通常の Skip をそのまま返す。
 ///
 /// 通常 1 依存あたり 1〜2 API call で済む。
 /// 全 candidate を網羅的にチェックする旧実装と違い、`@angular/*` のように
@@ -1655,8 +1657,73 @@ async fn judge_with_osv(
             ..
         } = &result
         else {
-            // Skip 結果は OSV と無関係に確定
-            return Ok(result);
+            if fallback_chain.is_empty() {
+                return Ok(result);
+            }
+            // フォールバックを使い切ったことを、通常の「最新」と区別する。
+            // 診断用の照会では age や他の更新条件を緩めて採用しない。
+            let mut diagnostic = crate::domain::OsvBlocked {
+                skipped_versions: fallback_chain,
+                ..Default::default()
+            };
+            if let Some(current) = crate::update::current_version_info(dep, &allowed) {
+                diagnostic.current_version = Some(current.version.clone());
+                match checker.check(ecosystem, &dep.name, &current.version).await {
+                    Ok(OsvCheck::Vulnerable(ids)) => {
+                        diagnostic.current_vulnerable = true;
+                        diagnostic.current_advisories = ids;
+                    }
+                    Ok(OsvCheck::Safe) => {}
+                    Err(error) => diagnostic.current_check_error = Some(error),
+                }
+            } else {
+                diagnostic.current_check_error = Some(
+                    "manifest baseline could not be matched to a published version; not queried"
+                        .into(),
+                );
+            }
+            // 通常の更新では選べなかった新しい版だけを、新しい順に最大5件確認する。
+            // 大量のリリースを持つ依存でも、診断が更新処理を際限なく延ばさない。
+            let waiting = judge.age_waiting_candidates(dep, &allowed);
+            for (info, eligible_at) in waiting.iter().take(5) {
+                if let Some(b) = bar {
+                    b.set_message(format!(
+                        "OSV: {} {} (waiting for --age)",
+                        dep.name, info.version
+                    ));
+                }
+                match checker.check(ecosystem, &dep.name, &info.version).await {
+                    Ok(OsvCheck::Safe) => {
+                        diagnostic.safe_after_age = Some(crate::domain::AgeWaitingVersion {
+                            version: info.version.clone(),
+                            eligible_at: *eligible_at,
+                        });
+                        break;
+                    }
+                    Ok(OsvCheck::Vulnerable(_)) => {}
+                    Err(error) => {
+                        diagnostic.waiting_check_error = Some(error);
+                        break;
+                    }
+                }
+            }
+            if diagnostic.safe_after_age.is_none()
+                && diagnostic.waiting_check_error.is_none()
+                && waiting.len() > 5
+            {
+                diagnostic.waiting_check_error = Some(
+                    "OSV waiting-version lookup limit reached; older versions not checked".into(),
+                );
+            }
+            let released_at = match result {
+                UpdateResult::Skip { released_at, .. } => released_at,
+                _ => None,
+            };
+            return Ok(UpdateResult::skip_with_optional_date(
+                dep.clone(),
+                SkipReason::KnownVulnerabilities(diagnostic),
+                released_at,
+            ));
         };
         let target = target.clone();
 
@@ -1728,6 +1795,10 @@ async fn judge_with_osv(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "orchestrator/osv_tests.rs"]
+mod osv_tests;
 
 /// 進捗バーがあれば `println` で行を出力 (バーを維持)、なければ stderr へ直接出す。
 fn osv_println(bar: Option<&ProgressBar>, line: &str) {

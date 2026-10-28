@@ -158,6 +158,9 @@ impl TextFormatter {
             SkipReason::FetchFailed(msg) => format!("fetch failed: {}", msg),
             SkipReason::LanguageFiltered => "filtered".to_string(),
             SkipReason::NoSuitableVersion => "no suitable version".to_string(),
+            SkipReason::KnownVulnerabilities(_) => {
+                "no eligible update without known vulnerabilities".to_string()
+            }
             SkipReason::ReleaseDateUnknown(version) => {
                 format!("release date unavailable for {version}")
             }
@@ -458,6 +461,7 @@ impl TextFormatter {
             // スキップ理由のサマリを表示
             let skip_reasons = self.summarize_skip_reasons(&skips);
             self.write_skip_reasons(&skip_reasons, self.verbosity == Verbosity::Verbose, writer)?;
+            self.write_osv_diagnostics(&skips, writer)?;
             writeln!(writer)?;
             return Ok(());
         }
@@ -526,7 +530,63 @@ impl TextFormatter {
             self.write_skip_reasons(&skip_reasons, true, writer)?;
         }
 
+        self.write_osv_diagnostics(&skips, writer)?;
+
         writeln!(writer)?;
+        Ok(())
+    }
+
+    /// OSV によって更新できなかった依存は、通常表示でも保持した版と理由を示す。
+    fn write_osv_diagnostics(
+        &self,
+        skips: &[&UpdateResult],
+        writer: &mut dyn Write,
+    ) -> std::io::Result<()> {
+        for result in skips {
+            let UpdateResult::Skip {
+                dependency,
+                reason: SkipReason::KnownVulnerabilities(diagnostic),
+                ..
+            } = result
+            else {
+                continue;
+            };
+            writeln!(
+                writer,
+                "  {} manifest baseline remains at {}: OSV excluded {}",
+                dependency.name,
+                dependency.version_spec.display_version(),
+                diagnostic.skipped_versions.join(", ")
+            )?;
+            if diagnostic.current_vulnerable {
+                let ids = if diagnostic.current_advisories.is_empty() {
+                    "no advisory IDs".to_string()
+                } else {
+                    diagnostic.current_advisories.join(", ")
+                };
+                writeln!(
+                    writer,
+                    "    current version has known vulnerabilities ({ids})"
+                )?;
+            }
+            if let Some(error) = &diagnostic.current_check_error {
+                writeln!(writer, "    current version OSV check failed: {error}")?;
+            }
+            if let Some(waiting) = &diagnostic.safe_after_age {
+                writeln!(
+                    writer,
+                    "    {} has no known vulnerabilities; satisfies --age at {}",
+                    waiting.version,
+                    waiting.eligible_at.to_rfc3339()
+                )?;
+            }
+            if let Some(error) = &diagnostic.waiting_check_error {
+                writeln!(
+                    writer,
+                    "    OSV check for versions waiting for --age incomplete: {error}"
+                )?;
+            }
+        }
         Ok(())
     }
 

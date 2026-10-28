@@ -715,6 +715,39 @@ impl UpdateJudge {
             .is_empty()
     }
 
+    /// 表示のための候補。age だけを外し、書き換え可否を含む通常の judge を通す。
+    /// 選択や書き込みには使わず、公開日不明の版から待機期限を作らない。
+    pub(crate) fn age_waiting_candidates<'a>(
+        &self,
+        dependency: &Dependency,
+        versions: &'a [VersionInfo],
+    ) -> Vec<(&'a VersionInfo, DateTime<Utc>)> {
+        let Some(age) = self
+            .filter
+            .min_age
+            .and_then(|age| chrono::Duration::from_std(age).ok())
+        else {
+            return Vec::new();
+        };
+        let mut filter = self.filter.clone();
+        filter.min_age = None;
+        let without_age = Self::with_time(filter, self.now);
+        self.release_date_candidates(dependency, versions)
+            .within
+            .into_iter()
+            .filter(|info| !self.admits_age(dependency, info))
+            .filter(|info| {
+                without_age
+                    .judge(dependency, std::slice::from_ref(*info))
+                    .is_update()
+            })
+            .filter_map(|info| {
+                let eligible_at = info.released_at?.checked_add_signed(age)?;
+                (eligible_at > self.now).then_some((info, eligible_at))
+            })
+            .collect()
+    }
+
     /// `min_age` が設定されていれば、現在時刻から逆算したリリース時刻以前のものだけを残す。
     fn apply_age_filter<'a>(
         &self,
@@ -982,7 +1015,7 @@ fn is_same_release(dependency: &Dependency, a: &str, b: &str) -> bool {
 }
 
 /// 絞り込み前の一覧から、完全一致を優先し、一意な安全な別表記だけを許す。
-fn current_version_info<'a>(
+pub(crate) fn current_version_info<'a>(
     dependency: &Dependency,
     versions: &'a [VersionInfo],
 ) -> Option<&'a VersionInfo> {
