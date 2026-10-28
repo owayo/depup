@@ -104,7 +104,11 @@ struct FailureGroup<'a> {
 impl<'a> FailureGroup<'a> {
     fn repeated(updates: &[&'a UpdateResult]) -> Vec<Self> {
         let mut groups: Vec<Self> = Vec::new();
-        for reason in updates.iter().filter_map(|result| result.write_error()) {
+        for reason in updates
+            .iter()
+            .filter(|result| result.cancellation().is_none())
+            .filter_map(|result| result.write_error())
+        {
             if let Some(group) = groups.iter_mut().find(|group| group.reason == reason) {
                 group.count += 1;
             } else {
@@ -211,15 +215,16 @@ impl TextFormatter {
     }
 
     /// 失敗理由を更新行の末尾に付ける。複数行のエラーも1行に収める。
-    fn write_failed_marker(&self, write_error: Option<&str>) -> String {
+    fn write_failed_marker(&self, write_error: Option<&str>, canceled: bool) -> String {
         let Some(reason) = write_error else {
             return String::new();
         };
         let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+        let status = if canceled { "canceled" } else { "failed" };
         if self.color {
-            format!(" {}", format!("✗ failed: {reason}").red())
+            format!(" {}", format!("✗ {status}: {reason}").red())
         } else {
-            format!(" [failed: {reason}]")
+            format!(" [{status}: {reason}]")
         }
     }
 
@@ -236,12 +241,13 @@ impl TextFormatter {
         osv_skipped: &[String],
         osv_checked: bool,
         write_error: Option<&str>,
+        canceled: bool,
         max_name_len: usize,
         writer: &mut dyn Write,
     ) -> std::io::Result<()> {
         let change_type = VersionChangeType::from_versions(old_version, new_version);
         let dev_marker = if is_dev { " 🔧" } else { "" };
-        let failed_marker = self.write_failed_marker(write_error);
+        let failed_marker = self.write_failed_marker(write_error, canceled);
 
         // リリース日をフォーマット
         let date_display = released_at
@@ -315,7 +321,14 @@ impl TextFormatter {
         // OSV で除外された候補があれば 1 行追記
         if !osv_skipped.is_empty() {
             let indent = " ".repeat(max_name_len + 4);
-            let body = format!("↳ OSV skipped: {}", osv_skipped.join(", "));
+            let body = if self.verbosity == Verbosity::Verbose {
+                format!("↳ OSV skipped: {}", osv_skipped.join(", "))
+            } else {
+                format!(
+                    "↳ OSV: {} candidate(s) excluded; details: --verbose",
+                    osv_skipped.len()
+                )
+            };
             if self.color {
                 writeln!(writer, "{}{}", indent, body.yellow())?;
             } else {
@@ -335,10 +348,11 @@ impl TextFormatter {
         new_version: &str,
         is_dev: bool,
         write_error: Option<&str>,
+        canceled: bool,
         max_name_len: usize,
         writer: &mut dyn Write,
     ) -> std::io::Result<()> {
-        let failed_marker = self.write_failed_marker(write_error);
+        let failed_marker = self.write_failed_marker(write_error, canceled);
         let ref_label = git.reference.display_name();
         let (old_display, new_display) = match &git.reference {
             GitReference::Tag(current) => (current.clone(), new_version.to_string()),
@@ -399,10 +413,14 @@ impl TextFormatter {
                 osv_risk_tradeoff,
                 age_exemption,
                 write_error,
+                ..
             } = result
             {
+                let cancellation = result.cancellation();
                 let mut display_error = write_error.clone();
-                let show_line = if let Some((index, group)) = failures
+                let show_line = if cancellation.is_some() && self.verbosity == Verbosity::Normal {
+                    false
+                } else if let Some((index, group)) = failures
                     .iter_mut()
                     .enumerate()
                     .find(|(_, group)| Some(group.reason) == write_error.as_deref())
@@ -427,6 +445,7 @@ impl TextFormatter {
                             new_version,
                             is_dev,
                             display_error.as_deref(),
+                            cancellation.is_some(),
                             max_name_len,
                             writer,
                         )?;
@@ -450,12 +469,15 @@ impl TextFormatter {
                             osv_skipped,
                             *osv_checked,
                             display_error.as_deref(),
+                            cancellation.is_some(),
                             max_name_len,
                             writer,
                         )?;
                     }
                 }
-                if let Some(exemption) = age_exemption {
+                if let Some(exemption) = age_exemption
+                    && (cancellation.is_none() || self.verbosity == Verbosity::Verbose)
+                {
                     writeln!(
                         writer,
                         "    age exempt: {} ({})",
@@ -463,7 +485,37 @@ impl TextFormatter {
                     )?;
                 }
                 if let Some(reduction) = osv_risk_tradeoff {
-                    writeln!(writer, "    ⚠ {}", reduction.describe(&dependency.name))?;
+                    if self.verbosity == Verbosity::Verbose {
+                        writeln!(writer, "    ⚠ {}", reduction.describe(&dependency.name))?;
+                    } else {
+                        let status = match cancellation {
+                            Some(state) if state.recovered => "candidate not applied",
+                            Some(_) => "recovery incomplete; installed version unverified",
+                            None if write_error.is_some() => {
+                                "update failed; installed version unverified"
+                            }
+                            None if self.dry_run => "dry-run candidate",
+                            None => "selected candidate",
+                        };
+                        let assessment = if cancellation.is_some() || write_error.is_some() {
+                            "OSV candidate trade-off"
+                        } else {
+                            "OSV severity trade-off accepted"
+                        };
+                        crate::output::write_wrapped(
+                            writer,
+                            if show_line { "    ⚠ " } else { "  ⚠ " },
+                            &format!(
+                                "{} {} -> {}: {status}; {assessment} (fixed: {}, introduced: {}, retained: {}); known vulnerabilities remain; details: --verbose",
+                                dependency.name,
+                                reduction.baseline_versions.join(", "),
+                                reduction.candidate_versions.join(", "),
+                                reduction.fixed.len(),
+                                reduction.introduced.len(),
+                                reduction.retained.len()
+                            ),
+                        )?;
+                    }
                 }
             }
         }
@@ -489,7 +541,12 @@ impl TextFormatter {
 
         // 更新数とスキップ数をカウント。更新数には書き込めなかった更新を含めず、別に数える
         let update_count = manifest.update_count();
-        let failed_count = manifest.failed_count();
+        let canceled_count = manifest
+            .results
+            .iter()
+            .filter(|result| result.cancellation().is_some())
+            .count();
+        let failed_count = manifest.failed_count() - canceled_count;
         let skip_count = skips.len();
 
         // 更新なしでスキップありの場合、スキップサマリを表示 (非 verbose モードでも)
@@ -531,7 +588,7 @@ impl TextFormatter {
         // その件数も出す
         let path_display = manifest.path.display().to_string();
         let lang_display = format!("({})", manifest.language);
-        let failed_display = if failed_count > 0 {
+        let mut failed_display = if failed_count > 0 {
             format!(
                 ", {} failed",
                 self.apply_color(&failed_count.to_string(), Color::Red)
@@ -539,6 +596,12 @@ impl TextFormatter {
         } else {
             String::new()
         };
+        if canceled_count > 0 {
+            failed_display.push_str(&format!(
+                ", {} canceled",
+                self.apply_color(&canceled_count.to_string(), Color::Yellow)
+            ));
+        }
         writeln!(
             writer,
             "{}{} {} — {} {}{}, {} {}",
@@ -578,19 +641,14 @@ impl TextFormatter {
                     Color::Red,
                 )
             )?;
-            // 長い lock 検証エラーも、ID を省略せず読みやすい幅に折り返す。
-            let mut line = String::from("    ");
-            for word in group.reason.split_whitespace() {
-                if line.len() > 4 && line.chars().count() + 1 + word.chars().count() > 100 {
-                    writeln!(writer, "{line}")?;
-                    line.truncate(4);
-                }
-                if line.len() > 4 {
-                    line.push(' ');
-                }
-                line.push_str(word);
-            }
-            writeln!(writer, "{line}")?;
+            crate::output::write_wrapped(writer, "    ", group.reason)?;
+        }
+
+        if canceled_count > 0 && self.verbosity == Verbosity::Normal {
+            writeln!(
+                writer,
+                "  Canceled updates: see recovery report above; use --verbose for packages and reasons."
+            )?;
         }
 
         // 本番依存を書き出す
@@ -889,18 +947,67 @@ impl OutputFormatter for TextFormatter {
             self.format_manifest_grouped(manifest, writer)?;
         }
 
-        // エラーがあればフォーマット
-        if !result.errors.is_empty() && self.verbosity != Verbosity::Quiet {
-            if self.color {
-                writeln!(writer, "{}:", "Errors".red().bold())?;
-                for error in &result.errors {
-                    writeln!(writer, "  {} {}", "✗".red(), error)?;
+        let errors: Vec<_> = result
+            .errors
+            .iter()
+            .filter(|error| !error.is_warning())
+            .collect();
+        if !errors.is_empty() {
+            writeln!(writer, "{}:", self.apply_color("Errors", Color::Red))?;
+            for error in errors {
+                crate::output::write_wrapped(writer, "  ✗ ", &error.to_string())?;
+            }
+            writeln!(writer)?;
+        }
+
+        let warnings: Vec<_> = result
+            .errors
+            .iter()
+            .filter(|error| {
+                matches!(
+                    error,
+                    crate::orchestrator::OrchestratorError::OsvWarning { .. }
+                        | crate::orchestrator::OrchestratorError::OsvTradeoff { .. }
+                )
+            })
+            .collect();
+        if !warnings.is_empty() {
+            writeln!(writer, "{}:", self.apply_color("Warnings", Color::Yellow))?;
+            for warning in warnings {
+                let message = match warning {
+                    crate::orchestrator::OrchestratorError::OsvTradeoff { package, report }
+                        if self.verbosity != Verbosity::Verbose =>
+                    {
+                        report.describe_summary(package)
+                    }
+                    _ => warning.to_string(),
+                };
+                crate::output::write_wrapped(writer, "  ⚠ ", &message)?;
+            }
+            writeln!(writer)?;
+        }
+        let excluded: Vec<_> = result
+            .errors
+            .iter()
+            .filter(|error| {
+                matches!(
+                    error,
+                    crate::orchestrator::OrchestratorError::OsvCandidateExcluded { .. }
+                )
+            })
+            .collect();
+        if !excluded.is_empty() {
+            writeln!(writer, "Notices:")?;
+            if self.verbosity == Verbosity::Verbose {
+                for notice in excluded {
+                    crate::output::write_wrapped(writer, "  - ", &notice.to_string())?;
                 }
             } else {
-                writeln!(writer, "Errors:")?;
-                for error in &result.errors {
-                    writeln!(writer, "  - {}", error)?;
-                }
+                writeln!(
+                    writer,
+                    "  OSV excluded {} vulnerable candidate(s); these notices did not stop the run. Details: --verbose.",
+                    excluded.len()
+                )?;
             }
             writeln!(writer)?;
         }
@@ -919,13 +1026,19 @@ impl OutputFormatter for TextFormatter {
         let prefix = self.dry_run_prefix();
         // 更新数には書き込めなかった更新を含めず、別に数える
         let updates = summary.total_updates();
-        let failed = summary.total_failed();
+        let canceled = summary
+            .manifests
+            .iter()
+            .flat_map(|manifest| &manifest.results)
+            .filter(|result| result.cancellation().is_some())
+            .count();
+        let failed = summary.total_failed() - canceled;
         let skips = summary.total_skips();
 
         if self.verbosity == Verbosity::Quiet {
             // 最小限の出力
-            if updates > 0 || failed > 0 {
-                let failed_display = if failed > 0 {
+            if updates > 0 || failed > 0 || canceled > 0 {
+                let mut failed_display = if failed > 0 {
                     format!(
                         ", {} failed",
                         self.apply_color(&failed.to_string(), Color::Red)
@@ -933,6 +1046,9 @@ impl OutputFormatter for TextFormatter {
                 } else {
                     String::new()
                 };
+                if canceled > 0 {
+                    failed_display.push_str(&format!(", {canceled} canceled"));
+                }
                 writeln!(
                     writer,
                     "{}{} updated{}",
@@ -989,6 +1105,14 @@ impl OutputFormatter for TextFormatter {
                 self.apply_color(&failed.to_string(), Color::Red)
             )?;
         }
+        if canceled > 0 {
+            writeln!(
+                writer,
+                "  {} update{} canceled",
+                self.apply_color(&canceled.to_string(), Color::Yellow),
+                if canceled == 1 { "" } else { "s" }
+            )?;
+        }
 
         // スキップサマリ
         if skips > 0 {
@@ -1020,14 +1144,23 @@ impl OutputFormatter for TextFormatter {
                 } else {
                     counts.language.to_string()
                 };
-                let failed_display = if counts.failed > 0 {
+                let canceled = summary
+                    .by_language(counts.language)
+                    .flat_map(|manifest| &manifest.results)
+                    .filter(|result| result.cancellation().is_some())
+                    .count();
+                let failed = counts.failed - canceled;
+                let mut failed_display = if failed > 0 {
                     format!(
                         ", {} failed",
-                        self.apply_color(&counts.failed.to_string(), Color::Red)
+                        self.apply_color(&failed.to_string(), Color::Red)
                     )
                 } else {
                     String::new()
                 };
+                if canceled > 0 {
+                    failed_display.push_str(&format!(", {canceled} canceled"));
+                }
                 writeln!(
                     writer,
                     "  {}: {} updated{}, {} skipped",
@@ -1167,6 +1300,7 @@ mod tests {
                 &[],
                 false,
                 None,
+                false,
                 6,
                 &mut output,
             )
@@ -1616,10 +1750,150 @@ mod tests {
         assert!(output.contains("[git] [failed: #1]"), "{output}");
         assert!(output.contains("package-29"), "{output}");
         assert!(
-            output.contains("OSV skipped: 1.2.0 (TEST-ADVISORY-C)"),
+            output.contains("OSV: 1 candidate(s) excluded; details: --verbose"),
             "{output}"
         );
+        assert!(!output.contains("TEST-ADVISORY-C"), "{output}");
+        assert!(format_text(&result, Verbosity::Verbose).contains("TEST-ADVISORY-C"));
         assert!(output.contains("26 more failed updates (#1)"), "{output}");
+    }
+
+    #[test]
+    fn canceled_updates_keep_risk_warnings_without_repeating_the_recovery_cause() {
+        use crate::domain::UpdateCancellation;
+        use crate::orchestrator::OrchestratorError;
+        use crate::osv::{AdvisoryGroup, RiskTradeoff, Severity};
+        for recovered in [false, true] {
+            let mut result = shared_failure_result();
+            for update in &mut result.summary.manifests[0].results {
+                if let Some(reason) = update.write_error().map(str::to_owned) {
+                    update.record_cancellation(
+                        reason,
+                        UpdateCancellation {
+                            lock_verification: true,
+                            recovered,
+                        },
+                    );
+                }
+            }
+            if let UpdateResult::Update {
+                dependency,
+                osv_risk_tradeoff,
+                ..
+            } = &mut result.summary.manifests[0].results[29]
+            {
+                dependency.name = "framework".into();
+                *osv_risk_tradeoff = Some(RiskTradeoff {
+                    baseline_versions: vec!["1.0.1".into()],
+                    candidate_versions: vec!["1.1.0".into()],
+                    fixed: vec![AdvisoryGroup {
+                        ids: vec!["TEST-FIX".into()],
+                        severity: Severity::High,
+                    }],
+                    introduced: vec![],
+                    retained: vec![AdvisoryGroup {
+                        ids: vec!["TEST-RETAINED".into()],
+                        severity: Severity::Critical,
+                    }],
+                });
+            }
+            result.errors.push(OrchestratorError::OsvCandidateExcluded {
+                package: "framework".into(),
+                version: "1.0.2".into(),
+                advisories: vec!["TEST-EXCLUDED".into()],
+            });
+            let output = format_text(&result, Verbosity::Normal);
+            let flattened = output.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                output.contains("— 1 update, 30 canceled, 0 skips"),
+                "{output}"
+            );
+            assert!(output.contains("30 updates canceled"), "{output}");
+            assert!(!output.contains("30 failed"), "{output}");
+            assert!(!output.contains("Failure #1"), "{output}");
+            assert!(
+                !output.contains("final lock OSV verification failed"),
+                "{output}"
+            );
+            assert!(!output.contains("Errors:"), "{output}");
+            assert!(output.contains("Notices:"), "{output}");
+            assert!(
+                output.contains("these notices did not stop the run"),
+                "{output}"
+            );
+            assert!(output.contains("framework 1.0.1 -> 1.1.0"), "{output}");
+            assert!(
+                flattened.contains("known vulnerabilities remain"),
+                "{output}"
+            );
+            for count in ["fixed: 1", "introduced: 0", "retained: 1"] {
+                assert!(flattened.contains(count), "{output}");
+            }
+            assert_eq!(
+                flattened.contains("candidate not applied"),
+                recovered,
+                "{output}"
+            );
+            assert_eq!(
+                flattened.contains("recovery incomplete"),
+                !recovered,
+                "{output}"
+            );
+            for id in ["TEST-FIX", "TEST-RETAINED", "TEST-EXCLUDED"] {
+                assert!(!output.contains(id), "{output}");
+                assert!(format_text(&result, Verbosity::Verbose).contains(id));
+            }
+            assert_eq!(
+                format_text(&result, Verbosity::Quiet).trim(),
+                "1 updated, 30 canceled"
+            );
+            let verbose = format_text(&result, Verbosity::Verbose);
+            assert_eq!(verbose.matches("[canceled:").count(), 30, "{verbose}");
+            assert!(
+                verbose.contains("1 updated, 30 canceled, 0 skipped"),
+                "{verbose}"
+            );
+            let mut json = vec![];
+            crate::output::JsonFormatter::new(Verbosity::Normal)
+                .format(&result, &mut json)
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&json).unwrap();
+            assert_eq!(json["summary"]["failed"], 30);
+            assert_eq!(json["manifests"][0]["failed"].as_array().unwrap().len(), 30);
+            assert!(
+                json["manifests"][0]["failed"][29]["osv_risk_tradeoff"]["retained"][0]["ids"][0]
+                    .as_str()
+                    .unwrap()
+                    .contains("TEST-RETAINED")
+            );
+        }
+    }
+
+    #[test]
+    fn genuine_errors_and_osv_lookup_warnings_keep_separate_sections() {
+        use crate::orchestrator::OrchestratorError;
+        let mut result = create_result_with_write_failures(&["react"]);
+        // 原因の文言だけでは取り消し扱いにしない。
+        result.summary.manifests[0].results[1]
+            .record_write_error("lock verification failed; update canceled: write failed");
+        result.errors.push(OrchestratorError::WriteError {
+            path: "package.json".into(),
+            message: "permission denied".into(),
+        });
+        result.errors.push(OrchestratorError::OsvWarning {
+            package: "library".into(),
+            message: "OSV check failed: offline".into(),
+        });
+        let output = format_text(&result, Verbosity::Normal);
+        assert!(output.contains("1 failed"), "{output}");
+        assert!(!output.contains("1 canceled"), "{output}");
+        let (errors, warnings) = output.split_once("Warnings:").unwrap();
+        assert!(errors.contains("Errors:"), "{output}");
+        assert!(errors.contains("permission denied"), "{output}");
+        assert!(!errors.contains("offline"), "{output}");
+        assert!(warnings.contains("OSV check failed: offline"), "{output}");
+        assert!(result.errors[1].is_warning());
+        assert!(!result.errors[0].is_warning());
     }
 
     #[test]

@@ -13,6 +13,104 @@ fn result() -> OrchestratorResult {
         errors: vec![],
     }
 }
+
+#[test]
+fn normal_recovery_report_keeps_the_cause_once_and_does_not_claim_unrestored_files_are_restored() {
+    use crate::output::{OutputFormatter, TextFormatter, Verbosity};
+    let directory = PathBuf::from("/project");
+    let path = directory.join("package.json");
+    let lock = directory.join("pnpm-lock.yaml");
+    let cause = "final lock OSV verification failed: sanitizer@1.1.0 is vulnerable (TEST-ADVISORY)";
+    for recovered in [true, false] {
+        let report = RollbackReport {
+            units: vec![FailedUnit {
+                directories: BTreeSet::from([directory.clone()]),
+                summaries: BTreeSet::from([0]),
+                reason: cause.into(),
+                files: BTreeMap::from([
+                    (
+                        path.clone(),
+                        if recovered {
+                            FileOutcome::Restored
+                        } else {
+                            FileOutcome::Kept {
+                                backup: Ok(PathBuf::from("/recovery/package.json")),
+                            }
+                        },
+                    ),
+                    (
+                        lock.clone(),
+                        if recovered {
+                            FileOutcome::Restored
+                        } else {
+                            FileOutcome::Conflict {
+                                reason: "external edit".into(),
+                                backup: Ok(PathBuf::from("/recovery/pnpm-lock.yaml")),
+                            }
+                        },
+                    ),
+                ]),
+                policy_failure: true,
+                skipped: !recovered,
+            }],
+            node_managers: BTreeMap::from([(directory.clone(), (directory.clone(), "pnpm"))]),
+        };
+        let mut result = result();
+        let mut manifest = ManifestUpdateResult::new(&path, Language::Node);
+        for index in 0..30 {
+            manifest.add_result(UpdateResult::update(
+                Dependency::new(
+                    format!("package-{index}"),
+                    VersionSpec::new(VersionSpecKind::Exact, "1.0.0", "1.0.0"),
+                    false,
+                    Language::Node,
+                ),
+                "1.1.0",
+            ));
+        }
+        result.summary.add_manifest(manifest);
+        report.mark_summary(&mut result.summary);
+        let mut output = vec![];
+        report.print(&mut output, false).unwrap();
+        TextFormatter::with_color(Verbosity::Normal, false, false)
+            .format(&result, &mut output)
+            .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.starts_with("Updates canceled —"), "{output}");
+        assert_eq!(output.matches("TEST-ADVISORY").count(), 1, "{output}");
+        assert!(output.contains("30 canceled"), "{output}");
+        assert!(!output.contains("30 failed"), "{output}");
+        if recovered {
+            assert!(
+                output.contains("Recovery: project files restored"),
+                "{output}"
+            );
+            assert!(output.contains("restored package.json"), "{output}");
+            assert!(output.contains("restored pnpm-lock.yaml"), "{output}");
+            assert!(output.contains("Next: run pnpm install"), "{output}");
+        } else {
+            assert!(output.contains("Recovery: skipped"), "{output}");
+            assert!(output.contains("no files restored"), "{output}");
+            assert!(
+                !output.contains("Recovery: project files restored"),
+                "{output}"
+            );
+            assert!(
+                output.contains("review the kept files and recovery copies"),
+                "{output}"
+            );
+            assert!(output.contains("Pre-write copy: /recovery/"), "{output}");
+        }
+        assert_eq!(result.summary.total_failed(), 30);
+        assert_eq!(result.summary.total_updates(), 0);
+        assert!(
+            result.summary.manifests[0]
+                .results
+                .iter()
+                .all(|update| update.cancellation().unwrap().recovered == recovered)
+        );
+    }
+}
 fn update(
     result: &mut OrchestratorResult,
     path: &Path,
@@ -1370,7 +1468,7 @@ fn a_kept_lockfile_keeps_its_manifest_only_after_a_lock_verification_failure() {
         let report = tx.rollback();
         report.mark_summary(&mut result.summary);
         let mut output = vec![];
-        report.print(&mut output).unwrap();
+        report.print(&mut output, true).unwrap();
         let output = String::from_utf8(output).unwrap();
         let error = result.summary.manifests[0].results[0]
             .write_error()
@@ -2164,7 +2262,7 @@ fn restore_io_failure_keeps_that_manifest_failed_backs_it_up_and_continues_other
     assert_eq!(value["summary"]["updates"], 0);
     assert_eq!(value["summary"]["failed"], 1);
     let mut report_text = vec![];
-    report.print(&mut report_text).unwrap();
+    report.print(&mut report_text, true).unwrap();
     let report_text = String::from_utf8(report_text).unwrap();
     assert!(report_text.contains("simulated recovery I/O failure"));
     assert!(report_text.contains("Pre-write copy"));
@@ -2772,7 +2870,7 @@ fn new_or_replaced_mise_directory_links_keep_existing_target_metadata() {
                 }
             }
             let mut output = vec![];
-            report.print(&mut output).unwrap();
+            report.print(&mut output, true).unwrap();
             assert!(
                 !String::from_utf8(output)
                     .unwrap()
@@ -2883,7 +2981,7 @@ fn no_manager_still_reports_observed_manifest_conflicts() {
             };
             assert_eq!(fs::read(copy).unwrap(), before);
             let mut output = vec![];
-            report.print(&mut output).unwrap();
+            report.print(&mut output, true).unwrap();
             assert!(
                 String::from_utf8(output)
                     .unwrap()

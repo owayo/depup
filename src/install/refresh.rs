@@ -435,7 +435,7 @@ async fn run_with(
     verify_manifests(&manifests, &mut tx, &mut errors);
     progress.finish_and_clear();
     let report = tx.rollback();
-    let report_error = report.print(&mut std::io::stderr()).err();
+    let report_error = report.print(&mut std::io::stderr(), args.verbose).err();
     report.mark_summary(&mut result.summary);
     rollback_osv.warn(orchestrator, result, args.quiet).await;
     if jobs.is_empty() {
@@ -451,7 +451,7 @@ async fn run_with(
         let key = (job.directory.clone(), job.language.to_string());
         let failed = report.covers_directory(&job.directory);
         if !failed && let Some(notices) = osv_notices.remove(&key) {
-            super::security::print_notices(notices, result);
+            super::security::print_notices(notices, result, orchestrator.live_osv_details());
         }
         result.summary.lock_refreshes.push(LockRefreshResult {
             directory: job.directory.clone(),

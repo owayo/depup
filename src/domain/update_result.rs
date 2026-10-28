@@ -5,6 +5,13 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+/// install の単位で取り消した更新。復元未完了の候補を未適用と断言しない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateCancellation {
+    pub lock_verification: bool,
+    pub recovered: bool,
+}
+
 /// 更新候補を OSV で除外した結果。安全性の照会は版の選択条件を緩めない。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OsvBlocked {
@@ -130,6 +137,8 @@ pub enum UpdateResult {
         /// 書き込みの段階より前は常に `None`
         #[serde(default, skip_serializing_if = "Option::is_none")]
         write_error: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cancellation: Option<UpdateCancellation>,
     },
     /// 依存関係の更新がスキップされた
     Skip {
@@ -162,6 +171,7 @@ impl UpdateResult {
             osv_risk_tradeoff: None,
             age_exemption: None,
             write_error: None,
+            cancellation: None,
         }
     }
 
@@ -189,6 +199,7 @@ impl UpdateResult {
             osv_risk_tradeoff: None,
             age_exemption: None,
             write_error: None,
+            cancellation: None,
         }
     }
 
@@ -307,6 +318,25 @@ impl UpdateResult {
         match self {
             UpdateResult::Update { write_error, .. } => write_error.as_deref(),
             UpdateResult::Skip { .. } => None,
+        }
+    }
+
+    pub fn cancellation(&self) -> Option<UpdateCancellation> {
+        match self {
+            Self::Update { cancellation, .. } => *cancellation,
+            Self::Skip { .. } => None,
+        }
+    }
+
+    pub(crate) fn record_cancellation(&mut self, reason: String, cancellation: UpdateCancellation) {
+        if let Self::Update {
+            write_error,
+            cancellation: state,
+            ..
+        } = self
+        {
+            *write_error = Some(reason);
+            *state = Some(cancellation);
         }
     }
 

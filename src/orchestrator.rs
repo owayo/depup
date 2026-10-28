@@ -127,6 +127,25 @@ pub enum OrchestratorError {
     },
     /// OSV 脆弱性チェックに失敗または脆弱性を検出
     OsvWarning { package: String, message: String },
+    /// 脆弱な候補を除いた通知。実行を失敗させるエラーではない。
+    OsvCandidateExcluded {
+        package: String,
+        version: String,
+        advisories: Vec<String>,
+    },
+    OsvTradeoff {
+        package: String,
+        report: Box<crate::osv::RiskTradeoff>,
+    },
+}
+
+impl OrchestratorError {
+    pub fn is_warning(&self) -> bool {
+        matches!(
+            self,
+            Self::OsvWarning { .. } | Self::OsvCandidateExcluded { .. } | Self::OsvTradeoff { .. }
+        )
+    }
 }
 
 impl std::fmt::Display for OrchestratorError {
@@ -174,6 +193,24 @@ impl std::fmt::Display for OrchestratorError {
             OrchestratorError::OsvWarning { package, message } => {
                 write!(f, "OSV check for {}: {}", package, message)
             }
+            OrchestratorError::OsvCandidateExcluded {
+                package,
+                version,
+                advisories,
+            } => {
+                write!(
+                    f,
+                    "OSV check for {package}: {version} vulnerable, falling back ({})",
+                    if advisories.is_empty() {
+                        "no advisory IDs".into()
+                    } else {
+                        advisories.join(", ")
+                    }
+                )
+            }
+            OrchestratorError::OsvTradeoff { package, report } => {
+                write!(f, "OSV check for {package}: {}", report.describe(package))
+            }
         }
     }
 }
@@ -181,6 +218,9 @@ impl std::fmt::Display for OrchestratorError {
 impl std::error::Error for OrchestratorError {}
 
 impl Orchestrator {
+    pub(crate) fn live_osv_details(&self) -> bool {
+        self.args.verbose || self.args.quiet || self.args.json || self.args.diff
+    }
     pub(crate) fn refresh_lock_requested(&self) -> bool {
         self.args.refresh_lock
     }
@@ -851,12 +891,7 @@ impl Orchestrator {
                         message: err_msg,
                     });
                 }
-                for warn in result.osv_warnings {
-                    errors.push(OrchestratorError::OsvWarning {
-                        package: result.name.clone(),
-                        message: warn,
-                    });
-                }
+                errors.extend(result.osv_warnings);
                 manifest_result.add_result(result.outcome);
             }
             summary.add_manifest(manifest_result);
@@ -1615,7 +1650,7 @@ struct OnePassResult {
     /// fetch 失敗時の原因メッセージ (存在する場合のみ `OrchestratorError` として記録される)
     fetch_error: Option<String>,
     /// OSV チェックで除外・問題が生じた version のメッセージ
-    osv_warnings: Vec<String>,
+    osv_warnings: Vec<OrchestratorError>,
 }
 
 /// `judge` の判定結果に対し、採用しようとした候補だけ OSV.dev に問い合わせ、
@@ -1637,7 +1672,7 @@ struct OsvJudgeContext<'a> {
     checker: &'a OsvChecker,
     ecosystem: &'a str,
     bar: Option<&'a ProgressBar>,
-    warnings: &'a mut Vec<String>,
+    warnings: &'a mut Vec<OrchestratorError>,
     baseline: Option<&'a str>,
 }
 
@@ -1648,12 +1683,9 @@ struct OsvFallback {
 }
 
 impl OsvFallback {
-    fn finish(self, bar: Option<&ProgressBar>, name: &str) -> UpdateResult {
+    fn finish(self, bar: Option<&ProgressBar>, name: &str, live_details: bool) -> UpdateResult {
         let message = format!("  ⚠ {}", self.report.describe(name));
-        match bar {
-            Some(bar) => bar.suspend(|| eprintln!("{message}")),
-            None => eprintln!("{message}"),
-        }
+        osv_println(bar, &message, live_details);
         self.outcome
             .with_osv_skipped(self.skipped)
             .with_osv_risk_tradeoff(self.report)
@@ -1672,6 +1704,11 @@ async fn judge_with_osv(
     let warnings = &mut context.warnings;
     let checker = context.checker;
     let ecosystem = context.ecosystem;
+    let live_details = orchestrator.live_osv_details();
+    let warning = |message| OrchestratorError::OsvWarning {
+        package: dep.name.clone(),
+        message,
+    };
     let mut allowed = versions;
     let mut locked_baseline_safe: Option<bool> = None;
     let mut fallback_chain: Vec<String> = Vec::new();
@@ -1692,7 +1729,7 @@ async fn judge_with_osv(
         } = &result
         else {
             if let Some(preferred) = improvement.take().or_else(|| tradeoff.take()) {
-                return Ok(preferred.finish(bar, &dep.name));
+                return Ok(preferred.finish(bar, &dep.name, live_details));
             }
             if fallback_chain.is_empty() {
                 return Ok(result);
@@ -1776,7 +1813,9 @@ async fn judge_with_osv(
                         Ok(OsvCheck::Safe) => true,
                         Ok(OsvCheck::Vulnerable(_)) => false,
                         Err(error) => {
-                            warnings.push(format!("locked baseline OSV check failed: {error}"));
+                            warnings.push(warning(format!(
+                                "locked baseline OSV check failed: {error}"
+                            )));
                             false
                         }
                     };
@@ -1795,7 +1834,7 @@ async fn judge_with_osv(
                 });
                 if before == allowed.len() {
                     if let Some(preferred) = improvement.take().or_else(|| tradeoff.take()) {
-                        return Ok(preferred.finish(bar, &dep.name));
+                        return Ok(preferred.finish(bar, &dep.name, live_details));
                     }
                     return Err(format!(
                         "could not exclude candidate {target} below locked baseline"
@@ -1828,7 +1867,7 @@ async fn judge_with_osv(
                         fallback_chain.join(", "),
                         target
                     );
-                    osv_println(bar, &line);
+                    osv_println(bar, &line, live_details);
                     return Ok(result
                         .with_osv_skipped(fallback_chain)
                         .with_osv_checked(true));
@@ -1859,7 +1898,7 @@ async fn judge_with_osv(
                 });
                 if before == allowed.len() {
                     if let Some(preferred) = improvement.take().or_else(|| tradeoff.take()) {
-                        return Ok(preferred.finish(bar, &dep.name));
+                        return Ok(preferred.finish(bar, &dep.name, live_details));
                     }
                     return Err(format!(
                         "could not exclude {target} while looking for an advisory-free candidate"
@@ -1871,9 +1910,9 @@ async fn judge_with_osv(
                 baseline_error,
             }) => {
                 if let Some(error) = baseline_error {
-                    warnings.push(format!(
+                    warnings.push(warning(format!(
                         "baseline OSV check failed; risk-reduction exception disabled: {error}"
-                    ));
+                    )));
                 }
                 let ids: Vec<_> = advisories
                     .into_iter()
@@ -1886,10 +1925,14 @@ async fn judge_with_osv(
                     ids.join(", ")
                 };
                 let line = format!("  ⚠ OSV: {} {} vulnerable ({})", dep.name, target, detail);
-                osv_println(bar, &line);
+                osv_println(bar, &line, live_details);
 
                 fallback_chain.push(format!("{} ({})", target, detail));
-                warnings.push(format!("{} vulnerable, falling back ({})", target, detail));
+                warnings.push(OrchestratorError::OsvCandidateExcluded {
+                    package: dep.name.clone(),
+                    version: target.clone(),
+                    advisories: ids,
+                });
                 let before = allowed.len();
                 // Python の PEP 440 ローカルバージョン (`1.0+cu121` 等) は build metadata を
                 // 無視する semver 比較では区別できず、安全な候補まで除外して NoSuitableVersion に
@@ -1904,13 +1947,13 @@ async fn judge_with_osv(
                         "  ⚠ {}: could not exclude {} from candidates, stopping candidate selection",
                         dep.name, target
                     );
-                    osv_println(bar, &line);
-                    warnings.push(format!(
+                    osv_println(bar, &line, live_details);
+                    warnings.push(warning(format!(
                         "could not exclude {} from candidates, stopping OSV check",
                         target
-                    ));
+                    )));
                     if let Some(preferred) = improvement.take().or_else(|| tradeoff.take()) {
-                        return Ok(preferred.finish(bar, &dep.name));
+                        return Ok(preferred.finish(bar, &dep.name, live_details));
                     }
                     return Err(format!("could not exclude OSV-rejected candidate {target}"));
                 }
@@ -1918,10 +1961,10 @@ async fn judge_with_osv(
             }
             Err(e) => {
                 let line = format!("  ⚠ OSV check failed for {} {}: {}", dep.name, target, e);
-                osv_println(bar, &line);
-                warnings.push(format!("OSV check failed for {}: {}", target, e));
+                osv_println(bar, &line, live_details);
+                warnings.push(warning(format!("OSV check failed for {}: {}", target, e)));
                 if let Some(preferred) = improvement.take().or_else(|| tradeoff.take()) {
-                    return Ok(preferred.finish(bar, &dep.name));
+                    return Ok(preferred.finish(bar, &dep.name, live_details));
                 }
                 return Ok(if fallback_chain.is_empty() {
                     result
@@ -1938,7 +1981,10 @@ async fn judge_with_osv(
 mod osv_tests;
 
 /// 進捗バーを一時的に隠して診断を出す。非 TTY でも診断を保持する。
-fn osv_println(bar: Option<&ProgressBar>, line: &str) {
+fn osv_println(bar: Option<&ProgressBar>, line: &str, enabled: bool) {
+    if !enabled {
+        return;
+    }
     match bar {
         Some(b) => b.suspend(|| eprintln!("{line}")),
         None => eprintln!("{}", line),

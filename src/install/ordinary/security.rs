@@ -44,7 +44,7 @@ pub(super) async fn audit_osv(
             Ok::<_, String>((content.into_bytes(), notices))
         }
         .await;
-        progress.suspend(|| finish_scope(path, checked, tx, &mut report));
+        progress.suspend(|| finish_scope(path, checked, tx, &mut report, args.verbose));
     }
     let pm = SystemPackageManager::new();
     for job in &plan.node_audits {
@@ -90,7 +90,7 @@ pub(super) async fn audit_osv(
             Ok((bytes, notices))
         }
         .await;
-        progress.suspend(|| finish_scope(path, checked, tx, &mut report));
+        progress.suspend(|| finish_scope(path, checked, tx, &mut report, args.verbose));
     }
     progress.finish_and_clear();
     report
@@ -101,6 +101,7 @@ fn finish_scope(
     checked: Result<(Vec<u8>, Notices), String>,
     tx: &mut InstallTransactions,
     result: &mut SecurityResult,
+    verbose: bool,
 ) {
     let checked = checked.and_then(|(bytes, notices)| {
         if tx.manages(&path) {
@@ -116,8 +117,12 @@ fn finish_scope(
         Err(error) => {
             result.failed = true;
             let reason = format!("final lock OSV verification failed: {error}");
-            eprintln!("  {} — {reason}", path.display());
-            tx.fail_holder(&path, reason);
+            // この理由が復元報告へ渡った場合だけ、通常表示の重複を抑える。
+            // 監査だけの lock や、別の原因ですでに失敗した単位の診断も残す。
+            let recorded = tx.fail_holder(&path, reason.clone());
+            if verbose || !recorded {
+                eprintln!("  {} — {reason}", path.display());
+            }
         }
     }
 }

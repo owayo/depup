@@ -207,7 +207,7 @@ async fn final_cargo_osv_tradeoff_accepts_medium_and_restores_on_high() {
         } else {
             assert!(!outcome.audit_failed);
             assert_eq!(run.project.locked_versions("leaf"), ["1.1.0"]);
-            assert!(run.result.errors.iter().any(|error| matches!(error, crate::orchestrator::OrchestratorError::OsvWarning { message, .. } if message.contains("severity trade-off accepted"))));
+            assert!(run.result.errors.iter().any(|error| matches!(error, crate::orchestrator::OrchestratorError::OsvTradeoff { report, .. } if !report.fixed.is_empty())));
         }
         run.project.cargo_ok(&["update", "--workspace", "--locked"]);
     }

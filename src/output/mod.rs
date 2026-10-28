@@ -17,6 +17,35 @@ use crate::domain::{ManifestUpdateResult, UpdateSummary};
 use crate::orchestrator::OrchestratorResult;
 use std::io::Write;
 
+/// 診断の単語や advisory ID を切らずに折り返す。
+pub(crate) fn write_wrapped(
+    writer: &mut dyn Write,
+    prefix: &str,
+    text: &str,
+) -> std::io::Result<()> {
+    let mut line = prefix.to_string();
+    let indent = prefix.chars().count();
+    let mut width = indent;
+    let mut has_word = false;
+    for word in text.split_whitespace() {
+        let word_width = word.chars().count();
+        if has_word && width + 1 + word_width > 100 {
+            writeln!(writer, "{line}")?;
+            line = " ".repeat(indent);
+            width = indent;
+            has_word = false;
+        }
+        if has_word {
+            line.push(' ');
+            width += 1;
+        }
+        line.push_str(word);
+        width += word_width;
+        has_word = true;
+    }
+    writeln!(writer, "{line}")
+}
+
 /// 出力フォーマットオプション
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OutputFormat {

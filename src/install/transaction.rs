@@ -673,14 +673,17 @@ impl InstallTransactions {
 
     /// この lockfile またはマニフェストを保持する単位を失敗にする。[`Self::fail_verification`] と違い、
     /// 同じディレクトリの独立した install（Cargo の隣の uv や Go）には影響しない。
-    pub(super) fn fail_holder(&mut self, path: &Path, reason: String) {
+    pub(super) fn fail_holder(&mut self, path: &Path, reason: String) -> bool {
         let key = identity(path);
+        let mut recorded = false;
         for unit in &mut self.units {
             if unit.files.contains(&key) && unit.failure.is_none() {
                 unit.failure = Some(reason.clone());
                 unit.policy_failure = true;
+                recorded = true;
             }
         }
+        recorded
     }
 
     pub(super) fn fail_verification(&mut self, directory: &Path, reason: String) {
@@ -1206,39 +1209,83 @@ impl RollbackReport {
                 }
                 for result in &mut manifest.results {
                     if result.is_update() && result.write_error().is_none() {
-                        result.record_write_error(format!(
-                            "{} failed; update canceled: {}{incomplete}",
-                            if unit.policy_failure {
-                                "lock verification"
-                            } else {
-                                "install"
+                        result.record_cancellation(
+                            format!(
+                                "{} failed; update canceled: {}{incomplete}",
+                                if unit.policy_failure {
+                                    "lock verification"
+                                } else {
+                                    "install"
+                                },
+                                unit.reason
+                            ),
+                            crate::domain::UpdateCancellation {
+                                lock_verification: unit.policy_failure,
+                                recovered: unit.recovered(),
                             },
-                            unit.reason
-                        ));
+                        );
                     }
                 }
             }
         }
     }
-    pub fn print(&self, out: &mut impl Write) -> io::Result<()> {
+    pub fn print(&self, out: &mut impl Write, verbose: bool) -> io::Result<()> {
         for unit in &self.units {
-            writeln!(
-                out,
-                "{} failed; recovering project changes ({})",
-                if unit.policy_failure {
-                    "Lock verification"
-                } else {
-                    "Install"
-                },
-                unit.reason
-            )?;
+            if !verbose {
+                writeln!(
+                    out,
+                    "Updates canceled — {}",
+                    if !unit.recovered() {
+                        "recovery incomplete"
+                    } else if unit.policy_failure {
+                        "final lock verification failed"
+                    } else {
+                        "package manager install failed"
+                    }
+                )?;
+                crate::output::write_wrapped(out, "  Cause: ", &unit.reason)?;
+                crate::output::write_wrapped(
+                    out,
+                    "  Scope: ",
+                    &unit
+                        .directories
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                )?;
+            } else {
+                writeln!(
+                    out,
+                    "{} failed; recovering project changes ({})",
+                    if unit.policy_failure {
+                        "Lock verification"
+                    } else {
+                        "Install"
+                    },
+                    unit.reason
+                )?;
+            }
             for (path, outcome) in &unit.files {
+                let display_path = if verbose {
+                    path.as_path()
+                } else {
+                    unit.directories
+                        .iter()
+                        .filter_map(|directory| path.strip_prefix(directory).ok())
+                        .min_by_key(|path| path.components().count())
+                        .unwrap_or(path)
+                };
                 match outcome {
                     FileOutcome::Unchanged => {}
-                    FileOutcome::Restored => writeln!(out, "  restored {}", path.display())?,
-                    FileOutcome::Removed => {
-                        writeln!(out, "  removed {} (created during install)", path.display())?
+                    FileOutcome::Restored => {
+                        writeln!(out, "  restored {}", display_path.display())?
                     }
+                    FileOutcome::Removed => writeln!(
+                        out,
+                        "  removed {} (created during install)",
+                        display_path.display()
+                    )?,
                     FileOutcome::Conflict { reason, backup }
                     | FileOutcome::Failed { reason, backup } => {
                         writeln!(
@@ -1261,28 +1308,78 @@ impl RollbackReport {
             if unit.recovered() {
                 writeln!(
                     out,
-                    "  The project files are back to their state before this run."
+                    "{}",
+                    if verbose {
+                        "  The project files are back to their state before this run."
+                    } else {
+                        "  Recovery: project files restored to their state before this run."
+                    }
                 )?;
             } else if unit.skipped {
                 writeln!(
                     out,
-                    "  Recovery was skipped: a file of this install changed outside depup, so none of its files were restored. The files listed above keep this run's changes, and whether they still match each other was not checked. Review the external change and the recovery information above before restoring them."
+                    "{}",
+                    if verbose {
+                        "  Recovery was skipped: a file of this install changed outside depup, so none of its files were restored. The files listed above keep this run's changes, and whether they still match each other was not checked. Review the external change and the recovery information above before restoring them."
+                    } else {
+                        "  Recovery: skipped because a file changed outside depup; no files restored. The files kept above were not checked for consistency."
+                    }
                 )?;
             } else {
                 writeln!(
                     out,
-                    "  Recovery is incomplete: the files kept above need manual recovery. Until then, they may not match the restored files."
+                    "{}",
+                    if verbose {
+                        "  Recovery is incomplete: the files kept above need manual recovery. Until then, they may not match the restored files."
+                    } else {
+                        "  Recovery: incomplete; files kept above need manual recovery and may not match restored files."
+                    }
                 )?;
             }
-            writeln!(
-                out,
-                "  Install artifacts are retained. Re-run the package manager after recovery{}",
-                if unit.policy_failure {
-                    "."
+            if !verbose {
+                if unit.recovered() {
+                    let node_managers: BTreeSet<_> = self
+                        .node_managers
+                        .values()
+                        .filter(|(directory, _)| unit.directories.contains(&identity(directory)))
+                        .map(|(_, manager)| *manager)
+                        .collect();
+                    if node_managers.len() == 1
+                        && !unit.files.keys().any(|path| path.ends_with("Cargo.toml"))
+                    {
+                        writeln!(
+                            out,
+                            "  Next: run {} install in the scope above to align node_modules with the restored lockfile.",
+                            node_managers.first().unwrap()
+                        )?;
+                    } else {
+                        writeln!(
+                            out,
+                            "  Next: re-run the package manager to align installed artifacts with the restored lockfile."
+                        )?;
+                    }
                 } else {
-                    "; age audits for this project were skipped."
+                    writeln!(
+                        out,
+                        "  Next: review the kept files and recovery copies above before running the package manager."
+                    )?;
                 }
-            )?;
+                writeln!(
+                    out,
+                    "  Installed artifacts (such as node_modules or target) were retained."
+                )?;
+                writeln!(out)?;
+            } else {
+                writeln!(
+                    out,
+                    "  Install artifacts are retained. Re-run the package manager after recovery{}",
+                    if unit.policy_failure {
+                        "."
+                    } else {
+                        "; age audits for this project were skipped."
+                    }
+                )?;
+            }
         }
         Ok(())
     }

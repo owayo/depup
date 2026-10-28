@@ -135,7 +135,7 @@ depup --no-osv
 - Swift packages are not checked: OSV identifies Swift packages by their full repository URL, while depup identifies them by GitHub `owner/repo`, so the lookups would not match.
 - mise tools are not checked: each backend has its own version scheme and namespace, so they cannot be mapped onto a single OSV ecosystem.
 - Cargo git dependencies are not checked either.
-- A failed OSV lookup does not block the update: the version is adopted without a vulnerability check, so it does not get the `✓ OSV` mark. The failure is listed in the `Errors:` section (the `errors` array in JSON) and does not change the exit code.
+- A failed OSV lookup does not block the update: the version is adopted without a vulnerability check, so it does not get the `✓ OSV` mark. The failure is listed in the `Warnings:` section (the `errors` array in JSON) and does not change the exit code.
 
 If OSV removes every eligible update, the skip reason is `no eligible update without known vulnerabilities`, rather than `latest`. The normal text report lists the rejected versions and checks the manifest's baseline version for advisory IDs. This baseline is the version used to compare the manifest constraint; it is not a claim about the version installed in a lockfile. If the baseline cannot be matched to a published version, or its OSV lookup fails, the report says it is unconfirmed.
 
@@ -158,7 +158,6 @@ When a candidate fails this policy, depup checks the next newest one. Advisory-f
 
 ```text
 $ depup --install --include-pinned
-  ⚠ OSV: dompurify 3.4.8 vulnerable (GHSA-vxr8-fq34-vvx9)
 ./package.json (Node.js) — 9 updates, 41 skips
   @mui/icons-material   9.0.1 → 9.1.0 [minor] (2026/06/08 08:30) ✓ OSV
   @mui/material         9.0.1 → 9.1.0 [minor] (2026/06/08 08:29) ✓ OSV
@@ -170,17 +169,17 @@ $ depup --install --include-pinned
   @types/node           25.9.1 → 25.9.2 [patch] (2026/06/05 22:33) ✓ OSV 🔧
   @types/react          19.2.15 → 19.2.17 [patch] (2026/06/05 20:10) ✓ OSV 🔧
 
-Errors:
-  ✗ OSV check for dompurify: 3.4.8 vulnerable, falling back (GHSA-vxr8-fq34-vvx9)
+Notices:
+  OSV excluded 1 vulnerable candidate(s); these notices did not stop the run. Details: --verbose.
 
 Summary:
   9 package(s) updated (4 minor, 5 patch)
   41 package(s) skipped
 ```
 
-In this run, no other dompurify candidate qualified after 3.4.8 was removed, so dompurify was not updated and is one of the 41 skips. When the fallback does find a safe version, the update line is followed by `↳ OSV skipped: <version> (<advisory>)`.
+In this run, no other dompurify candidate qualified after 3.4.8 was removed, so dompurify was not updated and is one of the 41 skips. When the fallback finds a safe version, the update line is followed by an excluded-candidate count; `--verbose` adds `↳ OSV skipped: <version> (<advisory>)`.
 
-The `falling back` entry is informational: depup avoided a vulnerable version as designed, so it does not affect the exit code. The `⚠ OSV:` line above the report is progress output on stderr: it appears only when stderr is a terminal, except with `--quiet`, where it is always printed. In the default text output, the same information also appears in the `Errors:` section (`errors` in JSON), so it is not lost in CI.
+Candidate exclusions are informational: depup avoided vulnerable versions as designed, so they do not affect the exit code. Normal text summarizes them under `Notices:` instead of repeating the advisory lists during progress. `--verbose` includes the full versions and advisory IDs. OSV lookup problems remain visible under `Warnings:`, and JSON keeps the original diagnostics in `errors`, so the details remain available in CI.
 
 ### Limiting Bumps (`--max-change`)
 
@@ -416,11 +415,14 @@ Versions that were already locked before the run never restore the unit by thems
 Restoration works like install-failure recovery: depup writes back the bytes saved before the run, removes lockfiles the install created, and keeps installed artifacts (`node_modules`, `target`, and similar). It never overwrites a file that changed outside depup's own operations, and if any file of the unit changed that way, it restores none of the unit's files. The package manager succeeded, so the files left in place still belong together, whereas restoring only the manifest would leave it out of step with the kept lockfile (`cargo --locked` would then fail). Each changed file keeps this run's changes, a recovery copy of its original is saved, and the report says that recovery was skipped and that the files were not checked against each other. Units connected through a shared lock, a pnpm workspace, or a Tauri project are restored together; an independent install in the same directory, such as a Go module or Gemfile next to `Cargo.toml`, keeps its changes. The canceled updates appear in `failed` with the reason (`lock verification failed; update canceled: ...`), and the run exits with code 2. Run the package manager again afterwards to bring installed artifacts back in line with the restored lockfile.
 
 ```text
-Lock verification failed; recovering project changes (Cargo.lock keeps versions this run added that do not pass --age: leaf 1.2.0 (newer than --age))
-  restored ./Cargo.lock
-  restored ./Cargo.toml
-  The project files are back to their state before this run.
-  Install artifacts are retained. Re-run the package manager after recovery.
+Updates canceled — final lock verification failed
+  Cause: Cargo.lock keeps versions this run added that do not pass --age: leaf 1.2.0 (newer than --age)
+  Scope: /path/to/project
+  restored Cargo.lock
+  restored Cargo.toml
+  Recovery: project files restored to their state before this run.
+  Next: re-run the package manager to align installed artifacts with the restored lockfile.
+  Installed artifacts (such as node_modules or target) were retained.
 ```
 
 A pnpm update-target mismatch (an override or resolution that left a direct dependency at another version) is not an age failure; it keeps the files for inspection and exits with code 2. Cargo `--install --refresh-lock` also retains the refresh when age violations involve only pre-run versions. See [Refreshing Lockfiles](#refreshing-lockfiles---install---refresh-lock) for its additional verification and recovery conditions, including OSV.
