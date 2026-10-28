@@ -5,6 +5,30 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+/// 更新候補を OSV で除外した結果。安全性の照会は版の選択条件を緩めない。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OsvBlocked {
+    pub skipped_versions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_version: Option<String>,
+    pub current_vulnerable: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub current_advisories: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_check_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safe_after_age: Option<AgeWaitingVersion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_check_error: Option<String>,
+}
+
+/// ほかの更新条件と OSV を満たすが、公開後の待機期間が残る版。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgeWaitingVersion {
+    pub version: String,
+    pub eligible_at: DateTime<Utc>,
+}
+
 /// 依存関係の更新がスキップされた理由
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -25,6 +49,8 @@ pub enum SkipReason {
     FetchFailed(String),
     /// 適切なバージョンが見つからない (例: 経過日数フィルタで全バージョンが除外)
     NoSuitableVersion,
+    /// 更新可能な版をすべて既知の脆弱性で除外した。
+    KnownVulnerabilities(OsvBlocked),
     /// 更新候補の公開日が不明で、age 制約を確認できない
     ReleaseDateUnknown(String),
     /// 公開日を個別に取得するレジストリで、取得の上限に達し、この版とそれより古い候補の
@@ -50,6 +76,9 @@ impl fmt::Display for SkipReason {
             SkipReason::PnpmOverride(message) => write!(f, "{message}"),
             SkipReason::FetchFailed(msg) => write!(f, "fetch failed: {}", msg),
             SkipReason::NoSuitableVersion => write!(f, "no suitable version"),
+            SkipReason::KnownVulnerabilities(_) => {
+                write!(f, "no eligible update without known vulnerabilities")
+            }
             SkipReason::ReleaseDateUnknown(version) => {
                 write!(f, "release date unavailable for {version}")
             }

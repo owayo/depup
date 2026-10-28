@@ -7,6 +7,7 @@ use crate::cli::CliArgs;
 use crate::domain::LockRefreshResult;
 use crate::file_snapshot::{FileGuard, FileState};
 use crate::manifest::{is_crates_io_source, parse_lock_packages};
+use crate::orchestrator::osv_report::RollbackOsvChecks;
 use crate::package_manager::{InstallResult, PreparedInstall, SystemPackageManager};
 use crate::progress::Progress;
 use async_trait::async_trait;
@@ -289,6 +290,7 @@ async fn run_with(
     let mut admitted = BTreeMap::new();
     let mut errors = BTreeMap::new();
     let mut audit_failed = false;
+    let mut rollback_osv = RollbackOsvChecks::default();
     let manifests = tx.declaration_snapshots();
     for job in &jobs {
         if tx.pending_report().covers_directory(&job.directory) {
@@ -338,6 +340,7 @@ async fn run_with(
             let (audit, receipt) = verifier
                 .cargo_age(job, &baseline, preferred, &progress)
                 .await;
+            rollback_osv.record(&job.directory, &audit);
             let ownership = receipt.map_or(Ok(()), |receipt| {
                 tx.accept_audit_lock(&lock_path(job), &receipt.before, &receipt.after)
             });
@@ -412,6 +415,7 @@ async fn run_with(
     let report = tx.rollback();
     let report_error = report.print(&mut std::io::stderr()).err();
     report.mark_summary(&mut result.summary);
+    rollback_osv.warn(orchestrator, result, args.quiet).await;
     if jobs.is_empty() {
         result.summary.lock_refreshes.push(LockRefreshResult {
             directory: args.path.clone(),

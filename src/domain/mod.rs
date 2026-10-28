@@ -23,5 +23,5 @@ pub use dependency::Dependency;
 pub use git_source::{GitReference, GitSource};
 pub use language::Language;
 pub use summary::{LanguageCounts, LockRefreshResult, ManifestUpdateResult, UpdateSummary};
-pub use update_result::{SkipReason, UpdateResult};
+pub use update_result::{AgeWaitingVersion, OsvBlocked, SkipReason, UpdateResult};
 pub use version_spec::{VersionSpec, VersionSpecKind, range_lower_bound_version};
