@@ -144,13 +144,17 @@ pub struct CliArgs {
 
     // 脆弱性チェック (OSV.dev)
     /// 更新候補を OSV.dev の脆弱性データベースで確認し、
-    /// 既知の脆弱性があるバージョンを除外する（既定で有効。ネットワーク接続が必要）
+    /// 重要度と解消件数に基づいて更新を判定する（既定で有効。ネットワーク接続が必要）
     #[arg(long, conflicts_with = "no_osv")]
     pub osv: bool,
 
     /// 今回の実行では OSV 脆弱性チェックを無効にする（グローバル設定と既定値より優先）
     #[arg(long = "no-osv")]
     pub no_osv: bool,
+
+    /// 既存の脆弱性を修正できる場合でも、既知の脆弱性が残る更新候補をすべて除外する
+    #[arg(long = "no-osv-risk-tradeoff")]
+    pub no_osv_risk_tradeoff: bool,
 
     // 変更レベル上限
     /// 許可する最大のバージョン変更レベルを制限する（patch / minor / major）

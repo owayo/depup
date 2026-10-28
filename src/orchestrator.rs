@@ -20,6 +20,7 @@ use crate::global_config::GlobalConfig;
 
 mod age;
 mod node_preflight;
+mod osv_policy;
 pub(crate) mod osv_report;
 use crate::manifest::{
     ManifestInfo, ManifestWriter, MiseSettings, RegistryLockEntries, WriteResult, detect_manifests,
@@ -341,6 +342,7 @@ impl Orchestrator {
         adapter: &(dyn RegistryAdapter + Send + Sync),
         judge: &UpdateJudge,
         bar: Option<&ProgressBar>,
+        osv_baseline: Option<String>,
     ) -> OnePassResult {
         // 早期スキップ判定
         if let Some(reason) = judge.should_skip(&dep) {
@@ -417,6 +419,7 @@ impl Orchestrator {
                             ecosystem: eco,
                             bar,
                             warnings: &mut osv_warnings,
+                            baseline: osv_baseline.as_deref(),
                         };
                         judge_with_osv(self, adapter, judge, &dep, versions, &mut context).await
                     }
@@ -723,6 +726,7 @@ impl Orchestrator {
 
         let mut pnpm_settings = BTreeMap::new();
         for ParsedManifest { info, dependencies } in parsed {
+            let osv_baselines = self.osv_baselines(info, &dependencies).await;
             let dir = info.path.parent().unwrap_or(&self.args.path);
             let mut filter = self.build_filter_for(dir);
             let policy = match self.resolved_age_policy_for_language(dir, info.language) {
@@ -801,6 +805,7 @@ impl Orchestrator {
             let concurrency = version_check_concurrency(dependencies.len());
             let results: Vec<OnePassResult> = stream::iter(dependencies)
                 .map(|dep| {
+                    let osv_baseline = osv_baselines.get(dep.manifest_name()).cloned();
                     let adapter = Arc::clone(&adapter);
                     let bar = progress_bar.clone();
                     let override_reason = overrides.and_then(|settings| settings.reason(&dep));
@@ -819,8 +824,14 @@ impl Orchestrator {
                                 osv_warnings: Vec::new(),
                             }
                         } else {
-                            self.process_one_dependency(dep, &*adapter, judge, bar.as_ref())
-                                .await
+                            self.process_one_dependency(
+                                dep,
+                                &*adapter,
+                                judge,
+                                bar.as_ref(),
+                                osv_baseline,
+                            )
+                            .await
                         };
                         if let Some(ref b) = bar {
                             b.inc(1);
@@ -1627,6 +1638,26 @@ struct OsvJudgeContext<'a> {
     ecosystem: &'a str,
     bar: Option<&'a ProgressBar>,
     warnings: &'a mut Vec<String>,
+    baseline: Option<&'a str>,
+}
+
+struct OsvFallback {
+    outcome: UpdateResult,
+    report: crate::osv::RiskTradeoff,
+    skipped: Vec<String>,
+}
+
+impl OsvFallback {
+    fn finish(self, bar: Option<&ProgressBar>, name: &str) -> UpdateResult {
+        let message = format!("  ⚠ {}", self.report.describe(name));
+        match bar {
+            Some(bar) => bar.suspend(|| eprintln!("{message}")),
+            None => eprintln!("{message}"),
+        }
+        self.outcome
+            .with_osv_skipped(self.skipped)
+            .with_osv_risk_tradeoff(self.report)
+    }
 }
 
 async fn judge_with_osv(
@@ -1642,7 +1673,10 @@ async fn judge_with_osv(
     let checker = context.checker;
     let ecosystem = context.ecosystem;
     let mut allowed = versions;
+    let mut locked_baseline_safe: Option<bool> = None;
     let mut fallback_chain: Vec<String> = Vec::new();
+    let mut improvement: Option<OsvFallback> = None;
+    let mut tradeoff: Option<OsvFallback> = None;
     loop {
         allowed = match orchestrator
             .resolve_java_release_dates(dep, adapter, judge, allowed)
@@ -1657,6 +1691,9 @@ async fn judge_with_osv(
             ..
         } = &result
         else {
+            if let Some(preferred) = improvement.take().or_else(|| tradeoff.take()) {
+                return Ok(preferred.finish(bar, &dep.name));
+            }
             if fallback_chain.is_empty() {
                 return Ok(result);
             }
@@ -1727,12 +1764,63 @@ async fn judge_with_osv(
         };
         let target = target.clone();
 
+        // lock より古い版を書いても、解決済みの脆弱な版がそのまま残り得る。
+        // lock が安全と確認できる場合は、従来どおり manifest の下限を上げられる。
+        if let Some(baseline) = context.baseline
+            && compare_dependency_versions(dep, &target, baseline) == std::cmp::Ordering::Less
+        {
+            let safe = match locked_baseline_safe {
+                Some(safe) => safe,
+                None => {
+                    let safe = match checker.check(ecosystem, &dep.name, baseline).await {
+                        Ok(OsvCheck::Safe) => true,
+                        Ok(OsvCheck::Vulnerable(_)) => false,
+                        Err(error) => {
+                            warnings.push(format!("locked baseline OSV check failed: {error}"));
+                            false
+                        }
+                    };
+                    locked_baseline_safe = Some(safe);
+                    safe
+                }
+            };
+            if !safe {
+                fallback_chain.push(format!(
+                    "{target} (below vulnerable or unconfirmed locked baseline {baseline})"
+                ));
+                let before = allowed.len();
+                allowed.retain(|version| {
+                    compare_dependency_versions(dep, &version.version, &target)
+                        != std::cmp::Ordering::Equal
+                });
+                if before == allowed.len() {
+                    if let Some(preferred) = improvement.take().or_else(|| tradeoff.take()) {
+                        return Ok(preferred.finish(bar, &dep.name));
+                    }
+                    return Err(format!(
+                        "could not exclude candidate {target} below locked baseline"
+                    ));
+                }
+                continue;
+            }
+        }
+
         if let Some(b) = bar {
             b.set_message(format!("OSV: {} {}", dep.name, target));
         }
 
-        match checker.check(ecosystem, &dep.name, &target).await {
-            Ok(OsvCheck::Safe) => {
+        let baseline: Vec<String> = context.baseline.into_iter().map(str::to_string).collect();
+        match checker
+            .assess_versions(
+                ecosystem,
+                &dep.name,
+                &baseline,
+                std::slice::from_ref(&target),
+                orchestrator.osv_risk_tradeoff_enabled(),
+            )
+            .await
+        {
+            Ok(crate::osv::Assessment::Safe) => {
                 if !fallback_chain.is_empty() {
                     let line = format!(
                         "  ↓ {}: skipped {} due to OSV → using {}",
@@ -1748,7 +1836,50 @@ async fn judge_with_osv(
                 // チェック完了・脆弱性なし
                 return Ok(result.with_osv_checked(true));
             }
-            Ok(OsvCheck::Vulnerable(ids)) => {
+            Ok(crate::osv::Assessment::Tradeoff(report)) => {
+                let slot = if report.introduced.is_empty() {
+                    &mut improvement
+                } else {
+                    &mut tradeoff
+                };
+                if slot.is_none() {
+                    *slot = Some(OsvFallback {
+                        outcome: result,
+                        report,
+                        skipped: fallback_chain.clone(),
+                    });
+                }
+                fallback_chain.push(format!(
+                    "{target} (known vulnerabilities; trade-off candidate)"
+                ));
+                let before = allowed.len();
+                allowed.retain(|version| {
+                    compare_dependency_versions(dep, &version.version, &target)
+                        != std::cmp::Ordering::Equal
+                });
+                if before == allowed.len() {
+                    if let Some(preferred) = improvement.take().or_else(|| tradeoff.take()) {
+                        return Ok(preferred.finish(bar, &dep.name));
+                    }
+                    return Err(format!(
+                        "could not exclude {target} while looking for an advisory-free candidate"
+                    ));
+                }
+            }
+            Ok(crate::osv::Assessment::Rejected {
+                advisories,
+                baseline_error,
+            }) => {
+                if let Some(error) = baseline_error {
+                    warnings.push(format!(
+                        "baseline OSV check failed; risk-reduction exception disabled: {error}"
+                    ));
+                }
+                let ids: Vec<_> = advisories
+                    .into_iter()
+                    .map(|advisory| advisory.id)
+                    .filter(|id| !id.is_empty())
+                    .collect();
                 let detail = if ids.is_empty() {
                     "no advisory IDs".to_string()
                 } else {
@@ -1770,7 +1901,7 @@ async fn judge_with_osv(
                 if allowed.len() == before {
                     // 除外できなかった (compare_versions の都合) → 無限ループ防止
                     let line = format!(
-                        "  ⚠ {}: could not exclude {} from candidates, keeping it",
+                        "  ⚠ {}: could not exclude {} from candidates, stopping candidate selection",
                         dep.name, target
                     );
                     osv_println(bar, &line);
@@ -1778,7 +1909,10 @@ async fn judge_with_osv(
                         "could not exclude {} from candidates, stopping OSV check",
                         target
                     ));
-                    return Ok(result.with_osv_skipped(fallback_chain));
+                    if let Some(preferred) = improvement.take().or_else(|| tradeoff.take()) {
+                        return Ok(preferred.finish(bar, &dep.name));
+                    }
+                    return Err(format!("could not exclude OSV-rejected candidate {target}"));
                 }
                 // ループ継続 → 次の候補で再判定
             }
@@ -1786,6 +1920,9 @@ async fn judge_with_osv(
                 let line = format!("  ⚠ OSV check failed for {} {}: {}", dep.name, target, e);
                 osv_println(bar, &line);
                 warnings.push(format!("OSV check failed for {}: {}", target, e));
+                if let Some(preferred) = improvement.take().or_else(|| tradeoff.take()) {
+                    return Ok(preferred.finish(bar, &dep.name));
+                }
                 return Ok(if fallback_chain.is_empty() {
                     result
                 } else {
@@ -1885,7 +2022,11 @@ fn git_urls_match(a: &str, b: &str) -> bool {
 /// 同じ結果になる。
 fn tauri_sync_protected(result: &UpdateResult) -> bool {
     match result {
-        UpdateResult::Update { osv_skipped, .. } => !osv_skipped.is_empty(),
+        UpdateResult::Update {
+            osv_skipped,
+            osv_risk_tradeoff,
+            ..
+        } => !osv_skipped.is_empty() || osv_risk_tradeoff.is_some(),
         UpdateResult::Skip { reason, .. } => !matches!(
             reason,
             SkipReason::AlreadyLatest | SkipReason::NoSuitableVersion
@@ -2884,7 +3025,7 @@ mod tests {
             // 版と公開日のキャッシュは実行全体で共有されるので、組ごとに名前を変える
             let dep = swift_dependency(&format!("owner/library{index}"));
             let result = orchestrator
-                .process_one_dependency(dep, &adapter, &judge, None)
+                .process_one_dependency(dep, &adapter, &judge, None, None)
                 .await
                 .outcome;
             let outcome = match &result {
@@ -2947,7 +3088,13 @@ mod tests {
             now,
         );
         let result = orchestrator
-            .process_one_dependency(swift_dependency("owner/cached"), &adapter, &judge, None)
+            .process_one_dependency(
+                swift_dependency("owner/cached"),
+                &adapter,
+                &judge,
+                None,
+                None,
+            )
             .await;
         assert!(
             matches!(&result.outcome, UpdateResult::Update { new_version, .. } if new_version == "1.1.0"),
@@ -2968,7 +3115,13 @@ mod tests {
             now,
         );
         let result = orchestrator
-            .process_one_dependency(swift_dependency("owner/failing"), &adapter, &judge, None)
+            .process_one_dependency(
+                swift_dependency("owner/failing"),
+                &adapter,
+                &judge,
+                None,
+                None,
+            )
             .await;
         assert!(result.fetch_error.is_some());
         assert!(matches!(
@@ -3266,6 +3419,7 @@ mod tests {
         let mut warnings = Vec::new();
         let mut context = OsvJudgeContext {
             checker: &checker,
+            baseline: None,
             ecosystem: "crates.io",
             bar: None,
             warnings: &mut warnings,

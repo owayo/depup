@@ -2,8 +2,73 @@ use super::*;
 use crate::domain::{ManifestUpdateResult, UpdateSummary};
 use clap::Parser;
 use std::sync::Mutex;
+use std::time::Duration;
 
 const SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
+
+#[tokio::test]
+async fn refresh_osv_tradeoff_accepts_medium_and_restores_on_high() {
+    use crate::osv::{Advisory, OsvChecker, Severity};
+    for severity in [Severity::Medium, Severity::High] {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut result, plan) =
+            fixture(temp.path(), &[(temp.path().to_path_buf(), Language::Rust)]);
+        let before = std::fs::read(temp.path().join("Cargo.lock")).unwrap();
+        let args = args(temp.path());
+        let orchestrator = Orchestrator::new(args.clone()).unwrap();
+        let verifier = FakeVerification {
+            checker: Some(OsvChecker::mock_advisories(&[
+                (
+                    "1.0.0",
+                    Ok(vec![Advisory {
+                        id: "RESOLVED".into(),
+                        aliases: vec![],
+                        severity: Severity::Medium,
+                    }]),
+                ),
+                (
+                    "1.1.0",
+                    Ok(vec![Advisory {
+                        id: "INTRODUCED".into(),
+                        aliases: vec![],
+                        severity,
+                    }]),
+                ),
+            ])),
+            ..Default::default()
+        };
+        let outcome = run_with(
+            &args,
+            &orchestrator,
+            &plan,
+            &mut result,
+            &verifier,
+            |command| {
+                std::fs::write(command.directory.join("Cargo.lock"), lock("1.1.0")).unwrap();
+                InstallResult::success(
+                    command.language,
+                    "cargo update".into(),
+                    String::new(),
+                    String::new(),
+                )
+            },
+        )
+        .await;
+        assert!(!outcome.install_failed);
+        if severity == Severity::High {
+            assert!(outcome.audit_failed);
+            assert_eq!(
+                std::fs::read(temp.path().join("Cargo.lock")).unwrap(),
+                before
+            );
+            assert_eq!(result.summary.lock_refreshes[0].status, "failed");
+        } else {
+            assert!(!outcome.audit_failed);
+            assert_eq!(result.summary.lock_refreshes[0].status, "completed");
+            assert!(result.errors.iter().any(|error| matches!(error, crate::orchestrator::OrchestratorError::OsvWarning { message, .. } if message.contains("severity trade-off accepted"))));
+        }
+    }
+}
 
 fn lock(version: &str) -> String {
     format!(
@@ -87,6 +152,7 @@ fn fixture(root: &Path, languages: &[(PathBuf, Language)]) -> (OrchestratorResul
 
 #[derive(Default)]
 struct FakeVerification {
+    checker: Option<crate::osv::OsvChecker>,
     node_version: Option<String>,
     seen: Mutex<Vec<String>>,
     osv_error: Option<String>,
@@ -98,6 +164,28 @@ struct FakeVerification {
 
 #[async_trait(?Send)]
 impl Verification for FakeVerification {
+    async fn osv_change(
+        &self,
+        language: Language,
+        name: &str,
+        before: &[String],
+        after: &[String],
+    ) -> Result<Option<crate::osv::RiskTradeoff>, String> {
+        if let Some(checker) = &self.checker {
+            return match checker
+                .assess_versions(language.osv_ecosystem().unwrap(), name, before, after, true)
+                .await?
+            {
+                crate::osv::Assessment::Safe => Ok(None),
+                crate::osv::Assessment::Tradeoff(report) => Ok(Some(report)),
+                crate::osv::Assessment::Rejected { .. } => Err(format!("OSV rejected {name}")),
+            };
+        }
+        for version in after.iter().filter(|version| !before.contains(version)) {
+            self.osv(language, name, version).await?;
+        }
+        Ok(None)
+    }
     async fn snapshot(&self, job: &InstallJob) -> Result<Snapshot, String> {
         let content = std::fs::read_to_string(lock_path(job)).map_err(|error| error.to_string())?;
         let packages = crate::manifest::parse_registry_entries(&content)

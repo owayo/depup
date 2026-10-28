@@ -100,6 +100,119 @@ fn args(directory: &Path) -> CliArgs {
     args
 }
 
+struct WithOsv<'a> {
+    fixed: &'a Fixed,
+    checker: crate::osv::OsvChecker,
+}
+
+#[async_trait(?Send)]
+impl Checks for WithOsv<'_> {
+    fn osv_enabled(&self) -> bool {
+        true
+    }
+    async fn osv_change(
+        &self,
+        _: Language,
+        name: &str,
+        before: &[String],
+        after: &[String],
+    ) -> Result<Option<crate::osv::RiskTradeoff>, String> {
+        match self
+            .checker
+            .assess_versions("crates.io", name, before, after, true)
+            .await?
+        {
+            crate::osv::Assessment::Safe => Ok(None),
+            crate::osv::Assessment::Tradeoff(report) => Ok(Some(report)),
+            crate::osv::Assessment::Rejected { .. } => Err(format!("OSV rejected {name}")),
+        }
+    }
+    async fn rust_lock(
+        &self,
+        lock: &RustLockPlan,
+        bar: Option<&ProgressBar>,
+    ) -> (LockAgeAuditResult, Option<AuditReceipt>) {
+        self.fixed.rust_lock(lock, bar).await
+    }
+    async fn node_baseline(&self, directory: &Path, manager: &str) -> NodeBaseline {
+        self.fixed.node_baseline(directory, manager).await
+    }
+    async fn node_lock(
+        &self,
+        directory: &Path,
+        manager: &str,
+        policy: &AgePolicy,
+        bar: Option<&ProgressBar>,
+    ) -> NodeLockAuditResult {
+        self.fixed.node_lock(directory, manager, policy, bar).await
+    }
+    async fn pnpm_targets(&self, directory: &Path, summary: &mut UpdateSummary) -> Vec<String> {
+        self.fixed.pnpm_targets(directory, summary).await
+    }
+}
+
+#[tokio::test]
+async fn final_cargo_osv_tradeoff_accepts_medium_and_restores_on_high() {
+    use crate::osv::{Advisory, OsvChecker, Severity};
+    for severity in [Severity::Medium, Severity::High] {
+        let mut run = rust_run("^1.1", "1.0.0");
+        let args = args(run.project.path());
+        let orchestrator = Orchestrator::new(args.clone()).unwrap();
+        let plan = InstallPlan::new(&orchestrator, &run.result, &None, run.project.path());
+        let checker = OsvChecker::mock_advisories(&[
+            (
+                "1.0.0",
+                Ok(vec![Advisory {
+                    id: "RESOLVED".into(),
+                    aliases: vec![],
+                    severity: Severity::Medium,
+                }]),
+            ),
+            (
+                "1.1.0",
+                Ok(vec![Advisory {
+                    id: "INTRODUCED".into(),
+                    aliases: vec![],
+                    severity,
+                }]),
+            ),
+        ]);
+        let checks = WithOsv {
+            fixed: &run.checks,
+            checker,
+        };
+        let project = &run.project;
+        let outcome = run_with(
+            &args,
+            &orchestrator,
+            &plan,
+            &mut run.result,
+            &checks,
+            |command| {
+                project.cargo_ok(&["update"]);
+                InstallResult::success(
+                    command.language,
+                    "cargo update".into(),
+                    String::new(),
+                    String::new(),
+                )
+            },
+        )
+        .await;
+        assert!(!outcome.install_failed);
+        if severity == Severity::High {
+            assert!(outcome.audit_failed);
+            assert_eq!(run.project.read("Cargo.toml"), run.manifest);
+            assert_eq!(run.project.read("Cargo.lock"), run.lock);
+        } else {
+            assert!(!outcome.audit_failed);
+            assert_eq!(run.project.locked_versions("leaf"), ["1.1.0"]);
+            assert!(run.result.errors.iter().any(|error| matches!(error, crate::orchestrator::OrchestratorError::OsvWarning { message, .. } if message.contains("severity trade-off accepted"))));
+        }
+        run.project.cargo_ok(&["update", "--workspace", "--locked"]);
+    }
+}
+
 /// `top` を `=1.0.0` から `=1.1.0` へ更新し、その後 `cargo update` が
 /// `top 1.1.0` の要件に合わせて `leaf` を解決する。cutoff より新しいのは `leaf 1.2.0` だけ。
 struct RustRun {

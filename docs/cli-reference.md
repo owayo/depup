@@ -32,8 +32,9 @@ depup [OPTIONS] [PATH]
 | `--include-pinned` | | Include pinned versions in update |
 | `--age <DURATION>` | | Minimum release age (e.g., 2w, 10d, 1m). Overrides global config |
 | `--no-age` | | Disable age filter for this run (overrides global config and default, but not a project `minimumReleaseAge`) |
-| `--osv` | | Check candidates against the OSV.dev vulnerability database and avoid versions with known vulnerabilities (enabled by default) |
+| `--osv` | | Check OSV.dev and prefer versions without known vulnerabilities; allow updates that fix existing vulnerabilities under severity and count limits by default |
 | `--no-osv` | | Disable OSV vulnerability check for this run (overrides global config and default) |
+| `--no-osv-risk-tradeoff` | | Reject every candidate with known vulnerabilities for this run, even if it fixes existing vulnerabilities |
 | `--max-change <LEVEL>` | | Limit allowed bumps: `patch` (patch only), `minor` (patch + minor), `major` (default — all) |
 | `--json` | | Output results in JSON format |
 | `--diff` | | Show changes in diff format |
@@ -97,7 +98,7 @@ depup --cd ./projects/myapp -n
 - `🔧` indicates development dependencies (such as devDependencies)
 - Known release dates are shown in `(yyyy/mm/dd HH:MM)` format; unavailable dates appear as `(release date unknown)`
 - Change type: `[major]`, `[minor]`, `[patch]`
-- `✓ OSV` marks versions that passed the vulnerability check. A `↳ OSV skipped:` line below an update lists the vulnerable versions that were removed from the candidates; the dependency itself was still updated
+- `✓ OSV` marks versions with no known OSV advisories. Updates allowed with remaining vulnerabilities carry no such mark; text reports fixed vulnerabilities, new vulnerabilities, and existing vulnerabilities that remain, and JSON adds `osv_risk_tradeoff` to the update with `baseline_versions`, `candidate_versions`, `fixed`, `introduced`, and `retained` arrays. Each issue group has deduplicated `ids` and a normalized `severity`. A `↳ OSV skipped:` line below an update lists the vulnerable versions that were removed from the candidates; the dependency itself was still updated
 - When OSV excludes every eligible update, the reason is `no eligible update without known vulnerabilities`. Normal output includes the manifest baseline's vulnerability status and, when confirmed, a safe newer version with its age eligibility time. JSON includes this skip with reason `known_vulnerabilities` and structured `osv` details even without `--verbose`. Cargo age rollback notices also flag vulnerable destinations remaining in the final lockfile; these notices do not change the exit code
 - Skipped dependencies are counted in each manifest heading (`— N updates, M skips`) and in the summary; a manifest with no updates also shows the count per reason
 - An update that could not be written to the manifest (for example, a write refused as ambiguous) ends with `✗ failed` and is not counted as an update: the heading becomes `— N updates, K failed, M skips`, and the summary adds `K package(s) failed to update`. The reason is listed in the `Errors:` section

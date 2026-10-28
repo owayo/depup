@@ -18,15 +18,38 @@ use async_trait::async_trait;
 use colored::Colorize;
 use indicatif::ProgressBar;
 
+mod security;
+use security::audit_osv;
+
 /// 既定の install の監査。テストではレジストリと Cargo へのアクセスを差し替える。
 #[async_trait(?Send)]
 pub(crate) trait Checks {
+    fn osv_enabled(&self) -> bool {
+        false
+    }
+    async fn osv_change(
+        &self,
+        _language: Language,
+        _name: &str,
+        _before: &[String],
+        _after: &[String],
+    ) -> Result<Option<crate::osv::RiskTradeoff>, String> {
+        Ok(None)
+    }
     async fn rust_lock(
         &self,
         lock: &RustLockPlan,
         bar: Option<&ProgressBar>,
     ) -> (LockAgeAuditResult, Option<AuditReceipt>);
     async fn node_baseline(&self, directory: &Path, manager: &str) -> NodeBaseline;
+    async fn node_osv_snapshot(
+        &self,
+        directory: &Path,
+        manager: &str,
+        _baseline: bool,
+    ) -> NodeBaseline {
+        self.node_baseline(directory, manager).await
+    }
     async fn node_lock(
         &self,
         directory: &Path,
@@ -41,6 +64,20 @@ struct SystemChecks<'a>(&'a Orchestrator);
 
 #[async_trait(?Send)]
 impl Checks for SystemChecks<'_> {
+    fn osv_enabled(&self) -> bool {
+        self.0.osv_active()
+    }
+    async fn osv_change(
+        &self,
+        language: Language,
+        name: &str,
+        before: &[String],
+        after: &[String],
+    ) -> Result<Option<crate::osv::RiskTradeoff>, String> {
+        self.0
+            .assess_osv_change(language, name, before, after)
+            .await
+    }
     async fn rust_lock(
         &self,
         lock: &RustLockPlan,
@@ -58,6 +95,23 @@ impl Checks for SystemChecks<'_> {
     }
     async fn node_baseline(&self, directory: &Path, manager: &str) -> NodeBaseline {
         crate::node_lock::read_baseline(directory, manager).await
+    }
+    async fn node_osv_snapshot(
+        &self,
+        directory: &Path,
+        manager: &str,
+        baseline: bool,
+    ) -> NodeBaseline {
+        if baseline
+            && crate::node_lock::audited_lockfile(directory, manager)
+                .is_some_and(|path| !path.exists())
+        {
+            return NodeBaseline::Known(BTreeSet::new());
+        }
+        match crate::node_lock::osv_lock_snapshot(directory, manager, baseline).await {
+            Ok((_, packages)) => NodeBaseline::Known(packages),
+            Err(error) => NodeBaseline::Unknown(error),
+        }
     }
     async fn node_lock(
         &self,
@@ -103,7 +157,8 @@ pub(crate) async fn run_with(
     let mut tx = InstallTransactions::begin(plan, result, &orchestrator.rust_lock_boundary());
     note_direct_only_age(args, plan, &tx);
     // パッケージマネージャーが lockfile を書き換える前に読む。
-    let baselines = node_baselines(plan, &tx, checks).await;
+    let baselines = node_baselines(plan, &tx, checks, false).await;
+    let osv_baselines = node_baselines(plan, &tx, checks, true).await;
     let mut progress = Progress::new(!args.quiet);
     tx.execute(|command| {
         progress.spinner(&format!(
@@ -136,9 +191,16 @@ pub(crate) async fn run_with(
     let mut audit_failed =
         audit_rust_locks(args, &audit_plan, &mut tx, checks, &mut rollback_osv).await;
     audit_failed |= audit_node_locks(args, plan, &baselines, &mut tx, checks).await;
+    let security = audit_osv(args, plan, &audit_plan, &osv_baselines, &mut tx, checks).await;
+    audit_failed |= security.failed;
     let recovery = tx.rollback();
     let report_error = recovery.print(&mut std::io::stderr()).err();
     recovery.mark_summary(&mut result.summary);
+    for (path, bytes, notices) in security.notices {
+        if std::fs::read(path).is_ok_and(|final_bytes| final_bytes == bytes) {
+            super::security::print_notices(notices, result);
+        }
+    }
     rollback_osv.warn(orchestrator, result, args.quiet).await;
     // pnpm の更新先の不一致は調査用にファイルを残す（age 違反ではない）。
     let mut verification = Progress::new(!args.quiet);
@@ -214,6 +276,7 @@ async fn node_baselines(
     plan: &InstallPlan,
     tx: &InstallTransactions,
     checks: &impl Checks,
+    osv: bool,
 ) -> BTreeMap<PathBuf, NodeBaseline> {
     let pending = tx.pending_report();
     let pm = SystemPackageManager::new();
@@ -224,10 +287,13 @@ async fn node_baselines(
         });
         if !installs
             || pending.covers_directory(&job.directory)
-            || !job
-                .policy
-                .as_ref()
-                .is_ok_and(|policy| policy.min_age.is_some())
+            || !(if osv {
+                checks.osv_enabled()
+            } else {
+                job.policy
+                    .as_ref()
+                    .is_ok_and(|policy| policy.min_age.is_some())
+            })
         {
             continue;
         }
@@ -240,7 +306,11 @@ async fn node_baselines(
         if matches!(manager, "pnpm" | "npm") {
             baselines.insert(
                 job.directory.clone(),
-                checks.node_baseline(&directory, manager).await,
+                if osv {
+                    checks.node_osv_snapshot(&directory, manager, true).await
+                } else {
+                    checks.node_baseline(&directory, manager).await
+                },
             );
         }
     }

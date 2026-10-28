@@ -88,6 +88,8 @@ struct JsonManifest {
 #[derive(Serialize)]
 struct JsonUpdate {
     #[serde(skip_serializing_if = "Option::is_none")]
+    osv_risk_tradeoff: Option<crate::osv::RiskTradeoff>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     age_exemption: Option<crate::update::AgeExemption>,
     /// パッケージ名
     name: String,
@@ -190,6 +192,7 @@ impl JsonFormatter {
             new_version,
             age_exemption,
             write_error,
+            osv_risk_tradeoff,
             ..
         } = result
         else {
@@ -201,6 +204,7 @@ impl JsonFormatter {
                 _ => git.current_commit.clone().unwrap_or_default(),
             };
             Some(JsonUpdate {
+                osv_risk_tradeoff: osv_risk_tradeoff.clone(),
                 age_exemption: age_exemption.clone(),
                 name: dependency.name.clone(),
                 kind: "git",
@@ -217,6 +221,7 @@ impl JsonFormatter {
             })
         } else {
             Some(JsonUpdate {
+                osv_risk_tradeoff: osv_risk_tradeoff.clone(),
                 age_exemption: age_exemption.clone(),
                 name: dependency.name.clone(),
                 kind: "registry",

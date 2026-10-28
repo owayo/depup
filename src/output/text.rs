@@ -367,6 +367,7 @@ impl TextFormatter {
                 released_at,
                 osv_skipped,
                 osv_checked,
+                osv_risk_tradeoff,
                 age_exemption,
                 write_error,
             } = result
@@ -413,6 +414,9 @@ impl TextFormatter {
                         "    age exempt: {} ({})",
                         exemption.identity, exemption.evidence
                     )?;
+                }
+                if let Some(reduction) = osv_risk_tradeoff {
+                    writeln!(writer, "    ⚠ {}", reduction.describe(&dependency.name))?;
                 }
             }
         }

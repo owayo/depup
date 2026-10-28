@@ -11,10 +11,6 @@ use crate::orchestrator::osv_report::RollbackOsvChecks;
 use crate::package_manager::{InstallResult, PreparedInstall, SystemPackageManager};
 use crate::progress::Progress;
 use async_trait::async_trait;
-use futures::{StreamExt, stream};
-use std::time::Duration;
-
-const VERIFICATION_BUDGET: Duration = Duration::from_secs(180);
 
 pub(super) fn plan_jobs(
     jobs: &mut Vec<InstallJob>,
@@ -138,6 +134,18 @@ fn lock_path(job: &InstallJob) -> PathBuf {
 
 #[async_trait(?Send)]
 trait Verification: Sync {
+    async fn osv_change(
+        &self,
+        language: Language,
+        name: &str,
+        before: &[String],
+        after: &[String],
+    ) -> Result<Option<crate::osv::RiskTradeoff>, String> {
+        for version in after.iter().filter(|version| !before.contains(version)) {
+            self.osv(language, name, version).await?;
+        }
+        Ok(None)
+    }
     async fn snapshot(&self, job: &InstallJob) -> Result<Snapshot, String>;
     async fn cargo_age(
         &self,
@@ -154,6 +162,17 @@ struct SystemVerification<'a>(&'a Orchestrator);
 
 #[async_trait(?Send)]
 impl Verification for SystemVerification<'_> {
+    async fn osv_change(
+        &self,
+        language: Language,
+        name: &str,
+        before: &[String],
+        after: &[String],
+    ) -> Result<Option<crate::osv::RiskTradeoff>, String> {
+        self.0
+            .assess_osv_change(language, name, before, after)
+            .await
+    }
     async fn snapshot(&self, job: &InstallJob) -> Result<Snapshot, String> {
         match std::fs::symlink_metadata(lock_path(job)) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -164,9 +183,10 @@ impl Verification for SystemVerification<'_> {
         }
         if job.language == Language::Node {
             let (bytes, node) = crate::node_lock::refresh_snapshot(&job.directory).await?;
+            let packages = crate::node_lock::osv_packages(&node)?;
             return Ok(Snapshot {
                 bytes: Some(bytes),
-                packages: node.packages,
+                packages,
                 protected: node.protected,
                 node_direct: node.direct,
                 node_direct_edges: node.direct_edges,
@@ -288,6 +308,7 @@ async fn run_with(
     let mut progress = Progress::new(!args.quiet);
     let mut baselines = BTreeMap::new();
     let mut admitted = BTreeMap::new();
+    let mut osv_notices = BTreeMap::new();
     let mut errors = BTreeMap::new();
     let mut audit_failed = false;
     let mut rollback_osv = RollbackOsvChecks::default();
@@ -371,13 +392,14 @@ async fn run_with(
                 if !failures.is_empty() { return Err(failures.into_iter().map(|failure| failure.message).collect::<Vec<_>>().join("; ")); }
             }
             if snapshot.protected != before.protected { return Err("lock refresh changed an external dependency whose registry policy cannot be verified".into()); }
-            check_osv(verifier, job.language, &before.packages, &snapshot.packages, &progress).await?;
+            let notices = check_osv(verifier, job.language, &before.packages, &snapshot.packages, &progress).await?;
             // ネットワーク処理の後、採用したバイト列を再確認する。
             tx.check_lock(&lock_path(job), snapshot.bytes.as_deref())?;
-            Ok::<_,String>(snapshot)
+            Ok::<_,String>((snapshot, notices))
         }.await;
         match checked {
-            Ok(snapshot) => {
+            Ok((snapshot, notices)) => {
+                osv_notices.insert(key.clone(), notices);
                 admitted.insert(key, snapshot);
             }
             Err(error) => reject(&mut tx, &mut errors, job, error),
@@ -428,6 +450,9 @@ async fn run_with(
     for job in jobs {
         let key = (job.directory.clone(), job.language.to_string());
         let failed = report.covers_directory(&job.directory);
+        if !failed && let Some(notices) = osv_notices.remove(&key) {
+            super::security::print_notices(notices, result);
+        }
         result.summary.lock_refreshes.push(LockRefreshResult {
             directory: job.directory.clone(),
             language: Some(job.language),
@@ -492,35 +517,11 @@ async fn check_osv(
     before: &BTreeSet<(String, String)>,
     after: &BTreeSet<(String, String)>,
     progress: &Progress,
-) -> Result<(), String> {
-    let targets: Vec<_> = after.difference(before).collect();
-    let bar = progress.bar();
-    if let Some(bar) = &bar {
-        bar.set_position(0);
-        bar.set_length(targets.len() as u64);
-    }
-    let bar = bar.as_ref();
-    let requests = stream::iter(targets)
-        .map(|(name, version)| async move {
-            if let Some(bar) = &bar {
-                bar.set_message(format!("OSV: {name}@{version}"));
-            }
-            let result = verifier.osv(language, name, version).await;
-            if let Some(bar) = &bar {
-                bar.inc(1);
-            }
-            result
-        })
-        .buffer_unordered(8);
-    tokio::time::timeout(VERIFICATION_BUDGET, async {
-        tokio::pin!(requests);
-        while let Some(result) = requests.next().await {
-            result?;
-        }
-        Ok(())
+) -> Result<super::security::Notices, String> {
+    super::security::check_changes(before, after, progress, |name, before, after| async move {
+        verifier.osv_change(language, &name, &before, &after).await
     })
     .await
-    .map_err(|_| "lock refresh OSV verification timed out".to_string())?
 }
 
 async fn check_tauri(

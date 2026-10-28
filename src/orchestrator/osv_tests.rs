@@ -61,6 +61,7 @@ async fn run(
     let mut warnings = Vec::new();
     let mut context = OsvJudgeContext {
         checker: &checker,
+        baseline: None,
         ecosystem: "crates.io",
         bar: None,
         warnings: &mut warnings,
@@ -324,4 +325,227 @@ async fn safe_fallback_and_ordinary_latest_keep_existing_results() {
             ..
         }
     ));
+}
+
+#[tokio::test]
+async fn osv_tradeoff_default_flags_candidate_priority_and_output() {
+    use crate::osv::{Advisory, Severity};
+    let medium = || Advisory {
+        id: "FIXED-MEDIUM".into(),
+        aliases: vec!["FIXED-ALIAS".into()],
+        severity: Severity::Medium,
+    };
+    let low = || Advisory {
+        id: "NEW-LOW".into(),
+        aliases: Vec::new(),
+        severity: Severity::Low,
+    };
+    let retained = || Advisory {
+        id: "RETAINED".into(),
+        aliases: Vec::new(),
+        severity: Severity::Low,
+    };
+    for (disable, baseline, clean, pure, expected) in [
+        (false, Some("1.0.0"), false, false, Some("1.0.2")),
+        (true, Some("1.0.0"), false, false, None),
+        (false, None, false, false, None),
+        (false, Some("1.0.0"), true, false, Some("1.0.1")),
+        (false, Some("1.0.0"), false, true, Some("1.0.1")),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut args = CliArgs::parse_from(["depup", "--no-osv", dir.path().to_str().unwrap()]);
+        args.no_osv_risk_tradeoff = disable;
+        let orchestrator = Orchestrator::new(args).unwrap();
+        let checker = OsvChecker::mock_advisories(&[
+            ("1.0.0", Ok(vec![medium(), retained()])),
+            (
+                "1.0.1",
+                Ok(if clean {
+                    vec![]
+                } else if pure {
+                    vec![retained()]
+                } else {
+                    vec![medium(), retained()]
+                }),
+            ),
+            ("1.0.2", Ok(vec![low(), retained()])),
+            ("1.0.3", Ok(vec![])),
+        ]);
+        let mut warnings = Vec::new();
+        let mut context = OsvJudgeContext {
+            checker: &checker,
+            ecosystem: "crates.io",
+            bar: None,
+            warnings: &mut warnings,
+            baseline,
+        };
+        let result = judge_with_osv(
+            &orchestrator,
+            &OfflineRegistry,
+            &UpdateJudge::with_time(
+                UpdateFilter::new().with_min_age(Duration::from_secs(7 * 86400)),
+                now(),
+            ),
+            &dependency(),
+            vec![
+                version("1.0.0", 40),
+                version("1.0.1", 20),
+                version("1.0.2", 15),
+                version("1.0.3", 1),
+            ],
+            &mut context,
+        )
+        .await
+        .unwrap();
+        match expected {
+            None => assert!(result.is_skip()),
+            Some(expected) => {
+                let UpdateResult::Update {
+                    ref new_version,
+                    ref osv_risk_tradeoff,
+                    osv_checked,
+                    ..
+                } = result
+                else {
+                    panic!("{result:?}");
+                };
+                assert_eq!(new_version, expected);
+                if clean {
+                    assert!(osv_checked);
+                    assert!(osv_risk_tradeoff.is_none());
+                } else {
+                    let report = osv_risk_tradeoff.as_ref().unwrap();
+                    assert!(!osv_checked);
+                    assert_eq!(report.fixed.len(), 1);
+                    assert_eq!(report.introduced.len(), usize::from(!pure));
+                    assert!(tauri_sync_protected(&result));
+                    let mut manifest = ManifestUpdateResult::new("Cargo.toml", Language::Rust);
+                    manifest.add_result(result);
+                    let mut text = Vec::new();
+                    TextFormatter::with_color(Verbosity::Normal, false, false)
+                        .format_manifest(&manifest, &mut text)
+                        .unwrap();
+                    let text = String::from_utf8(text).unwrap();
+                    assert!(text.contains("OSV severity trade-off accepted"));
+                    assert!(!text.contains("✓ OSV"));
+                    let mut summary = UpdateSummary::new(false);
+                    summary.add_manifest(manifest);
+                    let mut json = Vec::new();
+                    JsonFormatter::new(Verbosity::Normal)
+                        .format(
+                            &OrchestratorResult {
+                                summary,
+                                write_results: vec![],
+                                errors: vec![],
+                            },
+                            &mut json,
+                        )
+                        .unwrap();
+                    let json: serde_json::Value = serde_json::from_slice(&json).unwrap();
+                    assert_eq!(
+                        json["manifests"][0]["updates"][0]["osv_risk_tradeoff"]["fixed"][0]["severity"],
+                        "medium"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_advisory_free_version_below_the_actual_lock_does_not_displace_a_fix() {
+    use crate::osv::{Advisory, Severity};
+    let dir = tempfile::tempdir().unwrap();
+    let orchestrator = Orchestrator::new(CliArgs::parse_from([
+        "depup",
+        "--no-osv",
+        dir.path().to_str().unwrap(),
+    ]))
+    .unwrap();
+    let checker = OsvChecker::mock_advisories(&[
+        ("1.0.1", Ok(vec![])),
+        (
+            "1.0.2",
+            Ok(vec![Advisory {
+                id: "OLD".into(),
+                aliases: vec![],
+                severity: Severity::Critical,
+            }]),
+        ),
+        (
+            "1.0.3",
+            Ok(vec![Advisory {
+                id: "NEW".into(),
+                aliases: vec![],
+                severity: Severity::Medium,
+            }]),
+        ),
+    ]);
+    let mut warnings = Vec::new();
+    let mut context = OsvJudgeContext {
+        checker: &checker,
+        baseline: Some("1.0.2"),
+        ecosystem: "crates.io",
+        bar: None,
+        warnings: &mut warnings,
+    };
+    let result = judge_with_osv(
+        &orchestrator,
+        &OfflineRegistry,
+        &UpdateJudge::with_time(UpdateFilter::new(), now()),
+        &dependency(),
+        vec![
+            version("1.0.0", 40),
+            version("1.0.1", 30),
+            version("1.0.2", 20),
+            version("1.0.3", 10),
+        ],
+        &mut context,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(result, UpdateResult::Update { new_version, osv_risk_tradeoff: Some(_), osv_checked: false, .. } if new_version == "1.0.3")
+    );
+}
+
+#[tokio::test]
+async fn a_safe_locked_version_still_allows_manifest_lower_bound_updates() {
+    let dir = tempfile::tempdir().unwrap();
+    let orchestrator = Orchestrator::new(CliArgs::parse_from([
+        "depup",
+        "--no-osv",
+        dir.path().to_str().unwrap(),
+    ]))
+    .unwrap();
+    for (candidate, responses) in [
+        ("1.0.2", vec![("1.0.2", Ok(OsvCheck::Safe))]),
+        (
+            "1.0.1",
+            vec![("1.0.2", Ok(OsvCheck::Safe)), ("1.0.1", Ok(OsvCheck::Safe))],
+        ),
+    ] {
+        let checker = OsvChecker::mock(&responses);
+        let mut warnings = Vec::new();
+        let mut context = OsvJudgeContext {
+            checker: &checker,
+            baseline: Some("1.0.2"),
+            ecosystem: "crates.io",
+            bar: None,
+            warnings: &mut warnings,
+        };
+        let result = judge_with_osv(
+            &orchestrator,
+            &OfflineRegistry,
+            &UpdateJudge::with_time(UpdateFilter::new(), now()),
+            &dependency(),
+            vec![version("1.0.0", 40), version(candidate, 20)],
+            &mut context,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(result, UpdateResult::Update { new_version, osv_checked: true, osv_risk_tradeoff: None, .. } if new_version == candidate)
+        );
+    }
 }

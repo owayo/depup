@@ -23,10 +23,18 @@ The generated file looks like this:
 age = "1w"
 
 # Check candidate versions against the OSV.dev vulnerability database
-# and skip versions with known vulnerabilities (enabled by default).
+# and prefer versions without known vulnerabilities (enabled by default).
 # Requires network access; on API errors depup keeps the original candidate.
 # Override per-run with --osv / --no-osv.
 osv = true
+
+# Updates that fix existing vulnerabilities may introduce new Medium/Low issues
+# under the following limits.
+# New Medium issues cannot outnumber fixes of Medium-or-higher issues.
+# New Medium + Low issues cannot outnumber all known-severity fixes.
+# New High, Critical, Unknown, and malware are never allowed by this policy.
+# Set false (or pass --no-osv-risk-tradeoff) to require zero advisories.
+osv_risk_tradeoff = true
 
 # Limit the maximum allowed version change.
 # Accepts: "patch" (allow only patch bumps), "minor" (allow patch + minor),
@@ -40,7 +48,9 @@ osv = true
 # github = ["example-dev"]
 ```
 
-A key that is missing from the file falls back to the built-in default (`age = "1w"`, `osv = true`, no `max_change` limit). If the file cannot be created or parsed, depup prints a warning and uses the built-in defaults. If a single value is invalid (such as `age = "abc"`), depup prints a warning and uses the built-in default for that setting only.
+A key that is missing from the file falls back to the built-in default (`age = "1w"`, `osv = true`, `osv_risk_tradeoff = true`, no `max_change` limit). If the file cannot be created or parsed, depup prints a warning and uses the built-in defaults. If a single value is invalid (such as `age = "abc"`), depup prints a warning and uses the built-in default for that setting only.
+
+Updates that fix existing vulnerabilities may still be allowed under severity and count limits, even when an existing configuration file has no `osv_risk_tradeoff` key. See [Vulnerability Check](usage.md#vulnerability-check-osvdev) for the counting rules and baseline requirements.
 
 ## Age Exemptions by Verified Publisher
 

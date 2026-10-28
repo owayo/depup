@@ -116,9 +116,12 @@ pub enum UpdateResult {
         osv_skipped: Vec<String>,
         /// 採用版が OSV で検査され脆弱性なしと判定されたか。
         /// `false` は OSV 未実行 (`--osv` 無効、または Swift 等の未対応エコシステム、
-        /// API エラー時) を意味する。
+        /// API エラー時)、または脆弱性が残る交換ルールでの採用を意味する。
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         osv_checked: bool,
+        /// 脆弱性が残るが、解消した問題の重大度と件数を根拠に許容した更新。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        osv_risk_tradeoff: Option<crate::osv::RiskTradeoff>,
         /// age を免除した身元と、レジストリが確認した根拠。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         age_exemption: Option<crate::update::AgeExemption>,
@@ -156,6 +159,7 @@ impl UpdateResult {
             released_at: None,
             osv_skipped: Vec::new(),
             osv_checked: false,
+            osv_risk_tradeoff: None,
             age_exemption: None,
             write_error: None,
         }
@@ -182,6 +186,7 @@ impl UpdateResult {
             released_at,
             osv_skipped: Vec::new(),
             osv_checked: false,
+            osv_risk_tradeoff: None,
             age_exemption: None,
             write_error: None,
         }
@@ -209,6 +214,19 @@ impl UpdateResult {
         } = self
         {
             *osv_checked = checked;
+        }
+        self
+    }
+
+    pub fn with_osv_risk_tradeoff(mut self, reduction: crate::osv::RiskTradeoff) -> Self {
+        if let Self::Update {
+            osv_risk_tradeoff,
+            osv_checked,
+            ..
+        } = &mut self
+        {
+            *osv_risk_tradeoff = Some(reduction);
+            *osv_checked = false;
         }
         self
     }

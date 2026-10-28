@@ -8,7 +8,7 @@ Unless a dependency is pinned, depup looks up its published versions, picks the 
 
 - An exact version such as `"1.2.3"` in `package.json` is treated as an intentional pin and is not updated unless you pass `--include-pinned`. Go modules and mise tools are exceptions ([Pinned Versions and `--include-pinned`](#pinned-versions-and---include-pinned)).
 - Only versions that have been public for at least one week are candidates ([Age Filter](#age-filter)).
-- Versions with known vulnerabilities are avoided ([Vulnerability Check](#vulnerability-check-osvdev)).
+- Versions without known vulnerabilities are preferred; updates that fix existing vulnerabilities may still be allowed under severity and count limits by default ([Vulnerability Check](#vulnerability-check-osvdev)).
 - Prereleases are not proposed while the current version is stable ([Candidate Ordering and Prereleases](#candidate-ordering-and-prereleases)).
 - Ranges keep their shape and upper bound; only the lower bound moves ([Upper and Lower Bounds of Ranges](#upper-and-lower-bounds-of-ranges)).
 - Major bumps are allowed unless `--max-change` caps them ([Limiting Bumps](#limiting-bumps---max-change)).
@@ -103,7 +103,19 @@ The cutoff is fixed when the run starts. Candidate selection, Tauri synchronizat
 
 ### Vulnerability Check (OSV.dev)
 
-depup looks up the version it is about to adopt in the public [OSV.dev](https://osv.dev/) database. If that version has a known vulnerability, depup removes it from the candidates and checks the next newest one. **This check is enabled by default** — no flag required. Combined with the age filter, depup picks the newest version that is both mature and free of known vulnerabilities:
+depup queries [OSV.dev](https://osv.dev/) for candidate versions. **The check is enabled by default.** Updates that fix existing vulnerabilities may introduce new Medium/Low vulnerabilities under the conditions below. This is enabled even when an older configuration has no new policy key. Candidates still have to pass the age filter and all other update rules. Within those limits, depup prefers a version without known vulnerabilities, then a version that fixes some vulnerabilities without adding any, and finally a version meeting the conditions below. It chooses the newest version within each tier.
+
+To allow an update with remaining vulnerabilities, it must fix at least one vulnerability of known severity. Each new vulnerability requires a separate fix of the same or higher severity:
+
+- New Medium issues must not outnumber resolved Medium, High, and Critical issues combined.
+- New Medium and Low issues combined must not outnumber all resolved issues of known severity.
+- New High, Critical, and unknown-severity issues are never offset. A candidate containing malware (`MAL-` advisory IDs or aliases) is rejected by this exception.
+
+Thus fixing one Critical or Medium can permit one new Medium or Low; fixing one Low can permit one new Low, but cannot fund a new Medium. Fixing one Critical cannot fund two new Low issues. Same-severity replacements are permitted by this policy and are not a guarantee that real-world risk has decreased.
+
+Counts are per package. Aliases are merged transitively across both versions, withdrawn advisories are ignored, and retained issues do not count as fixes. Severity uses the highest available known assessment from OSV labels and CVSS v3 vectors; unsupported or absent ratings without a usable label remain unknown. A confirmed baseline is required: Cargo or supported npm/pnpm lockfiles for Rust/Node, and fixed Python/Ruby/PHP declarations. Go and Java declarations alone do not qualify because dependency resolution can select a higher version. Missing, ambiguous, private, or unverified lock baselines never fall back to a manifest range's lower bound.
+
+Updates allowed under these conditions warn that vulnerabilities remain, report fixed vulnerabilities, new vulnerabilities, and existing vulnerabilities that remain, and do not receive `✓ OSV`. JSON update objects include `osv_risk_tradeoff` with versions and those groups. To require zero advisories again, use `--no-osv-risk-tradeoff` or set `osv_risk_tradeoff = false` in the global configuration. This does not disable OSV checks.
 
 ```bash
 # OSV check runs by default
@@ -111,6 +123,9 @@ depup
 
 # Same as above (explicit opt-in, overrides `osv = false` in global config)
 depup --osv
+
+# Keep OSV enabled but reject all candidates with known vulnerabilities
+depup --no-osv-risk-tradeoff
 
 # Disable OSV check for this run (overrides global config and default)
 depup --no-osv
@@ -126,6 +141,8 @@ If OSV removes every eligible update, the skip reason is `no eligible update wit
 
 In this case depup also checks up to five newer versions excluded only by `--age`, newest first. If one has no known vulnerabilities, the report shows that version and the exact UTC time when it satisfies the effective age policy. Range bounds, prerelease rules, rejected versions, and `--max-change` still apply. The waiting version is not installed early. Failed or incomplete lookups are reported without calling an unchecked version safe. JSON includes these skips even without `--verbose`, using reason `known_vulnerabilities` and an `osv` object (`skipped_versions`, `current_version`, `current_vulnerable`, `current_advisories`, optional lookup errors, and optional `safe_after_age` with `version` and `eligible_at`).
 
+After ordinary `--install` or `--install --refresh-lock`, Cargo and supported npm/pnpm locks are checked again after age verification. Each changed public-registry package is compared across all its coexisting versions before and after the run, so one fix cannot pay for multiple added versions and an issue remaining in another version is not a fix. A rejected or unconfirmed final result restores the affected install unit and exits with code 2. Unchanged packages are not certified.
+
 After a Cargo.lock age rollback, depup also checks rollback destinations that remain in the final lockfile, after any install recovery. A vulnerable destination is reported with its advisory IDs; an unsuccessful check is reported as unconfirmed. These notices do not change rollback selection or the exit code. `--no-osv` disables these additional checks too.
 
 **Priority order (highest first):**
@@ -137,7 +154,7 @@ To turn the check off for every run, set `osv = false` in the [Global Configurat
 
 #### Fallback Example
 
-When the version depup is about to adopt has a known vulnerability, depup removes it from the candidates and checks the next newest one, until it finds a safe version or no newer candidate is left. Updates that pass the OSV check are marked with `✓ OSV`:
+When a candidate fails this policy, depup checks the next newest one. Advisory-free updates are marked with `✓ OSV`:
 
 ```text
 $ depup --install --include-pinned

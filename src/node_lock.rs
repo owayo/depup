@@ -19,7 +19,9 @@ const NODE_AUDIT_BUDGET: Duration = Duration::from_secs(180);
 const PNPM_LIST_TIMEOUT: Duration = Duration::from_secs(60);
 const PUBLICATION_CONCURRENCY: usize = 8;
 
+mod osv_baseline;
 mod targets;
+pub(crate) use osv_baseline::{osv_direct_baselines, osv_lock_snapshot, osv_packages};
 pub use targets::verify_pnpm_update_targets;
 pub(crate) use targets::{DirectEdges, target_failures};
 

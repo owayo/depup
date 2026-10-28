@@ -33,7 +33,7 @@
 
 depup finds the manifests in a project (`package.json`, `pyproject.toml`, `Cargo.toml`, `go.mod`, `Gemfile`, `composer.json`, Gradle build files, `Package.swift`, and mise config files), looks up newer versions in each registry, and rewrites the version specifiers in place, for every language in one run.
 
-It is conservative by default: a new version becomes a candidate only after it has been public for a week, versions with known vulnerabilities on OSV.dev are avoided, pinned versions stay as they are, and ranges keep their operators and upper bounds.
+It is conservative by default: a new version becomes a candidate only after it has been public for a week, versions without known vulnerabilities on OSV.dev are preferred, pinned versions stay as they are, and ranges keep their operators and upper bounds.
 
 Add `--install` to let each project's package manager refresh its lock file after the update.
 
@@ -45,7 +45,7 @@ Add `--install` to let each project's package manager refresh its lock file afte
 - **Pinned Version Detection**: Skips intentionally pinned versions by default
 - **Age Filter**: Only updates to versions that have been public for at least N days or weeks (1 week by default)
 - **Project Age Policies**: Inherits pnpm, Bun, and mise policies per directory and preserves stricter uv and mise native cutoffs
-- **Vulnerability Check**: Looks up the chosen version on OSV.dev and avoids versions with known vulnerabilities (enabled by default)
+- **Vulnerability Check**: Looks up candidates on OSV.dev, preferring versions without known vulnerabilities. Updates that fix existing vulnerabilities may still be allowed under severity and count limits (enabled by default)
 - **Package Manager Install**: `--install` runs each project's package manager after the update and passes the age filter on to pnpm, uv, and mise
 - **Lockfile Age Audit**: Checks the direct and transitive versions in `Cargo.lock` and npm/pnpm lockfiles after install; if a version the run added still fails, that project's manifests and lockfiles return to their state before the run (exit code `2`)
 - **Bun Catalogs**: Updates Bun `catalog` / `catalogs` definitions in `package.json`
@@ -191,10 +191,30 @@ Unless a dependency is pinned, depup looks up its published versions, picks the 
 
 - An exact version such as `"1.2.3"` in `package.json` is treated as an intentional pin and is not updated unless you pass `--include-pinned`. Go modules and mise tools are exceptions ([Pinned Versions and `--include-pinned`](docs/usage.md#pinned-versions-and---include-pinned)).
 - Only versions that have been public for at least one week are candidates ([Age Filter](docs/usage.md#age-filter)).
-- Versions with known vulnerabilities are avoided ([Vulnerability Check](docs/usage.md#vulnerability-check-osvdev)).
+- Versions without known vulnerabilities are preferred. By default, updates that fix existing vulnerabilities may introduce new Medium/Low vulnerabilities within severity and count limits ([Vulnerability Check](docs/usage.md#vulnerability-check-osvdev)).
 - Prereleases are not proposed while the current version is stable ([Candidate Ordering and Prereleases](docs/usage.md#candidate-ordering-and-prereleases)).
 - Ranges keep their shape and upper bound; only the lower bound moves ([Upper and Lower Bounds of Ranges](docs/usage.md#upper-and-lower-bounds-of-ranges)).
 - Major bumps are allowed unless `--max-change` caps them ([Limiting Bumps](docs/usage.md#limiting-bumps---max-change)).
+
+### Allowing Updates with Remaining Vulnerabilities (Enabled by Default)
+
+An update that fixes existing vulnerabilities may be allowed even if it introduces new Medium/Low vulnerabilities. Each new vulnerability requires a separate fix of the same or higher known severity.
+
+| Vulnerabilities fixed | Newly introduced vulnerabilities | Update allowed? |
+|---|---|---|
+| 1 Critical or High | 1 Medium or Low | Yes, with a warning |
+| 1 Medium | 1 Medium or Low | Yes, with a warning |
+| 1 Low | 1 Low | Yes, with a warning |
+| 1 Low | 1 Medium, High, or Critical | No |
+| 1 Critical | 2 Medium | No: new vulnerabilities outnumber fixes |
+
+Updates introducing High, Critical, or unknown-severity vulnerabilities are not allowed by this exception. Updates containing malware are also excluded. Allowing a new vulnerability of the same severity does not guarantee that real-world risk has decreased.
+
+Counts are per package. Aliases for the same vulnerability are counted once; a vulnerability still present in another locked version does not count as fixed.
+
+depup prefers versions without known vulnerabilities, then versions that fix some vulnerabilities without adding any, and finally versions meeting the conditions above. **The age waiting period and other update filters still apply.** The comparison requires confirmed Cargo or supported npm/pnpm lockfile versions, or a fixed Python/Ruby/PHP declaration. An unknown current version or a manifest range's lower bound alone does not qualify.
+
+Updates allowed under these conditions report fixed vulnerabilities, new vulnerabilities, and existing vulnerabilities that remain in text and JSON. They do not receive the `✓ OSV` mark because known vulnerabilities remain. Use `--no-osv-risk-tradeoff`, or set `osv_risk_tradeoff = false` in the global configuration, to reject all candidates with known vulnerabilities. `--no-osv` disables the check entirely.
 
 ### More Documentation
 
@@ -211,7 +231,7 @@ depup reads its defaults, monorepo directories, and release-age policies from th
 
 | Setting | Location | Purpose |
 |---|---|---|
-| Global defaults | `~/.config/depup/config.toml`, created on the first run | Default `age`, `osv`, and `max_change`, plus verified publisher exceptions (`age_exempt`) |
+| Global defaults | `~/.config/depup/config.toml`, created on the first run | Default `age`, `osv`, `osv_risk_tradeoff`, and `max_change`, plus verified publisher exceptions (`age_exempt`) |
 | Monorepo directories | `.depup` at the project root | Additional directories to process |
 | Project age policy | `minimumReleaseAge` in the pnpm or Bun settings, `minimum_release_age` in the mise settings | Minimum release age of that project |
 | Native age constraints | uv's `exclude-newer` and mise's global, local, and per-tool age settings | Preserve stricter cutoffs during candidate selection and install |
