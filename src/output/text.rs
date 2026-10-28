@@ -94,6 +94,32 @@ struct SkipPackageInfo {
     released_at: Option<DateTime<Utc>>,
 }
 
+/// 同一マニフェスト内の共通エラー。番号は表示順に決める。
+struct FailureGroup<'a> {
+    reason: &'a str,
+    count: usize,
+    shown: usize,
+}
+
+impl<'a> FailureGroup<'a> {
+    fn repeated(updates: &[&'a UpdateResult]) -> Vec<Self> {
+        let mut groups: Vec<Self> = Vec::new();
+        for reason in updates.iter().filter_map(|result| result.write_error()) {
+            if let Some(group) = groups.iter_mut().find(|group| group.reason == reason) {
+                group.count += 1;
+            } else {
+                groups.push(Self {
+                    reason,
+                    count: 1,
+                    shown: 0,
+                });
+            }
+        }
+        groups.retain(|group| group.count > 1);
+        groups
+    }
+}
+
 /// 条件付きスタイリング用の名前付きカラー
 #[derive(Clone, Copy)]
 enum Color {
@@ -360,6 +386,7 @@ impl TextFormatter {
         updates: &[&UpdateResult],
         is_dev: bool,
         max_name_len: usize,
+        failures: &mut [FailureGroup<'_>],
         writer: &mut dyn Write,
     ) -> std::io::Result<()> {
         for result in updates {
@@ -374,41 +401,60 @@ impl TextFormatter {
                 write_error,
             } = result
             {
-                // git 依存は専用フォーマットで表示
-                if let Some(git) = &dependency.git_source {
-                    self.format_git_update_line(
-                        &dependency.name,
-                        git,
-                        new_version,
-                        is_dev,
-                        write_error.as_deref(),
-                        max_name_len,
-                        writer,
-                    )?;
-                    continue;
-                }
-                // バージョンなしの依存には "-" を表示。
-                // 更新先はレジストリが返す生の値なので、現在版も同じ書式
-                // (Go なら `v` 付き) に揃える
-                let current_version = dependency.version_spec.display_version();
-                let old_version = if current_version.is_empty() {
-                    "-"
+                let mut display_error = write_error.clone();
+                let show_line = if let Some((index, group)) = failures
+                    .iter_mut()
+                    .enumerate()
+                    .find(|(_, group)| Some(group.reason) == write_error.as_deref())
+                {
+                    display_error = Some(format!("#{}", index + 1));
+                    // 個別の診断が付く行は省略せず、対象名と版を残す。
+                    let show = group.shown < 3
+                        || !osv_skipped.is_empty()
+                        || osv_risk_tradeoff.is_some()
+                        || age_exemption.is_some();
+                    group.shown += usize::from(show);
+                    show
                 } else {
-                    &current_version
+                    true
                 };
-                self.format_update_line(
-                    &dependency.name,
-                    old_version,
-                    new_version,
-                    is_dev,
-                    *released_at,
-                    dependency.variable_name.as_deref(),
-                    osv_skipped,
-                    *osv_checked,
-                    write_error.as_deref(),
-                    max_name_len,
-                    writer,
-                )?;
+                if show_line {
+                    // git 依存は専用フォーマットで表示
+                    if let Some(git) = &dependency.git_source {
+                        self.format_git_update_line(
+                            &dependency.name,
+                            git,
+                            new_version,
+                            is_dev,
+                            display_error.as_deref(),
+                            max_name_len,
+                            writer,
+                        )?;
+                    } else {
+                        // バージョンなしの依存には "-" を表示。
+                        // 更新先はレジストリが返す生の値なので、現在版も同じ書式
+                        // (Go なら `v` 付き) に揃える
+                        let current_version = dependency.version_spec.display_version();
+                        let old_version = if current_version.is_empty() {
+                            "-"
+                        } else {
+                            &current_version
+                        };
+                        self.format_update_line(
+                            &dependency.name,
+                            old_version,
+                            new_version,
+                            is_dev,
+                            *released_at,
+                            dependency.variable_name.as_deref(),
+                            osv_skipped,
+                            *osv_checked,
+                            display_error.as_deref(),
+                            max_name_len,
+                            writer,
+                        )?;
+                    }
+                }
                 if let Some(exemption) = age_exemption {
                     writeln!(
                         writer,
@@ -518,14 +564,54 @@ impl TextFormatter {
             .collect();
         let max_name_len = self.max_name_length(&all_results).max(20);
 
+        let mut failures = if self.verbosity == Verbosity::Normal {
+            FailureGroup::repeated(&all_results)
+        } else {
+            Vec::new()
+        };
+        for (index, group) in failures.iter().enumerate() {
+            writeln!(
+                writer,
+                "  {}",
+                self.apply_color(
+                    &format!("Failure #{} ({} packages):", index + 1, group.count),
+                    Color::Red,
+                )
+            )?;
+            // 長い lock 検証エラーも、ID を省略せず読みやすい幅に折り返す。
+            let mut line = String::from("    ");
+            for word in group.reason.split_whitespace() {
+                if line.len() > 4 && line.chars().count() + 1 + word.chars().count() > 100 {
+                    writeln!(writer, "{line}")?;
+                    line.truncate(4);
+                }
+                if line.len() > 4 {
+                    line.push(' ');
+                }
+                line.push_str(word);
+            }
+            writeln!(writer, "{line}")?;
+        }
+
         // 本番依存を書き出す
         if !prod_updates.is_empty() {
-            self.write_update_group(&prod_updates, false, max_name_len, writer)?;
+            self.write_update_group(&prod_updates, false, max_name_len, &mut failures, writer)?;
         }
 
         // 開発依存を書き出す
         if !dev_updates.is_empty() {
-            self.write_update_group(&dev_updates, true, max_name_len, writer)?;
+            self.write_update_group(&dev_updates, true, max_name_len, &mut failures, writer)?;
+        }
+
+        for (index, group) in failures.iter().enumerate() {
+            if group.count > group.shown {
+                writeln!(
+                    writer,
+                    "  ... {} more failed updates (#{}); use --verbose to list all packages",
+                    group.count - group.shown,
+                    index + 1
+                )?;
+            }
         }
 
         // verbose モードでスキップを書き出す
@@ -1372,6 +1458,168 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn shared_failure_result() -> OrchestratorResult {
+        let mut manifest = ManifestUpdateResult::new(PathBuf::from("package.json"), Language::Node);
+        for index in 0..30 {
+            let mut update = UpdateResult::update(
+                sample_dependency(&format!("package-{index:02}"), "1.0.0", index >= 2),
+                "1.1.0",
+            );
+            update.record_write_error("lock verification failed; update canceled: final lock OSV verification failed: sanitizer@3.4.15, 3.4.17 is vulnerable (TEST-ADVISORY-A, TEST-ADVISORY-B); risk-reduction conditions not met");
+            manifest.add_result(update);
+        }
+        manifest.add_result(UpdateResult::update(
+            sample_dependency("independent", "1.0.0", false),
+            "1.0.1",
+        ));
+        let mut summary = UpdateSummary::new(false);
+        summary.add_manifest(manifest);
+        OrchestratorResult {
+            summary,
+            write_results: Vec::new(),
+            errors: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn shared_failures_show_one_reason_and_a_preview_across_dependency_groups() {
+        let result = shared_failure_result();
+        for color in [false, true] {
+            let formatter = TextFormatter::with_color(Verbosity::Normal, false, color);
+            let mut output = Vec::new();
+            formatter.format(&result, &mut output).unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert!(
+                output.contains("— 1 update, 30 failed, 0 skips"),
+                "{output}"
+            );
+            assert_eq!(
+                output.matches("Failure #1 (30 packages)").count(),
+                1,
+                "{output}"
+            );
+            for id in ["TEST-ADVISORY-A", "TEST-ADVISORY-B"] {
+                assert_eq!(output.matches(id).count(), 1, "{output}");
+            }
+            for name in ["package-00", "package-01", "package-02", "independent"] {
+                assert!(output.contains(name), "{output}");
+            }
+            assert!(!output.contains("package-03"), "{output}");
+            assert!(!output.contains("package-29"), "{output}");
+            assert_eq!(output.matches("failed: #1").count(), 3, "{output}");
+            assert!(
+                output.contains("27 more failed updates (#1); use --verbose"),
+                "{output}"
+            );
+            assert!(
+                output.contains("30 package(s) failed to update"),
+                "{output}"
+            );
+            let reason_lines: Vec<_> = output
+                .lines()
+                .filter(|line| line.starts_with("    "))
+                .collect();
+            assert!(reason_lines.len() > 1, "{output}");
+            assert!(
+                reason_lines.iter().all(|line| line.chars().count() <= 100),
+                "{output}"
+            );
+        }
+        assert_eq!(
+            format_text(&result, Verbosity::Quiet).trim(),
+            "1 updated, 30 failed"
+        );
+        let verbose = format_text(&result, Verbosity::Verbose);
+        assert!(!verbose.contains("Failure #1"), "{verbose}");
+        assert!(!verbose.contains("more failed updates"), "{verbose}");
+        assert_eq!(verbose.matches("TEST-ADVISORY-A").count(), 30, "{verbose}");
+        for index in 0..30 {
+            assert!(
+                verbose.contains(&format!("package-{index:02}")),
+                "{verbose}"
+            );
+        }
+
+        // 表示の省略は結果を変更せず、JSON には全件の元の理由を残す。
+        let mut json = Vec::new();
+        crate::output::JsonFormatter::new(Verbosity::Normal)
+            .format(&result, &mut json)
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        let failed = json["manifests"][0]["failed"].as_array().unwrap();
+        assert_eq!(failed.len(), 30);
+        assert!(
+            failed
+                .iter()
+                .all(|entry| entry["error"].as_str().unwrap().contains("TEST-ADVISORY-A"))
+        );
+        assert_eq!(json["summary"]["updates"], 1);
+        assert_eq!(json["summary"]["failed"], 30);
+    }
+
+    #[test]
+    fn shared_failure_numbers_are_local_and_keep_single_failures_inline() {
+        let mut result = create_result_with_write_failures(&["lodash", "react", "typescript"]);
+        let manifest = &mut result.summary.manifests[0];
+        manifest.results[0].record_write_error("first common failure");
+        manifest.results[1].record_write_error("first common failure");
+        let mut other = manifest.clone();
+        other.path = PathBuf::from("other/package.json");
+        other.results[0].record_write_error("different common failure");
+        other.results[1].record_write_error("different common failure");
+        result.summary.add_manifest(other);
+        let output = format_text(&result, Verbosity::Normal);
+        assert_eq!(
+            output.matches("Failure #1 (2 packages)").count(),
+            2,
+            "{output}"
+        );
+        assert!(!output.contains("Failure #2"), "{output}");
+        assert_eq!(
+            output.matches("first common failure").count(),
+            1,
+            "{output}"
+        );
+        assert_eq!(
+            output.matches("different common failure").count(),
+            1,
+            "{output}"
+        );
+        assert_eq!(
+            output
+                .matches("[failed: Failed to update typescript]")
+                .count(),
+            2,
+            "{output}"
+        );
+        assert!(!output.contains("more failed updates"), "{output}");
+    }
+
+    #[test]
+    fn shared_failures_keep_git_updates_and_individual_diagnostics() {
+        let mut result = shared_failure_result();
+        if let UpdateResult::Update { dependency, .. } = &mut result.summary.manifests[0].results[0]
+        {
+            dependency.git_source = Some(GitSource::new(
+                "https://example.com/library.git",
+                GitReference::Tag("v1.0.0".into()),
+            ));
+        }
+        if let UpdateResult::Update { osv_skipped, .. } =
+            &mut result.summary.manifests[0].results[29]
+        {
+            osv_skipped.push("1.2.0 (TEST-ADVISORY-C)".into());
+        }
+        let output = format_text(&result, Verbosity::Normal);
+        assert!(output.contains("[git] [failed: #1]"), "{output}");
+        assert!(output.contains("package-29"), "{output}");
+        assert!(
+            output.contains("OSV skipped: 1.2.0 (TEST-ADVISORY-C)"),
+            "{output}"
+        );
+        assert!(output.contains("26 more failed updates (#1)"), "{output}");
     }
 
     #[test]

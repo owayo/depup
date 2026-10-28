@@ -44,7 +44,7 @@ pub(super) async fn audit_osv(
             Ok::<_, String>((content.into_bytes(), notices))
         }
         .await;
-        finish_scope(path, checked, tx, &mut report);
+        progress.suspend(|| finish_scope(path, checked, tx, &mut report));
     }
     let pm = SystemPackageManager::new();
     for job in &plan.node_audits {
@@ -90,7 +90,7 @@ pub(super) async fn audit_osv(
             Ok((bytes, notices))
         }
         .await;
-        finish_scope(path, checked, tx, &mut report);
+        progress.suspend(|| finish_scope(path, checked, tx, &mut report));
     }
     progress.finish_and_clear();
     report

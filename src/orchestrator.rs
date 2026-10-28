@@ -775,9 +775,9 @@ impl Orchestrator {
                     Language::Rust | Language::Go | Language::Swift
                 )
             {
-                eprintln!(
+                progress.suspend(|| eprintln!(
                     "Notice: age_exempt.github is unavailable for other registries; their dependencies retain the age filter"
-                );
+                ));
             }
             let package_filter = filter.clone();
             let judge = UpdateJudge::with_time(filter, self.evaluated_at);
@@ -1937,10 +1937,10 @@ async fn judge_with_osv(
 #[path = "orchestrator/osv_tests.rs"]
 mod osv_tests;
 
-/// 進捗バーがあれば `println` で行を出力 (バーを維持)、なければ stderr へ直接出す。
+/// 進捗バーを一時的に隠して診断を出す。非 TTY でも診断を保持する。
 fn osv_println(bar: Option<&ProgressBar>, line: &str) {
     match bar {
-        Some(b) => b.println(line),
+        Some(b) => b.suspend(|| eprintln!("{line}")),
         None => eprintln!("{}", line),
     }
 }
