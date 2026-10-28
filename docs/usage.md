@@ -632,6 +632,6 @@ Dates in the verbose skip list belong to the current version itself, never to an
     undated-library      1.0.0
 ```
 
-An update row that ends with `✗ failed` (`[failed]` without color) is an update depup found but could not write to the manifest, for example because the write was refused as ambiguous (see [Writing Rules](#writing-rules)). It is counted as failed instead of updated, its reason is listed in the `Errors:` section, and the exit code is `2`.
+An update row that ends with `✗ failed: <reason>` (`[failed: <reason>]` without color) is an update depup found but could not write to the manifest, for example because the write was refused as ambiguous (see [Writing Rules](#writing-rules)). It is counted as failed instead of updated, and the exit code is `2`. The reason appears at the end of the row, with multiline output collapsed onto one line. Updates canceled after an install failure also show their reason here; install failures exit with code `1`.
 
 If a dependency does not appear in the output at all, depup did not process the declaration; check in [Ecosystem Details](ecosystems.md#ecosystem-details) that its file, section, and declaration form are supported. Manifests of languages left out by a language flag such as `--node` are not parsed (project age settings in pnpm, Bun, and mise files are still read). If the manifest was updated but the install failed, see [Running the Package Manager](#running-the-package-manager---install).

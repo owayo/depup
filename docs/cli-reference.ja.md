@@ -101,7 +101,7 @@ depup --cd ./projects/myapp -n
 - `✓ OSV` は、OSV に既知の脆弱性がない版に付きます。脆弱性が残る状態で許可した版には付かず、テキストに修正した脆弱性・新たに加わる脆弱性・更新前から残る脆弱性の内訳を表示します。JSON の更新には `osv_risk_tradeoff` を追加し、`baseline_versions`、`candidate_versions`、`fixed`、`introduced`、`retained` の各配列を記録します。問題ごとに別名をまとめた `ids` と正規化した `severity` を持ちます。更新行の下の `↳ OSV skipped:` 行には、脆弱性があるため候補から外したバージョンを表示します。ラベルは skipped ですが、依存のスキップではありません（依存そのものは更新されています）。
 - OSV で更新可能な版をすべて除外した場合、理由は `no eligible update without known vulnerabilities` です。通常出力にもマニフェストの比較基準の脆弱性を示し、age 待ちの安全な版を確認できた場合は、その版と待機終了日時を付けます。JSON には `--verbose` がなくても該当のスキップを出し、理由を `known_vulnerabilities`、詳細を `osv` オブジェクトに記録します。Cargo の age 差し戻しでも、最終 lockfile に残った差し戻し先に脆弱性があれば通知します。これらの通知で終了コードは変わりません。
 - スキップした依存の件数は、マニフェストの見出し（`— N updates, M skips`）と Summary に表示します。更新が 0 件のマニフェストでは、理由ごとの件数も表示します。
-- マニフェストへ書き込めなかった更新（書き込み先が曖昧なための拒否など）は、行末に `✗ failed` が付き、更新の件数に入りません。見出しは `— N updates, K failed, M skips` になり、Summary に `K package(s) failed to update` の行が加わります。理由は `Errors:` 欄に表示します。
+- マニフェストへ書き込めなかった更新や install 失敗後に取り消した更新は、行末に `✗ failed: 理由`（色なしでは `[failed: 理由]`）を表示します。複数行の理由は、改行や連続する空白をまとめて1行に表示します。失敗した更新は更新の件数に入りません。見出しは `— N updates, K failed, M skips` になり、Summary に `K package(s) failed to update` の行が加わります。
 - `--verbose` を付けると、スキップした依存を理由ごとに一覧し、Summary にも理由別・言語別の内訳を付けます。
 - `latest` と `newer than --age` のスキップ一覧には、確認できた現在版自身の公開日を付けます。日付不明、wildcard・prefix の浮動指定の場合は日付を付けません。`newer than --age` は、現在版が適用される age より新しく、公開者の免除にも該当しないことを示します。依存を古い版へ差し戻す表示ではありません。
 - エラーは、OSV の通知も含めて `Errors:` 欄に表示します。

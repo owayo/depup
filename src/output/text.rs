@@ -184,14 +184,16 @@ impl TextFormatter {
             .unwrap_or(0)
     }
 
-    /// 書き込めなかった更新の行の末尾に付ける印
-    fn write_failed_marker(&self, write_failed: bool) -> String {
-        if !write_failed {
-            String::new()
-        } else if self.color {
-            format!(" {}", "✗ failed".red())
+    /// 失敗理由を更新行の末尾に付ける。複数行のエラーも1行に収める。
+    fn write_failed_marker(&self, write_error: Option<&str>) -> String {
+        let Some(reason) = write_error else {
+            return String::new();
+        };
+        let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+        if self.color {
+            format!(" {}", format!("✗ failed: {reason}").red())
         } else {
-            " [failed]".to_string()
+            format!(" [failed: {reason}]")
         }
     }
 
@@ -207,13 +209,13 @@ impl TextFormatter {
         variable_name: Option<&str>,
         osv_skipped: &[String],
         osv_checked: bool,
-        write_failed: bool,
+        write_error: Option<&str>,
         max_name_len: usize,
         writer: &mut dyn Write,
     ) -> std::io::Result<()> {
         let change_type = VersionChangeType::from_versions(old_version, new_version);
         let dev_marker = if is_dev { " 🔧" } else { "" };
-        let failed_marker = self.write_failed_marker(write_failed);
+        let failed_marker = self.write_failed_marker(write_error);
 
         // リリース日をフォーマット
         let date_display = released_at
@@ -306,11 +308,11 @@ impl TextFormatter {
         git: &GitSource,
         new_version: &str,
         is_dev: bool,
-        write_failed: bool,
+        write_error: Option<&str>,
         max_name_len: usize,
         writer: &mut dyn Write,
     ) -> std::io::Result<()> {
-        let failed_marker = self.write_failed_marker(write_failed);
+        let failed_marker = self.write_failed_marker(write_error);
         let ref_label = git.reference.display_name();
         let (old_display, new_display) = match &git.reference {
             GitReference::Tag(current) => (current.clone(), new_version.to_string()),
@@ -372,7 +374,6 @@ impl TextFormatter {
                 write_error,
             } = result
             {
-                let write_failed = write_error.is_some();
                 // git 依存は専用フォーマットで表示
                 if let Some(git) = &dependency.git_source {
                     self.format_git_update_line(
@@ -380,7 +381,7 @@ impl TextFormatter {
                         git,
                         new_version,
                         is_dev,
-                        write_failed,
+                        write_error.as_deref(),
                         max_name_len,
                         writer,
                     )?;
@@ -404,7 +405,7 @@ impl TextFormatter {
                     dependency.variable_name.as_deref(),
                     osv_skipped,
                     *osv_checked,
-                    write_failed,
+                    write_error.as_deref(),
                     max_name_len,
                     writer,
                 )?;
@@ -894,7 +895,7 @@ impl OutputFormatter for TextFormatter {
             writeln!(writer, "  {}", self.maybe_dimmed("No packages updated"))?;
         }
 
-        // 書き込めなかった更新 (理由は Errors 欄に出る)
+        // 書き込めなかった更新 (理由は各更新行の末尾にも出る)
         if failed > 0 {
             writeln!(
                 writer,
@@ -1079,7 +1080,7 @@ mod tests {
                 None,
                 &[],
                 false,
-                false,
+                None,
                 6,
                 &mut output,
             )
@@ -1292,12 +1293,16 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} の行が無い: {output}"))
                 .to_string()
         };
-        assert!(!line("lodash").contains("[failed]"));
+        assert!(!line("lodash").contains("failed:"));
         assert!(
-            line("react").ends_with("[major] (release date unknown) [failed]"),
+            line("react")
+                .ends_with("[major] (release date unknown) [failed: Failed to update react]"),
             "{output}"
         );
-        assert!(line("typescript").ends_with("🔧 [failed]"), "{output}");
+        assert!(
+            line("typescript").ends_with("🔧 [failed: Failed to update typescript]"),
+            "{output}"
+        );
         assert!(
             output.contains("1 package(s) updated (1 minor)"),
             "{output}"
@@ -1321,12 +1326,52 @@ mod tests {
 
         let output = format_text(&result, Verbosity::Normal);
         assert!(output.contains("— 0 updates, 3 failed, 1 skip"), "{output}");
-        assert_eq!(output.matches("[failed]").count(), 3, "{output}");
+        assert_eq!(output.matches("[failed:").count(), 3, "{output}");
         assert!(output.contains("No packages updated"), "{output}");
         assert!(output.contains("3 package(s) failed to update"), "{output}");
 
         let quiet = format_text(&result, Verbosity::Quiet);
         assert_eq!(quiet.trim(), "0 updated, 3 failed");
+    }
+
+    #[test]
+    fn test_format_failure_reason_stays_on_update_line() {
+        let reason = "bun install failed: resolving dependencies\r\n\n\terror: bun-types@1.4.4 was published within minimum release age\nerror: bun-types@1.4.4 failed to resolve";
+        let single_line = "bun install failed: resolving dependencies error: bun-types@1.4.4 was published within minimum release age error: bun-types@1.4.4 failed to resolve";
+        for git in [false, true] {
+            for color in [false, true] {
+                for verbosity in [Verbosity::Normal, Verbosity::Verbose] {
+                    let mut result = create_result_with_write_failures(&["react"]);
+                    for update in &mut result.summary.manifests[0].results {
+                        if update.package_name() == "react" {
+                            update.record_write_error(reason);
+                            if git && let UpdateResult::Update { dependency, .. } = update {
+                                dependency.git_source = Some(GitSource::new(
+                                    "https://example.com/library.git",
+                                    GitReference::Tag("v18.0.0".into()),
+                                ));
+                            }
+                        }
+                    }
+                    let formatter = TextFormatter::with_color(verbosity, false, color);
+                    let mut output = Vec::new();
+                    formatter.format(&result, &mut output).unwrap();
+                    let output = String::from_utf8(output).unwrap();
+                    let line = output.lines().find(|line| line.contains("react")).unwrap();
+                    let suffix = if color {
+                        format!("✗ failed: {single_line}").red().to_string()
+                    } else {
+                        format!("[failed: {single_line}]")
+                    };
+                    assert!(line.ends_with(&suffix), "{output}");
+                    assert_eq!(line.contains("[git]"), git, "{output}");
+                    assert_eq!(output.matches(single_line).count(), 1, "{output}");
+                    assert!(!output.contains('\r'), "{output}");
+                    let success = output.lines().find(|line| line.contains("lodash")).unwrap();
+                    assert!(!success.contains("failed:"), "{output}");
+                }
+            }
+        }
     }
 
     #[test]
