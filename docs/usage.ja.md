@@ -135,7 +135,7 @@ depup --no-osv
 - Swift パッケージは照会しません。OSV は Swift のパッケージをリポジトリの完全な URL で識別しますが、depup は GitHub の `owner/repo` で識別するため、照会しても一致しません。
 - mise のツールも照会しません。バックエンドごとにバージョン体系も名前空間も異なり、OSV の 1 つのエコシステムに対応付けられないためです。
 - Cargo の git 依存も照会しません。
-- OSV への問い合わせに失敗しても、更新は止めません。脆弱性を確認できていないバージョンがそのまま更新先になり、`✓ OSV` マークは付きません。失敗は `Errors:` 欄（JSON では `errors` 配列）に表示されますが、終了コードは変わりません。
+- OSV への問い合わせに失敗しても、更新は止めません。脆弱性を確認できていないバージョンがそのまま更新先になり、`✓ OSV` マークは付きません。失敗は `Warnings:` 欄（JSON では `errors` 配列）に表示されますが、終了コードは変わりません。
 
 OSV で更新可能な版をすべて除外した場合、スキップ理由は `no eligible update without known vulnerabilities` になります。通常のテキスト出力にも、除外した版と、マニフェストの比較基準となる版の脆弱性 ID を表示します。比較基準の版は lockfile に入った版を表すものではありません。公開済みの版と対応付けられない場合や、OSV への問い合わせに失敗した場合は、未確認であることを示します。
 
@@ -158,7 +158,6 @@ Cargo.lock の age 差し戻しでは、install の復元処理が終わった�
 
 ```text
 $ depup --install --include-pinned
-  ⚠ OSV: dompurify 3.4.8 vulnerable (GHSA-vxr8-fq34-vvx9)
 ./package.json (Node.js) — 9 updates, 41 skips
   @mui/icons-material   9.0.1 → 9.1.0 [minor] (2026/06/08 08:30) ✓ OSV
   @mui/material         9.0.1 → 9.1.0 [minor] (2026/06/08 08:29) ✓ OSV
@@ -170,17 +169,17 @@ $ depup --install --include-pinned
   @types/node           25.9.1 → 25.9.2 [patch] (2026/06/05 22:33) ✓ OSV 🔧
   @types/react          19.2.15 → 19.2.17 [patch] (2026/06/05 20:10) ✓ OSV 🔧
 
-Errors:
-  ✗ OSV check for dompurify: 3.4.8 vulnerable, falling back (GHSA-vxr8-fq34-vvx9)
+Notices:
+  OSV excluded 1 vulnerable candidate(s); these notices did not stop the run. Details: --verbose.
 
 Summary:
   9 package(s) updated (4 minor, 5 patch)
   41 package(s) skipped
 ```
 
-この例では、dompurify の 3.4.8 を候補から外したあと、条件を満たす候補が残りませんでした。そのため dompurify は更新されず、41 件のスキップに含まれています。安全なバージョンが見つかった場合は、更新行の下に `↳ OSV skipped: <バージョン> (<勧告 ID>)` 行が付きます。
+この例では、dompurify の 3.4.8 を候補から外したあと、条件を満たす候補が残りませんでした。そのため dompurify は更新されず、41 件のスキップに含まれています。安全なバージョンが見つかった場合は、更新行の下に除外した候補の件数が付きます。`--verbose` では `↳ OSV skipped: <バージョン> (<勧告 ID>)` と詳細を表示します。
 
-`falling back` は、脆弱なバージョンを設計どおりに避けたことを知らせる通知で、終了コードには影響しません。レポートの上にある `⚠ OSV:` 行は標準エラー出力への進捗表示です。標準エラー出力が端末のときに表示され、`--quiet` を付けたときは端末かどうかにかかわらず表示されます。デフォルトのテキスト出力では同じ内容が `Errors:` 欄（JSON では `errors`）にも入るため、CI でも失われません。
+候補の除外は、脆弱なバージョンを設計どおりに避けたことを知らせる通知で、終了コードには影響しません。通常表示では途中で脆弱性IDを繰り返さず、`Notices:` に件数をまとめます。`--verbose` では版と脆弱性IDも表示します。OSV の照会失敗は `Warnings:` に示し、JSON の `errors` には元の診断を残すため、CI でも詳細を確認できます。
 
 ### 更新幅の制限（`--max-change`）
 
@@ -417,11 +416,14 @@ age が有効なら、depup は install の後に Cargo と Node の lockfile �
 戻し方は install 失敗時の復元と同じです。実行前に保存した内容を書き戻し、install が作った lockfile は削除し、`node_modules` や `target` などのインストール成果物は残します。depup 自身の操作以外で変わったファイルは上書きしません。そのようなファイルが単位に 1 つでもあれば、単位のどのファイルも戻しません。パッケージマネージャーは成功しているので、残したファイルは一緒に書かれた組のままです。マニフェストだけを戻すと、残した lockfile と食い違い、`cargo --locked` などが通らなくなります。変わったファイルはどれもこの実行の変更を残し、元の内容の復旧用コピーを保存します。報告では、復元しなかったことと、ファイルどうしが合っているかを確かめていないことを示します。共有の lock、pnpm workspace、Tauri プロジェクトでつながる単位は一緒に戻します。同じディレクトリにあっても独立した install (`Cargo.toml` の隣の Go モジュールや Gemfile など) の変更は残します。取り消した更新は理由 (`lock verification failed; update canceled: ...`) 付きで `failed` に入り、終了コードは 2 です。戻した後は、パッケージマネージャーをもう一度実行して、インストール成果物を戻した lockfile に合わせてください。
 
 ```text
-Lock verification failed; recovering project changes (Cargo.lock keeps versions this run added that do not pass --age: leaf 1.2.0 (newer than --age))
-  restored ./Cargo.lock
-  restored ./Cargo.toml
-  The project files are back to their state before this run.
-  Install artifacts are retained. Re-run the package manager after recovery.
+Updates canceled — final lock verification failed
+  Cause: Cargo.lock keeps versions this run added that do not pass --age: leaf 1.2.0 (newer than --age)
+  Scope: /path/to/project
+  restored Cargo.lock
+  restored Cargo.toml
+  Recovery: project files restored to their state before this run.
+  Next: re-run the package manager to align installed artifacts with the restored lockfile.
+  Installed artifacts (such as node_modules or target) were retained.
 ```
 
 pnpm の更新先の不一致 (override や解決の結果、直接依存が別の版のまま残った) は age の失敗ではありません。調べられるようにファイルを残し、終了コード 2 にします。`--install --refresh-lock` の Cargo も、実行前からある版の age 違反だけでは再解決を戻しません。OSV など、追加の検証と復元の条件は[ロックファイルの再解決](#ロックファイルの再解決--install---refresh-lock)を参照してください。
@@ -475,6 +477,8 @@ age フィルターは、depup がマニフェストに書き込むバージョ�
 | npm | なし | package-lock 形式 2/3 の実際の解決版を install 後に検証する |
 | Yarn、Bun | なし | lock の監査は未対応。age が有効なら終了コード 2 で通知する |
 | pip、Poetry、Rye、Pipenv、Go、Bundler、Composer、Gradle、SwiftPM | なし | 適用されない（age フィルターが効くのは直接依存だけ） |
+
+uv では age が有効な場合、`uv lock --exclude-newer <日時>`、一時的な cutoff を渡さない `uv lock`、`uv sync --locked` の順に実行します。2 回目の lock で、継続的な cutoff や期間指定も含めて uv 本来の設定へ戻します。生成した lock は、通常の `uv lock --check` や `uv ... --locked` でそのまま利用できます。depup は前後の lock を比較し、グローバル cutoff とその期間表現以外の変更を認めません。解決済みのパッケージ・取得元・artifact・ほかの設定が変わった場合や、lock コマンドが失敗した場合は install 失敗として報告し、環境の同期を中止します。管理対象のプロジェクトファイルは実行前の状態へ戻します。選んだ版に cutoff 後の wheel などが追加された場合も対象です。エラーに表示されたパッケージを確認し、追加ファイルが age を満たすまで待つか、プロジェクトの age 設定を見直してください。age が無効な場合は、従来どおり `uv sync` を 1 回だけ実行します。
 
 `--verbose` を付けると、今回使うパッケージマネージャーのうち、age フィルターが直接依存にしか効かないものを通知します。`--no-age` を指定し、プロジェクトと PM 自身のポリシーもない場合は、age の値をどこにも渡さず、Rust と Node の lock の監査も行いません。uv のパッケージ・index 単位の明示例外は uv 自身の仕様に従います。
 

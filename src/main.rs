@@ -155,10 +155,7 @@ async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
     // 適切な終了コードを返す。
     // OSV 警告は「脆弱な候補を検出して安全な版へフォールバックした」という
     // 設計どおりの正常動作の通知なので、エラー扱い (exit code 2) にしない。
-    let has_errors = result
-        .errors
-        .iter()
-        .any(|e| !matches!(e, depup::orchestrator::OrchestratorError::OsvWarning { .. }));
+    let has_errors = result.errors.iter().any(|e| !e.is_warning());
 
     if has_errors || age_audit_failed {
         // 部分的な成功 - 一部エラーが発生

@@ -13,6 +13,105 @@ fn result() -> OrchestratorResult {
         errors: vec![],
     }
 }
+
+#[test]
+fn normal_recovery_report_keeps_the_cause_once_and_does_not_claim_unrestored_files_are_restored() {
+    use crate::output::{OutputFormatter, TextFormatter, Verbosity};
+    let temp = tempfile::tempdir().unwrap();
+    let directory = identity(temp.path());
+    let path = directory.join("package.json");
+    let lock = directory.join("pnpm-lock.yaml");
+    let cause = "final lock OSV verification failed: sanitizer@1.1.0 is vulnerable (TEST-ADVISORY)";
+    for recovered in [true, false] {
+        let report = RollbackReport {
+            units: vec![FailedUnit {
+                directories: BTreeSet::from([directory.clone()]),
+                summaries: BTreeSet::from([0]),
+                reason: cause.into(),
+                files: BTreeMap::from([
+                    (
+                        path.clone(),
+                        if recovered {
+                            FileOutcome::Restored
+                        } else {
+                            FileOutcome::Kept {
+                                backup: Ok(PathBuf::from("/recovery/package.json")),
+                            }
+                        },
+                    ),
+                    (
+                        lock.clone(),
+                        if recovered {
+                            FileOutcome::Restored
+                        } else {
+                            FileOutcome::Conflict {
+                                reason: "external edit".into(),
+                                backup: Ok(PathBuf::from("/recovery/pnpm-lock.yaml")),
+                            }
+                        },
+                    ),
+                ]),
+                policy_failure: true,
+                skipped: !recovered,
+            }],
+            node_managers: BTreeMap::from([(directory.clone(), (directory.clone(), "pnpm"))]),
+        };
+        let mut result = result();
+        let mut manifest = ManifestUpdateResult::new(&path, Language::Node);
+        for index in 0..30 {
+            manifest.add_result(UpdateResult::update(
+                Dependency::new(
+                    format!("package-{index}"),
+                    VersionSpec::new(VersionSpecKind::Exact, "1.0.0", "1.0.0"),
+                    false,
+                    Language::Node,
+                ),
+                "1.1.0",
+            ));
+        }
+        result.summary.add_manifest(manifest);
+        report.mark_summary(&mut result.summary);
+        let mut output = vec![];
+        report.print(&mut output, false).unwrap();
+        TextFormatter::with_color(Verbosity::Normal, false, false)
+            .format(&result, &mut output)
+            .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.starts_with("Updates canceled —"), "{output}");
+        assert_eq!(output.matches("TEST-ADVISORY").count(), 1, "{output}");
+        assert!(output.contains("30 canceled"), "{output}");
+        assert!(!output.contains("30 failed"), "{output}");
+        if recovered {
+            assert!(
+                output.contains("Recovery: project files restored"),
+                "{output}"
+            );
+            assert!(output.contains("restored package.json"), "{output}");
+            assert!(output.contains("restored pnpm-lock.yaml"), "{output}");
+            assert!(output.contains("Next: run pnpm install"), "{output}");
+        } else {
+            assert!(output.contains("Recovery: skipped"), "{output}");
+            assert!(output.contains("no files restored"), "{output}");
+            assert!(
+                !output.contains("Recovery: project files restored"),
+                "{output}"
+            );
+            assert!(
+                output.contains("review the kept files and recovery copies"),
+                "{output}"
+            );
+            assert!(output.contains("Pre-write copy: /recovery/"), "{output}");
+        }
+        assert_eq!(result.summary.total_failed(), 30);
+        assert_eq!(result.summary.total_updates(), 0);
+        assert!(
+            result.summary.manifests[0]
+                .results
+                .iter()
+                .all(|update| update.cancellation().unwrap().recovered == recovered)
+        );
+    }
+}
 fn update(
     result: &mut OrchestratorResult,
     path: &Path,
@@ -84,6 +183,238 @@ fn success(command: &PreparedInstall) -> InstallResult {
         String::new(),
         String::new(),
     )
+}
+
+#[test]
+fn uv_install_normalizes_transient_cutoff_without_changing_the_resolution() {
+    for workspace in [false, true] {
+        for native in [
+            "",
+            "exclude-newer = '2026-09-01T00:00:00Z'\n",
+            "exclude-newer = '0001-01-01T00:00:00Z'\nexclude-newer-span = 'P30D'\n",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let directory = temp.path();
+            let member = directory.join("packages/member");
+            let selected = if workspace {
+                member.as_path()
+            } else {
+                directory
+            };
+            let mut result = result();
+            let manifest = selected.join("pyproject.toml");
+            update(
+                &mut result,
+                &manifest,
+                Language::Python,
+                "[project]\nname = 'example'\nversion = '0.1.0'\ndependencies = ['example==1.0.0']\n",
+                "example",
+            );
+            if workspace {
+                fs::write(
+                    directory.join("pyproject.toml"),
+                    "[tool.uv.workspace]\nmembers = ['packages/*']\n",
+                )
+                .unwrap();
+            }
+            let lock = directory.join("uv.lock");
+            fs::write(&lock, "# old lock\n").unwrap();
+            // A member-local lock selects uv, but the workspace owns the real lock.
+            if workspace {
+                fs::write(selected.join("uv.lock"), "# unrelated member lock\n").unwrap();
+            }
+            let mut install = job(selected, Language::Python, std::slice::from_ref(&manifest));
+            install.policy.as_mut().unwrap().min_age =
+                Some(std::time::Duration::from_secs(604_800));
+            let plan = plan(vec![install]);
+            let mut tx = InstallTransactions::begin(&plan, &result, directory);
+            let packages = "[[package]]\nname = 'example'\nversion = '2.0.0'\nsource = { registry = 'https://pypi.org/simple' }\n";
+            let normalized =
+                format!("version = 1\n[options]\n{native}resolution-mode = 'highest'\n{packages}");
+            let mut calls = Vec::new();
+            tx.execute(|command| {
+                calls.push(command.argv.clone());
+                if calls.len() == 1 {
+                    assert_eq!(command.argv[1], "lock");
+                    assert!(command.argv.iter().any(|arg| arg == "--exclude-newer"));
+                    fs::write(&lock, format!("version = 1\n[options]\nexclude-newer = '2026-10-01T00:00:00Z'\nresolution-mode = 'highest'\n{packages}")).unwrap();
+                } else if calls.len() == 2 {
+                    assert_eq!(command.argv, ["uv", "lock"]);
+                    fs::write(&lock, &normalized).unwrap();
+                } else {
+                    assert_eq!(command.argv, ["uv", "sync", "--locked"]);
+                    assert_eq!(fs::read_to_string(&lock).unwrap(), normalized);
+                }
+                success(command)
+            });
+            let report = tx.rollback();
+            assert!(!report.has_failures());
+            assert_eq!(calls.len(), 3);
+            assert_eq!(fs::read_to_string(&lock).unwrap(), normalized);
+            assert!(fs::read_to_string(manifest).unwrap().contains("2.0.0"));
+            if workspace {
+                assert_eq!(
+                    fs::read_to_string(selected.join("uv.lock")).unwrap(),
+                    "# unrelated member lock\n"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn uv_normalization_failure_restores_files_before_syncing() {
+    for failure_kind in [
+        "command",
+        "version",
+        "source",
+        "metadata",
+        "package-policy",
+        "artifact",
+        "invalid",
+        "missing",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path();
+        let mut result = result();
+        let manifest = directory.join("pyproject.toml");
+        let original =
+            "[project]\nname = 'example'\nversion = '0.1.0'\ndependencies = ['example==1.0.0']\n";
+        update(
+            &mut result,
+            &manifest,
+            Language::Python,
+            original,
+            "example",
+        );
+        let lock = directory.join("uv.lock");
+        fs::write(&lock, "# original lock\n").unwrap();
+        let mut install = job(directory, Language::Python, std::slice::from_ref(&manifest));
+        install.policy.as_mut().unwrap().min_age = Some(std::time::Duration::from_secs(604_800));
+        let plan = plan(vec![install]);
+        let mut tx = InstallTransactions::begin(&plan, &result, directory);
+        let filtered = "version = 1\n[options]\nexclude-newer = '2026-10-01T00:00:00Z'\nexclude-newer-package = { other = false }\n[[package]]\nname = 'example'\nversion = '2.0.0'\nsource = { registry = 'https://pypi.org/simple' }\n";
+        let mut calls = 0;
+        tx.execute(|command| {
+            calls += 1;
+            assert_eq!(
+                command.argv[1], "lock",
+                "sync must not run after {failure_kind}"
+            );
+            if calls == 1 {
+                fs::write(&lock, filtered).unwrap();
+            } else {
+                match failure_kind {
+                    "command" => return failure(command),
+                    "version" => fs::write(&lock, filtered.replace("2.0.0", "3.0.0")).unwrap(),
+                    "source" => {
+                        fs::write(&lock, filtered.replace("pypi.org", "packages.example.com"))
+                            .unwrap()
+                    }
+                    "metadata" => {
+                        fs::write(&lock, filtered.replace("version = 1", "version = 2")).unwrap()
+                    }
+                    "artifact" => fs::write(&lock, format!("{filtered}wheels = [{{ url = 'https://files.example.com/new.whl', upload-time = '2026-10-20T00:00:00Z' }}]\n")).unwrap(),
+                    "package-policy" => fs::write(
+                        &lock,
+                        filtered.replace("other = false", "other = '2026-09-01'"),
+                    )
+                    .unwrap(),
+                    "invalid" => fs::write(&lock, "not valid TOML").unwrap(),
+                    "missing" => fs::remove_file(&lock).unwrap(),
+                    _ => unreachable!(),
+                }
+            }
+            success(command)
+        });
+        let report = tx.rollback();
+        report.mark_summary(&mut result.summary);
+        assert!(report.has_install_failures(), "{failure_kind}");
+        assert_eq!(calls, 2);
+        assert_eq!(fs::read_to_string(&lock).unwrap(), "# original lock\n");
+        assert_eq!(fs::read_to_string(&manifest).unwrap(), original);
+        assert_eq!(result.summary.total_failed(), 1);
+        if failure_kind == "artifact" {
+            let reason = result.summary.manifests[0].results[0]
+                .write_error()
+                .unwrap();
+            assert!(reason.contains("example 2.0.0"), "{reason}");
+            assert!(
+                reason.contains("files may have been uploaded after the cutoff"),
+                "{reason}"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires uv and a local Python interpreter; runs offline"]
+fn uv_real_install_leaves_a_lock_usable_with_native_settings() {
+    use std::process::Command;
+    for native in [
+        "",
+        "exclude-newer = '2026-08-01T00:00:00Z'\n",
+        "exclude-newer = '30 days'\n",
+        "exclude-newer = false\n",
+        "exclude-newer-package = { unused = false }\n",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("project");
+        let home = temp.path().join("home");
+        fs::create_dir_all(&directory).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        let manifest = directory.join("pyproject.toml");
+        fs::write(&manifest, "[project]\nname = 'example'\nversion = '1.0.0'\nrequires-python = '>=3.11'\ndependencies = []\n").unwrap();
+        fs::write(directory.join("uv.toml"), native).unwrap();
+        let invoke = |args: &[String]| {
+            Command::new("uv")
+                .args(args)
+                .current_dir(&directory)
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap())
+                .env("HOME", &home)
+                .env("XDG_CONFIG_HOME", &home)
+                .env("APPDATA", &home)
+                .env("UV_CACHE_DIR", temp.path().join("cache"))
+                .env("UV_OFFLINE", "1")
+                .env("UV_PYTHON_DOWNLOADS", "never")
+                .output()
+                .unwrap()
+        };
+        let baseline = invoke(&["lock".into()]);
+        assert!(baseline.status.success(), "{baseline:?}");
+        let original_lock = fs::read_to_string(directory.join("uv.lock")).unwrap();
+        let mut install = job(&directory, Language::Python, &[manifest]);
+        install.policy.as_mut().unwrap().min_age = Some(std::time::Duration::from_secs(60 * 86400));
+        let plan = plan(vec![install]);
+        let mut tx = InstallTransactions::begin(&plan, &result(), &directory);
+        tx.execute(|command| {
+            let output = invoke(&command.argv[1..]);
+            InstallResult {
+                language: command.language,
+                command: command.argv.join(" "),
+                success: output.status.success(),
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            }
+        });
+        let report = tx.rollback();
+        let mut diagnostic = vec![];
+        report.print(&mut diagnostic, false).unwrap();
+        assert!(
+            !report.has_failures(),
+            "{}",
+            String::from_utf8_lossy(&diagnostic)
+        );
+        assert_eq!(
+            fs::read_to_string(directory.join("uv.lock")).unwrap(),
+            original_lock
+        );
+        let checked = invoke(&["lock".into(), "--check".into()]);
+        assert!(checked.status.success(), "{native}: {checked:?}");
+        let synced = invoke(&["sync".into(), "--locked".into()]);
+        assert!(synced.status.success(), "{native}: {synced:?}");
+    }
 }
 
 #[test]
@@ -1370,7 +1701,7 @@ fn a_kept_lockfile_keeps_its_manifest_only_after_a_lock_verification_failure() {
         let report = tx.rollback();
         report.mark_summary(&mut result.summary);
         let mut output = vec![];
-        report.print(&mut output).unwrap();
+        report.print(&mut output, true).unwrap();
         let output = String::from_utf8(output).unwrap();
         let error = result.summary.manifests[0].results[0]
             .write_error()
@@ -2164,7 +2495,7 @@ fn restore_io_failure_keeps_that_manifest_failed_backs_it_up_and_continues_other
     assert_eq!(value["summary"]["updates"], 0);
     assert_eq!(value["summary"]["failed"], 1);
     let mut report_text = vec![];
-    report.print(&mut report_text).unwrap();
+    report.print(&mut report_text, true).unwrap();
     let report_text = String::from_utf8(report_text).unwrap();
     assert!(report_text.contains("simulated recovery I/O failure"));
     assert!(report_text.contains("Pre-write copy"));
@@ -2772,7 +3103,7 @@ fn new_or_replaced_mise_directory_links_keep_existing_target_metadata() {
                 }
             }
             let mut output = vec![];
-            report.print(&mut output).unwrap();
+            report.print(&mut output, true).unwrap();
             assert!(
                 !String::from_utf8(output)
                     .unwrap()
@@ -2883,7 +3214,7 @@ fn no_manager_still_reports_observed_manifest_conflicts() {
             };
             assert_eq!(fs::read(copy).unwrap(), before);
             let mut output = vec![];
-            report.print(&mut output).unwrap();
+            report.print(&mut output, true).unwrap();
             assert!(
                 String::from_utf8(output)
                     .unwrap()

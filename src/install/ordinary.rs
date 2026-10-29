@@ -194,11 +194,11 @@ pub(crate) async fn run_with(
     let security = audit_osv(args, plan, &audit_plan, &osv_baselines, &mut tx, checks).await;
     audit_failed |= security.failed;
     let recovery = tx.rollback();
-    let report_error = recovery.print(&mut std::io::stderr()).err();
+    let report_error = recovery.print(&mut std::io::stderr(), args.verbose).err();
     recovery.mark_summary(&mut result.summary);
     for (path, bytes, notices) in security.notices {
         if std::fs::read(path).is_ok_and(|final_bytes| final_bytes == bytes) {
-            super::security::print_notices(notices, result);
+            super::security::print_notices(notices, result, orchestrator.live_osv_details());
         }
     }
     rollback_osv.warn(orchestrator, result, args.quiet).await;

@@ -69,13 +69,17 @@ where
     .map_err(|_| "lockfile OSV verification timed out".to_string())?
 }
 
-pub(super) fn print_notices(notices: Notices, result: &mut OrchestratorResult) {
+pub(super) fn print_notices(notices: Notices, result: &mut OrchestratorResult, live_details: bool) {
     for (package, report) in notices {
-        let message = report.describe(&package);
-        eprintln!("  ⚠ {message}");
+        if live_details {
+            eprintln!("  ⚠ {}", report.describe(&package));
+        }
         result
             .errors
-            .push(crate::orchestrator::OrchestratorError::OsvWarning { package, message });
+            .push(crate::orchestrator::OrchestratorError::OsvTradeoff {
+                package,
+                report: Box::new(report),
+            });
     }
 }
 

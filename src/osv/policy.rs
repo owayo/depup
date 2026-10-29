@@ -71,6 +71,17 @@ pub struct RiskTradeoff {
 }
 
 impl RiskTradeoff {
+    pub fn describe_summary(&self, name: &str) -> String {
+        format!(
+            "{name} {} -> {}: OSV severity trade-off accepted (fixed: {}, introduced: {}, retained: {}); known vulnerabilities remain; details: --verbose",
+            self.baseline_versions.join(", "),
+            self.candidate_versions.join(", "),
+            self.fixed.len(),
+            self.introduced.len(),
+            self.retained.len()
+        )
+    }
+
     pub fn describe(&self, name: &str) -> String {
         let list = |groups: &[AdvisoryGroup]| {
             groups
