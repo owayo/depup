@@ -478,6 +478,8 @@ age フィルターは、depup がマニフェストに書き込むバージョ�
 | Yarn、Bun | なし | lock の監査は未対応。age が有効なら終了コード 2 で通知する |
 | pip、Poetry、Rye、Pipenv、Go、Bundler、Composer、Gradle、SwiftPM | なし | 適用されない（age フィルターが効くのは直接依存だけ） |
 
+uv では age が有効な場合、`uv lock --exclude-newer <日時>`、一時的な cutoff を渡さない `uv lock`、`uv sync --locked` の順に実行します。2 回目の lock で、継続的な cutoff や期間指定も含めて uv 本来の設定へ戻します。生成した lock は、通常の `uv lock --check` や `uv ... --locked` でそのまま利用できます。depup は前後の lock を比較し、グローバル cutoff とその期間表現以外の変更を認めません。解決済みのパッケージ・取得元・artifact・ほかの設定が変わった場合や、lock コマンドが失敗した場合は install 失敗として報告し、環境の同期を中止します。管理対象のプロジェクトファイルは実行前の状態へ戻します。選んだ版に cutoff 後の wheel などが追加された場合も対象です。エラーに表示されたパッケージを確認し、追加ファイルが age を満たすまで待つか、プロジェクトの age 設定を見直してください。age が無効な場合は、従来どおり `uv sync` を 1 回だけ実行します。
+
 `--verbose` を付けると、今回使うパッケージマネージャーのうち、age フィルターが直接依存にしか効かないものを通知します。`--no-age` を指定し、プロジェクトと PM 自身のポリシーもない場合は、age の値をどこにも渡さず、Rust と Node の lock の監査も行いません。uv のパッケージ・index 単位の明示例外は uv 自身の仕様に従います。
 
 #### Node の lock の監査

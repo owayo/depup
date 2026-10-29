@@ -475,6 +475,8 @@ The age filter decides which versions depup writes into manifests. Whether it al
 | Yarn, Bun | Nothing | Lock audit is currently unsupported; an active age policy produces exit 2 |
 | pip, Poetry, Rye, Pipenv, Go, Bundler, Composer, Gradle, SwiftPM | Nothing | Not filtered; only direct dependencies follow the age filter |
 
+For uv with an active age policy, depup first runs `uv lock --exclude-newer <timestamp>`, then `uv lock` without the temporary cutoff, and finally `uv sync --locked`. The second step restores uv's native configuration, including persistent cutoffs and cooldown durations, so the result can be used by ordinary `uv lock --check` and `uv ... --locked` commands. depup compares both locks and permits changes only to the global cutoff and its duration representation; resolved packages, sources, artifacts, and other settings must remain identical. If either lock step fails or the resolution changes, depup reports an install failure, skips environment synchronization, and restores the managed project files. This also applies when a selected version has new wheels or other files uploaded after the cutoff; the error identifies the changed packages. Retry once those files satisfy the age policy, or review the project age policy. With no active age policy, uv still runs a single `uv sync`.
+
 With `--verbose`, depup prints a note naming the package managers used in the run for which the age filter covers direct dependencies only. With `--no-age` and no project or native policy, nothing age-related is passed and neither the Rust nor Node lock audit runs. Native package/index exemptions configured in uv still follow uv's own semantics.
 
 #### Auditing Node Lockfiles

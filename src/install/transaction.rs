@@ -32,6 +32,7 @@ struct Task {
     trees: Vec<FileGuard>,
     tree_links: BTreeMap<PathBuf, FileGuard>,
     mise_locks: Option<mise_lock::Preservation>,
+    uv_lock: Option<uv_lock::Normalization>,
 }
 struct Unit {
     files: BTreeSet<PathBuf>,
@@ -260,6 +261,12 @@ impl InstallTransactions {
                         .clone()
                     {
                         Ok(scope) => {
+                            if let Ok(Some(command)) = &mut task.command {
+                                task.uv_lock = uv_lock::Normalization::prepare(
+                                    scope.root.join("uv.lock"),
+                                    command,
+                                );
+                            }
                             for name in ["pyproject.toml", "uv.lock"] {
                                 tx.add_scoped_path(&mut task, &scope.root.join(name));
                             }
@@ -587,7 +594,55 @@ impl InstallTransactions {
         else {
             return;
         };
-        let result = runner(&command);
+        if let Some(normalization) = self.tasks[index].uv_lock.clone() {
+            if !self.run_step(index, &normalization.resolve, runner) {
+                return;
+            }
+            let resolved = match normalization.snapshot(&self.files) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    self.units[unit].failure = Some(error);
+                    return;
+                }
+            };
+            if !self.run_step(index, &normalization.normalize, runner) {
+                return;
+            }
+            match normalization.snapshot(&self.files) {
+                Ok(normalized) if normalized == resolved => {}
+                Ok(normalized) => {
+                    let changed = uv_lock::describe_change(&resolved, &normalized);
+                    self.units[unit].failure = Some(format!(
+                        "uv lock normalization changed the age-filtered lock ({changed}); \
+                         files may have been uploaded after the cutoff for an existing version; \
+                         install canceled. Retry after the files satisfy --age, or review the project age policy."
+                    ));
+                    return;
+                }
+                Err(error) => {
+                    self.units[unit].failure = Some(error);
+                    return;
+                }
+            }
+        }
+        if self.run_step(index, &command, runner) {
+            self.repair_mise_locks(index, &command, runner);
+        }
+    }
+
+    fn run_step(
+        &mut self,
+        index: usize,
+        command: &PreparedInstall,
+        runner: &mut impl FnMut(&PreparedInstall) -> InstallResult,
+    ) -> bool {
+        let unit = self.task_units[index];
+        self.observe_trees(index, false);
+        self.observe(unit, &BTreeSet::new());
+        if self.units[unit].failure.is_some() {
+            return false;
+        }
+        let result = runner(command);
         self.observe_trees(index, true);
         let managed = self.tasks[index].managed.clone();
         self.observe(unit, &managed);
@@ -596,9 +651,7 @@ impl InstallTransactions {
                 format!("{} failed: {}", result.command, result.stderr.trim())
             });
         }
-        if self.units[unit].failure.is_none() {
-            self.repair_mise_locks(index, &command, runner);
-        }
+        self.units[unit].failure.is_none()
     }
 
     pub(super) fn materialize_nodes(
@@ -983,6 +1036,7 @@ impl Task {
             trees: vec![],
             tree_links: BTreeMap::new(),
             mise_locks: None,
+            uv_lock: None,
         }
     }
 }
@@ -1417,6 +1471,7 @@ mod line_endings;
 mod mise;
 mod mise_lock;
 mod scope;
+mod uv_lock;
 
 #[cfg(test)]
 mod tests;
