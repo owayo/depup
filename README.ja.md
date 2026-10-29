@@ -277,7 +277,7 @@ make ci      # CI と同じ検査 (書き換えない)
 `make` でターゲットの一覧を表示します。リリースは GitHub Actions で行います (**Actions → Release → Run workflow**)。
 <!-- standard:dev:end -->
 
-追加のテスト用ターゲット、CI が OS ごとに実行する内容、リリースの手順は [docs/development.ja.md](docs/development.ja.md) で説明しています。
+追加のテスト用ターゲット、JSON マニフェストの性能計測、CI が OS ごとに実行する内容、リリースの手順は [docs/development.ja.md](docs/development.ja.md) で説明しています。
 
 ## ライセンス
 

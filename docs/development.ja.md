@@ -17,6 +17,18 @@ mise を使わずに `PATH` 上のツールで動かす場合は `SYSTEM_TOOLS=1
 | `make test-e2e` | E2E テストだけを実行する |
 | `make test-integration` | 統合テストだけを実行する |
 
+## JSON マニフェストの性能計測
+
+固定したツールチェーンで、メモリ内の更新処理を計測できます。
+
+```bash
+mise exec -- cargo run --release --locked --example manifest_update_bench -- 1000 7
+```
+
+引数は 1 サンプルの更新回数とサンプル数です。各ケースで 100 回ウォームアップしてから、更新 1 回のナノ秒と、ウォームアップ後の 1 回で要求したメモリ確保回数・バイト数を CSV に出します。時間の計測中は確保量の集計を止めます。確保バイト数には再確保の要求も含み、ピークメモリ使用量ではありません。
+
+Node の依存 1・100・1,000 件、エスケープしたキーと CRLF、ネストした Bun catalogs、Composer の依存 1,000 件を対象に、末尾の依存を更新します。更新結果の JSON と、依存セクション外の同名キーを保持していることも検証します。ネットワークとディスクへの書き込みは含めず、マニフェストの書き換えだけを測ります。同じ入力・依存・ツールチェーン・release 設定で、ビルドやテストを並行実行せず比較してください。測定記録は [benchmarks/json-manifest](../benchmarks/json-manifest/README.md) にあります。
+
 ## リリース
 
 リリースは GitHub Actions から行います。**Actions > Release > Run workflow** を開いて実行してください。

@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 fn find_json_string_end(bytes: &[u8], start: usize) -> Option<usize> {
     let mut escaped = false;
     let mut i = start + 1;
@@ -49,44 +51,51 @@ fn find_matching_json_object_end(bytes: &[u8], start: usize) -> Option<usize> {
 
 /// オブジェクト本文の直下にあるキー（引用符込み）と値の開始位置を返す。
 /// オブジェクトと配列の両方を追跡し、文字列内の括弧は構造として扱わない。
-fn direct_child_properties(content: &str, start: usize, end: usize) -> Vec<(&str, usize)> {
+fn direct_child_properties(
+    content: &str,
+    start: usize,
+    end: usize,
+) -> impl Iterator<Item = (&str, usize)> {
     let bytes = content.as_bytes();
     let end = end.min(bytes.len());
-    let mut properties = Vec::new();
     let mut depth = 0usize;
     let mut i = start;
 
-    while i < end {
-        match bytes[i] {
-            b'"' => {
-                let Some(string_end) = find_json_string_end(bytes, i).filter(|&pos| pos < end)
-                else {
-                    break;
-                };
-                if depth == 0 {
-                    let mut j = skip_json_ws(bytes, string_end + 1);
-                    if j < end && bytes[j] == b':' {
-                        j = skip_json_ws(bytes, j + 1);
-                        if j < end {
-                            properties.push((&content[i..=string_end], j));
+    // 呼び出し側が使うプロパティを順に返し、全キーを一時 Vec へ集めない。
+    std::iter::from_fn(move || {
+        while i < end {
+            match bytes[i] {
+                b'"' => {
+                    let string_start = i;
+                    let Some(string_end) = find_json_string_end(bytes, i).filter(|&pos| pos < end)
+                    else {
+                        i = end;
+                        return None;
+                    };
+                    i = string_end + 1;
+                    if depth == 0 {
+                        let mut j = skip_json_ws(bytes, i);
+                        if j < end && bytes[j] == b':' {
+                            j = skip_json_ws(bytes, j + 1);
+                            if j < end {
+                                return Some((&content[string_start..=string_end], j));
+                            }
                         }
                     }
                 }
-                i = string_end + 1;
+                b'{' | b'[' => {
+                    depth += 1;
+                    i += 1;
+                }
+                b'}' | b']' => {
+                    depth = depth.saturating_sub(1);
+                    i += 1;
+                }
+                _ => i += 1,
             }
-            b'{' | b'[' => {
-                depth += 1;
-                i += 1;
-            }
-            b'}' | b']' => {
-                depth = depth.saturating_sub(1);
-                i += 1;
-            }
-            _ => i += 1,
         }
-    }
-
-    properties
+        None
+    })
 }
 
 pub(crate) fn direct_child_object_section_ranges(
@@ -100,7 +109,7 @@ pub(crate) fn direct_child_object_section_ranges(
         for (raw_key, value_start) in direct_child_properties(content, start, end) {
             if bytes[value_start] == b'{'
                 && let Some(key) = decode_json_string(raw_key)
-                && section_names.is_none_or(|names| names.contains(&key.as_str()))
+                && section_names.is_none_or(|names| names.contains(&key.as_ref()))
                 && let Some(object_end) = find_matching_json_object_end(bytes, value_start)
                 && object_end <= end
             {
@@ -137,8 +146,15 @@ pub(crate) fn replace_string_property_in_top_level_sections(
 }
 
 /// JSON 文字列リテラル (引用符込み) をデコードする
-fn decode_json_string(raw: &str) -> Option<String> {
-    serde_json::from_str::<String>(raw).ok()
+fn decode_json_string(raw: &str) -> Option<Cow<'_, str>> {
+    // 通常のキーと値は入力を借用し、エスケープの展開が要る場合だけ所有する。
+    // どちらも serde_json に検証させ、不正なエスケープや制御文字は受理しない。
+    #[derive(serde::Deserialize)]
+    struct JsonString<'a>(#[serde(borrow)] Cow<'a, str>);
+
+    serde_json::from_str::<JsonString<'_>>(raw)
+        .ok()
+        .map(|value| value.0)
 }
 
 /// 文字列を JSON 文字列リテラル (引用符込み) へエンコードする
@@ -286,6 +302,66 @@ mod tests {
             ComposerJsonParser.parse(&updated).unwrap()[0].version(),
             "2.0.0"
         );
+    }
+
+    #[test]
+    fn test_mixed_literals_preserve_transform_order_and_unselected_bytes() {
+        let content = concat!(
+            "{\r\n",
+            r#" "dependencies": {"nested":[{"target":"ignored"}],"target":"\u005e1.0"},"#,
+            "\r\n",
+            r#" "devDepend\u0065ncies": {"tar\u0067et":"~1.0","other":"unchanged"},"#,
+            "\r\n",
+            r#" "optionalDependencies": {"target":null},"#,
+            "\r\n",
+            r#" "overrides": {"target":"^1.0"}"#,
+            "\r\n}",
+        );
+        let mut visited = Vec::new();
+        let (updated, changed) = replace_string_property_in_top_level_sections(
+            content,
+            &["dependencies", "devDependencies", "optionalDependencies"],
+            "target",
+            |old| {
+                visited.push(old.to_string());
+                Some(format!("{old}\n\"日本語\"\\"))
+            },
+        );
+
+        assert!(changed);
+        assert_eq!(visited, ["^1.0", "~1.0"]);
+        assert_eq!(
+            updated,
+            content
+                .replace(r#""\u005e1.0""#, r#""^1.0\n\"日本語\"\\""#)
+                .replace(r#""~1.0""#, r#""~1.0\n\"日本語\"\\""#)
+        );
+        assert!(serde_json::from_str::<serde_json::Value>(&updated).is_ok());
+    }
+
+    #[test]
+    fn test_surrogate_pairs_match_without_accepting_invalid_string_literals() {
+        let content = r#"{"dependencies":{"\ud83d\ude00":"old","other":"old"}}"#;
+        let (updated, changed) = replace_string_property_in_top_level_sections(
+            content,
+            &["dependencies"],
+            "😀",
+            |_| Some("new".to_string()),
+        );
+        assert!(changed);
+        assert_eq!(updated, content.replacen("old", "new", 1));
+
+        for invalid in [r#""\ud83d""#, r#""\ude00""#, r#""bad\q""#, "\"bad\nkey\""] {
+            let content = format!(r#"{{"dependencies":{{{invalid}:"old","valid":{invalid}}}}}"#);
+            let (updated, changed) = replace_string_property_in_top_level_sections(
+                &content,
+                &["dependencies"],
+                "valid",
+                |_| panic!("不正な JSON 文字列は更新しない"),
+            );
+            assert!(!changed);
+            assert_eq!(updated, content);
+        }
     }
 
     #[test]

@@ -17,6 +17,18 @@ Besides `make test`, two targets run a single test suite:
 | `make test-e2e` | Run E2E tests only |
 | `make test-integration` | Run integration tests only |
 
+## JSON Manifest Benchmark
+
+Run the in-memory update benchmark with the pinned toolchain:
+
+```bash
+mise exec -- cargo run --release --locked --example manifest_update_bench -- 1000 7
+```
+
+The arguments are updates per sample and sample count. Each case warms up with 100 updates, then prints CSV with nanoseconds per update and allocation requests for one warmed update. Timing runs with allocation counting disabled; allocation bytes include reallocation requests and are not peak memory usage.
+
+Cases cover 1, 100, and 1,000 Node dependencies, escaped keys with CRLF, nested Bun catalogs, and 1,000 Composer dependencies. Each update targets the last dependency. The benchmark checks the resulting JSON and preserves a same-named entry outside the dependency sections. It excludes network requests and disk writes, so its results measure manifest rewriting, rather than total CLI duration. Compare the same inputs, dependencies, toolchain, and release profile, without concurrent builds or tests. Recorded measurements are in [benchmarks/json-manifest](../benchmarks/json-manifest/README.md).
+
 ## Release
 
 Releases are published from GitHub Actions: open **Actions > Release > Run workflow**.
