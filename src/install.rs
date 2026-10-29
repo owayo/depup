@@ -135,7 +135,14 @@ impl InstallPlan {
         if orchestrator.refresh_lock_requested() {
             refresh::plan_jobs(&mut jobs, orchestrator, result, &node_audits);
         } else if only_mode {
-            scoped::replace_scoped_jobs(&mut jobs, orchestrator, result);
+            scoped::replace_scoped_jobs(
+                &mut jobs,
+                orchestrator,
+                result,
+                &[Language::Rust, Language::Php],
+            );
+        } else if orchestrator.package_exclusions_requested() {
+            scoped::replace_scoped_jobs(&mut jobs, orchestrator, result, &[Language::Rust]);
         } else if result.errors.iter().any(|error| {
             matches!(
                 error,

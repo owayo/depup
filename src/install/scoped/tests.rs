@@ -199,6 +199,13 @@ fn shared_workspace_lock_combines_member_targets_once() {
         project.path().join("second-app"),
     ]);
     let plan = InstallPlan::new_scoped(&orchestrator, &result, &directories, project.path(), true);
+    let mut excluded = CliArgs::parse_from(["depup", "--exclude", "untouched", "--no-age"]);
+    excluded.path = project.path().to_path_buf();
+    let excluded = Orchestrator::new(excluded).unwrap();
+    let excluded_plan = InstallPlan::new(&excluded, &result, &directories, project.path());
+    assert_eq!(excluded_plan.jobs.len(), 1);
+    assert_eq!(excluded_plan.jobs[0].directory, plan.jobs[0].directory);
+    assert_eq!(excluded_plan.jobs[0].scope, plan.jobs[0].scope);
     assert_eq!(plan.jobs.len(), 1);
     assert_eq!(
         plan.jobs[0].directory,
@@ -412,14 +419,59 @@ fn cargo_location_failure_stays_a_scoped_preparation_failure() {
         &temp.path().join("Cargo.toml"),
         vec![dep("selected", "1.0.0")],
     );
-    let mut args = CliArgs::parse_from(["depup", "--only", "selected", "--no-age"]);
+    for (option, name, only) in [
+        ("--only", "selected", true),
+        ("--exclude", "ignored", false),
+    ] {
+        let mut args = CliArgs::parse_from(["depup", option, name, "--no-age"]);
+        args.path = temp.path().to_path_buf();
+        let orchestrator = Orchestrator::new(args).unwrap();
+        let plan = InstallPlan::new_scoped(&orchestrator, &result, &None, temp.path(), only);
+        assert_eq!(plan.jobs.len(), 1);
+        assert!(plan.jobs[0].scope.is_err());
+        std::fs::write(temp.path().join("Cargo.toml"), "broken {{").unwrap();
+        let plan = InstallPlan::new_scoped(&orchestrator, &result, &None, temp.path(), only);
+        assert_eq!(plan.jobs.len(), 1);
+        assert!(plan.jobs[0].scope.is_err());
+        std::fs::remove_file(temp.path().join("Cargo.toml")).unwrap();
+    }
+}
+
+#[test]
+fn exclusion_scopes_initial_cargo_resolution_without_changing_composer() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("src")).unwrap();
+    std::fs::write(temp.path().join("src/lib.rs"), "").unwrap();
+    std::fs::write(
+        temp.path().join("Cargo.toml"),
+        "[package]\nname = 'app'\nversion = '0.1.0'\n",
+    )
+    .unwrap();
+    std::fs::write(temp.path().join("composer.lock"), "{}").unwrap();
+    let mut result = result(&temp.path().join("Cargo.toml"), vec![dep("selected", "1")]);
+    let mut php = ManifestUpdateResult::new(temp.path().join("composer.json"), Language::Php);
+    php.add_result(UpdateResult::update(
+        Dependency::production(
+            "vendor/selected",
+            VersionSpec::new(VersionSpecKind::Caret, "^1", "1"),
+            Language::Php,
+        ),
+        "2.0.0",
+    ));
+    result.summary.add_manifest(php);
+    let mut args = CliArgs::parse_from(["depup", "--exclude", "ignored", "--no-age"]);
     args.path = temp.path().to_path_buf();
     let orchestrator = Orchestrator::new(args).unwrap();
-    let plan = InstallPlan::new_scoped(&orchestrator, &result, &None, temp.path(), true);
-    assert_eq!(plan.jobs.len(), 1);
-    assert!(plan.jobs[0].scope.is_err());
-    std::fs::write(temp.path().join("Cargo.toml"), "broken {{").unwrap();
-    let plan = InstallPlan::new_scoped(&orchestrator, &result, &None, temp.path(), true);
-    assert_eq!(plan.jobs.len(), 1);
-    assert!(plan.jobs[0].scope.is_err());
+    let plan = InstallPlan::new(&orchestrator, &result, &None, temp.path());
+    assert_eq!(plan.jobs.len(), 2);
+    for job in &plan.jobs {
+        assert_eq!(
+            job.scope,
+            Ok(match job.language {
+                Language::Rust => InstallScope::CargoWorkspace,
+                Language::Php => InstallScope::Full,
+                _ => panic!("unexpected install"),
+            })
+        );
+    }
 }

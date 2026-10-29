@@ -14,6 +14,8 @@ use std::collections::BTreeSet;
 use std::sync::Mutex;
 use std::time::Duration;
 
+mod excluded_git;
+
 fn old() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()
 }
