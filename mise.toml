@@ -5,4 +5,4 @@
 # プロファイルとコンポーネントを明示する。省略すると rustup の既定プロファイルに依存し、
 # GitHub Actions の minimal プロファイルには rustfmt・clippy がなく make ci が失敗する。
 # minimal にこの2つを加え、ローカルと CI で同じ構成を入れる（rust-docs は省く）。
-rust = { version = "1.99.0", profile = "minimal", components = ["rustfmt", "clippy"] }
+rust = { version = "1.99.1", profile = "minimal", components = ["rustfmt", "clippy"] }
