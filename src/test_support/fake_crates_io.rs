@@ -10,14 +10,15 @@ use crate::registry::RegistryAdapter;
 use crate::update::VersionInfo;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// 公開日を固定した crates.io の代わり (`RegistryAdapter` を実装する)
 pub(crate) struct FakeCratesIo {
     /// crate 名 → 登録された版 (登録順のまま持ち、返すときに並べる)
     releases: HashMap<String, Vec<VersionInfo>>,
-    /// `fetch_versions` が呼ばれた回数 (未登録の名前で失敗した呼び出しも数える)
+    yanked: HashSet<(String, String)>,
+    /// 版情報を照会した回数 (未登録の名前で失敗した呼び出しも数える)
     fetch_count: AtomicUsize,
 }
 
@@ -42,6 +43,7 @@ impl FakeCratesIo {
     pub fn new() -> Self {
         Self {
             releases: HashMap::new(),
+            yanked: HashSet::new(),
             fetch_count: AtomicUsize::new(0),
         }
     }
@@ -60,9 +62,29 @@ impl FakeCratesIo {
         self
     }
 
-    /// fetch_versions が呼ばれた回数
+    /// 版情報を照会した回数
     pub fn fetch_count(&self) -> usize {
         self.fetch_count.load(Ordering::SeqCst)
+    }
+
+    pub fn yank(mut self, name: &str, version: &str) -> Self {
+        assert!(
+            self.releases
+                .get(name)
+                .is_some_and(|versions| { versions.iter().any(|info| info.version == version) })
+        );
+        self.yanked.insert((name.into(), version.into()));
+        self
+    }
+
+    fn all_versions(&self, package: &str) -> Result<Vec<VersionInfo>, RegistryError> {
+        let mut versions = self
+            .releases
+            .get(package)
+            .cloned()
+            .ok_or_else(|| RegistryError::package_not_found(package, self.registry_name()))?;
+        versions.sort();
+        Ok(versions)
     }
 }
 
@@ -78,15 +100,35 @@ impl RegistryAdapter for FakeCratesIo {
 
     async fn fetch_versions(&self, package: &str) -> Result<Vec<VersionInfo>, RegistryError> {
         self.fetch_count.fetch_add(1, Ordering::SeqCst);
-        let Some(versions) = self.releases.get(package) else {
-            return Err(RegistryError::package_not_found(
-                package,
-                self.registry_name(),
-            ));
-        };
-        // 本物の crates.io アダプタと同じく、版の昇順で返す
-        let mut versions = versions.clone();
-        versions.sort();
+        let mut versions = self.all_versions(package)?;
+        versions.retain(|info| {
+            !self
+                .yanked
+                .contains(&(package.into(), info.version.clone()))
+        });
+        Ok(versions)
+    }
+
+    async fn fetch_locked_versions(
+        &self,
+        package: &str,
+        _locked: &[String],
+        _publisher_cutoff: Option<DateTime<Utc>>,
+    ) -> Result<Vec<VersionInfo>, RegistryError> {
+        self.fetch_count.fetch_add(1, Ordering::SeqCst);
+        self.all_versions(package)
+    }
+
+    async fn fetch_yanked_versions(
+        &self,
+        package: &str,
+    ) -> Result<Vec<VersionInfo>, RegistryError> {
+        self.fetch_count.fetch_add(1, Ordering::SeqCst);
+        let mut versions = self.all_versions(package)?;
+        versions.retain(|info| {
+            self.yanked
+                .contains(&(package.into(), info.version.clone()))
+        });
         Ok(versions)
     }
 }

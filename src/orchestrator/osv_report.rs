@@ -19,7 +19,7 @@ impl RollbackOsvChecks {
         for adjustment in &audit.adjustments {
             if matches!(
                 adjustment.status,
-                LockAgeStatus::Downgraded | LockAgeStatus::Restored
+                LockAgeStatus::Downgraded | LockAgeStatus::RestoredYanked | LockAgeStatus::Restored
             ) && let Some(to) = &adjustment.to
             {
                 self.targets
@@ -230,6 +230,28 @@ mod tests {
                     .is_empty()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn rollback_osv_checks_a_yanked_preinstall_restoration() {
+        let temp = tempfile::tempdir().unwrap();
+        lock(
+            temp.path(),
+            "1.0.1",
+            "registry+https://github.com/rust-lang/crates.io-index",
+        );
+        let mut audit = audit();
+        audit.adjustments[0].status = LockAgeStatus::RestoredYanked;
+        let mut checks = RollbackOsvChecks::default();
+        checks.record(temp.path(), &audit);
+        let checker = OsvChecker::mock(&[(
+            "1.0.1",
+            Ok(OsvCheck::Vulnerable(vec!["YANKED-ADVISORY".into()])),
+        )]);
+        let warnings = checks.warnings(&checker, &mut Progress::new(false)).await;
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].1.contains("sample@1.0.1"));
+        assert!(warnings[0].1.contains("YANKED-ADVISORY"));
     }
 
     #[tokio::test]
