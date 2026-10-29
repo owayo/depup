@@ -57,6 +57,14 @@ pub trait RegistryAdapter: Send + Sync {
     /// パッケージの利用可能なバージョンを取得
     async fn fetch_versions(&self, package: &str) -> Result<Vec<VersionInfo>, RegistryError>;
 
+    /// レジストリで yank 済みと確認した版。通常候補とは分け、実行前の lock の復元だけに使う。
+    async fn fetch_yanked_versions(
+        &self,
+        _package: &str,
+    ) -> Result<Vec<VersionInfo>, RegistryError> {
+        Ok(Vec::new())
+    }
+
     /// `fetch_versions` が仮の日時を返し、更新を報告する前に
     /// 本当の日時を解決する必要があるかどうか。
     fn release_dates_deferred(&self) -> bool {

@@ -129,7 +129,7 @@ pub fn lock_age_report_lines(
     let rolled_back: Vec<&LockAgeAdjustment> = audit
         .adjustments
         .iter()
-        .filter(|a| a.status.is_resolved())
+        .filter(|a| a.status.is_resolved() && a.status != LockAgeStatus::RestoredYanked)
         .collect();
     let unverified: Vec<&LockAgeAdjustment> = audit
         .adjustments
@@ -140,6 +140,11 @@ pub fn lock_age_report_lines(
         .adjustments
         .iter()
         .filter(|a| a.status.is_restored())
+        .collect();
+    let restored_yanked: Vec<_> = audit
+        .adjustments
+        .iter()
+        .filter(|a| a.status == LockAgeStatus::RestoredYanked)
         .collect();
     let preexisting: Vec<&LockAgeAdjustment> = audit
         .adjustments
@@ -170,6 +175,21 @@ pub fn lock_age_report_lines(
             lines.push(ReportLine::info(format!(
                 "    {} {} → {}",
                 adj.name, adj.from, to
+            )));
+        }
+    }
+
+    if !restored_yanked.is_empty() {
+        lines.push(ReportLine::warning(format!(
+            "  {dir} — {} crate(s) returned to yanked versions locked before the install (no ordinary rollback candidate):",
+            restored_yanked.len()
+        )));
+        for adj in &restored_yanked {
+            lines.push(ReportLine::warning(format!(
+                "    {} {} → {} (returned to the yanked version locked before the install)",
+                adj.name,
+                adj.from,
+                adj.to.as_deref().unwrap_or("?")
             )));
         }
     }
@@ -249,6 +269,9 @@ pub fn lock_age_report_lines(
 fn lock_age_status_detail(status: &LockAgeStatus) -> String {
     match status {
         LockAgeStatus::Downgraded => "rolled back".to_string(),
+        LockAgeStatus::RestoredYanked => {
+            "returned to the yanked version locked before the install".to_string()
+        }
         LockAgeStatus::Removed => "removed from Cargo.lock".to_string(),
         LockAgeStatus::Restored => {
             "returned to the version locked before the install (also newer than --age)".to_string()
@@ -428,6 +451,31 @@ mod tests {
                 .iter()
                 .any(|line| line.text.contains("crate(s) rolled back to satisfy"))
         );
+    }
+
+    #[test]
+    fn yanked_preinstall_restorations_warn_without_becoming_age_failures() {
+        let audit = LockAgeAuditResult {
+            adjustments: vec![adjustment(
+                "sample",
+                "1.2.0",
+                Some("1.0.0"),
+                LockAgeStatus::RestoredYanked,
+            )],
+            ..Default::default()
+        };
+        assert!(!audit.has_unresolved());
+        for verbose in [false, true] {
+            let lines = lock_age_report_lines(Path::new("."), &audit, verbose);
+            assert_eq!(lines.len(), 2);
+            assert!(lines.iter().all(|line| line.warning));
+            assert!(lines[1].text.contains("sample 1.2.0 → 1.0.0"));
+            assert!(
+                lines[1]
+                    .text
+                    .contains("returned to the yanked version locked before the install")
+            );
+        }
     }
 
     #[test]

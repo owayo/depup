@@ -67,6 +67,11 @@ struct CratesIoResponse {
 }
 
 impl CratesIoResponse {
+    fn into_yanked_versions(mut self) -> Vec<VersionInfo> {
+        self.versions.retain(|version| version.yanked);
+        self.into_versions(true)
+    }
+
     fn into_versions(self, include_yanked: bool) -> Vec<VersionInfo> {
         let mut versions = Vec::new();
         for version in self.versions {
@@ -233,17 +238,22 @@ impl CratesIoAdapter {
         crate_name: &str,
         include_yanked: bool,
     ) -> Result<Vec<VersionInfo>, RegistryError> {
+        Ok(self
+            .api_response(crate_name)
+            .await?
+            .into_versions(include_yanked))
+    }
+
+    async fn api_response(&self, crate_name: &str) -> Result<CratesIoResponse, RegistryError> {
         self.validate_crate_name(crate_name)?;
         let _permit = self.apply_rate_limit().await;
-        let response: CratesIoResponse = self
-            .client
+        self.client
             .get_json(
                 &self.build_url(crate_name),
                 crate_name,
                 self.registry_name(),
             )
-            .await?;
-        Ok(response.into_versions(include_yanked))
+            .await
     }
 }
 
@@ -259,6 +269,13 @@ impl RegistryAdapter for CratesIoAdapter {
 
     async fn fetch_versions(&self, crate_name: &str) -> Result<Vec<VersionInfo>, RegistryError> {
         self.api_versions(crate_name, false).await
+    }
+
+    async fn fetch_yanked_versions(
+        &self,
+        crate_name: &str,
+    ) -> Result<Vec<VersionInfo>, RegistryError> {
+        Ok(self.api_response(crate_name).await?.into_yanked_versions())
     }
 
     async fn fetch_locked_versions(
@@ -302,7 +319,8 @@ mod tests {
         let response = || {
             serde_json::from_value::<CratesIoResponse>(serde_json::json!({"versions":[
                 {"num":"1.0.0","created_at":"2026-01-01T00:00:00Z","yanked":false},
-                {"num":"1.0.1","created_at":"2026-01-02T00:00:00Z","yanked":true}
+                {"num":"1.0.1","created_at":"2026-01-02T00:00:00Z","yanked":true},
+                {"num":"1.0.2","created_at":"invalid","yanked":true}
             ]}))
             .unwrap()
         };
@@ -310,6 +328,9 @@ mod tests {
         let locked = response().into_versions(true);
         assert_eq!(locked.len(), 2);
         assert_eq!(locked[1].version, "1.0.1");
+        let yanked = response().into_yanked_versions();
+        assert_eq!(yanked.len(), 1);
+        assert_eq!(yanked[0].version, "1.0.1");
         assert_eq!(
             locked[1].released_at,
             Some("2026-01-02T00:00:00Z".parse::<DateTime<Utc>>().unwrap())

@@ -190,6 +190,8 @@ pub struct LockAgeAdjustment {
 pub enum LockAgeStatus {
     /// 違反バージョンを差し戻した (1 件ずつの `--precise`、またはまとめ解き)
     Downgraded,
+    /// 通常候補がなく、期間を満たす yank 済みの実行前の版へ戻した（警告付きの成功）。
+    RestoredYanked,
     /// まとめて解き直した結果、この crate を必要とする依存が無くなり Cargo.lock から外れた
     Removed,
     /// install 前の lock にあった版へ戻した。ただしその版も期間を満たさない
@@ -216,7 +218,10 @@ pub enum LockAgeStatus {
 impl LockAgeStatus {
     /// 違反が解消した (差し戻した、または lock から外れた) か
     pub fn is_resolved(&self) -> bool {
-        matches!(self, LockAgeStatus::Downgraded | LockAgeStatus::Removed)
+        matches!(
+            self,
+            LockAgeStatus::Downgraded | LockAgeStatus::RestoredYanked | LockAgeStatus::Removed
+        )
     }
 
     /// install 前の版へ戻したが、その版も期間を満たさないか
@@ -417,6 +422,27 @@ fn version_floor(
         .cloned()
 }
 
+/// 通常の戻し先が無い場合だけ使う、実行前に lock されていた yank 済みの版。
+/// 公開日不明・若い版・プレリリースは、公開者免除があっても新しく採用しない。
+fn yanked_baseline_target(
+    yanked: &[VersionInfo],
+    before: &[String],
+    current: &str,
+    cutoff: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    yanked
+        .iter()
+        .filter(|info| before.contains(&info.version))
+        .filter(|info| same_series(&info.version, current))
+        .filter(|info| compare_versions(&info.version, current) == std::cmp::Ordering::Less)
+        .filter(|info| {
+            semver::Version::parse(&info.version).is_ok_and(|version| version.pre.is_empty())
+        })
+        .filter(|info| info.released_at.is_some_and(|date| date <= cutoff))
+        .max_by(|a, b| compare_versions(&a.version, &b.version))
+        .map(|info| info.version.clone())
+}
+
 /// 差し戻しの後の lock (`entries`) で、`name` の今の版 (`current`) が外れたかを調べる。
 /// 外れていなければ None。外れていれば、同じ semver 系列で lock に残った版
 /// (その系列の版が無ければ `Some(None)` = lock から外れた)
@@ -542,6 +568,8 @@ struct AuditState {
     deadline: Instant,
     installed_lock: String,
     admitted: HashSet<(String, String)>,
+    /// 通常候補には混ぜない。取得失敗も空で覚え、lock ごとに繰り返し照会しない。
+    yanked_before: HashMap<String, Vec<VersionInfo>>,
     changes: restore::AuditChanges,
     #[cfg(test)]
     elapsed_offset: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
@@ -566,6 +594,7 @@ impl AuditState {
             deadline: started + budget,
             installed_lock: String::new(),
             admitted: HashSet::new(),
+            yanked_before: HashMap::new(),
             changes: Default::default(),
             #[cfg(test)]
             elapsed_offset: None,
@@ -846,14 +875,39 @@ impl<'a> LockAgeAuditor<'a> {
                     continue;
                 }
 
-                let Some(target) = rollback_target(
+                let before = baseline.get(name).map(Vec::as_slice).unwrap_or_default();
+                let mut target = rollback_target(
                     &all_versions,
                     current,
                     cutoff,
                     preferred.get(name).map(Vec::as_slice),
                     baseline.get(name).map(Vec::as_slice),
                     exemptions,
-                ) else {
+                );
+                let using_yanked = target.is_none();
+                if using_yanked
+                    && before.iter().any(|version| {
+                        same_series(version, current)
+                            && compare_versions(version, current) == std::cmp::Ordering::Less
+                    })
+                {
+                    if !state.yanked_before.contains_key(name) {
+                        let remaining = budget.saturating_sub(state.elapsed());
+                        let fetched =
+                            tokio::time::timeout(remaining, adapter.fetch_yanked_versions(name))
+                                .await;
+                        let Ok(fetched) = fetched else {
+                            outcome.budget_exhausted = true;
+                            break 'audit;
+                        };
+                        state
+                            .yanked_before
+                            .insert(name.clone(), fetched.unwrap_or_default());
+                    }
+                    target =
+                        yanked_baseline_target(&state.yanked_before[name], before, current, cutoff);
+                }
+                let Some(target) = target else {
                     state
                         .log
                         .record(name, current, None, LockAgeStatus::NoOlderCandidate);
@@ -878,7 +932,8 @@ impl<'a> LockAgeAuditor<'a> {
                         &all_versions,
                         baseline.get(name).map(Vec::as_slice),
                         current,
-                    ),
+                    )
+                    .or_else(|| using_yanked.then(|| target.clone())),
                 };
 
                 if verify_only {
@@ -1292,6 +1347,7 @@ impl<'a> LockAgeAuditor<'a> {
             mut problems,
             changes,
             installed_lock,
+            yanked_before,
             ..
         } = state;
         let (content, final_entries) = match read_audit_lock(&lock_path) {
@@ -1361,7 +1417,17 @@ impl<'a> LockAgeAuditor<'a> {
                 .and_then(|known| known.iter().find(|info| info.version == *to));
             adjustment.status = match info {
                 Some(info) if exemptions.admits(Language::Rust, &adjustment.name, info, cutoff) => {
-                    LockAgeStatus::Downgraded
+                    if baseline
+                        .get(&adjustment.name)
+                        .is_some_and(|before| before.contains(to))
+                        && yanked_before
+                            .get(&adjustment.name)
+                            .is_some_and(|versions| versions.iter().any(|info| info.version == *to))
+                    {
+                        LockAgeStatus::RestoredYanked
+                    } else {
+                        LockAgeStatus::Downgraded
+                    }
                 }
                 Some(_)
                     if baseline
@@ -1442,6 +1508,9 @@ impl<'a> LockAgeAuditor<'a> {
 
 #[cfg(test)]
 mod helper_tests;
+
+#[cfg(test)]
+mod yanked_tests;
 
 mod restore;
 mod snapshot;
