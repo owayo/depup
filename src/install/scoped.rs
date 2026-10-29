@@ -79,13 +79,14 @@ pub(super) fn replace_scoped_jobs(
     jobs: &mut Vec<InstallJob>,
     orchestrator: &Orchestrator,
     result: &OrchestratorResult,
+    languages: &[Language],
 ) {
-    jobs.retain(|job| !matches!(job.language, Language::Rust | Language::Php));
+    jobs.retain(|job| !languages.contains(&job.language));
     let boundary = orchestrator.rust_lock_boundary();
     let mut groups: BTreeMap<(PathBuf, String), Vec<&ManifestUpdateResult>> = BTreeMap::new();
     let mut rust_roots: BTreeMap<PathBuf, Result<PathBuf, String>> = BTreeMap::new();
     for manifest in &result.summary.manifests {
-        if !manifest.has_updates() || !matches!(manifest.language, Language::Rust | Language::Php) {
+        if !manifest.has_updates() || !languages.contains(&manifest.language) {
             continue;
         }
         let parent = manifest.path.parent().unwrap_or(Path::new("."));

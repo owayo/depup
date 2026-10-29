@@ -225,6 +225,10 @@ impl Orchestrator {
         self.args.refresh_lock
     }
 
+    pub(crate) fn package_exclusions_requested(&self) -> bool {
+        !self.args.exclude.is_empty()
+    }
+
     pub(crate) async fn check_locked_version(
         &self,
         ecosystem: &str,
