@@ -69,8 +69,15 @@ where
     .map_err(|_| "lockfile OSV verification timed out".to_string())?
 }
 
-pub(super) fn print_notices(notices: Notices, result: &mut OrchestratorResult, live_details: bool) {
+/// 保持した lock に既存の脆弱版が残るときは、復元せず終了コード 2 にするため true を返す。
+pub(super) fn print_notices(
+    notices: Notices,
+    result: &mut OrchestratorResult,
+    live_details: bool,
+) -> bool {
+    let mut retained = false;
     for (package, report) in notices {
+        retained |= !report.retained_versions.is_empty();
         if live_details {
             eprintln!("  ⚠ {}", report.describe(&package));
         }
@@ -81,6 +88,7 @@ pub(super) fn print_notices(notices: Notices, result: &mut OrchestratorResult, l
                 report: Box::new(report),
             });
     }
+    retained
 }
 
 pub(super) fn rust_packages(entries: &RegistryLockEntries) -> BTreeSet<(String, String)> {
@@ -128,7 +136,7 @@ mod tests {
                 &Progress::disabled(),
                 |name, before, after| async move {
                     match checker
-                        .assess_versions("crates.io", &name, &before, &after, true)
+                        .assess_lock_versions("crates.io", &name, &before, &after, true)
                         .await?
                     {
                         Assessment::Safe => Ok(None),

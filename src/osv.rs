@@ -141,6 +141,11 @@ pub enum OsvCheck {
     Vulnerable(Vec<String>),
 }
 
+enum AssessmentPolicy {
+    Candidate { allow_tradeoff: bool },
+    FinalLock { allow_tradeoff: bool },
+}
+
 impl OsvChecker {
     /// 新しいチェッカを構築する。
     ///
@@ -290,27 +295,87 @@ impl OsvChecker {
         after: &[String],
         allow_tradeoff: bool,
     ) -> Result<Assessment, String> {
+        self.assess_version_sets(
+            ecosystem,
+            name,
+            before,
+            after,
+            AssessmentPolicy::Candidate { allow_tradeoff },
+        )
+        .await
+    }
+
+    /// 最終 lock では、実行前の版だけに問題が残る場合は更新を保持して報告する。
+    pub(crate) async fn assess_lock_versions(
+        &self,
+        ecosystem: &str,
+        name: &str,
+        before: &[String],
+        after: &[String],
+        allow_tradeoff: bool,
+    ) -> Result<Assessment, String> {
+        self.assess_version_sets(
+            ecosystem,
+            name,
+            before,
+            after,
+            AssessmentPolicy::FinalLock { allow_tradeoff },
+        )
+        .await
+    }
+
+    async fn assess_version_sets(
+        &self,
+        ecosystem: &str,
+        name: &str,
+        before: &[String],
+        after: &[String],
+        policy: AssessmentPolicy,
+    ) -> Result<Assessment, String> {
+        let (allow_tradeoff, final_lock) = match policy {
+            AssessmentPolicy::Candidate { allow_tradeoff } => (allow_tradeoff, false),
+            AssessmentPolicy::FinalLock { allow_tradeoff } => (allow_tradeoff, true),
+        };
         let mut candidate = Vec::new();
+        let mut affected_versions = Vec::new();
         for version in after {
-            candidate.extend(self.advisories(ecosystem, name, version).await?);
+            let records = self.advisories(ecosystem, name, version).await?;
+            if !records.is_empty() {
+                affected_versions.push(version.clone());
+            }
+            candidate.extend(records);
         }
         if candidate.is_empty() {
             return Ok(Assessment::Safe);
         }
         let mut baseline = Vec::new();
-        if allow_tradeoff && !before.is_empty() {
+        if (allow_tradeoff || final_lock) && !before.is_empty() {
             for version in before {
                 match self.advisories(ecosystem, name, version).await {
                     Ok(records) => baseline.extend(records),
                     Err(error) => {
                         return Ok(Assessment::Rejected {
                             advisories: candidate,
+                            affected_versions,
                             baseline_error: Some(error),
                         });
                     }
                 }
             }
-            if let Some(mut report) = policy::tradeoff(&baseline, &candidate) {
+            // 同じ advisory が既存版にあっても、新しく入った脆弱版にはこの例外を使わない。
+            let retained = (final_lock
+                && affected_versions
+                    .iter()
+                    .all(|version| before.contains(version)))
+            .then(|| policy::retained(&baseline, &candidate))
+            .flatten();
+            if let Some(mut report) = retained {
+                report.baseline_versions = before.to_vec();
+                report.candidate_versions = after.to_vec();
+                report.retained_versions = affected_versions;
+                return Ok(Assessment::Tradeoff(report));
+            }
+            if allow_tradeoff && let Some(mut report) = policy::tradeoff(&baseline, &candidate) {
                 report.baseline_versions = before.to_vec();
                 report.candidate_versions = after.to_vec();
                 return Ok(Assessment::Tradeoff(report));
@@ -318,6 +383,7 @@ impl OsvChecker {
         }
         Ok(Assessment::Rejected {
             advisories: candidate,
+            affected_versions,
             baseline_error: None,
         })
     }
@@ -326,6 +392,70 @@ impl OsvChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn retained_lock_exception_requires_known_unchanged_affected_versions() {
+        let advisory = Advisory {
+            id: "EXISTING".into(),
+            aliases: vec![],
+            severity: Severity::High,
+        };
+        let checker = OsvChecker::mock_advisories(&[
+            ("1.0.0", Ok(vec![advisory.clone()])),
+            ("1.1.0", Ok(vec![])),
+            ("1.2.0", Ok(vec![advisory])),
+            ("0.9.0", Err("baseline unavailable".into())),
+            ("1.3.0", Err("candidate unavailable".into())),
+        ]);
+        for before in [vec![], vec!["0.9.0".into()], vec!["1.1.0".into()]] {
+            assert!(matches!(
+                checker
+                    .assess_lock_versions(
+                        "npm",
+                        "example",
+                        &before,
+                        &["1.0.0".into(), "1.1.0".into()],
+                        true
+                    )
+                    .await
+                    .unwrap(),
+                Assessment::Rejected { .. }
+            ));
+        }
+        assert!(matches!(
+            checker
+                .assess_lock_versions(
+                    "npm",
+                    "example",
+                    &["1.0.0".into()],
+                    &["1.0.0".into(), "1.2.0".into()],
+                    true
+                )
+                .await
+                .unwrap(),
+            Assessment::Rejected { .. }
+        ));
+        assert!(
+            checker
+                .assess_lock_versions(
+                    "npm",
+                    "example",
+                    &["1.0.0".into()],
+                    &["1.0.0".into(), "1.3.0".into()],
+                    true
+                )
+                .await
+                .is_err()
+        );
+        // 候補の選択では、同じ脆弱性が残るだけの更新を引き続き拒否する。
+        assert!(matches!(
+            checker
+                .assess_versions("npm", "example", &["1.0.0".into()], &["1.2.0".into()], true)
+                .await
+                .unwrap(),
+            Assessment::Rejected { .. }
+        ));
+    }
 
     #[test]
     fn package_severity_overrides_top_level_and_malformed_metadata_stays_unknown() {

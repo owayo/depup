@@ -114,14 +114,14 @@ impl Checks for WithOsv<'_> {
     }
     async fn osv_change(
         &self,
-        _: Language,
+        language: Language,
         name: &str,
         before: &[String],
         after: &[String],
     ) -> Result<Option<crate::osv::RiskTradeoff>, String> {
         match self
             .checker
-            .assess_versions("crates.io", name, before, after, true)
+            .assess_lock_versions(language.osv_ecosystem().unwrap(), name, before, after, true)
             .await?
         {
             crate::osv::Assessment::Safe => Ok(None),
@@ -138,6 +138,21 @@ impl Checks for WithOsv<'_> {
     }
     async fn node_baseline(&self, directory: &Path, manager: &str) -> NodeBaseline {
         self.fixed.node_baseline(directory, manager).await
+    }
+    async fn node_osv_snapshot(
+        &self,
+        directory: &Path,
+        manager: &str,
+        baseline: bool,
+    ) -> NodeBaseline {
+        if baseline {
+            self.fixed.node_baseline(directory, manager).await
+        } else {
+            match crate::node_lock::osv_lock_snapshot(directory, manager, false).await {
+                Ok((_, packages)) => NodeBaseline::Known(packages),
+                Err(error) => NodeBaseline::Unknown(error),
+            }
+        }
     }
     async fn node_lock(
         &self,
@@ -662,3 +677,104 @@ async fn node_units_are_restored_only_for_versions_the_run_added() {
 }
 
 mod yanked;
+
+#[tokio::test]
+async fn node_osv_retained_vulnerability_keeps_manifest_and_lock_updates_with_exit_two() {
+    use crate::osv::{Advisory, OsvChecker, Severity};
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("package.json");
+    let original = r#"{"dependencies":{"example":"1.0.0"}}"#;
+    std::fs::write(&path, original).unwrap();
+    let lock = temp.path().join("package-lock.json");
+    std::fs::write(&lock, "before install").unwrap();
+    let mut update = ManifestUpdateResult::new(&path, Language::Node);
+    update.add_result(UpdateResult::update(
+        PackageJsonParser.parse(original).unwrap().remove(0),
+        "2.0.0",
+    ));
+    let write = ManifestWriter::new(false)
+        .apply_updates(&update, &PackageJsonParser)
+        .unwrap();
+    let written = std::fs::read(&path).unwrap();
+    let mut summary = UpdateSummary::new(false);
+    summary.add_manifest(update);
+    let mut result = OrchestratorResult {
+        summary,
+        write_results: vec![write],
+        errors: vec![],
+    };
+    let args = args(temp.path());
+    let orchestrator = Orchestrator::new(args.clone()).unwrap();
+    let plan = InstallPlan::new(&orchestrator, &result, &None, temp.path());
+    let fixed = Fixed::node(
+        NodeBaseline::Known(BTreeSet::from([
+            ("example".into(), "1.0.0".into()),
+            ("source-map-js".into(), "1.2.1".into()),
+        ])),
+        NodeLockAuditResult::default(),
+    );
+    let checks = WithOsv {
+        fixed: &fixed,
+        checker: OsvChecker::mock_advisories(&[
+            ("2.0.0", Ok(vec![])),
+            (
+                "1.2.1",
+                Ok(vec![Advisory {
+                    id: "EXISTING".into(),
+                    aliases: vec![],
+                    severity: Severity::High,
+                }]),
+            ),
+            ("1.2.2", Ok(vec![])),
+        ]),
+    };
+    let package = |name: &str, version: &str| {
+        serde_json::json!({
+            "version": version, "resolved": format!("https://registry.npmjs.org/{name}/-/{name}-{version}.tgz")
+        })
+    };
+    let installed = serde_json::to_vec(&serde_json::json!({"lockfileVersion": 3, "packages": {
+        "": {"dependencies": {"example": "2.0.0"}},
+        "node_modules/example": package("example", "2.0.0"),
+        "node_modules/source-map-js": package("source-map-js", "1.2.1"),
+        "node_modules/example/node_modules/source-map-js": package("source-map-js", "1.2.2"),
+    }}))
+    .unwrap();
+    let outcome = run_with(
+        &args,
+        &orchestrator,
+        &plan,
+        &mut result,
+        &checks,
+        |command| {
+            std::fs::write(&lock, &installed).unwrap();
+            InstallResult::success(
+                command.language,
+                "npm install".into(),
+                String::new(),
+                String::new(),
+            )
+        },
+    )
+    .await;
+    assert!(!outcome.install_failed && outcome.audit_failed);
+    assert_eq!(std::fs::read(path).unwrap(), written);
+    assert_eq!(std::fs::read(lock).unwrap(), installed);
+    assert_eq!(result.summary.total_updates(), 1);
+    assert!(result.errors.iter().any(|error| matches!(error,
+        crate::orchestrator::OrchestratorError::OsvTradeoff { report, .. }
+        if report.retained_versions == ["1.2.1"])));
+    let mut json = Vec::new();
+    crate::output::create_formatter(crate::output::OutputConfig::from_cli(
+        true, false, false, false, false,
+    ))
+    .format(&result, &mut json)
+    .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&json).unwrap();
+    assert!(
+        json["errors"][0]
+            .as_str()
+            .unwrap()
+            .contains("source-map-js@1.2.1")
+    );
+}

@@ -117,6 +117,8 @@ Counts are per package. Aliases are merged transitively across both versions, wi
 
 Updates allowed under these conditions warn that vulnerabilities remain, report fixed vulnerabilities, new vulnerabilities, and existing vulnerabilities that remain, and do not receive `✓ OSV`. JSON update objects include `osv_risk_tradeoff` with versions and those groups. To require zero advisories again, use `--no-osv-risk-tradeoff` or set `osv_risk_tradeoff = false` in the global configuration. This does not disable OSV checks.
 
+Final lock verification for `--install` and `--install --refresh-lock` distinguishes newly locked vulnerable versions from vulnerable versions already present before the run. If every affected version was already locked and all newly added versions have no known vulnerabilities, depup keeps the updates, warns with the affected versions and advisory IDs, and exits with code 2. This also applies with `--no-osv-risk-tradeoff`: candidate selection still rejects vulnerable candidates. A newly added version affected by an existing advisory does not qualify as retained. Missing or unverified baselines and failed OSV lookups do not grant this exception, and malware remains rejected. Unchanged packages are outside this incremental check. For pnpm and Cargo, `--install --refresh-lock` can re-resolve dependencies within their declared constraints to remove retained vulnerable versions when a permitted fixed version exists.
+
 ```bash
 # OSV check runs by default
 depup
@@ -373,6 +375,8 @@ Cargo runs `cargo update`, then applies its existing age rollback and final veri
 For Cargo age verification, restoration depends on violating or unverified versions still in the final lock that this run introduced, or problems that prevented the audit from completing. Young versions already in the pre-run lock, including a rollback to a young pre-run version, produce warnings and exit code 2 while retaining other updates. The refresh is still reported as `completed`; `changed` is `false` if the rollbacks leave the lock unchanged from before the run. Unrelated projects continue.
 
 Local workspace/path packages are not public-registry audit targets. This incremental OSV check does not certify unchanged versions already in the lock. `--no-age` and `--no-osv` retain their existing configuration precedence.
+
+When a changed package retains a vulnerable pre-run version alongside newly added advisory-free versions, the refresh remains `completed`, the updates are kept, and the command exits with code 2. Rejection messages list only affected versions, separating previously locked versions from newly added ones; advisory-free versions are not labeled vulnerable.
 
 Refresh cannot be combined with `--only`, `--exclude`, or `--max-change`, including a global `max-change` default; depup rejects the combination before changing files. Language filters still apply. A dry run never starts the package manager. The `Lock refresh` result and JSON `lock_refreshes` array report each scope separately; transitive changes do not increase direct update counts. PM failures return exit code 1; verification failures return 2, with 1 taking precedence when both occur. Recovery retains install artifacts and preserves external file edits, as described below.
 
