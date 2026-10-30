@@ -8,6 +8,16 @@ CI の quality ジョブは、Linux と macOS で `make setup` と `make ci` を
 
 mise を使わずに `PATH` 上のツールで動かす場合は `SYSTEM_TOOLS=1` を付けてください。その場合、版が CI と一致する保証はありません。
 
+Windows では、レシピが POSIX シェルを使うため `make` のターゲットを Git Bash で実行します。PowerShell から固定ツールチェーンで同じ検査を行う場合は、次のコマンドを使います。
+
+```powershell
+mise install
+mise exec -- cargo fetch --locked
+mise exec -- cargo fmt --all -- --check
+mise exec -- cargo clippy --locked --all-targets -- -D warnings
+mise exec -- cargo test --locked
+```
+
 ## テスト用のターゲット
 
 `make test` のほかに、テストスイートを 1 つだけ実行するターゲットがあります。
@@ -28,6 +38,16 @@ mise exec -- cargo run --release --locked --example manifest_update_bench -- 100
 引数は 1 サンプルの更新回数とサンプル数です。各ケースで 100 回ウォームアップしてから、更新 1 回のナノ秒と、ウォームアップ後の 1 回で要求したメモリ確保回数・バイト数を CSV に出します。時間の計測中は確保量の集計を止めます。確保バイト数には再確保の要求も含み、ピークメモリ使用量ではありません。
 
 Node の依存 1・100・1,000 件、エスケープしたキーと CRLF、ネストした Bun catalogs、Composer の依存 1,000 件を対象に、末尾の依存を更新します。更新結果の JSON と、依存セクション外の同名キーを保持していることも検証します。ネットワークとディスクへの書き込みは含めず、マニフェストの書き換えだけを測ります。同じ入力・依存・ツールチェーン・release 設定で、ビルドやテストを並行実行せず比較してください。測定記録は [benchmarks/json-manifest](../benchmarks/json-manifest/README.md) にあります。
+
+## Cargo マニフェストの性能計測
+
+第 3 引数で Cargo のケースを選びます。
+
+```bash
+mise exec -- cargo run --release --locked --example manifest_update_bench -- 1000 7 cargo
+```
+
+ウォームアップ・時間計測・確保量の集計は JSON のケースと共通です。単純指定は依存 1・100・1,000 件、inline table・dotted key・複数行テーブルは各 100 件を測ります。3 つのテーブル形式では git tag の更新も測ります。入力は単一引用符・CRLF・最終行の改行なしとし、出力全体の一致と TOML の妥当性を確認します。測定記録と対象範囲は [benchmarks/cargo-manifest](../benchmarks/cargo-manifest/README.ja.md) にあります。
 
 ## リリース
 

@@ -154,7 +154,7 @@ pub(crate) fn write_checked(
 }
 
 fn temporary_path(parent: &Path, nonce: u128) -> PathBuf {
-    // The clock can return the same value to concurrent writers on Windows.
+    // Windows では、同時に書き込む処理が時計から同じ値を得ることがある。
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
     let sequence = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
     parent.join(format!(
@@ -177,7 +177,7 @@ fn replace_checked(
     if expected.bytes.is_some() {
         fs::OpenOptions::new().write(true).open(&guard.target)?;
     }
-    // A failed create_new must not remove a file belonging to another writer.
+    // create_new に失敗した場合は、ほかの書き込み処理が作ったファイルを削除しない。
     let file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)

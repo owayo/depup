@@ -142,6 +142,7 @@ make ci                # CI と同じ検査 (fmt-check + lint + test、書き換
 ## Testing Strategy
 
 - JSON マニフェスト更新の性能は `mise exec -- cargo run --release --locked --example manifest_update_bench -- 1000 7` で測る。入力・依存・ツールチェーン・release 設定をそろえ、ビルドやテストを並行実行しない。確保バイト数は再確保を含む要求量で、ピークメモリではない。生データと比較条件は `benchmarks/json-manifest/` に保存する。
+- Cargo の更新性能は同じコマンドの末尾に `cargo` を付けて測り、生データと比較条件を `benchmarks/cargo-manifest/` に保存する。単純指定・inline table・dotted key・複数行テーブルと git tag の更新を含む。Cargo のレジストリ依存はパッケージ名を文字列として照合し、後続の構文を固定の正規表現で読む。ソース除外と書き換えで同じ名前照合を使い、名前入りの正規表現を更新ごとにコンパイルしない。
 - **Unit tests**: 各モジュール内に `#[cfg(test)]` で配置
 - **Integration tests**: `tests/integration_tests.rs` - マニフェスト検出、パース、パイプラインテスト
 - **E2E tests**: `tests/e2e_tests.rs` - バイナリ実行テスト (dry-run、JSON出力、exit code)

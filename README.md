@@ -277,7 +277,7 @@ make ci      # Run the same checks as CI (no changes)
 Run `make` to list every target. Releases are published from GitHub Actions (**Actions → Release → Run workflow**).
 <!-- standard:dev:end -->
 
-The additional test targets, JSON manifest benchmark, what CI runs on each OS, and the release steps are described in [docs/development.md](docs/development.md).
+The additional test targets, JSON and Cargo manifest benchmarks, what CI runs on each OS, and the release steps are described in [docs/development.md](docs/development.md). On Windows, run the `make` targets in Git Bash; the guide also lists equivalent PowerShell commands.
 
 ## License
 

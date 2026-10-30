@@ -8,6 +8,16 @@ The CI quality job runs `make setup` and `make ci` on Linux and macOS, so runnin
 
 To use the tools on your `PATH` instead of mise, pass `SYSTEM_TOOLS=1`; their versions may then differ from CI.
 
+On Windows, run the `make` targets in Git Bash, since their recipes use a POSIX shell. From PowerShell, the equivalent checks with the pinned toolchain are:
+
+```powershell
+mise install
+mise exec -- cargo fetch --locked
+mise exec -- cargo fmt --all -- --check
+mise exec -- cargo clippy --locked --all-targets -- -D warnings
+mise exec -- cargo test --locked
+```
+
 ## Test Targets
 
 Besides `make test`, two targets run a single test suite:
@@ -28,6 +38,16 @@ mise exec -- cargo run --release --locked --example manifest_update_bench -- 100
 The arguments are updates per sample and sample count. Each case warms up with 100 updates, then prints CSV with nanoseconds per update and allocation requests for one warmed update. Timing runs with allocation counting disabled; allocation bytes include reallocation requests and are not peak memory usage.
 
 Cases cover 1, 100, and 1,000 Node dependencies, escaped keys with CRLF, nested Bun catalogs, and 1,000 Composer dependencies. Each update targets the last dependency. The benchmark checks the resulting JSON and preserves a same-named entry outside the dependency sections. It excludes network requests and disk writes, so its results measure manifest rewriting, rather than total CLI duration. Compare the same inputs, dependencies, toolchain, and release profile, without concurrent builds or tests. Recorded measurements are in [benchmarks/json-manifest](../benchmarks/json-manifest/README.md).
+
+## Cargo Manifest Benchmark
+
+Select the Cargo cases with the third argument:
+
+```bash
+mise exec -- cargo run --release --locked --example manifest_update_bench -- 1000 7 cargo
+```
+
+This uses the same warmup, timing, and allocation counters as the JSON cases. It covers simple versions with 1, 100, and 1,000 dependencies, and inline tables, dotted keys, and multiline tables with 100 dependencies. The three table forms also have git tag cases. Inputs use single quotes, CRLF, and a final line without a newline; each case checks the complete output and validates the TOML. Recorded measurements and scope limits are in [benchmarks/cargo-manifest](../benchmarks/cargo-manifest/README.md).
 
 ## Release
 
