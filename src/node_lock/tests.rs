@@ -557,11 +557,97 @@ async fn metadata_wait_is_bounded_by_the_remaining_audit_budget() {
     assert!(result.unverified[0].reason.contains("timed out"));
 }
 
+#[test]
+fn pnpm_registry_output_accepts_plain_absolute_urls() {
+    for registry in [
+        "https://registry.npmjs.org/",
+        "https://registry.example.com/npm/",
+        "http://localhost:4873/",
+    ] {
+        for output in [registry.to_string(), format!(" \t{registry}\r\n")] {
+            assert_eq!(
+                parse_pnpm_registry_output(output.as_bytes()),
+                Ok(Some(registry.to_string())),
+                "{output:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn pnpm_registry_output_preserves_json_and_unset_values() {
+    assert_eq!(
+        parse_pnpm_registry_output(b"\"https://registry.npmjs.org/\"\r\n"),
+        Ok(Some("https://registry.npmjs.org/".into()))
+    );
+    for output in ["", " \t\r\n", "null", " null\r\n"] {
+        assert_eq!(parse_pnpm_registry_output(output.as_bytes()), Ok(None));
+    }
+}
+
+#[test]
+fn pnpm_registry_output_rejects_unverified_values() {
+    for output in [
+        &b"not JSON"[..],
+        b"registry.npmjs.org/",
+        b"//registry.npmjs.org/",
+        b"/registry.npmjs.org/",
+        b"https://registry.npmjs.org/\nwarning",
+        b"https://registry.npmjs.org/\rhttps://registry.example.com/",
+        b"https://registry.\tnpmjs.org/",
+        b"https://registry.npmjs.org/\0",
+        b"https://registry.npmjs.org/\xff",
+        b"\"https://registry.npmjs.org/",
+        b"{}",
+        b"[]",
+        b"true",
+        b"42",
+    ] {
+        assert!(parse_pnpm_registry_output(output).is_err(), "{output:?}");
+    }
+}
+
 #[cfg(unix)]
 fn fake_pnpm(directory: &Path, script: &str) -> std::path::PathBuf {
     let program = directory.join("fake-pnpm");
     crate::test_support::exec::write_script(&program, &format!("#!/bin/sh\n{script}\n"), 0o755);
     program
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pnpm_plain_registry_output_checks_unscoped_and_scoped_packages() {
+    let directory = tempfile::tempdir().unwrap();
+    let program = fake_pnpm(
+        directory.path(),
+        "case \"$3\" in registry) printf '  https://registry.npmjs.org/\\r\\n';; *) exit 0;; esac",
+    );
+    let mut snapshot = parse_pnpm_snapshot(&json!([{"dependencies":{
+        "public":package("public","1.0.0"),
+        "@example/public":package("@example/public","1.0.0")
+    }}]))
+    .unwrap();
+    verify_pnpm_registry_sources(
+        directory.path(),
+        &program,
+        &mut snapshot,
+        Instant::now() + Duration::from_secs(2),
+    )
+    .await
+    .unwrap();
+    let provider = FakeDates {
+        dates: ["public", "@example/public"]
+            .into_iter()
+            .map(|name| (name.into(), dates(&[("1.0.0", "2026-09-01T00:00:00Z")])))
+            .collect(),
+        ..Default::default()
+    };
+    let result = check(snapshot, &provider).await;
+    assert!(!result.has_failures(), "{result:?}");
+    assert_eq!(result.checked, 2);
+    let mut requests = provider.requests.lock().unwrap().clone();
+    requests.sort();
+    assert_eq!(requests, ["@example/public", "public"]);
 }
 
 #[cfg(unix)]
@@ -684,8 +770,14 @@ async fn pnpm_unreadable_registry_config_never_sends_names_to_public_npm() {
         "printf ' \t\r\n'",
         "printf warning >&2",
         "printf 'not JSON'",
+        "printf 'registry.npmjs.org/'",
+        "printf '//registry.npmjs.org/'",
+        "printf 'https://registry.npmjs.org/\\nwarning'",
+        "printf 'https://registry.\\tnpmjs.org/'",
         "printf null",
         "printf '\"https://registry.npmjs.org/\"'; printf warning >&2",
+        "printf 'https://registry.npmjs.org/'; printf warning >&2",
+        "printf 'https://registry.npmjs.org/'; exit 7",
     ] {
         let program = fake_pnpm(directory.path(), script);
         let mut snapshot =

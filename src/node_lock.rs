@@ -388,16 +388,31 @@ async fn read_pnpm_registry(
     if !output.status.success() || !output.stderr.is_empty() {
         return Err("effective registry configuration could not be verified".into());
     }
+    parse_pnpm_registry_output(&output.stdout)
+}
+
+fn parse_pnpm_registry_output(output: &[u8]) -> Result<Option<String>, String> {
+    let invalid = || "effective registry configuration was not valid JSON or a single absolute URL";
+    let output = std::str::from_utf8(output)
+        .map_err(|_| invalid().to_string())?
+        .trim();
     // pnpm 11 は未設定のキーに JSON を出さず、それより新しい版は null を出す。
-    if output.stdout.trim_ascii().is_empty() {
+    if output.is_empty() {
         return Ok(None);
     }
-    match serde_json::from_slice::<Value>(&output.stdout)
-        .map_err(|_| "effective registry configuration was not valid JSON".to_string())?
-    {
-        Value::Null => Ok(None),
-        Value::String(value) => Ok(Some(value)),
-        _ => Err("effective registry configuration had an unsupported value".into()),
+    match serde_json::from_str::<Value>(output) {
+        Ok(Value::Null) => Ok(None),
+        Ok(Value::String(value)) => Ok(Some(value)),
+        Ok(_) => Err("effective registry configuration had an unsupported value".into()),
+        // pnpm 10 は --json でも既定の registry を引用符なしで出す。
+        // URL parser が無視する改行・タブ・制御文字は、受理する前に拒否する。
+        Err(_)
+            if !output.chars().any(|c| c.is_whitespace() || c.is_control())
+                && reqwest::Url::parse(output).is_ok() =>
+        {
+            Ok(Some(output.to_string()))
+        }
+        Err(_) => Err(invalid().into()),
     }
 }
 
