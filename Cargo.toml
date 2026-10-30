@@ -1,6 +1,6 @@
 [package]
 name = "depup"
-version = "26.10.118"
+version = "26.10.119"
 edition = "2024"
 rust-version = "1.99"
 authors = ["owayo"]
