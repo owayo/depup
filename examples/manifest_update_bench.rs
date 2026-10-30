@@ -1,7 +1,8 @@
-//! ネットワークとファイル I/O を除いた JSON マニフェスト更新の計測。
+//! ネットワークとファイル I/O を除いたマニフェスト更新の計測。
 //! `mise exec -- cargo run --release --locked --example manifest_update_bench -- 1000 7`
+//! Cargo の各宣言形式は末尾に `cargo` を付けて選ぶ。
 
-use depup::manifest::{ComposerJsonParser, ManifestParser, PackageJsonParser};
+use depup::manifest::{CargoTomlParser, ComposerJsonParser, ManifestParser, PackageJsonParser};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -89,10 +90,115 @@ fn positive_argument(index: usize, default: usize) -> usize {
     value
 }
 
+fn measure(
+    name: &str,
+    iterations: usize,
+    samples: usize,
+    expected: &str,
+    update: impl Fn() -> String,
+) {
+    for _ in 0..100 {
+        black_box(update());
+    }
+    ALLOCATIONS.store(0, Ordering::Relaxed);
+    ALLOCATED_BYTES.store(0, Ordering::Relaxed);
+    COUNTING.store(true, Ordering::Relaxed);
+    let measured = update();
+    COUNTING.store(false, Ordering::Relaxed);
+    assert_eq!(measured, expected);
+    let allocations = ALLOCATIONS.load(Ordering::Relaxed);
+    let allocated_bytes = ALLOCATED_BYTES.load(Ordering::Relaxed);
+    for sample in 1..=samples {
+        let started = Instant::now();
+        for _ in 0..iterations {
+            black_box(update());
+        }
+        let ns = started.elapsed().as_nanos() as f64 / iterations as f64;
+        println!("{name},{sample},{iterations},{ns:.2},{allocations},{allocated_bytes}");
+    }
+}
+
+fn cargo_cases(iterations: usize, samples: usize) {
+    for (name, count, style, git) in [
+        ("cargo-simple-1", 1, "simple", false),
+        ("cargo-simple-100", 100, "simple", false),
+        ("cargo-simple-1000", 1000, "simple", false),
+        ("cargo-inline-100", 100, "inline", false),
+        ("cargo-dotted-100", 100, "dotted", false),
+        ("cargo-table-100", 100, "table", false),
+        ("cargo-git-inline-100", 100, "inline", true),
+        ("cargo-git-dotted-100", 100, "dotted", true),
+        ("cargo-git-table-100", 100, "table", true),
+    ] {
+        let field = if git { "tag" } else { "version" };
+        let old = if git { "v1.0.0" } else { "^1.0.0" };
+        let new = if git { "v2.3.4" } else { "^2.3.4" };
+        let target = format!("crate-{:04}", count - 1);
+        let mut content = String::from("[dependencies]\r\n");
+        let mut target_line = String::new();
+        for index in 0..count {
+            let package = format!("crate-{index:04}");
+            let line = match style {
+                "simple" => format!("{package} = '{old}'\r\n"),
+                "inline" => {
+                    let source = if git {
+                        "git = 'https://example.com/repo', "
+                    } else {
+                        ""
+                    };
+                    format!("{package} = {{ {source}{field} = '{old}', features = ['std'] }}\r\n")
+                }
+                "dotted" => {
+                    let source = if git {
+                        format!("{package}.git = 'https://example.com/repo'\r\n")
+                    } else {
+                        String::new()
+                    };
+                    format!("{source}{package}.{field} = '{old}'\r\n")
+                }
+                "table" => {
+                    let source = if git {
+                        "git = 'https://example.com/repo'\r\n"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "[dependencies.{package}]\r\n{source}{field} = '{old}'\r\nfeatures = ['std']\r\n"
+                    )
+                }
+                _ => unreachable!(),
+            };
+            content.push_str(&line);
+            if package == target {
+                target_line = line;
+            }
+        }
+        // 同名のメタデータと最終行の改行なしも、出力の完全一致で検証する。
+        content.push_str(&format!("[package.metadata]\r\n{target} = '{old}'"));
+        let expected = content.replacen(&target_line, &target_line.replace(old, new), 1);
+        toml::from_str::<toml::Value>(&content).unwrap();
+        let update = || {
+            if git {
+                CargoTomlParser.update_git_tag(black_box(&content), black_box(&target), "v2.3.4")
+            } else {
+                CargoTomlParser.update_version(black_box(&content), black_box(&target), "2.3.4")
+            }
+            .unwrap()
+        };
+        assert_eq!(update(), expected);
+        toml::from_str::<toml::Value>(&expected).unwrap();
+        measure(name, iterations, samples, &expected, update);
+    }
+}
+
 fn main() {
     let iterations = positive_argument(1, 1000);
     let samples = positive_argument(2, 7);
     println!("case,sample,iterations,ns_per_update,allocations,allocated_bytes");
+    if std::env::args().nth(3).as_deref() == Some("cargo") {
+        cargo_cases(iterations, samples);
+        return;
+    }
     for (name, count, section, escaped) in [
         ("node-1", 1, "dependencies", false),
         ("node-100", 100, "dependencies", false),
@@ -131,24 +237,6 @@ fn main() {
                 .update_version(black_box(&content), black_box(&target), "2.3.4")
                 .unwrap()
         };
-        for _ in 0..100 {
-            black_box(update());
-        }
-        ALLOCATIONS.store(0, Ordering::Relaxed);
-        ALLOCATED_BYTES.store(0, Ordering::Relaxed);
-        COUNTING.store(true, Ordering::Relaxed);
-        let measured = update();
-        COUNTING.store(false, Ordering::Relaxed);
-        assert_eq!(measured, expected);
-        let allocations = ALLOCATIONS.load(Ordering::Relaxed);
-        let allocated_bytes = ALLOCATED_BYTES.load(Ordering::Relaxed);
-        for sample in 1..=samples {
-            let started = Instant::now();
-            for _ in 0..iterations {
-                black_box(update());
-            }
-            let ns = started.elapsed().as_nanos() as f64 / iterations as f64;
-            println!("{name},{sample},{iterations},{ns:.2},{allocations},{allocated_bytes}");
-        }
+        measure(name, iterations, samples, &expected, update);
     }
 }

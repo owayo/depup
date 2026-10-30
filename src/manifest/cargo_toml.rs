@@ -80,6 +80,70 @@ fn is_cargo_git_tag_inline_section(section: &str) -> bool {
 static VERSION_LINE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"^(\s*version\s*=\s*)(?:"([^"]+)"|'([^']+)')"#).unwrap());
 
+// パッケージ名は文字列として照合し、後ろの構文だけを固定の正規表現で読む。
+// 更新のたびにパッケージ名入りの正規表現をコンパイルしない。
+static SIMPLE_VERSION_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"^(\s*=\s*)(?:"([^"]+)"|'([^']+)')"#).unwrap());
+static INLINE_VERSION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^(\s*=\s*\{[^\n}]*?\bversion\s*=\s*)(?:"([^"]+)"|'([^']+)')"#).unwrap()
+});
+static DOTTED_VERSION_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"^(\s*\.\s*version\s*=\s*)(?:"([^"]+)"|'([^']+)')"#).unwrap());
+static INLINE_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^(\s*=\s*\{[^\n}]*?\btag\s*=\s*)(?:"([^"]+)"|'([^']+)')"#).unwrap()
+});
+static DOTTED_TAG_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"^(\s*\.\s*tag\s*=\s*)(?:"([^"]+)"|'([^']+)')"#).unwrap());
+static DOTTED_PATH_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*\.\s*path\s*=").unwrap());
+static DOTTED_REGISTRY_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"^\s*\.\s*registry\s*=\s*(?:"([^"]*)"|'([^']*)')"#).unwrap());
+static DOTTED_REGISTRY_INDEX_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*\.\s*registry-index\s*=").unwrap());
+
+/// 行頭のインデントとパッケージ名を、後続の構文から分ける。
+/// 名前の直後が `=` / `.` かどうかは後続の正規表現で確認するため、
+/// `serde` が `serde_json` の宣言に一致することはない。
+fn cargo_package_line<'a>(line: &'a str, package: &str) -> Option<(&'a str, &'a str)> {
+    let remainder = line.trim_start().strip_prefix(package)?;
+    Some((&line[..line.len() - remainder.len()], remainder))
+}
+
+/// 宣言形式の判定後は、旧制約の解析・更新先の整形を同じ経路で行う。
+fn cargo_version_replacement(
+    line: &str,
+    package: &str,
+    new_version: &str,
+    parser: &dyn VersionParser,
+) -> Option<String> {
+    let (key, remainder) = cargo_package_line(line, package)?;
+    let (regex, caps, simple) = SIMPLE_VERSION_RE
+        .captures(remainder)
+        .map(|caps| (&*SIMPLE_VERSION_RE, caps, true))
+        .or_else(|| {
+            INLINE_VERSION_RE
+                .captures(remainder)
+                .map(|caps| (&*INLINE_VERSION_RE, caps, false))
+        })
+        .or_else(|| {
+            DOTTED_VERSION_RE
+                .captures(remainder)
+                .map(|caps| (&*DOTTED_VERSION_RE, caps, false))
+        })?;
+    let (quote, old_version) = captured_quote_and_version(&caps);
+    if simple && old_version.contains('/') {
+        return None;
+    }
+    let new_ver = parser.parse(old_version)?.try_format_updated(new_version)?;
+    // 単純指定は従来どおり等号の前後を空白 1 つにし、他の形式は空白を保持する。
+    let replacement = if simple {
+        format!("{key} = {quote}{new_ver}{quote}")
+    } else {
+        format!("{key}{}{quote}{new_ver}{quote}", &caps[1])
+    };
+    Some(regex.replace(remainder, replacement.as_str()).into_owned())
+}
+
 // 依存宣言内の `path` キー (inline table 内・複数行テーブル内の両方)
 static PATH_KEY_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?:^|[{,])\s*path\s*=").unwrap());
@@ -158,39 +222,28 @@ fn non_crates_io_dependency_sections(
     package: &str,
 ) -> std::collections::HashSet<String> {
     let mut excluded = std::collections::HashSet::new();
-    let mut section = String::new();
-    let escaped_package = regex::escape(package);
-    let dotted_path_re = Regex::new(&format!(r"^\s*{}\s*\.\s*path\s*=", escaped_package)).unwrap();
-    let dotted_registry_re = Regex::new(&format!(
-        r#"^\s*{}\s*\.\s*registry\s*=\s*(?:"([^"]*)"|'([^']*)')"#,
-        escaped_package
-    ))
-    .unwrap();
-    // `registry-index` は値に関わらず crates.io 以外を指すので値は見ない
-    let dotted_registry_index_re = Regex::new(&format!(
-        r"^\s*{}\s*\.\s*registry-index\s*=",
-        escaped_package
-    ))
-    .unwrap();
+    let mut section = "";
 
     for line in content.lines() {
         if let Some(name) = cargo_section_name(line) {
-            section.clear();
-            section.push_str(name);
+            section = name;
             continue;
         }
-        let package_table_is_excluded = is_cargo_package_dependency_table(&section, package)
+        let package_table_is_excluded = is_cargo_package_dependency_table(section, package)
             && declares_non_crates_io_source(line, SourceKeyScope::TableBody);
-        let dotted_key_is_excluded = is_cargo_dependency_section(&section)
-            && (dotted_path_re.is_match(line)
-                || dotted_registry_index_re.is_match(line)
-                || dotted_registry_re.captures(line).is_some_and(|caps| {
-                    caps.get(1)
-                        .or_else(|| caps.get(2))
-                        .is_none_or(|value| value.as_str() != "crates-io")
-                }));
+        let dotted_key_is_excluded = is_cargo_dependency_section(section)
+            && cargo_package_line(line, package).is_some_and(|(_, remainder)| {
+                // `registry-index` は値に関わらず crates.io 以外を指す。
+                DOTTED_PATH_RE.is_match(remainder)
+                    || DOTTED_REGISTRY_INDEX_RE.is_match(remainder)
+                    || DOTTED_REGISTRY_RE.captures(remainder).is_some_and(|caps| {
+                        caps.get(1)
+                            .or_else(|| caps.get(2))
+                            .is_none_or(|value| value.as_str() != "crates-io")
+                    })
+            });
         if package_table_is_excluded || dotted_key_is_excluded {
-            excluded.insert(section.clone());
+            excluded.insert(section.to_owned());
         }
     }
 
@@ -279,57 +332,28 @@ impl ManifestParser for CargoTomlParser {
         // 同名クレートが複数の依存セクションにある場合に備えて最初の一致では打ち切らず、
         // 全依存セクションの全出現を置換する (各出現は自身の旧値から整形するため、
         // 出現ごとに制約形式が異なっていても正しく更新される)。
-        let simple_pattern = format!(
-            r#"^(\s*{})\s*=\s*(?:"([^"]+)"|'([^']+)')"#,
-            regex::escape(package)
-        );
-        let table_pattern = format!(
-            r#"^(\s*{}\s*=\s*\{{[^\n}}]*?\bversion\s*=\s*)(?:"([^"]+)"|'([^']+)')"#,
-            regex::escape(package)
-        );
         // TOML の dotted key 形式: `tokio.version = "1.38"`
         // toml クレートは dotted key を inline table と同じ構造へ畳むため parse は
         // 依存として surface する。ここを書き換えないと「更新あり」と報告した後に
         // 書き込みが失敗し、report/apply が矛盾する。
-        let dotted_pattern = format!(
-            r#"^(\s*{}\s*\.\s*version\s*=\s*)(?:"([^"]+)"|'([^']+)')"#,
-            regex::escape(package)
-        );
-        let simple_re =
-            Regex::new(&simple_pattern).map_err(|e| ManifestError::InvalidVersionSpec {
-                path: PathBuf::from("Cargo.toml"),
-                spec: package.to_string(),
-                message: format!("invalid regex pattern: {}", e),
-            })?;
-        let table_re =
-            Regex::new(&table_pattern).map_err(|e| ManifestError::InvalidVersionSpec {
-                path: PathBuf::from("Cargo.toml"),
-                spec: package.to_string(),
-                message: format!("invalid regex pattern: {}", e),
-            })?;
-        let dotted_re =
-            Regex::new(&dotted_pattern).map_err(|e| ManifestError::InvalidVersionSpec {
-                path: PathBuf::from("Cargo.toml"),
-                spec: package.to_string(),
-                message: format!("invalid regex pattern: {}", e),
-            })?;
         // path / 別レジストリを指す複数行テーブルと dotted key は
         // 書き換え対象から外す (parse と同じ範囲)
         let excluded_sections = non_crates_io_dependency_sections(content, package);
-        let mut section = String::new();
-        let mut rebuilt = String::new();
+        let mut section = "";
+        let mut rebuilt = String::with_capacity(content.len());
         for segment in content.split_inclusive('\n') {
             let (line, newline) = split_line_ending(segment);
 
             if let Some(name) = cargo_section_name(line) {
-                section.clear();
-                section.push_str(name);
+                section = name;
                 rebuilt.push_str(segment);
                 continue;
             }
 
-            if is_cargo_dependency_section(&section) {
-                if excluded_sections.contains(&section) {
+            if is_cargo_dependency_section(section) {
+                if excluded_sections.contains(section)
+                    || cargo_package_line(line, package).is_none()
+                {
                     rebuilt.push_str(segment);
                     continue;
                 }
@@ -341,40 +365,7 @@ impl ManifestParser for CargoTomlParser {
                     rebuilt.push_str(segment);
                     continue;
                 }
-                let replacement = if let Some(caps) = simple_re.captures(line) {
-                    let (quote, old_version) = captured_quote_and_version(&caps);
-                    if !old_version.contains('/')
-                        && let Some(spec) = parser.parse(old_version)
-                        && let Some(new_ver) = spec.try_format_updated(new_version)
-                    {
-                        let replacement = format!("{} = {}{}{}", &caps[1], quote, new_ver, quote);
-                        Some(simple_re.replace(line, replacement.as_str()).to_string())
-                    } else {
-                        None
-                    }
-                } else if let Some(caps) = table_re.captures(line) {
-                    let (quote, old_version) = captured_quote_and_version(&caps);
-                    if let Some(spec) = parser.parse(old_version)
-                        && let Some(new_ver) = spec.try_format_updated(new_version)
-                    {
-                        let replacement = format!("{}{}{}{}", &caps[1], quote, new_ver, quote);
-                        Some(table_re.replace(line, replacement.as_str()).to_string())
-                    } else {
-                        None
-                    }
-                } else if let Some(caps) = dotted_re.captures(line) {
-                    let (quote, old_version) = captured_quote_and_version(&caps);
-                    if let Some(spec) = parser.parse(old_version)
-                        && let Some(new_ver) = spec.try_format_updated(new_version)
-                    {
-                        let replacement = format!("{}{}{}{}", &caps[1], quote, new_ver, quote);
-                        Some(dotted_re.replace(line, replacement.as_str()).to_string())
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
+                let replacement = cargo_version_replacement(line, package, new_version, &*parser);
 
                 if let Some(new_line) = replacement {
                     rebuilt.push_str(&new_line);
@@ -382,8 +373,8 @@ impl ManifestParser for CargoTomlParser {
                     updated = true;
                     continue;
                 }
-            } else if is_cargo_package_dependency_table(&section, package)
-                && !excluded_sections.contains(&section)
+            } else if is_cargo_package_dependency_table(section, package)
+                && !excluded_sections.contains(section)
             {
                 // 複数行テーブル:
                 // テーブル形式の例: [dependencies.package]
@@ -428,71 +419,46 @@ impl ManifestParser for CargoTomlParser {
     ) -> Result<String, ManifestError> {
         let mut updated = false;
 
-        let inline_pattern = format!(
-            r#"^(\s*{}\s*=\s*\{{[^\n}}]*?\btag\s*=\s*)(?:"([^"]+)"|'([^']+)')"#,
-            regex::escape(package)
-        );
-        let inline_re =
-            Regex::new(&inline_pattern).map_err(|e| ManifestError::InvalidVersionSpec {
-                path: PathBuf::from("Cargo.toml"),
-                spec: package.to_string(),
-                message: format!("invalid regex pattern: {}", e),
-            })?;
         // TOML の dotted key 形式: `mylib.git = "..."` + `mylib.tag = "v1.0.0"`
         // toml クレートは dotted key を inline table と同じ構造へ畳むため、parse は
         // git tag 依存として surface する。ここを書き換えないと `git ls-remote` で
         // 見つけた新しいタグを「更新あり」と報告した後に書き込みが失敗し、
         // report/apply が矛盾する (update_version 側の dotted key 対応と対になる)。
-        let dotted_pattern = format!(
-            r#"^(\s*{}\s*\.\s*tag\s*=\s*)(?:"([^"]+)"|'([^']+)')"#,
-            regex::escape(package)
-        );
-        let dotted_re =
-            Regex::new(&dotted_pattern).map_err(|e| ManifestError::InvalidVersionSpec {
-                path: PathBuf::from("Cargo.toml"),
-                spec: package.to_string(),
-                message: format!("invalid regex pattern: {}", e),
-            })?;
 
         // インラインテーブル・dotted key・複数行テーブルをセクション追跡しながら更新する。
         // 依存セクション外の同名キーを誤って書き換えず、TOML の単一引用符も保持する。
-        let mut section = String::new();
-        let mut rebuilt = String::new();
+        let mut section = "";
+        let mut rebuilt = String::with_capacity(content.len());
         for segment in content.split_inclusive('\n') {
             let (line, newline) = split_line_ending(segment);
 
             if let Some(name) = cargo_section_name(line) {
-                section.clear();
-                section.push_str(name);
+                section = name;
                 rebuilt.push_str(segment);
                 continue;
             }
 
-            if is_cargo_git_tag_inline_section(&section)
-                && let Some(caps) = inline_re.captures(line)
+            // inline table と dotted key は同じ親セクションで有効になる。
+            if is_cargo_git_tag_inline_section(section)
+                && let Some((key, remainder)) = cargo_package_line(line, package)
+                && let Some((regex, caps)) = INLINE_TAG_RE
+                    .captures(remainder)
+                    .map(|caps| (&*INLINE_TAG_RE, caps))
+                    .or_else(|| {
+                        DOTTED_TAG_RE
+                            .captures(remainder)
+                            .map(|caps| (&*DOTTED_TAG_RE, caps))
+                    })
             {
                 let quote = if caps.get(3).is_some() { "'" } else { "\"" };
-                let replacement = format!("{}{}{}{}", &caps[1], quote, new_tag, quote);
-                rebuilt.push_str(&inline_re.replace(line, replacement.as_str()));
+                let replacement = format!("{key}{}{quote}{new_tag}{quote}", &caps[1]);
+                rebuilt.push_str(&regex.replace(remainder, replacement.as_str()));
                 rebuilt.push_str(newline);
                 updated = true;
                 continue;
             }
 
-            // ドット付きキー は inline table と同じく依存セクション直下に書かれるため、
-            // 対象セクションの判定も inline table と同じものを使う
-            if is_cargo_git_tag_inline_section(&section)
-                && let Some(caps) = dotted_re.captures(line)
-            {
-                let quote = if caps.get(3).is_some() { "'" } else { "\"" };
-                let replacement = format!("{}{}{}{}", &caps[1], quote, new_tag, quote);
-                rebuilt.push_str(&dotted_re.replace(line, replacement.as_str()));
-                rebuilt.push_str(newline);
-                updated = true;
-                continue;
-            }
-
-            if is_cargo_package_git_tag_table(&section, package)
+            if is_cargo_package_git_tag_table(section, package)
                 && let Some(caps) = TAG_LINE_RE.captures(line)
             {
                 let quote = if caps.get(3).is_some() { "'" } else { "\"" };
@@ -692,6 +658,36 @@ mod tests {
 
     fn parse(content: &str) -> Result<Vec<Dependency>, ManifestError> {
         CargoTomlParser.parse(content)
+    }
+
+    #[test]
+    fn test_update_version_key_boundaries_and_spacing() {
+        // 接頭辞を共有する別依存の取得元で、対象のセクションを除外しない。
+        let content = "[dependencies]\r\n\tserde\t=  '1.0' # 保持\r\nserde_json.path = '../serde_json'\r\nserde_json.version = '1.0'\r\n[dev-dependencies]\r\n  serde . version\t= '1.0' # 保持\r\n[build-dependencies]\r\nserde={ features = ['std'], version\t= '1.0' } # 保持\r\n[package.metadata]\r\nserde = '1.0'";
+        let expected = content
+            .replace("\tserde\t=  '1.0'", "\tserde = '1.2.3'")
+            .replace("serde . version\t= '1.0'", "serde . version\t= '1.2.3'")
+            .replace("version\t= '1.0' }", "version\t= '1.2.3' }");
+        assert_eq!(
+            CargoTomlParser
+                .update_version(content, "serde", "1.2.3")
+                .unwrap(),
+            expected
+        );
+        toml::from_str::<Value>(&expected).unwrap();
+    }
+
+    #[test]
+    fn test_update_git_tag_key_boundaries_and_spacing() {
+        let content = "[dependencies]\r\n  my-lib = { git = 'https://example.com/repo', tag\t= 'v1.0.0' } # 保持\r\nmy-lib-extra = { git = 'https://example.com/repo', tag = 'v1.0.0' }\r\n[dev-dependencies]\r\n  my-lib . tag\t= 'v1.0.0' # 保持\r\nmy-lib.git = 'https://example.com/repo'\r\n[package.metadata]\r\nmy-lib.tag = 'v1.0.0'";
+        let expected = content.replace("tag\t= 'v1.0.0'", "tag\t= 'v2.0.0'");
+        assert_eq!(
+            CargoTomlParser
+                .update_git_tag(content, "my-lib", "v2.0.0")
+                .unwrap(),
+            expected
+        );
+        toml::from_str::<Value>(&expected).unwrap();
     }
 
     #[test]
