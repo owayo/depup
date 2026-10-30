@@ -7,6 +7,61 @@ use std::time::Duration;
 const SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
 #[tokio::test]
+async fn refresh_osv_retains_only_preexisting_vulnerabilities_without_reverting_safe_versions() {
+    use crate::osv::{Advisory, OsvChecker, Severity};
+    let temp = tempfile::tempdir().unwrap();
+    let (mut result, plan) = fixture(temp.path(), &[(temp.path().into(), Language::Rust)]);
+    let args = args(temp.path());
+    let orchestrator = Orchestrator::new(args.clone()).unwrap();
+    let verifier = FakeVerification {
+        checker: Some(OsvChecker::mock_advisories(&[
+            (
+                "1.0.0",
+                Ok(vec![Advisory {
+                    id: "EXISTING".into(),
+                    aliases: vec![],
+                    severity: Severity::High,
+                }]),
+            ),
+            ("1.1.0", Ok(vec![])),
+        ])),
+        ..Default::default()
+    };
+    let installed = format!(
+        "{}{}",
+        lock("1.0.0"),
+        lock("1.1.0").strip_prefix("version = 4\n").unwrap()
+    );
+    let outcome = run_with(
+        &args,
+        &orchestrator,
+        &plan,
+        &mut result,
+        &verifier,
+        |command| {
+            std::fs::write(command.directory.join("Cargo.lock"), &installed).unwrap();
+            InstallResult::success(
+                command.language,
+                "cargo update".into(),
+                String::new(),
+                String::new(),
+            )
+        },
+    )
+    .await;
+    assert!(!outcome.install_failed && outcome.audit_failed);
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("Cargo.lock")).unwrap(),
+        installed
+    );
+    assert_eq!(result.summary.lock_refreshes[0].status, "completed");
+    assert!(result.summary.lock_refreshes[0].changed);
+    assert!(result.errors.iter().any(|error| matches!(error,
+        crate::orchestrator::OrchestratorError::OsvTradeoff { report, .. }
+        if report.retained_versions == ["1.0.0"])));
+}
+
+#[tokio::test]
 async fn refresh_osv_tradeoff_accepts_medium_and_restores_on_high() {
     use crate::osv::{Advisory, OsvChecker, Severity};
     for severity in [Severity::Medium, Severity::High] {
@@ -173,7 +228,7 @@ impl Verification for FakeVerification {
     ) -> Result<Option<crate::osv::RiskTradeoff>, String> {
         if let Some(checker) = &self.checker {
             return match checker
-                .assess_versions(language.osv_ecosystem().unwrap(), name, before, after, true)
+                .assess_lock_versions(language.osv_ecosystem().unwrap(), name, before, after, true)
                 .await?
             {
                 crate::osv::Assessment::Safe => Ok(None),

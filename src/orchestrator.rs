@@ -1912,6 +1912,7 @@ async fn judge_with_osv(
             Ok(crate::osv::Assessment::Rejected {
                 advisories,
                 baseline_error,
+                ..
             }) => {
                 if let Some(error) = baseline_error {
                     warnings.push(warning(format!(

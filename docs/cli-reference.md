@@ -194,11 +194,13 @@ Updates that could not be written get no hunk. The last line counts updates the 
 
 | Code | Meaning |
 |------|---------|
-| `0` | No failures. This includes runs with no updates, dry runs, and runs whose only diagnostics are OSV notices or warnings (fallbacks, permitted trade-offs, or failed lookups). |
+| `0` | No failures. This includes runs with no updates, dry runs, and runs whose only diagnostics are candidate OSV notices or warnings (fallbacks, permitted trade-offs, or failed lookups). Final lock verification of retained vulnerabilities is an exception described below. |
 | `1` | A package manager install failed or could not be prepared (whether or not its recovery completed), `--cd` could not change the directory, or depup itself could not continue (for example, the HTTP client failed to initialize, or the results or the recovery report could not be written). |
 | `2` | Part of the run failed: a manifest could not be read, parsed, or written (including a refused ambiguous write), a registry lookup failed, or a Rust or Node lockfile age audit left violations or unverified entries (including an unreadable lock or an exhausted time budget). This includes `--install` runs that restored a unit because a version they added failed the audit, even when some files were kept for manual recovery. Invalid command-line arguments also exit with `2`. |
 
 A code-2 failure does not stop the run. A failed lookup skips that dependency, and a manifest that cannot be read or parsed is left out; everything else is still written and installed. If a file cannot be saved, it keeps its original content. If only some updates in a manifest cannot be written (for example, one refused as ambiguous), the rest are still saved. Either way, the updates that could not be written are reported as failed instead of updated, and they do not make `--install` run. With `--install`, when a version this run added to a lockfile fails the age audit, the manifests and lockfiles of that install unit are restored to their state before the run and its updates are reported as failed (see [When the Final Lockfile Fails the Age Audit](usage.md#when-the-final-lockfile-fails-the-age-audit)). When both `1` and `2` apply, `1` wins.
+
+Final OSV lock verification exits with code 2 when a changed package retains vulnerable pre-run versions alongside new advisory-free versions. Updates remain applied; the warning identifies only the affected pre-run versions and suggests `--install --refresh-lock` for pnpm/Cargo. This differs from permitted severity trade-offs and candidate lookup warnings, which do not change the exit code. The JSON `errors` array retains the warning text.
 
 These lookup problems leave the exit code unchanged:
 

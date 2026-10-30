@@ -68,10 +68,16 @@ pub struct RiskTradeoff {
     pub fixed: Vec<AdvisoryGroup>,
     pub introduced: Vec<AdvisoryGroup>,
     pub retained: Vec<AdvisoryGroup>,
+    /// 最終 lock の検証で、新規版に問題がなく、実行前の版だけに残った問題。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retained_versions: Vec<String>,
 }
 
 impl RiskTradeoff {
     pub fn describe_summary(&self, name: &str) -> String {
+        if !self.retained_versions.is_empty() {
+            return self.describe(name);
+        }
         format!(
             "{name} {} -> {}: OSV severity trade-off accepted (fixed: {}, introduced: {}, retained: {}); known vulnerabilities remain; details: --verbose",
             self.baseline_versions.join(", "),
@@ -90,6 +96,13 @@ impl RiskTradeoff {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
+        if !self.retained_versions.is_empty() {
+            return format!(
+                "{name}@{}: pre-existing lock vulnerabilities remain: {}; no newly locked version is affected; updates kept; for pnpm/Cargo, try --install --refresh-lock to re-resolve dependencies within their constraints",
+                self.retained_versions.join(", "),
+                list(&self.retained),
+            );
+        }
         format!(
             "{name} {} -> {}: OSV severity trade-off accepted; fixed: {}; introduced: {}; retained: {} (known vulnerabilities remain)",
             self.baseline_versions.join(", "),
@@ -115,6 +128,7 @@ pub(crate) enum Assessment {
     Tradeoff(RiskTradeoff),
     Rejected {
         advisories: Vec<Advisory>,
+        affected_versions: Vec<String>,
         baseline_error: Option<String>,
     },
 }
@@ -128,6 +142,39 @@ struct Group {
 
 /// 重大度ごとの件数を使い、新規 Medium を Low の解消で相殺しない。
 pub(crate) fn tradeoff(before: &[Advisory], after: &[Advisory]) -> Option<RiskTradeoff> {
+    let report = compare_advisories(before, after)?;
+    let medium_budget = report
+        .fixed
+        .iter()
+        .filter(|group| group.severity.medium_or_above())
+        .count();
+    let total_budget = report
+        .fixed
+        .iter()
+        .filter(|group| group.severity != Severity::Unknown)
+        .count();
+    (total_budget > 0
+        && report.introduced.len() <= total_budget
+        && report
+            .introduced
+            .iter()
+            .filter(|group| group.severity == Severity::Medium)
+            .count()
+            <= medium_budget
+        && report
+            .introduced
+            .iter()
+            .all(|group| matches!(group.severity, Severity::Low | Severity::Medium)))
+    .then_some(report)
+}
+
+/// 呼び出し元で、問題のある版がすべて実行前の lock にあると確認した場合だけ使う。
+pub(crate) fn retained(before: &[Advisory], after: &[Advisory]) -> Option<RiskTradeoff> {
+    let report = compare_advisories(before, after)?;
+    (report.introduced.is_empty() && !report.retained.is_empty()).then_some(report)
+}
+
+fn compare_advisories(before: &[Advisory], after: &[Advisory]) -> Option<RiskTradeoff> {
     if after
         .iter()
         .any(|advisory| advisory.malicious() || advisory.id.is_empty())
@@ -189,30 +236,13 @@ pub(crate) fn tradeoff(before: &[Advisory], after: &[Advisory]) -> Option<RiskTr
             _ => unreachable!(),
         }
     }
-    let medium_budget = fixed
-        .iter()
-        .filter(|group| group.severity.medium_or_above())
-        .count();
-    let total_budget = fixed
-        .iter()
-        .filter(|group| group.severity != Severity::Unknown)
-        .count();
-    (total_budget > 0
-        && introduced.len() <= total_budget
-        && introduced
-            .iter()
-            .filter(|group| group.severity == Severity::Medium)
-            .count()
-            <= medium_budget
-        && introduced
-            .iter()
-            .all(|group| matches!(group.severity, Severity::Low | Severity::Medium)))
-    .then_some(RiskTradeoff {
+    Some(RiskTradeoff {
         baseline_versions: Vec::new(),
         candidate_versions: Vec::new(),
         fixed,
         introduced,
         retained,
+        retained_versions: Vec::new(),
     })
 }
 

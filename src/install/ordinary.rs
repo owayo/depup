@@ -198,7 +198,8 @@ pub(crate) async fn run_with(
     recovery.mark_summary(&mut result.summary);
     for (path, bytes, notices) in security.notices {
         if std::fs::read(path).is_ok_and(|final_bytes| final_bytes == bytes) {
-            super::security::print_notices(notices, result, orchestrator.live_osv_details());
+            audit_failed |=
+                super::security::print_notices(notices, result, orchestrator.live_osv_details());
         }
     }
     rollback_osv.warn(orchestrator, result, args.quiet).await;

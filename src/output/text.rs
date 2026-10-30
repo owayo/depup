@@ -1791,6 +1791,7 @@ mod tests {
                         severity: Severity::High,
                     }],
                     introduced: vec![],
+                    retained_versions: vec![],
                     retained: vec![AdvisoryGroup {
                         ids: vec!["TEST-RETAINED".into()],
                         severity: Severity::Critical,

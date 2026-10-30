@@ -27,7 +27,7 @@ impl Orchestrator {
             return Ok(None);
         };
         match checker
-            .assess_versions(
+            .assess_lock_versions(
                 ecosystem,
                 name,
                 before,
@@ -40,13 +40,26 @@ impl Orchestrator {
             Assessment::Tradeoff(report) => Ok(Some(report)),
             Assessment::Rejected {
                 advisories,
+                affected_versions,
                 baseline_error,
             } => Err(format!(
-                "{name}@{} is vulnerable ({});{}",
-                after.join(", "),
+                "{name}@{} is vulnerable ({}); previously locked affected versions: {}; newly locked affected versions: {};{}",
+                affected_versions.join(", "),
                 advisories
                     .iter()
                     .map(|record| record.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                affected_versions
+                    .iter()
+                    .filter(|version| before.contains(version))
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                affected_versions
+                    .iter()
+                    .filter(|version| !before.contains(version))
+                    .cloned()
                     .collect::<Vec<_>>()
                     .join(", "),
                 baseline_error.map_or_else(
@@ -134,6 +147,94 @@ impl Orchestrator {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[tokio::test]
+    async fn final_lock_retains_existing_vulnerabilities_without_rejecting_safe_additions() {
+        use crate::osv::{Advisory, OsvChecker, Severity};
+        for allow_tradeoff in [true, false] {
+            for severity in [Severity::High, Severity::Critical, Severity::Unknown] {
+                let mut args = CliArgs::parse_from(["depup", "--osv"]);
+                args.no_osv_risk_tradeoff = !allow_tradeoff;
+                let mut orchestrator = Orchestrator::new(args).unwrap();
+                orchestrator.osv_checker = Some(OsvChecker::mock_advisories(&[
+                    (
+                        "1.2.1",
+                        Ok(vec![Advisory {
+                            id: "EXISTING".into(),
+                            aliases: vec![],
+                            severity,
+                        }]),
+                    ),
+                    ("1.2.2", Ok(vec![])),
+                ]));
+                let report = orchestrator
+                    .assess_osv_change(
+                        Language::Node,
+                        "source-map-js",
+                        &["1.2.1".into()],
+                        &["1.2.1".into(), "1.2.2".into()],
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(report.fixed.is_empty() && report.introduced.is_empty());
+                assert_eq!(report.retained.len(), 1);
+                assert_eq!(report.retained_versions, ["1.2.1"]);
+                let message = report.describe("source-map-js");
+                assert!(message.contains("source-map-js@1.2.1"), "{message}");
+                assert!(!message.contains("1.2.2"), "{message}");
+                assert!(message.contains("--install --refresh-lock"));
+                assert!(message.contains("updates kept"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn final_lock_rejection_identifies_only_affected_versions_and_their_origin() {
+        use crate::osv::{Advisory, OsvChecker, Severity};
+        let mut orchestrator = Orchestrator::new(CliArgs::parse_from(["depup", "--osv"])).unwrap();
+        orchestrator.osv_checker = Some(OsvChecker::mock_advisories(&[
+            (
+                "1.2.1",
+                Ok(vec![Advisory {
+                    id: "SAME".into(),
+                    aliases: vec![],
+                    severity: Severity::High,
+                }]),
+            ),
+            (
+                "1.2.2",
+                Ok(vec![Advisory {
+                    id: "SAME".into(),
+                    aliases: vec![],
+                    severity: Severity::High,
+                }]),
+            ),
+            ("1.2.3", Ok(vec![])),
+        ]));
+        let message = orchestrator
+            .assess_osv_change(
+                Language::Node,
+                "example",
+                &["1.2.1".into()],
+                &["1.2.1".into(), "1.2.2".into(), "1.2.3".into()],
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            message.contains("example@1.2.1, 1.2.2 is vulnerable"),
+            "{message}"
+        );
+        assert!(
+            message.contains("previously locked affected versions: 1.2.1"),
+            "{message}"
+        );
+        assert!(
+            message.contains("newly locked affected versions: 1.2.2"),
+            "{message}"
+        );
+        assert!(!message.contains("1.2.3"), "{message}");
+    }
 
     #[tokio::test]
     async fn java_and_go_declarations_do_not_provide_fixed_baselines() {
