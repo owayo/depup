@@ -2,6 +2,7 @@
 use std::fs::{self, Permissions};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
@@ -140,13 +141,6 @@ pub(crate) fn write_checked(
     bytes: &[u8],
     permissions: Option<&Permissions>,
 ) -> io::Result<()> {
-    guard.check()?;
-    if !expected.matches(&FileState::read(&guard.target)?) {
-        return Err(io::Error::other("File changed before writing"));
-    }
-    if expected.bytes.is_some() {
-        fs::OpenOptions::new().write(true).open(&guard.target)?;
-    }
     let parent = guard
         .target
         .parent()
@@ -155,12 +149,41 @@ pub(crate) fn write_checked(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let tmp = parent.join(format!(".depup-tmp-{}-{nonce}", std::process::id()));
+    let tmp = temporary_path(parent, nonce);
+    replace_checked(guard, expected, bytes, permissions, &tmp)
+}
+
+fn temporary_path(parent: &Path, nonce: u128) -> PathBuf {
+    // The clock can return the same value to concurrent writers on Windows.
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+    let sequence = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!(
+        ".depup-tmp-{}-{nonce}-{sequence}",
+        std::process::id()
+    ))
+}
+
+fn replace_checked(
+    guard: &FileGuard,
+    expected: &FileState,
+    bytes: &[u8],
+    permissions: Option<&Permissions>,
+    tmp: &Path,
+) -> io::Result<()> {
+    guard.check()?;
+    if !expected.matches(&FileState::read(&guard.target)?) {
+        return Err(io::Error::other("File changed before writing"));
+    }
+    if expected.bytes.is_some() {
+        fs::OpenOptions::new().write(true).open(&guard.target)?;
+    }
+    // A failed create_new must not remove a file belonging to another writer.
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(tmp)?;
     let result = (|| {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
+        let mut file = file;
         file.write_all(bytes)?;
         if let Some(permissions) = permissions {
             file.set_permissions(permissions.clone())?;
@@ -170,8 +193,10 @@ pub(crate) fn write_checked(
         if !expected.matches(&FileState::read(&guard.target)?) {
             return Err(io::Error::other("File changed before replacement"));
         }
-        fs::rename(&tmp, &guard.target)?;
-        if let Ok(directory) = fs::File::open(parent) {
+        fs::rename(tmp, &guard.target)?;
+        if let Some(parent) = guard.target.parent()
+            && let Ok(directory) = fs::File::open(parent)
+        {
             let _ = directory.sync_all();
         }
         Ok(())
@@ -286,5 +311,81 @@ mod tests {
             guard.check().unwrap();
             assert_eq!(guard.read().unwrap().bytes, Some(b"new lock".to_vec()));
         }
+    }
+
+    #[test]
+    fn temporary_files_coexist_when_the_clock_does_not_advance() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..16).map(|_| temporary_path(temp.path(), 42)).collect();
+        for (index, path) in paths.iter().enumerate() {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .unwrap();
+            write!(file, "writer-{index}").unwrap();
+        }
+        for (index, path) in paths.iter().enumerate() {
+            assert_eq!(fs::read_to_string(path).unwrap(), format!("writer-{index}"));
+        }
+    }
+
+    #[test]
+    fn create_failure_preserves_the_other_writers_temporary_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Cargo.toml");
+        fs::write(&path, b"original\n").unwrap();
+        let guard = FileGuard::capture(&path).unwrap();
+        let before = guard.read().unwrap();
+        let tmp = temp.path().join(".depup-tmp-existing");
+        fs::write(&tmp, b"another writer owns these bytes\n").unwrap();
+
+        let error = replace_checked(
+            &guard,
+            &before,
+            b"updated\n",
+            before.permissions.as_ref(),
+            &tmp,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read(&tmp).unwrap(),
+            b"another writer owns these bytes\n"
+        );
+        assert!(before.matches(&guard.read().unwrap()));
+    }
+
+    #[test]
+    fn concurrent_replacements_keep_each_files_bytes_with_a_fixed_clock() {
+        let temp = tempfile::tempdir().unwrap();
+        std::thread::scope(|scope| {
+            for writer in 0..8 {
+                let path = temp.path().join(format!("manifest-{writer}.toml"));
+                scope.spawn(move || {
+                    fs::write(&path, b"original\n").unwrap();
+                    let guard = FileGuard::capture(&path).unwrap();
+                    for iteration in 0..16 {
+                        let before = guard.read().unwrap();
+                        let content = format!("# writer {writer}\nversion = '{iteration}'\n");
+                        let tmp = temporary_path(guard.target.parent().unwrap(), 42);
+                        replace_checked(
+                            &guard,
+                            &before,
+                            content.as_bytes(),
+                            before.permissions.as_ref(),
+                            &tmp,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            guard.read().unwrap().bytes.as_deref(),
+                            Some(content.as_bytes())
+                        );
+                        assert!(!tmp.exists());
+                    }
+                });
+            }
+        });
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 8);
     }
 }
