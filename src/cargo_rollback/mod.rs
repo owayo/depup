@@ -8,6 +8,7 @@
 pub(crate) mod audit;
 pub mod batch;
 pub mod graph;
+mod lock_entries;
 pub mod report;
 pub mod scratch;
 pub mod series;

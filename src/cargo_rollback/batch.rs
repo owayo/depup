@@ -13,6 +13,7 @@
 //! 前の lock に戻す。
 
 use super::graph::{LockGraph, PackageKey};
+use super::lock_entries::lock_tables;
 use super::scratch::{AgePin, CargoCommand, CargoError, ScratchWorkspace};
 use super::series::same_series;
 use crate::manifest::{RegistryLockEntries, parse_registry_entries, write_manifest};
@@ -113,43 +114,15 @@ fn check_restoration(
     installed: &str,
 ) -> Result<(), String> {
     use crate::manifest::{is_crates_io_source, parse_lock_packages};
-    let tables = |content: &str| {
-        let document: toml::Value =
-            toml::from_str(content).unwrap_or(toml::Value::Table(Default::default()));
-        document
-            .get("package")
-            .and_then(toml::Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|package| {
-                Some((
-                    (
-                        package.get("name")?.as_str()?.to_string(),
-                        package.get("version")?.as_str()?.to_string(),
-                        package
-                            .get("source")
-                            .and_then(toml::Value::as_str)
-                            .map(str::to_string),
-                    ),
-                    package.clone(),
-                ))
-            })
-            .collect::<HashMap<_, _>>()
-    };
-    let before_tables = tables(before);
-    let after_tables = tables(after);
-    let before_graph = LockGraph::from_lock_content(before);
-    let after_graph = LockGraph::from_lock_content(after);
-    let allowed: HashSet<_> = members
-        .iter()
-        .flat_map(|member| {
-            member
-                .current
-                .iter()
-                .chain(std::iter::once(&member.installed))
-                .map(|version| (member.name.clone(), version.clone()))
-        })
-        .chain(discarded.iter().cloned())
+    let before_tables = lock_tables(before);
+    let after_tables = lock_tables(after);
+    // 一時依存の追加は crates.io の lock をすべて無効化しうる。その再解決では、
+    // 選択外の依存元の辺も、同名・同取得元の別系列へ付け替わる。パッケージの
+    // 集合とその他のフィールドは下で保持を確かめ、辺は多重度を含めて照合する。
+    let unlocked = before_tables
+        .keys()
+        .filter(|id| id.2.as_deref().is_some_and(is_crates_io_source))
+        .cloned()
         .collect();
     let ids = |content: &str| {
         parse_lock_packages(content)
@@ -198,56 +171,17 @@ fn check_restoration(
         }
         if !selected {
             let key = (name.clone(), version.clone(), source.clone());
-            let mut previous = before_tables[&key].clone();
-            let mut restored = after_tables[&key].clone();
-            let previous_dependencies = previous
-                .as_table_mut()
-                .and_then(|table| table.remove("dependencies"));
-            let restored_dependencies = restored
-                .as_table_mut()
-                .and_then(|table| table.remove("dependencies"));
-            if previous != restored {
+            let previous = &before_tables[&key];
+            let restored = &after_tables[&key];
+            if previous.fields != restored.fields {
                 return Err(format!(
                     "restoration would change an unrelated package table {name} {version}"
                 ));
             }
-            if previous_dependencies != restored_dependencies {
-                let key = (name.clone(), version.clone());
-                let left = before_graph.dependencies(&key);
-                let right = after_graph.dependencies(&key);
-                let count = |value: &Option<toml::Value>| {
-                    value
-                        .as_ref()
-                        .and_then(toml::Value::as_array)
-                        .map_or(0, Vec::len)
-                };
-                let ambiguous = left.iter().chain(&right).any(|key| {
-                    [&before, &after].iter().any(|ids| {
-                        ids.iter()
-                            .filter(|id| id.0 == key.0 && id.1 == key.1)
-                            .count()
-                            > 1
-                    })
-                });
-                let same_edges = left.len() == right.len()
-                    && left.iter().all(|dependency| {
-                        right.contains(dependency)
-                            || (allowed.contains(dependency)
-                                && right.iter().any(|target| {
-                                    allowed.contains(target)
-                                        && dependency.0 == target.0
-                                        && same_series(&dependency.1, &target.1)
-                                }))
-                    });
-                if ambiguous
-                    || left.len() != count(&previous_dependencies)
-                    || right.len() != count(&restored_dependencies)
-                    || !same_edges
-                {
-                    return Err(format!(
-                        "restoration would change unrelated dependency edges of {name} {version}"
-                    ));
-                }
+            if !previous.rewired(restored, &unlocked) {
+                return Err(format!(
+                    "restoration would change unrelated dependency edges of {name} {version}"
+                ));
             }
         }
     }
@@ -1058,6 +992,113 @@ mod tests {
                 .unwrap_err()
                 .contains("remained alongside")
         );
+    }
+
+    #[tokio::test]
+    async fn restoration_accepts_cargos_cross_series_rewiring_and_keeps_independent_rollbacks() {
+        use crate::test_support::local_registry::{LocalRegistry, TestProject};
+
+        let registry = LocalRegistry::new();
+        registry.publish("shared", "0.1.0", &[]);
+        registry.publish("holder", "1.0.0", &[("shared", ">=0.1, <0.3")]);
+        registry.publish("keep-old", "1.0.0", &[("shared", "=0.1.0")]);
+        registry.publish("foo", "1.0.1", &[]);
+        registry.publish("solo", "1.0.1", &[]);
+        let manifest = "[package]\nname = 'app'\nversion = '0.1.0'\nedition = '2024'\n\
+                        [dependencies]\nfoo = '1'\nsolo = '1'\nholder = '1'\nkeep-old = '1'\n";
+        let project = TestProject::new(&registry, manifest);
+        project.cargo_ok(&["generate-lockfile"]);
+        registry.publish("shared", "0.2.0", &[]);
+        registry.publish("keep-new", "1.0.0", &[("shared", "=0.2.0")]);
+        let manifest = format!("{manifest}keep-new = '1'\n");
+        project.write("Cargo.toml", &manifest);
+        project.cargo_ok(&["update", "--workspace"]);
+        let before = project.read("Cargo.lock");
+        let holder = key("holder", "1.0.0");
+        assert_eq!(
+            LockGraph::from_lock_content(&before).dependencies(&holder),
+            vec![key("shared", "0.1.0")]
+        );
+
+        registry.publish("foo", "1.0.2", &[]);
+        registry.publish("solo", "1.0.2", &[]);
+        project.cargo_ok(&["update"]);
+        let installed = project.read("Cargo.lock");
+        project.write("Cargo.lock", &before);
+        project.cargo_ok(&["update", "--workspace", "--locked"]);
+        let cargo = project.cargo_envs().into_iter().fold(
+            CargoCommand::new().program(TestProject::cargo_program()),
+            |cargo, (key, value)| cargo.env(key, value),
+        );
+        let restored = restore_installed(
+            project.path(),
+            RestorationScope {
+                members: &[RestoreCandidate {
+                    name: "foo".into(),
+                    current: Some("1.0.1".into()),
+                    installed: "1.0.2".into(),
+                }],
+                discarded: &[],
+                installed: &installed,
+                expected_lock: &before,
+            },
+            &cargo,
+            Instant::now() + Duration::from_secs(60),
+            Duration::from_secs(20),
+        )
+        .await
+        .expect("Cargo's own edge rewiring must not abort selective restoration");
+        assert_eq!(project.read("Cargo.lock"), restored);
+        assert_eq!(project.read("Cargo.toml"), manifest);
+        assert_eq!(project.locked_versions("foo"), ["1.0.2"]);
+        assert_eq!(project.locked_versions("solo"), ["1.0.1"]);
+        assert_eq!(project.locked_versions("shared"), ["0.1.0", "0.2.0"]);
+        assert_eq!(
+            LockGraph::from_lock_content(&restored).dependencies(&holder),
+            vec![key("shared", "0.2.0")]
+        );
+        project.cargo_ok(&["update", "--workspace", "--locked"]);
+    }
+
+    #[test]
+    fn restoration_preserves_edge_multiplicity_and_sources() {
+        let members = [RestoreCandidate {
+            name: "foo".into(),
+            current: Some("1.1.0".into()),
+            installed: "1.2.0".into(),
+        }];
+        let before = lock(&[("foo", "1.1.0"), ("shared", "0.1.0"), ("shared", "0.2.0")]);
+        let after = before.replace("version = \"1.1.0\"", "version = \"1.2.0\"");
+        let holder = |lock: &str, edges: &str| {
+            format!(
+                "{lock}\n[[package]]\nname = 'holder'\nversion = '1.0.0'\ndependencies = [{edges}]\n"
+            )
+        };
+        let before = holder(&before, "'shared 0.1.0', 'shared 0.1.0'");
+        let restored = holder(&after, "'shared 0.2.0', 'shared 0.2.0'");
+        assert!(check_restoration(&before, &restored, &members, &[], &after).is_ok());
+        let lost_edge = holder(&after, "'shared 0.2.0'");
+        assert!(check_restoration(&before, &lost_edge, &members, &[], &after).is_err());
+
+        for source in [
+            "registry+https://example.invalid/index",
+            "git+https://example.invalid/shared#1234567",
+        ] {
+            let external =
+                format!("\n[[package]]\nname = 'shared'\nversion = '0.2.0'\nsource = '{source}'\n");
+            let before = format!("{before}{external}");
+            let reference_source = source.split('#').next().unwrap();
+            let restored = format!(
+                "{}{external}",
+                holder(
+                    &after,
+                    &format!(
+                        "'shared 0.2.0 ({reference_source})', 'shared 0.2.0 ({reference_source})'"
+                    )
+                )
+            );
+            assert!(check_restoration(&before, &restored, &members, &[], &after).is_err());
+        }
     }
 
     /// 固定した crate が目標の版に、固定していない crate も今より古い同じ系列の版に移れば成功
