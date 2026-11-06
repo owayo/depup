@@ -444,7 +444,7 @@ The package manager is detected from files in the directory where the install ru
 | | `bun.lock` / `bun.lockb` | `bun install` |
 | | `package-lock.json`, or `package.json` alone | `npm install` |
 | Python | `uv.lock` | `uv sync` |
-| | `poetry.lock` | `poetry install` |
+| | `poetry.lock` | `poetry lock`, then `poetry install` (below) |
 | | `requirements.lock` / `requirements-dev.lock` | `rye sync` |
 | | `Pipfile.lock` | `pipenv install` |
 | | `pyproject.toml` / `requirements.txt` | `pip install -e .` |
@@ -460,6 +460,8 @@ The package manager is detected from files in the directory where the install ru
 If none of the listed files is present, no install runs for that language, and nothing is printed. When the age filter is active, pnpm, uv, and mise also receive the age setting ([below](#transitive-dependencies-and-the-age-filter)), and `uv sync` always runs with `UV_MALWARE_CHECK=1` ([uv Malware Check](#uv-malware-check-preview)).
 
 When `--install` processes a PHP project, depup runs `composer update` rather than `composer install`. `composer install` reuses the existing lock file and cannot reflect constraints that depup has just changed in `composer.json`; `composer update` resolves those constraints and refreshes `composer.lock`.
+
+For Poetry projects, depup refreshes the lock before `poetry install`, because `poetry install` in Poetry 1.8 and later fails when the dependencies in `pyproject.toml` no longer match `poetry.lock`. depup runs `poetry --version` with the same executable and environment as the install, then runs `poetry lock` on Poetry 2 and later or `poetry lock --no-update` on 1.x. Both keep locked versions where possible. If the version cannot be determined or the lock refresh fails, depup does not run `poetry install`; it treats the install as failed and restores the files.
 
 When `--only` is combined with `--install`, Cargo and Composer select packages whose updates were applied successfully. Cargo also uses this selective update with `--exclude`, so an excluded git dependency keeps its locked commit while unrelated eligible packages update. Cargo receives `--package <old-package-ID>` selectors, including the locked version and source; renamed dependencies use their real crate name. Git branch updates use the same selectors. Changed git tags and dependencies without an old lock entry are reconciled by Cargo without unlocking their old sources; if no package selectors are needed, depup runs `cargo update --workspace`. Both forms retain unrelated locked packages. Dependencies needed by selected updates can still change. Without an existing lock, Cargo resolves the initial lock. An unreadable lock or an ambiguous target is reported as an install failure instead of running a full update.
 

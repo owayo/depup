@@ -445,7 +445,7 @@ pnpm の更新先の不一致 (override や解決の結果、直接依存が別�
 | | `bun.lock` / `bun.lockb` | `bun install` |
 | | `npm-shrinkwrap.json` / `package-lock.json`、または `package.json` のみ | `npm install` |
 | Python | `uv.lock` | `uv sync` |
-| | `poetry.lock` | `poetry install` |
+| | `poetry.lock` | `poetry lock` の後に `poetry install`（下記） |
 | | `requirements.lock` / `requirements-dev.lock` | `rye sync` |
 | | `Pipfile.lock` | `pipenv install` |
 | | `pyproject.toml` / `requirements.txt` | `pip install -e .` |
@@ -461,6 +461,8 @@ pnpm の更新先の不一致 (override や解決の結果、直接依存が別�
 表のファイルがどれもなければ、その言語の install は実行せず、何も表示しません。age フィルターが有効なときは、pnpm・uv・mise に age の値も渡します（[推移的依存と age フィルター](#推移的依存と-age-フィルター)）。`uv sync` には常に `UV_MALWARE_CHECK=1` を付けます（[uv のマルウェアチェック](#uv-のマルウェアチェックpreview)）。
 
 PHP プロジェクトを `--install` で処理するとき、depup は `composer install` ではなく `composer update` を実行します。`composer install` は既存のロックファイルを再利用するため、depup が直前に `composer.json` へ書いた制約を反映できません。`composer update` で制約を解決し直し、`composer.lock` を更新します。
+
+Poetry のプロジェクトでは、`poetry install` の前に lock を更新します。Poetry 1.8 以降の `poetry install` は、`pyproject.toml` の依存が `poetry.lock` と合わないと失敗するためです。depup は install と同じ実行ファイルと環境で `poetry --version` を実行し、Poetry 2 以降なら `poetry lock`、1.x なら `poetry lock --no-update` を実行します。どちらも lock 済みの版をできるだけ保ちます。版を確かめられないときや lock の更新に失敗したときは、`poetry install` を実行せず、install の失敗としてファイルを元に戻します。
 
 `--only` と `--install` を併用すると、Cargo と Composer は書き込みに成功した更新だけを指定して実行します。Cargo は `--exclude` でも同じ限定更新を使い、除外した git 依存のコミットを lock に保ちながら、無関係の更新を進めます。Cargo には更新前の lock の版と取得元を含む `--package <パッケージID>` を渡します。リネーム依存でも実クレート名を使い、git branch の更新にも同じ指定を使います。git tag を変更した依存や、更新前の lock にない依存は、旧取得元の指定を外したまま Cargo が解決します。パッケージの指定が 1 件も必要なければ `cargo update --workspace` を使います。どちらも無関係のロック済みパッケージを維持します。選んだ更新に必要な依存は変わる場合があります。既存の lock がなければ、最初の lock を解決します。lock が読めない場合や対象を一意に決められない場合は、install の失敗として表示します。
 
