@@ -1098,17 +1098,8 @@ fn select_latest_candidate(
         != std::cmp::Ordering::Less
     {
         // max_change で除外された「より新しい候補」が存在すれば ChangeLevelLimited
-        if let Some(max) = max_change {
-            let current = dependency.version();
-            let has_newer_excluded = eligible.iter().any(|v| {
-                compare_dependency_versions(dependency, &v.version, current)
-                    == std::cmp::Ordering::Greater
-                    && crate::domain::ChangeLevel::from_versions(current, &v.version)
-                        .is_some_and(|level| level > max)
-            });
-            if has_newer_excluded {
-                return UpdateResult::skip(dependency.clone(), SkipReason::ChangeLevelLimited(max));
-            }
+        if let Some(max) = excluded_by_max_change(dependency, eligible, max_change) {
+            return UpdateResult::skip(dependency.clone(), SkipReason::ChangeLevelLimited(max));
         }
         return UpdateResult::skip_already_latest_with_optional_date(
             dependency.clone(),
@@ -1127,7 +1118,12 @@ fn select_latest_candidate(
     // 書き換え結果が現在の raw と同一なら、マニフェスト上は何も変わらない
     // phantom update (例: Wildcard `1.x` の範囲内に最新版がある場合)。
     // writer が no-op なのに毎回「更新あり」と報告し続けないよう AlreadyLatest にする。
+    // ただし `--max-change` で除外した新しい版があれば、それが書き換えを止めた理由なので
+    // ChangeLevelLimited と報告する (`4.x` に対する 5.0.0 など、#106)。
     if formatted == dependency.version_spec.raw {
+        if let Some(max) = excluded_by_max_change(dependency, eligible, max_change) {
+            return UpdateResult::skip(dependency.clone(), SkipReason::ChangeLevelLimited(max));
+        }
         return UpdateResult::skip_already_latest_with_optional_date(
             dependency.clone(),
             current_released_at,
@@ -1135,6 +1131,26 @@ fn select_latest_candidate(
     }
 
     UpdateResult::update_with_optional_date(dependency.clone(), &latest.version, latest.released_at)
+}
+
+/// `--max-change` で除外した、現在版より新しい候補があれば、その上限 (`ChangeLevelLimited` で
+/// 報告する)。なければ `None`。
+fn excluded_by_max_change(
+    dependency: &Dependency,
+    eligible: &[&VersionInfo],
+    max_change: Option<crate::domain::ChangeLevel>,
+) -> Option<crate::domain::ChangeLevel> {
+    let max = max_change?;
+    let current = dependency.version();
+    eligible
+        .iter()
+        .any(|v| {
+            compare_dependency_versions(dependency, &v.version, current)
+                == std::cmp::Ordering::Greater
+                && crate::domain::ChangeLevel::from_versions(current, &v.version)
+                    .is_some_and(|level| level > max)
+        })
+        .then_some(max)
 }
 
 #[cfg(test)]
@@ -1340,6 +1356,66 @@ mod tests {
                 dep.version_spec.try_format_updated(expected).as_deref(),
                 Some(written),
                 "{raw} ({language:?})"
+            );
+        }
+    }
+
+    /// Issue #106: 書き換えの要らない指定 (ワイルドカード・RubyGems の `~>`・mise の部分版) でも、
+    /// `--max-change` で除外した新しい版があれば `max-change=<LEVEL>` と報告する。以前は
+    /// 書き換え後の表記が同じなら、除外した版を見ずに `latest` と報告していた。
+    #[test]
+    fn unchanged_specs_report_versions_excluded_by_max_change() {
+        use crate::domain::ChangeLevel;
+        for (language, raw, available, max) in [
+            (
+                Language::Node,
+                "4.x",
+                vec!["4.17.21", "5.0.0"],
+                ChangeLevel::Minor,
+            ),
+            (
+                Language::Ruby,
+                "~> 7.1",
+                vec!["7.1.4", "7.2.0"],
+                ChangeLevel::Patch,
+            ),
+            (
+                Language::Mise,
+                "22",
+                vec!["22.11.0", "24.0.0"],
+                ChangeLevel::Minor,
+            ),
+        ] {
+            let spec = crate::parser::get_parser(language).parse(raw).unwrap();
+            let dep = Dependency::production("example", spec, language);
+            let versions: Vec<_> = available
+                .into_iter()
+                .map(|version| make_version_info_at(version, fixed_time()))
+                .collect();
+            let limited =
+                UpdateJudge::with_time(UpdateFilter::new().with_max_change(max), fixed_time())
+                    .judge(&dep, &versions);
+            assert!(
+                matches!(
+                    &limited,
+                    UpdateResult::Skip { reason: SkipReason::ChangeLevelLimited(level), .. } if *level == max
+                ),
+                "{raw} ({language:?}): {limited:?}"
+            );
+            // 除外した版がなければ、これまでどおり latest
+            let latest_only: Vec<_> = versions.into_iter().take(1).collect();
+            let latest =
+                UpdateJudge::with_time(UpdateFilter::new().with_max_change(max), fixed_time())
+                    .judge(&dep, &latest_only);
+            assert!(
+                matches!(
+                    &latest,
+                    UpdateResult::Skip {
+                        reason: SkipReason::AlreadyLatest,
+                        ..
+                    }
+                ),
+                "{raw} ({language:?}): {latest:?}"
             );
         }
     }

@@ -198,7 +198,7 @@ depup --max-change minor
 depup --max-change major
 ```
 
-When every newer candidate exceeds the cap, the dependency is skipped with reason `max-change=<LEVEL>`; if some newer candidates are within the cap, depup updates to the newest of them. Cargo git dependencies that track a tag work differently: only the newest tag is considered, and if it exceeds the cap, the dependency is skipped with `max-change=<LEVEL>`.
+When every newer candidate exceeds the cap, the dependency is skipped with reason `max-change=<LEVEL>`; if some newer candidates are within the cap, depup updates to the newest of them. A specification that needs no rewrite for the newest version within the cap, such as `4.x`, RubyGems' `~> 7.1`, or mise's `node = "22"`, is still reported as `max-change=<LEVEL>` when a newer version exceeds the cap. Cargo git dependencies that track a tag work differently: only the newest tag is considered, and if it exceeds the cap, the dependency is skipped with `max-change=<LEVEL>`.
 
 **Priority order (highest first):**
 1. CLI `--max-change <LEVEL>`
