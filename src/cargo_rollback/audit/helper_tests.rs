@@ -1,5 +1,23 @@
 use super::*;
 
+/// 仮想時計は実時間を数えず、オフセットだけを経過時間にする。短い予算のテストは
+/// これを使い、cargo の起動が遅い (負荷の高い) 環境でも同じ分岐を通る (#86)
+#[test]
+fn frozen_clock_counts_only_the_offset() {
+    let mut state = AuditState::new(Duration::from_secs(19));
+    state.frozen_clock = true;
+    std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(state.elapsed(), Duration::ZERO);
+    let offset = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1_500));
+    state.elapsed_offset = Some(offset.clone());
+    assert_eq!(state.elapsed(), Duration::from_millis(1_500));
+    offset.store(20_000, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(state.elapsed(), Duration::from_secs(20));
+    // 実時計の監査は、従来どおり実時間にオフセットを足す
+    state.frozen_clock = false;
+    assert!(state.elapsed() >= Duration::from_millis(20_030));
+}
+
 mod retry_regressions {
     use super::*;
     use crate::test_support::fake_crates_io::FakeCratesIo;
@@ -383,6 +401,7 @@ mod retry_regressions {
         };
         let versions = VersionFetcher::new(4, 1);
         let result = LockAgeAuditor::new(&input, &versions, false)
+            .with_frozen_clock()
             .run(None)
             .await;
         assert_eq!(project.locked_versions("z-top"), ["1.2.0"], "{result:?}");
@@ -412,6 +431,7 @@ mod retry_regressions {
         let versions = VersionFetcher::new(4, 1);
         let auditor = LockAgeAuditor::new(&input, &versions, false);
         let mut state = AuditState::new(input.budget);
+        state.frozen_clock = true;
         state.installed_lock = project.read("Cargo.lock");
         auditor.run_pass(&mut state, 0, false, None).await.unwrap();
         assert_eq!(project.locked_versions("middle"), ["1.1.0"]);
@@ -516,6 +536,7 @@ mod retry_regressions {
         let versions = VersionFetcher::new(4, 1);
         let auditor = LockAgeAuditor::new(&input, &versions, false);
         let mut state = AuditState::new(input.budget);
+        state.frozen_clock = true;
         let blocked = RollbackCandidate {
             name: "a-block".into(),
             current: "1.2.0".into(),
@@ -647,6 +668,7 @@ mod retry_regressions {
         };
         let versions = VersionFetcher::new(4, 1);
         let result = LockAgeAuditor::new(&input, &versions, false)
+            .with_frozen_clock()
             .run(None)
             .await;
         assert_eq!(project.locked_versions("a-dep"), ["1.1.0"], "{result:?}");
@@ -713,6 +735,7 @@ mod retry_regressions {
         };
         let versions = VersionFetcher::new(4, 1);
         let result = LockAgeAuditor::new(&input, &versions, false)
+            .with_frozen_clock()
             .run(None)
             .await;
         assert_eq!(
@@ -747,6 +770,7 @@ mod retry_regressions {
             };
             let versions = VersionFetcher::new(4, 1);
             let result = LockAgeAuditor::new(&input, &versions, false)
+                .with_frozen_clock()
                 .run(None)
                 .await;
             assert_eq!(project.locked_versions("z-top"), ["1.2.0"], "{result:?}");
@@ -1351,12 +1375,17 @@ mod retry_regressions {
         let versions = VersionFetcher::new(4, 1);
         let auditor = LockAgeAuditor::new(&input, &versions, false);
         let mut state = AuditState::new(input.budget);
+        state.frozen_clock = true;
+        let offset = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        state.elapsed_offset = Some(offset.clone());
         state.installed_lock = project.read("Cargo.lock");
         auditor.run_pass(&mut state, 0, false, None).await.unwrap();
         assert_eq!(project.locked_versions("z-top"), ["1.1.0"]);
         assert_eq!(project.locked_versions("s-solo"), ["1.0.0"]);
         project.cargo_ok(&["update", "-p", "s-solo@1.0.0", "--precise", "1.1.0"]);
         state.started = Instant::now() - Duration::from_secs(20);
+        // 仮想時計では、監査の予算 (19 秒) を使い切った状態を経過時間のオフセットで作る
+        offset.store(20_000, std::sync::atomic::Ordering::SeqCst);
         state.deadline = Instant::now();
         auditor.restore_mixed(&mut state).await;
         assert!(state.problems.is_empty(), "{:?}", state.problems);
@@ -1389,6 +1418,7 @@ mod retry_regressions {
         };
         let versions = VersionFetcher::new(4, 1);
         let result = LockAgeAuditor::new(&input, &versions, false)
+            .with_frozen_clock()
             .run(None)
             .await;
         assert!(result.has_unresolved(), "{result:?}");
@@ -1540,6 +1570,7 @@ mod retry_regressions {
             .await
             .unwrap();
         let mut state = AuditState::new(input.budget);
+        state.frozen_clock = true;
         state.installed_lock = installed.clone();
         state.changes.observe(&installed);
         auditor.run_pass(&mut state, 0, false, None).await.unwrap();

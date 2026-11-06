@@ -573,6 +573,10 @@ struct AuditState {
     changes: restore::AuditChanges,
     #[cfg(test)]
     elapsed_offset: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// テストで実時間を数えず、`elapsed_offset` だけを経過時間にする (仮想時計)。
+    /// 短い予算で分岐を確かめるテストの合否が、cargo の起動の速さで変わらないようにする
+    #[cfg(test)]
+    frozen_clock: bool,
 }
 
 struct AloneFailure {
@@ -598,14 +602,26 @@ impl AuditState {
             changes: Default::default(),
             #[cfg(test)]
             elapsed_offset: None,
+            #[cfg(test)]
+            frozen_clock: false,
         }
     }
 
     fn elapsed(&self) -> Duration {
         #[cfg(test)]
-        if let Some(offset) = &self.elapsed_offset {
-            return self.started.elapsed()
-                + Duration::from_millis(offset.load(std::sync::atomic::Ordering::SeqCst));
+        {
+            let offset = self
+                .elapsed_offset
+                .as_ref()
+                .map_or(Duration::ZERO, |offset| {
+                    Duration::from_millis(offset.load(std::sync::atomic::Ordering::SeqCst))
+                });
+            if self.frozen_clock {
+                return offset;
+            }
+            if self.elapsed_offset.is_some() {
+                return self.started.elapsed() + offset;
+            }
         }
         self.started.elapsed()
     }
@@ -630,6 +646,8 @@ pub(crate) struct LockAgeAuditor<'a> {
     verbose: bool,
     #[cfg(test)]
     elapsed_offset: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    #[cfg(test)]
+    frozen_clock: bool,
 }
 
 impl<'a> LockAgeAuditor<'a> {
@@ -644,7 +662,17 @@ impl<'a> LockAgeAuditor<'a> {
             verbose,
             #[cfg(test)]
             elapsed_offset: None,
+            #[cfg(test)]
+            frozen_clock: false,
         }
+    }
+
+    /// 実時間を数えない仮想時計で監査する (経過時間は `elapsed_offset` だけになる)。
+    /// 短い予算で「まとめ解きに入らない」などの分岐を確かめるテストが使う
+    #[cfg(test)]
+    pub(crate) fn with_frozen_clock(mut self) -> Self {
+        self.frozen_clock = true;
+        self
     }
 
     /// 検査・差し戻しを反復し、最終 lock の状態から結果を確定する。
@@ -662,6 +690,7 @@ impl<'a> LockAgeAuditor<'a> {
         #[cfg(test)]
         {
             state.elapsed_offset = self.elapsed_offset.clone();
+            state.frozen_clock = self.frozen_clock;
         }
         match read_audit_lock(&self.input.project_dir.join("Cargo.lock")) {
             Ok((content, entries)) => {
