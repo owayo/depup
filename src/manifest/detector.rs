@@ -710,14 +710,19 @@ fn collect_gradle_includes(content: &str) -> Vec<String> {
     paths
 }
 
-/// Gradle のプロジェクトパス (`:app:core`) を相対ディレクトリ (`app/core`) へ変換する
+/// Gradle のプロジェクトパス (`:app:core`) を相対ディレクトリ (`app/core`) へ変換する。
+///
+/// 先頭の `:` は省略できる (`include('app')` は `include(':app')` と同じ。`gradle init` も
+/// 省略した形で書く)。以前は `:` を必須にしていて、省略したサブプロジェクトを検出しなかった
+/// (#96)。`includeBuild` などとの区別は呼び出し側の語の境界の判定で済んでいる。Gradle の
+/// プロジェクト名に使えない `/` `\` や、`.` / `..` の要素は受け付けない。
 fn gradle_project_path_to_dir(project_path: &str) -> Option<String> {
     let trimmed = project_path.trim();
-    // `include` の引数はプロジェクトパスなので `:` 始まりのみを対象にする
-    // (`includeBuild '../other'` のようなディレクトリ指定と混同しない)
-    let body = trimmed.strip_prefix(':')?;
+    let body = trimmed.strip_prefix(':').unwrap_or(trimmed);
     let segments: Vec<&str> = body.split(':').map(str::trim).collect();
-    if segments.iter().any(|segment| segment.is_empty()) {
+    if segments.iter().any(|segment| {
+        segment.is_empty() || matches!(*segment, "." | "..") || segment.contains(['/', '\\'])
+    }) {
         return None;
     }
     Some(segments.join("/"))
@@ -1715,6 +1720,38 @@ members = ["crates/nonexistent"]
         assert_eq!(paths.len(), 2);
         assert!(paths.contains(&app));
         assert!(paths.contains(&core));
+    }
+
+    /// Issue #96: プロジェクトパスの先頭の `:` は省略できる (`gradle init` が生成する形)。
+    /// 以前は `:` を必須にしていて、`include('app')` のサブプロジェクトを検出しなかった。
+    #[test]
+    fn test_detect_gradle_subprojects_without_leading_colon() {
+        let dir = create_temp_dir();
+        let app = create_gradle_project(dir.path(), "app", "build.gradle");
+        let api = create_gradle_project(dir.path(), "core/api", "build.gradle.kts");
+        let lib = create_gradle_project(dir.path(), "lib", "build.gradle");
+        create_gradle_project(dir.path(), "nested/dir", "build.gradle");
+        fs::write(
+            dir.path().join("settings.gradle"),
+            concat!(
+                "rootProject.name = 'demo'\n",
+                "include('app')\n",
+                "include \"core:api\", ':lib'\n",
+                // Gradle のプロジェクト名に使えない `/` を含むパスと `..` は展開しない
+                "include 'nested/dir', '..'\n",
+            ),
+        )
+        .unwrap();
+
+        let paths: Vec<_> = detect_manifests(dir.path())
+            .into_iter()
+            .filter(|m| m.language == Language::Java)
+            .map(|m| m.path)
+            .collect();
+        assert_eq!(paths.len(), 3, "{paths:?}");
+        assert!(paths.contains(&app));
+        assert!(paths.contains(&api));
+        assert!(paths.contains(&lib));
     }
 
     /// コメントアウトされた include と、プロジェクト外へ出るパスは展開しない
