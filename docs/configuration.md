@@ -97,3 +97,4 @@ The `.depup` format:
 - Paths are relative to the `.depup` file location
 - If any entry is an absolute path, contains `..`, or is a symlink that resolves outside the directory containing `.depup`, depup prints a warning and ignores the whole `.depup` file. The run then behaves as if there were no `.depup`: the root and its automatically detected workspaces are still processed
 - Non-existent directories are ignored with a warning
+- Write the file as UTF-8 text. A UTF-8 byte order mark at the start is skipped. A file that cannot be read, or cannot be read as UTF-8 (such as the UTF-16 that `>` writes in Windows PowerShell 5.1), is ignored as a whole with a warning, as with an invalid entry
