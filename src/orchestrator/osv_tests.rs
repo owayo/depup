@@ -549,3 +549,135 @@ async fn a_safe_locked_version_still_allows_manifest_lower_bound_updates() {
         );
     }
 }
+
+/// 判定の結果と、判定中に積んだ警告を返す。
+async fn run_with_warnings(
+    checker: &OsvChecker,
+    baseline: Option<&str>,
+    versions: Vec<VersionInfo>,
+) -> (UpdateResult, Vec<OrchestratorError>) {
+    let dir = tempfile::tempdir().unwrap();
+    let orchestrator = Orchestrator::new(CliArgs::parse_from([
+        "depup",
+        "--no-osv",
+        dir.path().to_str().unwrap(),
+    ]))
+    .unwrap();
+    let mut warnings = Vec::new();
+    let mut context = OsvJudgeContext {
+        checker,
+        baseline,
+        ecosystem: "crates.io",
+        bar: None,
+        warnings: &mut warnings,
+    };
+    let result = judge_with_osv(
+        &orchestrator,
+        &OfflineRegistry,
+        &UpdateJudge::with_time(UpdateFilter::new(), now()),
+        &dependency(),
+        versions,
+        &mut context,
+    )
+    .await
+    .unwrap();
+    (result, warnings)
+}
+
+#[tokio::test]
+async fn candidate_lookup_failure_after_a_fallback_keeps_the_skipped_versions_unchecked() {
+    let checker = OsvChecker::mock(&[
+        ("1.0.2", vulnerable()),
+        ("1.0.1", Err("OSV request failed: timed out".into())),
+    ]);
+    let (result, warnings) = run_with_warnings(
+        &checker,
+        None,
+        vec![
+            version("1.0.0", 40),
+            version("1.0.1", 20),
+            version("1.0.2", 10),
+        ],
+    )
+    .await;
+    let UpdateResult::Update {
+        new_version,
+        osv_checked,
+        osv_skipped,
+        osv_risk_tradeoff,
+        ..
+    } = &result
+    else {
+        panic!("expected an update, got {result:?}");
+    };
+    // 照会できなかった候補は採用するが、検査済みとは表示しない。
+    assert_eq!(new_version, "1.0.1");
+    assert!(!osv_checked);
+    assert!(osv_risk_tradeoff.is_none());
+    assert_eq!(osv_skipped, &["1.0.2 (TEST-ADVISORY)"]);
+    assert!(
+        matches!(
+            &warnings[..],
+            [
+                OrchestratorError::OsvCandidateExcluded { version, advisories, .. },
+                OrchestratorError::OsvWarning { message, .. },
+            ] if version == "1.0.2"
+                && advisories == &["TEST-ADVISORY"]
+                && message == "OSV check failed for 1.0.1: OSV request failed: timed out"
+        ),
+        "{warnings:?}"
+    );
+}
+
+#[tokio::test]
+async fn candidate_lookup_failure_falls_back_to_the_held_trade_off() {
+    use crate::osv::{Advisory, Severity};
+    let advisory = |id: &str, severity| Advisory {
+        id: id.into(),
+        aliases: Vec::new(),
+        severity,
+    };
+    let checker = OsvChecker::mock_advisories(&[
+        ("1.0.0", Ok(vec![advisory("FIXED", Severity::Medium)])),
+        ("1.0.2", Ok(vec![advisory("INTRODUCED", Severity::Low)])),
+        (
+            "1.0.1",
+            Err("OSV returned status 503 Service Unavailable".into()),
+        ),
+    ]);
+    let (result, warnings) = run_with_warnings(
+        &checker,
+        Some("1.0.0"),
+        vec![
+            version("1.0.0", 40),
+            version("1.0.1", 20),
+            version("1.0.2", 10),
+        ],
+    )
+    .await;
+    let UpdateResult::Update {
+        new_version,
+        osv_checked,
+        osv_skipped,
+        osv_risk_tradeoff,
+        ..
+    } = &result
+    else {
+        panic!("expected an update, got {result:?}");
+    };
+    // 照会に失敗した版より、照会できた交換の候補を優先する。
+    assert_eq!(new_version, "1.0.2");
+    assert!(!osv_checked);
+    assert!(osv_skipped.is_empty());
+    let report = osv_risk_tradeoff.as_ref().expect("trade-off report");
+    assert_eq!(report.fixed.len(), 1);
+    assert_eq!(report.introduced.len(), 1);
+    assert!(
+        matches!(
+            &warnings[..],
+            [OrchestratorError::OsvWarning { message, .. }]
+                if message == "OSV check failed for 1.0.1: OSV returned status 503 Service Unavailable"
+        ),
+        "{warnings:?}"
+    );
+}
