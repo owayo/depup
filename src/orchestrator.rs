@@ -33,6 +33,7 @@ use crate::registry::{
     MavenCentralAdapter, MiseAdapter, NpmAdapter, PackagistAdapter, PyPIAdapter, RegistryAdapter,
     RubyGemsAdapter,
 };
+use crate::registry_sources::RegistrySources;
 use crate::tauri_sync::{TAURI_CRATE, TAURI_NPM_PACKAGES, TauriVersionSync};
 use crate::update::{
     AgePolicy, UpdateFilter, UpdateJudge, VersionInfo, compare_dependency_versions,
@@ -793,6 +794,9 @@ impl Orchestrator {
                     "Notice: age_exempt.github is unavailable for other registries; their dependencies retain the age filter"
                 ));
             }
+            // 私設のレジストリやリポジトリから取る依存は、公開レジストリの版で判定しない (#91)。
+            let sources = RegistrySources::for_manifest(info, &self.args.path);
+            let sources = &sources;
             let package_filter = filter.clone();
             let judge = UpdateJudge::with_time(filter, self.evaluated_at);
             let judge = &judge;
@@ -824,12 +828,14 @@ impl Orchestrator {
                     let bar = progress_bar.clone();
                     let override_reason = overrides.and_then(|settings| settings.reason(&dep));
                     let package_filter = package_filter.package_filter_skip_reason(&dep);
+                    let source_reason = sources.skip_reason(&dep.name);
                     async move {
                         if let Some(ref b) = bar {
                             b.set_message(format!("Checking {}", dep.name));
                         }
-                        let result = if let Some(reason) =
-                            package_filter.or_else(|| override_reason.map(SkipReason::PnpmOverride))
+                        let result = if let Some(reason) = package_filter
+                            .or(source_reason)
+                            .or_else(|| override_reason.map(SkipReason::PnpmOverride))
                         {
                             OnePassResult {
                                 name: dep.name.clone(),
@@ -2545,6 +2551,121 @@ mod tests {
             .unwrap();
         assert_eq!(root_result.updates().count(), 1);
         assert_eq!(app_result.updates().count(), 0);
+    }
+
+    /// 依存を `(名前, 公開レジストリの版で判定しない理由)` で並べる (更新は理由なし)。
+    fn source_outcomes(manifest: &ManifestUpdateResult) -> Vec<(String, Option<SkipReason>)> {
+        manifest
+            .results
+            .iter()
+            .map(|result| match result {
+                UpdateResult::Update { dependency, .. } => (dependency.name.clone(), None),
+                UpdateResult::Skip {
+                    dependency, reason, ..
+                } => (dependency.name.clone(), Some(reason.clone())),
+            })
+            .collect()
+    }
+
+    /// Issue #91: 私設のレジストリを指す設定がある依存は、公開レジストリに同じ名前の新しい版が
+    /// あっても更新しない。npm alias は参照先の名前の scope で判定し、workspace のルートの
+    /// `.npmrc` もメンバーに効く。
+    #[tokio::test]
+    async fn npm_dependencies_from_a_private_registry_are_not_updated() {
+        let root = TempDir::new().unwrap();
+        let app = root.path().join("packages/app");
+        fs::create_dir_all(&app).unwrap();
+        fs::write(
+            app.join("package.json"),
+            r#"{"dependencies":{"@example/ui":"^1.0.0","alias":"npm:@example/core@^1.0.0","library":"^1.0.0"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.path().join(".npmrc"),
+            "@example:registry=https://npm.example.com/\n",
+        )
+        .unwrap();
+        let orchestrator = Orchestrator::new(make_args_with_path(
+            root.path(),
+            &["--no-age", "--no-osv", "--dry-run", "--quiet"],
+        ))
+        .unwrap();
+        let now = chrono::Utc::now();
+        {
+            // 公開 npm に同じ名前の新しい版がある (dependency confusion の形)
+            let mut cache = orchestrator.versions.cache.lock().await;
+            for name in ["@example/ui", "@example/core", "library"] {
+                cache.insert(
+                    (Language::Node, name.into()),
+                    vec![
+                        VersionInfo::new("1.0.0", now - chrono::Duration::days(60)),
+                        VersionInfo::new("9.0.0", now - chrono::Duration::days(30)),
+                    ],
+                );
+            }
+        }
+        let result = orchestrator
+            .run_directories(std::slice::from_ref(&app))
+            .await;
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let private = Some(SkipReason::NonPublicSource(
+            ".npmrc: @example:registry".into(),
+        ));
+        let mut outcomes = source_outcomes(&result.summary.manifests[0]);
+        outcomes.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            outcomes,
+            [
+                ("@example/core".to_string(), private.clone()),
+                ("@example/ui".to_string(), private),
+                ("library".to_string(), None),
+            ]
+        );
+    }
+
+    /// Issue #91: Packagist 以外のリポジトリが供給する依存は、Packagist の版で更新しない。
+    #[tokio::test]
+    async fn composer_dependencies_from_another_repository_are_not_updated() {
+        let root = TempDir::new().unwrap();
+        fs::write(
+            root.path().join("composer.json"),
+            r#"{"repositories":[{"type":"vcs","url":"https://git.example.com/acme/ui.git","only":["acme/*"]}],"require":{"acme/ui":"^1.0","monolog/monolog":"^1.0"}}"#,
+        )
+        .unwrap();
+        let orchestrator = Orchestrator::new(make_args_with_path(
+            root.path(),
+            &["--no-age", "--no-osv", "--dry-run", "--quiet"],
+        ))
+        .unwrap();
+        let now = chrono::Utc::now();
+        {
+            let mut cache = orchestrator.versions.cache.lock().await;
+            for name in ["acme/ui", "monolog/monolog"] {
+                cache.insert(
+                    (Language::Php, name.into()),
+                    vec![
+                        VersionInfo::new("1.0.0", now - chrono::Duration::days(60)),
+                        VersionInfo::new("9.0.0", now - chrono::Duration::days(30)),
+                    ],
+                );
+            }
+        }
+        let result = orchestrator.run().await;
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let mut outcomes = source_outcomes(&result.summary.manifests[0]);
+        outcomes.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            outcomes,
+            [
+                (
+                    "acme/ui".to_string(),
+                    Some(SkipReason::NonPublicSource(
+                        "composer.json: repositories[0] (vcs)".into()
+                    ))
+                ),
+                ("monolog/monolog".to_string(), None),
+            ]
+        );
     }
 
     #[tokio::test]

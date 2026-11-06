@@ -185,6 +185,10 @@ impl TextFormatter {
             SkipReason::Excluded => "excluded".to_string(),
             SkipReason::NotInOnlyList => "not in --only".to_string(),
             SkipReason::PnpmOverride(message) => message.clone(),
+            SkipReason::NonPublicSource(origin) => format!("non-public source ({origin})"),
+            SkipReason::SourceUnverified(reason) => {
+                format!("source could not be verified ({reason})")
+            }
             SkipReason::FetchFailed(msg) => format!("fetch failed: {}", msg),
             SkipReason::LanguageFiltered => "filtered".to_string(),
             SkipReason::NoSuitableVersion => "no suitable version".to_string(),

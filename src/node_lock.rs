@@ -4,6 +4,7 @@
 //! マニフェストの候補を選ぶフィルタと分け、既存版・推移依存も検査する。
 
 use crate::registry::{HttpClient, NpmAdapter};
+use crate::registry_sources::is_public_npm_registry;
 use crate::update::AgePolicy;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -414,19 +415,6 @@ fn parse_pnpm_registry_output(output: &[u8]) -> Result<Option<String>, String> {
         }
         Err(_) => Err(invalid().into()),
     }
-}
-
-fn is_public_npm_registry(registry: &str) -> bool {
-    reqwest::Url::parse(registry).is_ok_and(|url| {
-        matches!(url.scheme(), "https" | "http")
-            && url.host_str() == Some("registry.npmjs.org")
-            && url.port().is_none()
-            && url.username().is_empty()
-            && url.password().is_none()
-            && url.path() == "/"
-            && url.query().is_none()
-            && url.fragment().is_none()
-    })
 }
 
 fn audit_error(error: String) -> NodeLockAuditResult {
