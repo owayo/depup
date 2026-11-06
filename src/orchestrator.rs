@@ -1669,6 +1669,146 @@ impl OsvFallback {
     }
 }
 
+/// OSV で退けた候補の記録と、照会を続ける間に保留した交換の候補。
+#[derive(Default)]
+struct OsvFallbacks {
+    /// 退けた版と理由 (新しい順。各要素は `"<version> (<理由>)"`)
+    chain: Vec<String>,
+    /// 新しい advisory を持ち込まずに、既存の問題を減らす候補
+    improvement: Option<OsvFallback>,
+    /// 重大度の低い advisory を持ち込む代わりに、より重い問題を解消する候補
+    tradeoff: Option<OsvFallback>,
+}
+
+impl OsvFallbacks {
+    /// 種類ごとに最初に見つかった交換の候補だけを、その時点で退けていた版と一緒に保留する。
+    fn hold(&mut self, outcome: UpdateResult, report: crate::osv::RiskTradeoff) {
+        let slot = if report.introduced.is_empty() {
+            &mut self.improvement
+        } else {
+            &mut self.tradeoff
+        };
+        if slot.is_none() {
+            *slot = Some(OsvFallback {
+                outcome,
+                report,
+                skipped: self.chain.clone(),
+            });
+        }
+    }
+
+    /// 保留した候補があれば、新しい advisory を持ち込まないものを優先して採用する。
+    fn finish_preferred(
+        &mut self,
+        bar: Option<&ProgressBar>,
+        name: &str,
+        live_details: bool,
+    ) -> Option<UpdateResult> {
+        self.improvement
+            .take()
+            .or_else(|| self.tradeoff.take())
+            .map(|preferred| preferred.finish(bar, name, live_details))
+    }
+}
+
+/// `target` と同じ版を候補から外し、1 件以上外せたかを返す。
+///
+/// Python の PEP 440 ローカルバージョン (`1.0+cu121` 等) は build metadata を
+/// 無視する semver 比較では区別できず、安全な候補まで除外して NoSuitableVersion に
+/// 落としてしまう。同じ版かどうかは言語別の `compare_dependency_versions` で判定する。
+fn exclude_candidate(dep: &Dependency, allowed: &mut Vec<VersionInfo>, target: &str) -> bool {
+    let before = allowed.len();
+    allowed.retain(|version| {
+        compare_dependency_versions(dep, &version.version, target) != std::cmp::Ordering::Equal
+    });
+    allowed.len() != before
+}
+
+impl OsvJudgeContext<'_> {
+    /// OSV で更新先の候補をすべて退けたときの skip を作る。
+    ///
+    /// 通常の「最新」と区別できるよう、マニフェストの比較基準の版と、age だけで
+    /// 除外した新しい版の脆弱性を診断に添える。診断用の照会では age や他の更新条件を
+    /// 緩めて採用しない。
+    async fn blocked_skip(
+        &self,
+        judge: &UpdateJudge,
+        dep: &Dependency,
+        allowed: &[VersionInfo],
+        skipped_versions: Vec<String>,
+        result: UpdateResult,
+    ) -> UpdateResult {
+        let mut diagnostic = crate::domain::OsvBlocked {
+            skipped_versions,
+            ..Default::default()
+        };
+        if let Some(current) = crate::update::current_version_info(dep, allowed) {
+            diagnostic.current_version = Some(current.version.clone());
+            match self
+                .checker
+                .check(self.ecosystem, &dep.name, &current.version)
+                .await
+            {
+                Ok(OsvCheck::Vulnerable(ids)) => {
+                    diagnostic.current_vulnerable = true;
+                    diagnostic.current_advisories = ids;
+                }
+                Ok(OsvCheck::Safe) => {}
+                Err(error) => diagnostic.current_check_error = Some(error),
+            }
+        } else {
+            diagnostic.current_check_error = Some(
+                "manifest baseline could not be matched to a published version; not queried".into(),
+            );
+        }
+        // 通常の更新では選べなかった新しい版だけを、新しい順に最大5件確認する。
+        // 大量のリリースを持つ依存でも、診断が更新処理を際限なく延ばさない。
+        let waiting = judge.age_waiting_candidates(dep, allowed);
+        for (info, eligible_at) in waiting.iter().take(5) {
+            if let Some(b) = self.bar {
+                b.set_message(format!(
+                    "OSV: {} {} (waiting for --age)",
+                    dep.name, info.version
+                ));
+            }
+            match self
+                .checker
+                .check(self.ecosystem, &dep.name, &info.version)
+                .await
+            {
+                Ok(OsvCheck::Safe) => {
+                    diagnostic.safe_after_age = Some(crate::domain::AgeWaitingVersion {
+                        version: info.version.clone(),
+                        eligible_at: *eligible_at,
+                    });
+                    break;
+                }
+                Ok(OsvCheck::Vulnerable(_)) => {}
+                Err(error) => {
+                    diagnostic.waiting_check_error = Some(error);
+                    break;
+                }
+            }
+        }
+        if diagnostic.safe_after_age.is_none()
+            && diagnostic.waiting_check_error.is_none()
+            && waiting.len() > 5
+        {
+            diagnostic.waiting_check_error =
+                Some("OSV waiting-version lookup limit reached; older versions not checked".into());
+        }
+        let released_at = match result {
+            UpdateResult::Skip { released_at, .. } => released_at,
+            _ => None,
+        };
+        UpdateResult::skip_with_optional_date(
+            dep.clone(),
+            SkipReason::KnownVulnerabilities(diagnostic),
+            released_at,
+        )
+    }
+}
+
 async fn judge_with_osv(
     orchestrator: &Orchestrator,
     adapter: &(dyn RegistryAdapter + Send + Sync),
@@ -1678,7 +1818,6 @@ async fn judge_with_osv(
     context: &mut OsvJudgeContext<'_>,
 ) -> Result<UpdateResult, String> {
     let bar = context.bar;
-    let warnings = &mut context.warnings;
     let checker = context.checker;
     let ecosystem = context.ecosystem;
     let live_details = orchestrator.live_osv_details();
@@ -1688,93 +1827,27 @@ async fn judge_with_osv(
     };
     let mut allowed = versions;
     let mut locked_baseline_safe: Option<bool> = None;
-    let mut fallback_chain: Vec<String> = Vec::new();
-    let mut improvement: Option<OsvFallback> = None;
-    let mut tradeoff: Option<OsvFallback> = None;
+    let mut fallbacks = OsvFallbacks::default();
     loop {
-        allowed = match orchestrator
+        allowed = orchestrator
             .resolve_java_release_dates(dep, adapter, judge, allowed)
-            .await
-        {
-            Ok(versions) => versions,
-            Err(error) => return Err(error),
-        };
+            .await?;
         let result = judge.judge(dep, &allowed);
         let UpdateResult::Update {
             new_version: target,
             ..
         } = &result
         else {
-            if let Some(preferred) = improvement.take().or_else(|| tradeoff.take()) {
-                return Ok(preferred.finish(bar, &dep.name, live_details));
+            if let Some(outcome) = fallbacks.finish_preferred(bar, &dep.name, live_details) {
+                return Ok(outcome);
             }
-            if fallback_chain.is_empty() {
+            if fallbacks.chain.is_empty() {
                 return Ok(result);
             }
             // フォールバックを使い切ったことを、通常の「最新」と区別する。
-            // 診断用の照会では age や他の更新条件を緩めて採用しない。
-            let mut diagnostic = crate::domain::OsvBlocked {
-                skipped_versions: fallback_chain,
-                ..Default::default()
-            };
-            if let Some(current) = crate::update::current_version_info(dep, &allowed) {
-                diagnostic.current_version = Some(current.version.clone());
-                match checker.check(ecosystem, &dep.name, &current.version).await {
-                    Ok(OsvCheck::Vulnerable(ids)) => {
-                        diagnostic.current_vulnerable = true;
-                        diagnostic.current_advisories = ids;
-                    }
-                    Ok(OsvCheck::Safe) => {}
-                    Err(error) => diagnostic.current_check_error = Some(error),
-                }
-            } else {
-                diagnostic.current_check_error = Some(
-                    "manifest baseline could not be matched to a published version; not queried"
-                        .into(),
-                );
-            }
-            // 通常の更新では選べなかった新しい版だけを、新しい順に最大5件確認する。
-            // 大量のリリースを持つ依存でも、診断が更新処理を際限なく延ばさない。
-            let waiting = judge.age_waiting_candidates(dep, &allowed);
-            for (info, eligible_at) in waiting.iter().take(5) {
-                if let Some(b) = bar {
-                    b.set_message(format!(
-                        "OSV: {} {} (waiting for --age)",
-                        dep.name, info.version
-                    ));
-                }
-                match checker.check(ecosystem, &dep.name, &info.version).await {
-                    Ok(OsvCheck::Safe) => {
-                        diagnostic.safe_after_age = Some(crate::domain::AgeWaitingVersion {
-                            version: info.version.clone(),
-                            eligible_at: *eligible_at,
-                        });
-                        break;
-                    }
-                    Ok(OsvCheck::Vulnerable(_)) => {}
-                    Err(error) => {
-                        diagnostic.waiting_check_error = Some(error);
-                        break;
-                    }
-                }
-            }
-            if diagnostic.safe_after_age.is_none()
-                && diagnostic.waiting_check_error.is_none()
-                && waiting.len() > 5
-            {
-                diagnostic.waiting_check_error = Some(
-                    "OSV waiting-version lookup limit reached; older versions not checked".into(),
-                );
-            }
-            let released_at = match result {
-                UpdateResult::Skip { released_at, .. } => released_at,
-                _ => None,
-            };
-            return Ok(UpdateResult::skip_with_optional_date(
-                dep.clone(),
-                SkipReason::KnownVulnerabilities(diagnostic),
-                released_at,
-            ));
+            return Ok(context
+                .blocked_skip(judge, dep, &allowed, fallbacks.chain, result)
+                .await);
         };
         let target = target.clone();
 
@@ -1790,7 +1863,7 @@ async fn judge_with_osv(
                         Ok(OsvCheck::Safe) => true,
                         Ok(OsvCheck::Vulnerable(_)) => false,
                         Err(error) => {
-                            warnings.push(warning(format!(
+                            context.warnings.push(warning(format!(
                                 "locked baseline OSV check failed: {error}"
                             )));
                             false
@@ -1801,21 +1874,15 @@ async fn judge_with_osv(
                 }
             };
             if !safe {
-                fallback_chain.push(format!(
+                fallbacks.chain.push(format!(
                     "{target} (below vulnerable or unconfirmed locked baseline {baseline})"
                 ));
-                let before = allowed.len();
-                allowed.retain(|version| {
-                    compare_dependency_versions(dep, &version.version, &target)
-                        != std::cmp::Ordering::Equal
-                });
-                if before == allowed.len() {
-                    if let Some(preferred) = improvement.take().or_else(|| tradeoff.take()) {
-                        return Ok(preferred.finish(bar, &dep.name, live_details));
-                    }
-                    return Err(format!(
-                        "could not exclude candidate {target} below locked baseline"
-                    ));
+                if !exclude_candidate(dep, &mut allowed, &target) {
+                    return fallbacks
+                        .finish_preferred(bar, &dep.name, live_details)
+                        .ok_or_else(|| {
+                            format!("could not exclude candidate {target} below locked baseline")
+                        });
                 }
                 continue;
             }
@@ -1837,49 +1904,34 @@ async fn judge_with_osv(
             .await
         {
             Ok(crate::osv::Assessment::Safe) => {
-                if !fallback_chain.is_empty() {
+                if !fallbacks.chain.is_empty() {
                     let line = format!(
                         "  ↓ {}: skipped {} due to OSV → using {}",
                         dep.name,
-                        fallback_chain.join(", "),
+                        fallbacks.chain.join(", "),
                         target
                     );
                     osv_println(bar, &line, live_details);
                     return Ok(result
-                        .with_osv_skipped(fallback_chain)
+                        .with_osv_skipped(fallbacks.chain)
                         .with_osv_checked(true));
                 }
                 // チェック完了・脆弱性なし
                 return Ok(result.with_osv_checked(true));
             }
             Ok(crate::osv::Assessment::Tradeoff(report)) => {
-                let slot = if report.introduced.is_empty() {
-                    &mut improvement
-                } else {
-                    &mut tradeoff
-                };
-                if slot.is_none() {
-                    *slot = Some(OsvFallback {
-                        outcome: result,
-                        report,
-                        skipped: fallback_chain.clone(),
-                    });
-                }
-                fallback_chain.push(format!(
+                fallbacks.hold(result, report);
+                fallbacks.chain.push(format!(
                     "{target} (known vulnerabilities; trade-off candidate)"
                 ));
-                let before = allowed.len();
-                allowed.retain(|version| {
-                    compare_dependency_versions(dep, &version.version, &target)
-                        != std::cmp::Ordering::Equal
-                });
-                if before == allowed.len() {
-                    if let Some(preferred) = improvement.take().or_else(|| tradeoff.take()) {
-                        return Ok(preferred.finish(bar, &dep.name, live_details));
-                    }
-                    return Err(format!(
-                        "could not exclude {target} while looking for an advisory-free candidate"
-                    ));
+                if !exclude_candidate(dep, &mut allowed, &target) {
+                    return fallbacks
+                        .finish_preferred(bar, &dep.name, live_details)
+                        .ok_or_else(|| {
+                            format!(
+                                "could not exclude {target} while looking for an advisory-free candidate"
+                            )
+                        });
                 }
             }
             Ok(crate::osv::Assessment::Rejected {
@@ -1888,7 +1940,7 @@ async fn judge_with_osv(
                 ..
             }) => {
                 if let Some(error) = baseline_error {
-                    warnings.push(warning(format!(
+                    context.warnings.push(warning(format!(
                         "baseline OSV check failed; risk-reduction exception disabled: {error}"
                     )));
                 }
@@ -1905,49 +1957,46 @@ async fn judge_with_osv(
                 let line = format!("  ⚠ OSV: {} {} vulnerable ({})", dep.name, target, detail);
                 osv_println(bar, &line, live_details);
 
-                fallback_chain.push(format!("{} ({})", target, detail));
-                warnings.push(OrchestratorError::OsvCandidateExcluded {
-                    package: dep.name.clone(),
-                    version: target.clone(),
-                    advisories: ids,
-                });
-                let before = allowed.len();
-                // Python の PEP 440 ローカルバージョン (`1.0+cu121` 等) は build metadata を
-                // 無視する semver 比較では区別できず、安全な候補まで除外して NoSuitableVersion に
-                // 落としてしまう。compare_dependency_versions で言語別比較に切り替える。
-                allowed.retain(|v| {
-                    compare_dependency_versions(dep, &v.version, &target)
-                        != std::cmp::Ordering::Equal
-                });
-                if allowed.len() == before {
-                    // 除外できなかった (compare_versions の都合) → 無限ループ防止
+                fallbacks.chain.push(format!("{} ({})", target, detail));
+                context
+                    .warnings
+                    .push(OrchestratorError::OsvCandidateExcluded {
+                        package: dep.name.clone(),
+                        version: target.clone(),
+                        advisories: ids,
+                    });
+                if !exclude_candidate(dep, &mut allowed, &target) {
+                    // 除外できなかった (比較の都合) → 無限ループ防止
                     let line = format!(
                         "  ⚠ {}: could not exclude {} from candidates, stopping candidate selection",
                         dep.name, target
                     );
                     osv_println(bar, &line, live_details);
-                    warnings.push(warning(format!(
+                    context.warnings.push(warning(format!(
                         "could not exclude {} from candidates, stopping OSV check",
                         target
                     )));
-                    if let Some(preferred) = improvement.take().or_else(|| tradeoff.take()) {
-                        return Ok(preferred.finish(bar, &dep.name, live_details));
-                    }
-                    return Err(format!("could not exclude OSV-rejected candidate {target}"));
+                    return fallbacks
+                        .finish_preferred(bar, &dep.name, live_details)
+                        .ok_or_else(|| {
+                            format!("could not exclude OSV-rejected candidate {target}")
+                        });
                 }
                 // ループ継続 → 次の候補で再判定
             }
             Err(e) => {
                 let line = format!("  ⚠ OSV check failed for {} {}: {}", dep.name, target, e);
                 osv_println(bar, &line, live_details);
-                warnings.push(warning(format!("OSV check failed for {}: {}", target, e)));
-                if let Some(preferred) = improvement.take().or_else(|| tradeoff.take()) {
-                    return Ok(preferred.finish(bar, &dep.name, live_details));
+                context
+                    .warnings
+                    .push(warning(format!("OSV check failed for {}: {}", target, e)));
+                if let Some(outcome) = fallbacks.finish_preferred(bar, &dep.name, live_details) {
+                    return Ok(outcome);
                 }
-                return Ok(if fallback_chain.is_empty() {
+                return Ok(if fallbacks.chain.is_empty() {
                     result
                 } else {
-                    result.with_osv_skipped(fallback_chain)
+                    result.with_osv_skipped(fallbacks.chain)
                 });
             }
         }
