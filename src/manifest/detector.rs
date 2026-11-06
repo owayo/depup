@@ -211,15 +211,8 @@ fn detect_gradle_version_catalogs(dir: &Path) -> Vec<PathBuf> {
     let mut catalogs = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-
-        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-
-        if file_name.ends_with(".versions.toml") {
+        // パーサの選択 (`GradleFile::of`) と同じ規則で判定する。
+        if path.is_file() && super::GradleFile::of(&path) == super::GradleFile::VersionCatalog {
             catalogs.push(path);
         }
     }

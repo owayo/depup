@@ -457,7 +457,7 @@ spotless = { id = "com.diffplug.spotless", version = "6.25.0" }
         assert_eq!(catalog_manifest.language, depup::domain::Language::Java);
 
         // パース: libraries は Maven 座標、plugins は marker 座標で抽出する
-        let parser = depup::manifest::get_parser(depup::domain::Language::Java);
+        let parser = depup::manifest::parser_for(&catalog_manifest.path, catalog_manifest.language);
         let deps = parser.parse(catalog).unwrap();
 
         assert!(

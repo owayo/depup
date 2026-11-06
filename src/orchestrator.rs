@@ -24,7 +24,7 @@ mod osv_policy;
 pub(crate) mod osv_report;
 use crate::manifest::{
     ManifestInfo, ManifestWriter, MiseSettings, RegistryLockEntries, WriteResult, detect_manifests,
-    find_cargo_lock_upward, get_parser, has_mise_config, read_git_entries,
+    find_cargo_lock_upward, has_mise_config, parser_for, read_git_entries,
 };
 use crate::osv::{OsvCheck, OsvChecker};
 use crate::progress::Progress;
@@ -697,7 +697,7 @@ impl Orchestrator {
             if !self.should_process_language(info.language) {
                 continue;
             }
-            let parser = get_parser(info.language);
+            let parser = parser_for(&info.path, info.language);
             let parse_error = |message: String| OrchestratorError::ManifestParseError {
                 path: info.path.display().to_string(),
                 message,
@@ -917,7 +917,7 @@ impl Orchestrator {
             .filter(|manifest| !skip.contains(&manifest.path))
             .cloned()
             .collect();
-        let write_results = writer.apply_all_updates(&writable, get_parser);
+        let write_results = writer.apply_all_updates(&writable, parser_for);
         progress.finish_and_clear();
 
         for result in &write_results {

@@ -345,14 +345,14 @@ impl ManifestWriter {
     pub fn apply_all_updates(
         &self,
         manifests: &[ManifestUpdateResult],
-        get_parser: impl Fn(Language) -> Box<dyn ManifestParser>,
+        get_parser: impl Fn(&Path, Language) -> Box<dyn ManifestParser>,
     ) -> Vec<WriteResult> {
         manifests
             .iter()
             // 更新対象があるマニフェストだけ処理する
             .filter(|manifest| manifest.has_judged_updates())
             .map(|manifest| {
-                let parser = get_parser(manifest.language);
+                let parser = get_parser(&manifest.path, manifest.language);
                 self.apply_updates(manifest, parser.as_ref())
                     .unwrap_or_else(|e| {
                         // 読み込み・解析に失敗したので、どの更新も試せていない
@@ -724,7 +724,7 @@ beta = { module = "com.example:beta", version.ref = "shared" }
         let path = temp_dir.path().join("libs.versions.toml");
         fs::write(&path, original_content).unwrap();
 
-        let parser = crate::manifest::GradleParser;
+        let parser = crate::manifest::GradleVersionCatalogParser;
         let dependency = parser
             .parse(original_content)
             .unwrap()
@@ -757,7 +757,7 @@ android-library = { id = "com.android.library", version.ref = "agp" }
         let path = temp_dir.path().join("libs.versions.toml");
         fs::write(&path, content).unwrap();
 
-        let parser = crate::manifest::GradleParser;
+        let parser = crate::manifest::GradleVersionCatalogParser;
         let mut manifest_result = ManifestUpdateResult::new(&path, Language::Java);
         for dependency in parser.parse(content).unwrap() {
             manifest_result.add_result(UpdateResult::update(dependency, "9.4.1"));
@@ -1306,7 +1306,7 @@ shared = "=2.0.0"
     fn test_apply_all_updates_empty() {
         let writer = ManifestWriter::new(false);
         let results =
-            writer.apply_all_updates(&[], |_| Box::new(crate::manifest::PackageJsonParser));
+            writer.apply_all_updates(&[], |_, _| Box::new(crate::manifest::PackageJsonParser));
         assert!(results.is_empty());
     }
 
@@ -1319,7 +1319,7 @@ shared = "=2.0.0"
         let manifest_result = ManifestUpdateResult::new(&path, Language::Node);
 
         let writer = ManifestWriter::new(false);
-        let results = writer.apply_all_updates(&[manifest_result], |_| {
+        let results = writer.apply_all_updates(&[manifest_result], |_, _| {
             Box::new(crate::manifest::PackageJsonParser)
         });
 
@@ -1335,7 +1335,7 @@ shared = "=2.0.0"
         manifest_result.add_result(UpdateResult::update(dep, "4.18.0"));
 
         let writer = ManifestWriter::new(false);
-        let results = writer.apply_all_updates(&[manifest_result], |_| {
+        let results = writer.apply_all_updates(&[manifest_result], |_, _| {
             Box::new(crate::manifest::PackageJsonParser)
         });
 
@@ -1455,7 +1455,7 @@ shared = "=2.0.0"
         ));
         manifest_result.add_result(UpdateResult::update(tagged, "v1.1.0"));
 
-        let results = ManifestWriter::new(false).apply_all_updates(&[manifest_result], |_| {
+        let results = ManifestWriter::new(false).apply_all_updates(&[manifest_result], |_, _| {
             Box::new(crate::manifest::CargoTomlParser)
         });
 

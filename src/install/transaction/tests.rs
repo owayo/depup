@@ -2,7 +2,7 @@ use super::*;
 use crate::domain::{
     Dependency, GitSource, ManifestUpdateResult, UpdateResult, VersionSpec, VersionSpecKind,
 };
-use crate::manifest::{ManifestWriter, get_parser};
+use crate::manifest::{ManifestWriter, parser_for};
 use crate::update::AgePolicy;
 use clap::Parser;
 
@@ -133,7 +133,7 @@ fn update(
         "2.0.0",
     ));
     let write = ManifestWriter::new(false)
-        .apply_updates(&manifest, get_parser(language).as_ref())
+        .apply_updates(&manifest, parser_for(path, language).as_ref())
         .unwrap();
     assert!(write.file_modified, "{:?}", write.errors);
     result.write_results.push(write);
@@ -1960,7 +1960,7 @@ fn symlink_and_permissions_survive_recovery_and_replaced_links_are_kept() {
         ));
         result.write_results.push(
             ManifestWriter::new(false)
-                .apply_updates(&manifest, get_parser(Language::Node).as_ref())
+                .apply_updates(&manifest, parser_for(&link, Language::Node).as_ref())
                 .unwrap(),
         );
         result.summary.add_manifest(manifest);
