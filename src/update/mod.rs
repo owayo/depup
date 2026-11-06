@@ -7,6 +7,7 @@
 
 pub(crate) mod age_policy;
 mod filter;
+mod implicit_upper;
 mod version_info;
 
 pub use age_policy::{AgeExemption, AgeExemptions, AgePolicy, PublisherEvidence};
@@ -354,6 +355,12 @@ fn extract_upper_bound(raw: &str, language: Language) -> Option<(String, bool)> 
         {
             best = stricter_upper_bound(best, (upper, false), language);
         }
+    }
+    // 比較子の組の中の `^` / `~` / `~>` / x-range / 裸の版の暗黙の上限 (`>=1.2.5 ^1.2.0` の
+    // `<2.0.0`) も同じ土俵で比較する。読まないと下限だけを進めて、充足できない範囲
+    // (`>=2.0.0 ^1.2.0`) を書き込む (#99)
+    for bound in implicit_upper::implicit_upper_bounds(trimmed, language) {
+        best = stricter_upper_bound(best, bound, language);
     }
     if best.is_some() {
         return best;
@@ -1279,6 +1286,61 @@ mod tests {
                 "{raw}: {result:?}"
             );
             assert!(dep.version_spec.format_updated(expected).contains(expected));
+        }
+    }
+
+    /// Issue #99: 比較子の組の中の `^` / `~` / `~>` / x-range / 裸の版が持つ暗黙の上限も上限として
+    /// 扱い、書き込む範囲が空集合にならない版を選ぶ。以前は明示的な `<` / `<=` だけを読み、
+    /// `>=1.2.5 ^1.2.0` を `>=2.0.0 ^1.2.0` (空集合) に書き換えていた。
+    #[test]
+    fn implicit_upper_bounds_inside_comparator_sets_limit_the_update() {
+        let available = ["1.2.5", "1.2.9", "1.3.0", "1.9.0", "2.0.0"];
+        let versions: Vec<_> = available
+            .into_iter()
+            .map(|version| make_version_info_at(version, fixed_time()))
+            .collect();
+        for (language, raw, expected, written) in [
+            (Language::Node, ">=1.2.5 ^1.2.0", "1.9.0", ">=1.9.0 ^1.2.0"),
+            (Language::Php, ">=1.2.5 ^1.2", "1.9.0", ">=1.9.0 ^1.2"),
+            (
+                Language::Rust,
+                ">=1.2.5, ~1.2, <2.0",
+                "1.2.9",
+                ">=1.2.9, ~1.2, <2.0",
+            ),
+            (Language::Node, ">=1.2.5 ~1.2", "1.2.9", ">=1.2.9 ~1.2"),
+            (Language::Php, ">=1.2.5 ~1.2", "1.9.0", ">=1.9.0 ~1.2"),
+            (
+                Language::Ruby,
+                ">= 1.2.5, ~> 1.2.0, < 3.0",
+                "1.2.9",
+                ">= 1.2.9, ~> 1.2.0, < 3.0",
+            ),
+            (
+                Language::Rust,
+                ">=1.2.5, 1.3, <3",
+                "1.9.0",
+                ">=1.9.0, 1.3, <3",
+            ),
+            // 置き換わる先頭の `^` は新しい版の `^` になるので、その上限では絞らない
+            (Language::Node, "^1.2.5 <3.0.0", "2.0.0", "^2.0.0 <3.0.0"),
+        ] {
+            let spec = crate::parser::get_parser(language)
+                .parse(raw)
+                .unwrap_or_else(|| panic!("{raw} ({language:?})"));
+            assert_eq!(spec.kind, VersionSpecKind::Range, "{raw} ({language:?})");
+            let dep = Dependency::production("example", spec, language);
+            let result =
+                UpdateJudge::with_time(UpdateFilter::new(), fixed_time()).judge(&dep, &versions);
+            assert!(
+                matches!(&result, UpdateResult::Update { new_version, .. } if new_version == expected),
+                "{raw} ({language:?}): {result:?}"
+            );
+            assert_eq!(
+                dep.version_spec.try_format_updated(expected).as_deref(),
+                Some(written),
+                "{raw} ({language:?})"
+            );
         }
     }
 
