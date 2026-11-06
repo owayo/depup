@@ -1,0 +1,38 @@
+# measure.sh が一時ディレクトリへ pyproject.toml として写して使う合成マニフェスト
+# (このファイル名のままでは depup も Python のツールも読まない)。
+# よく使われる PyPI のパッケージ 30 件を、更新候補が見つかる古い下限で並べている。
+[project]
+name = "http-compression-fixture"
+version = "0.1.0"
+dependencies = [
+    "aiohttp>=3.0",
+    "attrs>=20.0",
+    "beautifulsoup4>=4.0",
+    "boto3>=1.20",
+    "certifi>=2020.1.1",
+    "click>=7.0",
+    "cryptography>=3.0",
+    "django>=3.0",
+    "fastapi>=0.60",
+    "flask>=1.0",
+    "httpx>=0.20",
+    "jinja2>=2.0",
+    "lxml>=4.0",
+    "matplotlib>=3.0",
+    "numpy>=1.20",
+    "pandas>=1.0",
+    "pillow>=8.0",
+    "pydantic>=1.0",
+    "pytest>=6.0",
+    "python-dateutil>=2.7",
+    "pyyaml>=5.0",
+    "requests>=2.20",
+    "rich>=10.0",
+    "scikit-learn>=0.24",
+    "scipy>=1.5",
+    "setuptools>=50.0",
+    "sqlalchemy>=1.3",
+    "tqdm>=4.0",
+    "urllib3>=1.25",
+    "uvicorn>=0.13",
+]

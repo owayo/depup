@@ -62,6 +62,8 @@ bash benchmarks/crates-io-fetch/measure.sh before ./depup-before 3 > before-b.cs
 
 The arguments are an implementation label, the depup executable, and the number of runs per input. The inputs are depup's own `Cargo.toml` (22 direct dependencies, default settings) and a synthetic manifest with 60 dependencies (`--no-osv`); both run with `--dry-run`. On Unix, the script points `HOME` to a temporary directory so the user's global configuration is not read. Recorded measurements are in [benchmarks/crates-io-fetch](../benchmarks/crates-io-fetch/README.md).
 
+npm and PyPI fetches are measured the same way with `benchmarks/http-compression/measure.sh`, using the same arguments and run order. Its inputs are synthetic manifests with 30 widely used npm and PyPI packages each, run with `--dry-run --no-osv`. The measurements taken when HTTP compression (gzip) was enabled are in [benchmarks/http-compression](../benchmarks/http-compression/README.md).
+
 ## Release
 
 Releases are published from GitHub Actions: open **Actions > Release > Run workflow**.

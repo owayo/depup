@@ -1,0 +1,39 @@
+{
+  "name": "http-compression-fixture",
+  "private": true,
+  "description": "measure.sh が一時ディレクトリへ package.json として写して使う合成マニフェスト (このファイル名のままでは depup も npm も読まない)。よく使われるパッケージ 30 件を、更新候補が見つかる古い版の指定で並べている。",
+  "dependencies": {
+    "@angular/core": "^12.0.0",
+    "@babel/core": "^7.0.0",
+    "axios": "^0.21.0",
+    "chalk": "^4.0.0",
+    "commander": "^6.0.0",
+    "dayjs": "^1.8.0",
+    "esbuild": "^0.14.0",
+    "express": "^4.0.0",
+    "lodash": "^4.0.0",
+    "moment": "^2.0.0",
+    "next": "^12.0.0",
+    "postcss": "^8.0.0",
+    "react": "^16.0.0",
+    "react-dom": "^16.0.0",
+    "rxjs": "^6.0.0",
+    "sass": "^1.30.0",
+    "vue": "^2.0.0",
+    "zod": "^3.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^14.0.0",
+    "@types/react": "^16.0.0",
+    "eslint": "^7.0.0",
+    "jest": "^26.0.0",
+    "nodemon": "^2.0.0",
+    "prettier": "^2.0.0",
+    "rollup": "^2.0.0",
+    "tailwindcss": "^2.0.0",
+    "ts-node": "^9.0.0",
+    "typescript": "^4.0.0",
+    "vite": "^2.0.0",
+    "webpack": "^4.0.0"
+  }
+}

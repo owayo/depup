@@ -1,0 +1,11 @@
+implementation,scenario,run,seconds,exit_code
+before,npm,1,4.785,0
+before,npm,2,4.596,0
+before,npm,3,4.915,0
+before,npm,4,4.614,0
+before,npm,5,4.825,0
+before,pypi,1,2.037,0
+before,pypi,2,5.131,0
+before,pypi,3,1.904,0
+before,pypi,4,2.123,0
+before,pypi,5,2.198,0

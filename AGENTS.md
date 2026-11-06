@@ -10,7 +10,7 @@ depup は複数のプログラミング言語のパッケージ依存関係を�
 
 - **Language**: Rust (Edition 2024)
 - **Async Runtime**: tokio (full features)
-- **HTTP Client**: reqwest (json feature)
+- **HTTP Client**: reqwest (json / gzip feature)
 - **CLI Framework**: clap (derive feature)
 - **Serialization**: serde / serde_json / toml
 - **Error Handling**: thiserror / anyhow
@@ -144,6 +144,7 @@ make ci                # CI と同じ検査 (fmt-check + lint + test、書き換
 - JSON マニフェスト更新の性能は `mise exec -- cargo run --release --locked --example manifest_update_bench -- 1000 7` で測る。入力・依存・ツールチェーン・release 設定をそろえ、ビルドやテストを並行実行しない。確保バイト数は再確保を含む要求量で、ピークメモリではない。生データと比較条件は `benchmarks/json-manifest/` に保存する。
 - Cargo の更新性能は同じコマンドの末尾に `cargo` を付けて測り、生データと比較条件を `benchmarks/cargo-manifest/` に保存する。単純指定・inline table・dotted key・複数行テーブルと git tag の更新を含む。Cargo のレジストリ依存はパッケージ名を文字列として照合し、後続の構文を固定の正規表現で読む。ソース除外と書き換えで同じ名前照合を使い、名前入りの正規表現を更新ごとにコンパイルしない。
 - crates.io の版の取得を含む CLI 全体の時間は `bash benchmarks/crates-io-fetch/measure.sh <実装名> <depup の実行ファイル> <回数>` で測る。ネットワークに左右されるので、変更前後の release ビルドを before → after → after → before の順に交互に測り、生データと比較条件を `benchmarks/crates-io-fetch/` に保存する。
+- npm と PyPI の取得 (HTTP の圧縮の効果) は、同じ手順で `bash benchmarks/http-compression/measure.sh <実装名> <depup の実行ファイル> <回数>` を使い、`benchmarks/http-compression/` に保存する。
 - **Unit tests**: 各モジュール内に `#[cfg(test)]` で配置
 - **Integration tests**: `tests/integration_tests.rs` - マニフェスト検出、パース、パイプラインテスト
 - **E2E tests**: `tests/e2e_tests.rs` - バイナリ実行テスト (dry-run、JSON出力、exit code)
@@ -280,6 +281,7 @@ make ci                # CI と同じ検査 (fmt-check + lint + test、書き換
 - 書き換え結果が現在の raw 表記と同一になる場合 (例: ワイルドカード `1.x` の範囲内に最新版がある場合) は Update ではなく AlreadyLatest として扱う (毎回 phantom update が報告される問題の防止)。`1.x` → `2.x` のように形が変わる更新は従来どおり Update
 - `--max-change` で候補が空になったとき、`ChangeLevelLimited` を返すのは「現在版より新しい候補が max-change で除外された」場合のみ。新しい候補がそもそも無ければ `AlreadyLatest`
 - レジストリ層の一貫性: PyPI は yanked リリース (全ファイル yanked または ファイル 0 件) を候補から除外。Packagist の `time` 欠損は `UNIX_EPOCH` フォールバック (age フィルタで永久除外されない)。npm の dist-tags.latest 超のバージョンは prerelease と判定できるもののみ候補に残す (canary/beta 利用者の更新を妨げない)。GitHub Tags は Link ヘッダの `rel="next"` を辿って全ページ取得 (最大10ページ)、403 + `X-RateLimit-Remaining: 0` はレート制限として報告。RubyGems は `platform != "ruby"` のエントリを除外。Go proxy の `.info` / `.mod` URL はバージョン側も case-encode (Go 仕様どおり ASCII 大文字のみ対象、`v1.0.0-RC1` → `v1.0.0-!r!c1`)。HTTP クライアントは 5xx もリトライし `Retry-After` を尊重 (上限10秒)
+- HTTP クライアントは reqwest の `gzip` 機能で `Accept-Encoding: gzip` を送り、応答を自動で展開する (OSV のクライアントも同じ)。npm の packument は版の数に比例して大きく (`typescript` は 15.9 MB、gzip で 2.0 MB)、PyPI・Packagist・RubyGems も 12〜22% に縮む。npm 30 件の確認は中央値 4.870 秒 → 2.728 秒、PyPI 30 件は 2.058 秒 → 1.083 秒 (`benchmarks/http-compression/`)。npm と PyPI は br / zstd を返さないので gzip だけを有効にする。index.crates.io は圧縮しないので crates.io の取得は変わらない。展開後の本文を扱うので、応答の `content_length()` は使わない
 - HTTP のハング対策は多層で持つ: reqwest 側にリクエスト単位の `timeout` (30秒) に加えて `connect_timeout` (10秒) と `tcp_keepalive` (60秒) を設定し、さらにリトライループ全体を `tokio::time::timeout` の `TOTAL_DEADLINE` (120秒) で切る。reqwest の `timeout` は 1 回の送受信にしか掛からないため、これが無いとリトライを使い切るまでの合計 (最悪 2 分超) が実質の上限になり、接続プール内の半死コネクションを掴んだケースも拾えない。`connect_timeout` は経路が塞がれた環境 (プロキシ配下・VPN 切断直後) で応答の来ない SYN を全体タイムアウトいっぱい待たされるのを防ぐ。`tcp_keepalive` は crates.io のように 1 リクエスト/秒 で数十秒アイドルする接続が経路上の NAT / LB に黙って切られたまま残るのを防ぐ。OSV クライアントも同様に `connect_timeout` (5秒) を持つ
 - 長時間かかるフェーズは必ず進捗を出す (ネットワーク待ちの無音は利用者からハングと区別できない)。`--install` のパッケージマネージャ実行は出力をキャプチャするため完了まで無表示になるので言語ごとにスピナーを出し、Rust の post-install age 監査は `{pos}/{len}` 付きバーで「今どの crate を照会中か」「どの crate を差し戻し中か」を表示する。バー表示中の警告・詳細ログは `Progress::suspend` で包み、バーと出力行が混ざらないようにする
 - `git ls-remote` は `GIT_TERMINAL_PROMPT=0` + 30秒タイムアウト付きで実行され、認証プロンプトでハングしない。URL スキームは許可リスト (https/http/ssh/git/git@/file) で検証され、`ext::` 等は拒否される

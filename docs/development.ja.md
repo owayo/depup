@@ -62,6 +62,8 @@ bash benchmarks/crates-io-fetch/measure.sh before ./depup-before 3 > before-b.cs
 
 引数は実装名、depup の実行ファイル、入力ごとの実行回数です。入力は depup 自身の `Cargo.toml`（直接依存 22 件、既定の設定）と、依存 60 件の合成マニフェスト（`--no-osv`）で、どちらも `--dry-run` で実行します。Unix では `HOME` を一時ディレクトリに向け、利用者のグローバル設定を読ませません。測定記録は [benchmarks/crates-io-fetch](../benchmarks/crates-io-fetch/README.ja.md) にあります。
 
+npm と PyPI の取得は `benchmarks/http-compression/measure.sh` で同じように測ります。引数も実行の順序も同じです。入力は npm と PyPI のよく使われるパッケージ各 30 件の合成マニフェストで、`--dry-run --no-osv` で実行します。HTTP の圧縮 (gzip) を有効にしたときの測定記録は [benchmarks/http-compression](../benchmarks/http-compression/README.ja.md) にあります。
+
 ## リリース
 
 リリースは GitHub Actions から行います。**Actions > Release > Run workflow** を開いて実行してください。

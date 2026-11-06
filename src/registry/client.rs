@@ -514,6 +514,49 @@ mod tests {
         (format!("http://{}/", addr), handle)
     }
 
+    /// 圧縮を要求し、gzip の応答を展開して返す。npm の packument などは圧縮で
+    /// 転送量が 1/5〜1/8 になるため、reqwest の `gzip` 機能を外すとこのテストが失敗する
+    #[tokio::test]
+    async fn responses_are_requested_and_decoded_as_gzip() {
+        use std::io::{Read, Write};
+        // `{"ok":true}` を gzip で圧縮したバイト列
+        const BODY: [u8; 31] = [
+            0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, 0xab, 0x56, 0xca, 0xcf,
+            0x56, 0xb2, 0x2a, 0x29, 0x2a, 0x4d, 0xad, 0x05, 0x00, 0x90, 0x5f, 0xd4, 0xa7, 0x0b,
+            0x00, 0x00, 0x00,
+        ];
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]).to_ascii_lowercase();
+            let header = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-encoding: gzip\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                BODY.len()
+            );
+            stream.write_all(header.as_bytes()).unwrap();
+            stream.write_all(&BODY).unwrap();
+            request
+        });
+
+        let value: serde_json::Value = HttpClient::new()
+            .unwrap()
+            .get_json(&format!("http://{address}/"), "pkg", "reg")
+            .await
+            .unwrap();
+
+        assert_eq!(value, serde_json::json!({"ok": true}));
+        let request = server.join().unwrap();
+        assert!(
+            request
+                .lines()
+                .any(|line| line.starts_with("accept-encoding:") && line.contains("gzip")),
+            "{request}"
+        );
+    }
+
     /// リトライコア: 5xx は再試行され、回復すれば成功レスポンスが返る
     #[tokio::test]
     async fn test_get_response_with_retry_recovers_from_5xx() {
