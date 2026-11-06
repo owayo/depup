@@ -335,6 +335,9 @@ impl SystemPackageManager {
     ///   前方一致指定 (`node = "26"`) を解決するときにも age 制約を効かせる。
     ///   depup が完全版へ書き換えた依存には影響しないが、部分指定のまま残る
     ///   ツールでは mise 側の解決に効く。
+    /// - **yarn**: `YARN_ENABLE_IMMUTABLE_INSTALLS=false`。Yarn 2 以降は CI で
+    ///   immutable install が既定になり、depup が書き換えた package.json に合わせて
+    ///   lock を更新できず失敗する。Yarn 1 はこの設定を読まない。
     /// - 他 PM: 現状追加なし。
     fn get_install_env(&self, pm: &str, min_age: Option<Duration>) -> Vec<(String, String)> {
         let mut env: Vec<(String, String)> = Vec::new();
@@ -365,6 +368,12 @@ impl SystemPackageManager {
         if pm == "uv" {
             env.push(("UV_MALWARE_CHECK".to_string(), "1".to_string()));
         }
+        if pm == "yarn" {
+            env.push((
+                "YARN_ENABLE_IMMUTABLE_INSTALLS".to_string(),
+                "false".to_string(),
+            ));
+        }
         env
     }
 
@@ -374,7 +383,10 @@ impl SystemPackageManager {
             // Node.js パッケージマネージャ
             "npm" => vec!["npm", "install"],
             "yarn" => vec!["yarn", "install"],
-            "pnpm" => vec!["pnpm", "install"],
+            // pnpm は CI (`CI=true`) では既定で `--frozen-lockfile` になる。depup は直前に
+            // package.json を書き換えているので、lock を更新できない install は必ず失敗する。
+            // `composer update` / `cargo update` と同じく、lock の更新を前提に明示する
+            "pnpm" => vec!["pnpm", "install", "--no-frozen-lockfile"],
             "bun" => vec!["bun", "install"],
             // Python パッケージマネージャ
             "pip" => vec!["pip", "install", "-e", "."],
@@ -1434,11 +1446,32 @@ mod tests {
         assert_eq!(cmd, vec!["yarn", "install"]);
     }
 
+    /// pnpm は CI (`CI=true`) では既定で frozen lockfile になり、depup が書き換えた
+    /// package.json に lock を合わせられず必ず失敗する (#88)。lock の更新を明示する
     #[test]
     fn test_get_install_command_pnpm() {
         let pm = SystemPackageManager::new();
         let cmd = pm.get_install_command("pnpm");
-        assert_eq!(cmd, vec!["pnpm", "install"]);
+        assert_eq!(cmd, vec!["pnpm", "install", "--no-frozen-lockfile"]);
+    }
+
+    /// Yarn 2 以降の CI の immutable install を、Yarn 1 にも無害な設定で外す (#88)
+    #[test]
+    fn yarn_install_disables_immutable_installs() {
+        let pm = SystemPackageManager::new();
+        let env = pm.get_install_env("yarn", None);
+        assert_eq!(
+            env,
+            vec![(
+                "YARN_ENABLE_IMMUTABLE_INSTALLS".to_string(),
+                "false".to_string()
+            )]
+        );
+        assert!(
+            !pm.get_install_env("pnpm", None)
+                .iter()
+                .any(|(key, _)| key.starts_with("YARN_"))
+        );
     }
 
     #[test]
@@ -1614,7 +1647,7 @@ mod tests {
     fn test_get_install_command_args_pnpm_without_age() {
         let pm = SystemPackageManager::new();
         let cmd = pm.get_install_command_args("pnpm", None);
-        assert_eq!(cmd, vec!["pnpm".to_string(), "install".to_string()]);
+        assert_eq!(cmd, ["pnpm", "install", "--no-frozen-lockfile"]);
     }
 
     #[test]
@@ -1624,7 +1657,7 @@ mod tests {
         let pm = SystemPackageManager::new();
         let age = Duration::from_secs(14 * 24 * 60 * 60);
         let cmd = pm.get_install_command_args("pnpm", Some(age));
-        assert_eq!(cmd, vec!["pnpm".to_string(), "install".to_string()]);
+        assert_eq!(cmd, ["pnpm", "install", "--no-frozen-lockfile"]);
     }
 
     #[test]
