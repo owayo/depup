@@ -98,6 +98,8 @@ PEP 440 prerelease versions are detected and removed from the candidates by defa
 
 In `Cargo.toml`, dependency updates are limited to dependency tables such as `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]`, `[workspace.dependencies]`, and target-specific dependency tables; metadata tables are left untouched.
 
+An inline table may span several lines, for example when its `features` array is split across lines or when it uses the newlines that TOML 1.1 allows inside inline tables. depup still rewrites its `version` and its git `tag`.
+
 Cargo renamed dependencies such as `alias = { package = "actual-crate", version = "1" }` are fetched by the real package name and written back through the manifest key. `--only` and `--exclude` accept either name.
 
 A dependency is often declared in `[dependencies]` and again in `[dev-dependencies]` to add `features` for tests. When such declarations point to the same source — the same crates.io version requirement written the same way, or the same git URL and reference — depup treats them as one dependency: it looks the dependency up once, shows one update, and rewrites every declaration. The version requirement is compared as written, so `"1.0"` and `"^1.0"` count as different. Declarations that differ in version requirement, git URL or reference, the `version` written beside `git`, or the `package` they point to are not combined, and an update to them is refused as ambiguous.
@@ -219,7 +221,7 @@ depup does not answer mise's confirmation prompts for you (it does not pass `MIS
 | Prefix | `node = "26"` / `"26.7"` | Segment count preserved (`26` → `27`, `26.7` → `26.8`) |
 | Explicit selector | `go = "prefix:1.19"` | `prefix:` preserved (`prefix:1.24`) |
 | Vendored | `java = "temurin-21.0.5"` | Stays within the same vendor (`temurin-21.0.9`) |
-| Inline table | `python = { version = "3.13", virtualenv = ".venv" }` | Only `version` is rewritten; other options are preserved |
+| Inline table | `python = { version = "3.13", virtualenv = ".venv" }` | Only `version` is rewritten; other options are preserved. The table may span several lines |
 | Table form | `[tools.terraform]` + `version = "1.15.0"` | Same as above |
 | Floating | `latest` / `lts` / `system` | Not processed — there is no fixed version to update |
 | Non-version | `ref:master` / `path:./shfmt` / `sub-2:lts` | Not processed |

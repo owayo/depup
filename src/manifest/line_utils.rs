@@ -163,9 +163,256 @@ pub(crate) fn opens_unclosed_multiline_string(line: &str) -> Option<&'static str
     scan_toml_line_outside_strings(line, |_, _| {})
 }
 
+/// 単一行の文字列 (`text[start]` が引用符) の終わり (閉じ引用符の次) の位置。
+/// 改行に達する・閉じていないときは `None`。
+fn single_line_string_end(text: &str, start: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let quote = bytes[start];
+    let mut index = start + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' if quote == b'"' => index += 2,
+            b'\n' | b'\r' => return None,
+            byte if byte == quote => return Some(index + 1),
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+/// 複数行の文字列が始まるか (基本文字列と literal 文字列の両方)
+fn starts_multiline_string(text: &str, index: usize) -> bool {
+    text[index..].starts_with("\"\"\"") || text[index..].starts_with("'''")
+}
+
+/// 複数行の文字列 (`text[start..]` が `"""` か `'''`) の終わり (閉じる区切りの次) の位置。
+/// 閉じていないときは `None`。TOML では閉じる区切りの直前に引用符を 2 つまで書けるので
+/// (`""""` は内容の `"` と区切り)、続く引用符は 5 つまでを文字列に含める。
+fn multiline_string_end(text: &str, start: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let quote = bytes[start];
+    let mut index = start + 3;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' if quote == b'"' => index += 2,
+            byte if byte == quote => {
+                let run = bytes[index..]
+                    .iter()
+                    .take(5)
+                    .take_while(|&&byte| byte == quote)
+                    .count();
+                if run >= 3 {
+                    return Some(index + run);
+                }
+                index += run;
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+/// 文字列 (`text[start]` が引用符) の終わり。複数行の文字列も読み飛ばす。
+fn toml_string_end(text: &str, start: usize) -> Option<usize> {
+    if starts_multiline_string(text, start) {
+        multiline_string_end(text, start)
+    } else {
+        single_line_string_end(text, start)
+    }
+}
+
+/// `text[open]` の `{` から始まる inline table の終わり (`}` の次の位置)。行をまたいでよい
+/// (TOML 1.0 でも配列の中と複数行の文字列は改行でき、TOML 1.1 は inline table の中も
+/// 改行できる)。入れ子の配列と表、文字列、コメントを考慮する。閉じていない・括弧が
+/// 食い違うときは `None`。
+pub(crate) fn toml_inline_table_end(text: &str, open: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    if bytes.get(open) != Some(&b'{') {
+        return None;
+    }
+    let mut stack: Vec<u8> = Vec::new();
+    let mut index = open;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' | b'\'' => {
+                index = toml_string_end(text, index)?;
+                continue;
+            }
+            b'#' => {
+                index = text[index..]
+                    .find('\n')
+                    .map_or(bytes.len(), |offset| index + offset);
+                continue;
+            }
+            bracket @ (b'{' | b'[') => stack.push(bracket),
+            b'}' => {
+                if stack.pop()? != b'{' {
+                    return None;
+                }
+                if stack.is_empty() {
+                    return Some(index + 1);
+                }
+            }
+            b']' if stack.pop()? != b'[' => return None,
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+/// inline table (`text[open..end]`) の直下のキー `key` の、単一行の文字列の値の範囲
+/// (引用符を含む)。入れ子の値の中や文字列の中の同じ名前は見ない。キーの値が単一行の
+/// 文字列でない (複数行の文字列や dotted key の一部を含む) ときと、キーがないときは `None`。
+pub(crate) fn toml_inline_table_string_value(
+    text: &str,
+    open: usize,
+    end: usize,
+    key: &str,
+) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut expecting_key = false;
+    let mut index = open;
+    while index < end {
+        match bytes[index] {
+            b'{' | b'[' => {
+                depth += 1;
+                expecting_key = depth == 1;
+                index += 1;
+            }
+            b'}' | b']' => {
+                depth = depth.saturating_sub(1);
+                index += 1;
+            }
+            b',' => {
+                expecting_key = depth == 1;
+                index += 1;
+            }
+            b'#' => {
+                index = text[index..end]
+                    .find('\n')
+                    .map_or(end, |offset| index + offset);
+            }
+            b'"' | b'\'' => {
+                // 複数行の文字列はキーにならないので、値として読み飛ばす
+                let multiline = starts_multiline_string(text, index);
+                let string_end = toml_string_end(text, index)?;
+                if depth == 1 && expecting_key {
+                    if !multiline && &text[index + 1..string_end - 1] == key {
+                        return string_value_after_key(text, string_end, end);
+                    }
+                    expecting_key = false;
+                }
+                index = string_end;
+            }
+            byte if byte.is_ascii_whitespace() => index += 1,
+            byte if depth == 1 && expecting_key && is_bare_key_byte(byte) => {
+                let start = index;
+                while index < end && is_bare_key_byte(bytes[index]) {
+                    index += 1;
+                }
+                if &text[start..index] == key {
+                    return string_value_after_key(text, index, end);
+                }
+                expecting_key = false;
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+fn is_bare_key_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
+}
+
+/// キーの直後 (`after`) の `=` に続く単一行の文字列の値の範囲 (引用符を含む)。
+fn string_value_after_key(text: &str, after: usize, end: usize) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let skip_blank = |mut index: usize| {
+        while index < end && matches!(bytes[index], b' ' | b'\t') {
+            index += 1;
+        }
+        index
+    };
+    let equals = skip_blank(after);
+    // `version.workspace = true` のような dotted key は文字列の値ではない
+    if bytes.get(equals) != Some(&b'=') {
+        return None;
+    }
+    let value = skip_blank(equals + 1);
+    if !matches!(bytes.get(value), Some(b'"' | b'\'')) || starts_multiline_string(text, value) {
+        return None;
+    }
+    let value_end = single_line_string_end(text, value)?;
+    (value_end <= end).then_some((value, value_end))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_tables_may_span_lines_with_nested_values_strings_and_comments() {
+        let text = "x = { features = [\n  \"rt\", # comment }\n  \"a}b\",\n], nested = { k = '}' }, version = \"1.0\" } # tail\n";
+        let open = text.find('{').unwrap();
+        let end = toml_inline_table_end(text, open).unwrap();
+        assert_eq!(&text[end - 1..end], "}");
+        assert!(text[end..].starts_with(" # tail"));
+        let (start, value_end) =
+            toml_inline_table_string_value(text, open, end, "version").unwrap();
+        assert_eq!(&text[start..value_end], "\"1.0\"");
+        // 入れ子の値や文字列の中の同じ名前は直下のキーではない
+        assert_eq!(toml_inline_table_string_value(text, open, end, "k"), None);
+        assert_eq!(toml_inline_table_string_value(text, open, end, "rt"), None);
+        // 閉じていない・括弧が食い違う inline table は扱わない
+        for broken in [
+            "x = { version = \"1\"\n",
+            "x = { a = [ } ]\n",
+            "x = { a = \"\"\"\nb }\n",
+        ] {
+            let open = broken.find('{').unwrap();
+            assert_eq!(toml_inline_table_end(broken, open), None, "{broken}");
+        }
+    }
+
+    #[test]
+    fn multiline_strings_inside_inline_tables_are_skipped_as_values() {
+        // 複数行の文字列の中の括弧・引用符・コメントの記号は数えない。閉じる区切りの直前の
+        // 引用符 (`""""` / `'''''`) は内容で、エスケープした引用符は区切りにならない。
+        let text = "x = { run = \"\"\"\necho \\\"\"\" } # ]\"\"\"\", other = '''\n}''''', version = \"2\" }\n";
+        assert!(toml::from_str::<toml::Value>(text).is_ok(), "{text}");
+        let open = text.find('{').unwrap();
+        let end = toml_inline_table_end(text, open).unwrap();
+        assert_eq!(&text[end..], "\n");
+        let (start, value_end) =
+            toml_inline_table_string_value(text, open, end, "version").unwrap();
+        assert_eq!(&text[start..value_end], "\"2\"");
+        // 複数行の文字列の値は、単一行の文字列として書き換える先にならない
+        assert_eq!(toml_inline_table_string_value(text, open, end, "run"), None);
+        assert_eq!(
+            toml_inline_table_string_value(text, open, end, "other"),
+            None
+        );
+    }
+
+    #[test]
+    fn only_string_values_of_top_level_keys_are_found() {
+        for (text, expected) in [
+            ("{ 'version' = '2.0' }", Some("'2.0'")),
+            ("{\n  version = \"1.0\",\n}", Some("\"1.0\"")),
+            // dotted key と文字列以外の値は書き換え先にならない
+            ("{ version.workspace = true }", None),
+            ("{ version = 1 }", None),
+            ("{ other = \"version = 'x'\" }", None),
+        ] {
+            let end = toml_inline_table_end(text, 0).unwrap();
+            let found = toml_inline_table_string_value(text, 0, end, "version")
+                .map(|(start, end)| &text[start..end]);
+            assert_eq!(found, expected, "{text}");
+        }
+    }
 
     #[test]
     fn multiline_delimiters_inside_strings_and_comments_do_not_open_a_block() {

@@ -98,6 +98,8 @@ PEP 440 のプレリリースは、区切り文字なしで書かれた場合（
 
 `Cargo.toml` で書き換えるのは、`[dependencies]`、`[dev-dependencies]`、`[build-dependencies]`、`[workspace.dependencies]`、ターゲット固有の依存テーブルだけで、メタデータのテーブルは変更しません。
 
+inline table は複数行に分けて書いてもかまいません（`features` の配列を改行した形や、TOML 1.1 で書ける改行を含む inline table）。その場合も `version` と git の `tag` を書き換えます。
+
 `alias = { package = "actual-crate", version = "1" }` のような Cargo のリネーム依存は、実際のパッケージ名でバージョンを取得し、マニフェスト上のキーへ書き戻します。`--only` / `--exclude` はどちらの名前でも指定できます。
 
 テストでだけ `features` を足すために、同じ依存を `[dependencies]` と `[dev-dependencies]` の両方に書くことがよくあります。こうした宣言が同じ取得元（同じ表記の crates.io のバージョン指定、または同じ git の URL と参照）を指すなら、depup は 1 つの依存として扱います。問い合わせは 1 回、表示する更新は 1 件で、すべての宣言を書き換えます。バージョン指定は書かれた表記のまま比べるので、`"1.0"` と `"^1.0"` は別物として扱います。バージョン指定、git の URL や参照、`git` と併記した `version`、`package` で指すクレートのどれかが食い違う宣言はまとめず、その更新は曖昧として拒否します。
@@ -215,7 +217,7 @@ depup は mise の確認を自動では承認しません（`MISE_YES` を渡し
 | 前方一致 | `node = "26"` / `"26.7"` | セグメント数を保って更新（`26` → `27`、`26.7` → `26.8`） |
 | 明示セレクター | `go = "prefix:1.19"` | `prefix:` を保持して更新（`prefix:1.24`） |
 | ベンダー付き | `java = "temurin-21.0.5"` | 同じベンダー内で更新（`temurin-21.0.9`） |
-| inline table | `python = { version = "3.13", virtualenv = ".venv" }` | `version` だけ更新し、他のオプションは保持 |
+| inline table | `python = { version = "3.13", virtualenv = ".venv" }` | `version` だけ更新し、他のオプションは保持。複数行に分けてもよい |
 | テーブル形式 | `[tools.terraform]` + `version = "1.15.0"` | 同上 |
 | 浮動指定 | `latest` / `lts` / `system` | 固定のバージョンがなく、更新するものがないため対象外 |
 | 非バージョン | `ref:master` / `path:./shfmt` / `sub-2:lts` | 対象外 |

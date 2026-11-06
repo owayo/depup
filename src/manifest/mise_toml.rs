@@ -24,6 +24,7 @@
 use super::ManifestParser;
 use super::line_utils::{
     opens_unclosed_multiline_string, parse_toml_section_header, split_line_ending,
+    toml_inline_table_end, toml_inline_table_string_value,
 };
 use crate::domain::{Dependency, Language};
 use crate::error::ManifestError;
@@ -339,8 +340,14 @@ impl ManifestParser for MiseTomlParser {
             let Some(location) = locate_tool_value(content, name) else {
                 continue;
             };
-            // マルチライン文字列で書かれた値は安全に書き戻せないので同じく除外する
-            if is_multiline_string_value(location.value_part) {
+            // マルチライン文字列で書かれた値は安全に書き戻せないので同じく除外する。
+            // 複数行の inline table も、書き換え先の文字列が無ければ同じ (#98)。
+            if is_multiline_string_value(location.value_part)
+                || matches!(
+                    locate_multiline_inline_table(content, &location),
+                    Some(MultilineInlineTable::Unwritable)
+                )
+            {
                 continue;
             }
             dependencies.push(Dependency::production(name, spec, Language::Mise));
@@ -371,6 +378,25 @@ impl ManifestParser for MiseTomlParser {
         // マルチライン文字列に紛れた `[tools]` / `node = "..."` を掴まない。
         let location = locate_tool_value(content, package)
             .ok_or_else(|| error(format!("tool '{package}' not found in [tools] section")))?;
+
+        match locate_multiline_inline_table(content, &location) {
+            Some(MultilineInlineTable::Version(value_start, value_end)) => {
+                let formatted =
+                    format_mise_version(&content[value_start + 1..value_end - 1], new_version);
+                let quote = &content[value_start..value_start + 1];
+                return Ok(format!(
+                    "{}{quote}{formatted}{quote}{}",
+                    &content[..value_start],
+                    &content[value_end..]
+                ));
+            }
+            Some(MultilineInlineTable::Unwritable) => {
+                return Err(error(format!(
+                    "tool '{package}' version is not a single-line string in [tools] section"
+                )));
+            }
+            None => {}
+        }
 
         let mut result = String::with_capacity(content.len());
         let mut updated = false;
@@ -407,6 +433,49 @@ impl ManifestParser for MiseTomlParser {
 
         Ok(result)
     }
+}
+
+/// 値が閉じないまま次の行へ続く inline table (`shellcheck = {\n  version = "0.10.0",\n}`) の
+/// 書き換え先
+enum MultilineInlineTable {
+    /// 直下の `version` (なければ `prefix`) の単一行の文字列の、`content` の中の範囲 (引用符を含む)
+    Version(usize, usize),
+    /// 書き換えられる文字列がない (値が複数行の文字列など) か、閉じる `}` が見つからない
+    Unwritable,
+}
+
+/// `location` の値が複数行の inline table なら、その書き換え先。値が 1 行で閉じるか、
+/// inline table でなければ `None` (行の中で書き換える)。parse (toml クレート) は複数行の
+/// inline table もツールとして読むので、parse と書き換えがこの判定を共有し、書き換えられない
+/// 形は報告もしない (#98)。
+fn locate_multiline_inline_table(
+    content: &str,
+    location: &ToolValue<'_>,
+) -> Option<MultilineInlineTable> {
+    let value = location.value_part.trim_start();
+    if !location.allow_inline_table || !value.starts_with('{') {
+        return None;
+    }
+    let line_start: usize = content
+        .split_inclusive('\n')
+        .take(location.line_index)
+        .map(str::len)
+        .sum();
+    let open = line_start + location.value_start + (location.value_part.len() - value.len());
+    let Some(end) = toml_inline_table_end(content, open) else {
+        return Some(MultilineInlineTable::Unwritable);
+    };
+    // `value_part` は改行の前の行の終わりまで
+    if end <= line_start + location.value_start + location.value_part.len() {
+        return None;
+    }
+    Some(
+        toml_inline_table_string_value(content, open, end, VERSION_KEY)
+            .or_else(|| toml_inline_table_string_value(content, open, end, PREFIX_KEY))
+            .map_or(MultilineInlineTable::Unwritable, |(start, end)| {
+                MultilineInlineTable::Version(start, end)
+            }),
+    )
 }
 
 /// 文字列リテラル (`"..."` / `'...'`) の範囲を列挙する。
@@ -608,6 +677,42 @@ python = "3.13"
 minimum_release_age = "7d"
 "#;
         assert!(parse(content).is_empty());
+    }
+
+    /// Issue #98: 複数行に分けた inline table のツールも書き換える。以前は値の 1 行目しか見ず、
+    /// `version is not a single-line string` で失敗していた。
+    #[test]
+    fn multiline_inline_table_is_updated() {
+        let content = "[tools]\nshellcheck = {\n  version = \"0.10.0\",\n  os = [\"linux\"],\n}\nnode = \"24\"\n";
+        let tools = parse(content);
+        assert!(tools.iter().any(|tool| tool.name == "shellcheck"));
+        let updated = MiseTomlParser
+            .update_version(content, "shellcheck", "0.11.0")
+            .unwrap();
+        assert_eq!(updated, content.replace("0.10.0", "0.11.0"));
+        // 複数行の文字列 (postinstall のコマンドなど) を含んでいてもよい。後のツールも読める
+        let content = "[tools]\npython = {\n  version = \"3.13\",\n  postinstall = \"\"\"\npip install -U pip # }\n\"\"\",\n}\nnode = \"24\"\n";
+        let names: Vec<_> = parse(content).into_iter().map(|tool| tool.name).collect();
+        assert_eq!(names, ["node", "python"]);
+        let updated = MiseTomlParser
+            .update_version(content, "python", "3.14")
+            .unwrap();
+        assert_eq!(updated, content.replace("\"3.13\"", "\"3.14\""));
+    }
+
+    /// 複数行の inline table でも、直下の `version` / `prefix` が単一行の文字列でなければ、
+    /// 書き換えられないので報告もしない (report/apply の整合)。
+    #[test]
+    fn multiline_inline_table_without_a_writable_version_is_not_reported() {
+        let content =
+            "[tools]\nshellcheck = {\n  version = \"\"\"0.10.0\"\"\",\n}\nnode = \"24\"\n";
+        let names: Vec<_> = parse(content).into_iter().map(|tool| tool.name).collect();
+        assert_eq!(names, ["node"]);
+        assert!(
+            MiseTomlParser
+                .update_version(content, "shellcheck", "0.11.0")
+                .is_err()
+        );
     }
 
     #[test]
