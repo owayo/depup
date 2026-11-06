@@ -8,6 +8,17 @@ use std::path::PathBuf;
 
 pub const GRADLE_WRAPPER_PACKAGE: &str = "gradle:wrapper";
 
+/// プロジェクトのルートから見た、Wrapper の配布 URL を記録する properties ファイル。
+pub(crate) const GRADLE_WRAPPER_PROPERTIES: &str = "gradle/wrapper/gradle-wrapper.properties";
+
+/// Wrapper の更新で書き換わる、プロジェクトのルートからのファイル。
+pub(crate) const GRADLE_WRAPPER_FILES: [&str; 4] = [
+    GRADLE_WRAPPER_PROPERTIES,
+    "gradle/wrapper/gradle-wrapper.jar",
+    "gradlew",
+    "gradlew.bat",
+];
+
 fn is_distribution_url_line(line: &str) -> bool {
     let trimmed = line.trim_start();
     if trimmed.starts_with(['#', '!']) {

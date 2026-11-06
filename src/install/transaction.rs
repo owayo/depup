@@ -1,10 +1,10 @@
 //! 管理するファイルを共有するジョブの単位で、install の失敗から復元する。
-use super::{InstallPlan, RustAuditPlan};
+use super::{InstallJob, InstallPlan, RustAuditPlan};
 use crate::domain::{Language, UpdateSummary};
 use crate::file_snapshot::{
     FileGuard, FileState, resolved_path, save_recovery_copy as backup, write_checked,
 };
-use crate::manifest::detect_manifests;
+use crate::manifest::{GRADLE_WRAPPER_FILES, GRADLE_WRAPPER_PROPERTIES, detect_manifests};
 use crate::node_scope::node_resolution_directory;
 use crate::orchestrator::OrchestratorResult;
 use crate::package_manager::{InstallResult, InstallScope, PreparedInstall, SystemPackageManager};
@@ -40,6 +40,29 @@ struct Unit {
     directories: BTreeSet<PathBuf>,
     failure: Option<String>,
     policy_failure: bool,
+}
+
+/// ジョブの間で使い回す、lock を共有する範囲の探索結果。
+#[derive(Default)]
+struct ResolutionRoots {
+    /// Cargo.toml ごとの、共有の Cargo.lock を解決するディレクトリ
+    cargo: BTreeMap<PathBuf, Result<PathBuf, String>>,
+    /// ディレクトリごとの uv workspace
+    uv: BTreeMap<PathBuf, Result<scope::UvScope, String>>,
+}
+
+impl ResolutionRoots {
+    fn cargo(&mut self, manifest: &Path, boundary: &Path) -> &Result<PathBuf, String> {
+        self.cargo
+            .entry(identity(manifest))
+            .or_insert_with(|| crate::cargo_scope::rust_resolution_directory(manifest, boundary))
+    }
+
+    fn uv(&mut self, directory: &Path, boundary: &Path) -> &Result<scope::UvScope, String> {
+        self.uv
+            .entry(identity(directory))
+            .or_insert_with(|| scope::uv_root(directory, boundary))
+    }
 }
 
 /// コマンドの準備とスナップショットの作成は、PM の実行前に一度だけ行う。
@@ -113,7 +136,21 @@ impl InstallTransactions {
                 tx.node_managers.insert(identity(&job.directory), manager);
             }
         }
-        // 後で保存する更新済みのマニフェストの状態を、書き込み記録で上書きする。
+        tx.record_manifest_writes(result);
+        for (directory, version) in &plan.wrapper_updates {
+            tx.add_wrapper_tasks(&pm, directory, version, result);
+        }
+        let mut roots = ResolutionRoots::default();
+        for job in &plan.jobs {
+            let task = tx.job_task(&pm, job, result, boundary, &mut roots);
+            tx.tasks.push(task);
+        }
+        tx.group(result);
+        tx
+    }
+
+    /// 後で保存する更新済みのマニフェストの状態を、書き込み記録で上書きする。
+    fn record_manifest_writes(&mut self, result: &OrchestratorResult) {
         for write in &result.write_results {
             if let Some(journal) = &write.journal {
                 let before = FileState {
@@ -124,7 +161,7 @@ impl InstallTransactions {
                     bytes: Some(journal.written.clone()),
                     permissions: Some(journal.permissions.clone()),
                 };
-                tx.files
+                self.files
                     .entry(journal.target.clone())
                     .and_modify(|record| {
                         if !record.expected.matches(&before) {
@@ -142,262 +179,259 @@ impl InstallTransactions {
                     });
             }
         }
-        for (directory, version) in &plan.wrapper_updates {
-            // 単位は共有しつつ、各回で個別に観測の境界を置く。
-            for _ in 0..2 {
-                let command = pm.prepare_gradle_wrapper(directory, version).map(Some);
-                let mut task = Task::new(directory, command);
-                for name in [
-                    "gradle/wrapper/gradle-wrapper.properties",
-                    "gradle/wrapper/gradle-wrapper.jar",
-                    "gradlew",
-                    "gradlew.bat",
-                ] {
-                    tx.add_path(&mut task, &directory.join(name), true);
-                }
-                task.summaries.extend(
-                    result
-                        .summary
-                        .manifests
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, manifest)| {
-                            manifest.path
-                                == directory.join("gradle/wrapper/gradle-wrapper.properties")
-                        })
-                        .map(|(index, _)| index),
-                );
-                tx.tasks.push(task);
+    }
+
+    /// Wrapper の配布物を書き換えるタスクを 2 つ加える。
+    /// 単位は共有しつつ、各回で個別に観測の境界を置く。
+    fn add_wrapper_tasks(
+        &mut self,
+        pm: &SystemPackageManager,
+        directory: &Path,
+        version: &str,
+        result: &OrchestratorResult,
+    ) {
+        let properties = directory.join(GRADLE_WRAPPER_PROPERTIES);
+        for _ in 0..2 {
+            let command = pm.prepare_gradle_wrapper(directory, version).map(Some);
+            let mut task = Task::new(directory, command);
+            for name in GRADLE_WRAPPER_FILES {
+                self.add_path(&mut task, &directory.join(name), true);
             }
+            task.summaries.extend(
+                result
+                    .summary
+                    .manifests
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, manifest)| manifest.path == properties)
+                    .map(|(index, _)| index),
+            );
+            self.tasks.push(task);
         }
-        let mut cargo_roots = BTreeMap::new();
-        let mut uv_roots = BTreeMap::new();
-        for job in &plan.jobs {
-            // 選択結果と確定したファイルの関係は、ポリシーや引数の妥当性に依存しない。
-            let selection = match &job.scope {
-                Ok(scope) => pm.resolve_scoped_package_manager(job.language, &job.directory, scope),
-                Err(_) if job.language != Language::Rust => {
-                    pm.resolve_package_manager(job.language, &job.directory)
+    }
+
+    /// install ジョブ 1 件の実行コマンドと、復元のために保存するファイルを決める。
+    fn job_task(
+        &mut self,
+        pm: &SystemPackageManager,
+        job: &InstallJob,
+        result: &OrchestratorResult,
+        boundary: &Path,
+        roots: &mut ResolutionRoots,
+    ) -> Task {
+        // 選択結果と確定したファイルの関係は、ポリシーや引数の妥当性に依存しない。
+        let selection = match &job.scope {
+            Ok(scope) => pm.resolve_scoped_package_manager(job.language, &job.directory, scope),
+            Err(_) if job.language != Language::Rust => {
+                pm.resolve_package_manager(job.language, &job.directory)
+            }
+            Err(_) => None,
+        };
+        let command = job
+            .policy
+            .as_ref()
+            .and_then(|policy| job.scope.as_ref().map(|scope| (policy, scope)))
+            .map_err(Clone::clone)
+            .and_then(|(policy, scope)| match &selection {
+                Some((directory, manager)) => {
+                    pm.prepare_resolved_install(job.language, directory, manager, policy, scope)
                 }
-                Err(_) => None,
+                None => Ok(None),
+            });
+        let mut task = Task::new(&job.directory, command);
+        let directory = selection
+            .as_ref()
+            .map_or(&job.directory, |(directory, _)| directory)
+            .clone();
+        let full_scope = matches!(job.scope, Ok(InstallScope::Full));
+        if job.language == Language::Rust {
+            let root = if full_scope && selection.is_some() {
+                roots.cargo(&directory.join("Cargo.toml"), boundary).clone()
+            } else {
+                Ok(directory.clone())
             };
-            let command = job
-                .policy
-                .as_ref()
-                .and_then(|policy| job.scope.as_ref().map(|scope| (policy, scope)))
-                .map_err(Clone::clone)
-                .and_then(|(policy, scope)| match &selection {
-                    Some((directory, manager)) => {
-                        pm.prepare_resolved_install(job.language, directory, manager, policy, scope)
-                    }
-                    None => Ok(None),
-                });
-            let mut task = Task::new(&job.directory, command);
-            let directory = selection
-                .as_ref()
-                .map_or(&job.directory, |(directory, _)| directory)
-                .clone();
-            if job.language == Language::Rust {
-                let root = if matches!(job.scope, Ok(InstallScope::Full)) && selection.is_some() {
-                    cargo_roots
-                        .entry(identity(&directory.join("Cargo.toml")))
-                        .or_insert_with(|| {
-                            crate::cargo_scope::rust_resolution_directory(
-                                &directory.join("Cargo.toml"),
-                                boundary,
-                            )
-                        })
-                        .clone()
-                } else {
-                    Ok(directory.clone())
-                };
-                match root {
-                    Ok(root) => {
-                        task.rust_root = Some(root.clone());
-                        tx.add_path(&mut task, &root.join("Cargo.lock"), true);
-                    }
-                    Err(error) => task.command = Err(error),
+            match root {
+                Ok(root) => {
+                    task.rust_root = Some(root.clone());
+                    self.add_path(&mut task, &root.join("Cargo.lock"), true);
                 }
+                Err(error) => task.command = Err(error),
             }
-            if job.language == Language::Node {
-                task.node_root = Some(directory.clone());
-                if matches!(job.scope, Ok(InstallScope::Refresh)) {
-                    tx.add_path(&mut task, &directory.join("pnpm-workspace.yaml"), true);
-                }
-            }
-            for (index, manifest) in result.summary.manifests.iter().enumerate() {
-                let applies = if job.language == Language::Rust
-                    && task.rust_root.is_some()
-                    && matches!(job.scope, Ok(InstallScope::Full))
-                {
-                    manifest.language == Language::Rust
-                        && cargo_roots
-                            .entry(identity(&manifest.path))
-                            .or_insert_with(|| {
-                                crate::cargo_scope::rust_resolution_directory(
-                                    &manifest.path,
-                                    boundary,
-                                )
-                            })
-                            .as_ref()
-                            .is_ok_and(|root| Some(root) == task.rust_root.as_ref())
-                } else {
-                    job.manifests.contains(&manifest.path)
-                };
-                if applies {
-                    task.summaries.insert(index);
-                    tx.add_path(&mut task, &manifest.path, false);
-                }
-            }
-            if let Some((effective_dir, manager)) = selection {
-                if job.language == Language::Node {
-                    tx.node_managers
-                        .insert(identity(&job.directory), (effective_dir.clone(), manager));
-                }
-                if manager == "uv" {
-                    match uv_roots
-                        .entry(identity(&effective_dir))
-                        .or_insert_with(|| scope::uv_root(&effective_dir, boundary))
-                        .clone()
-                    {
-                        Ok(scope) => {
-                            if let Ok(Some(command)) = &mut task.command {
-                                task.uv_lock = uv_lock::Normalization::prepare(
-                                    scope.root.join("uv.lock"),
-                                    command,
-                                );
-                            }
-                            for name in ["pyproject.toml", "uv.lock"] {
-                                tx.add_scoped_path(&mut task, &scope.root.join(name));
-                            }
-                            // uv は、各メンバーで選ばれたコマンドが pip である場合や準備に失敗した場合も含め、
-                            // 確定したすべてのメンバーの要件を解決する。
-                            for (index, manifest) in result
-                                .summary
-                                .manifests
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, manifest)| manifest.language == Language::Python)
-                            {
-                                let Some(parent) = manifest.path.parent() else {
-                                    continue;
-                                };
-                                // 除外や非メンバーと確定した場合、子の設定を解析する必要はない。
-                                if !scope.members.contains(&identity(parent)) {
-                                    continue;
-                                }
-                                match uv_roots
-                                    .entry(identity(parent))
-                                    .or_insert_with(|| scope::uv_root(parent, boundary))
-                                    .as_ref()
-                                {
-                                    Ok(member_scope) if member_scope.root == scope.root => {
-                                        task.summaries.insert(index);
-                                        tx.add_path(&mut task, &manifest.path, false);
-                                    }
-                                    Err(error) => {
-                                        task.command = Err(error.clone());
-                                        task.summaries.insert(index);
-                                        tx.add_path(&mut task, &manifest.path, false);
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                        Err(error) => task.command = Err(error),
-                    }
-                }
-                if manager == "mise" {
-                    match mise::managed_paths(&effective_dir, &job.manifests, boundary) {
-                        Ok(scope) => {
-                            for config in &scope.configs {
-                                tx.add_guarded_path(
-                                    &mut task,
-                                    config,
-                                    false,
-                                    Some(&identity(boundary)),
-                                );
-                            }
-                            // このマニフェスト自身のジョブの準備に失敗しても、別のジョブによって、
-                            // 共有コマンドが読む設定を確定できる場合がある。
-                            for (index, manifest) in result.summary.manifests.iter().enumerate() {
-                                if manifest.language == Language::Mise
-                                    && scope.configs.contains(&identity(&manifest.path))
-                                {
-                                    task.summaries.insert(index);
-                                    tx.add_guarded_path(
-                                        &mut task,
-                                        &manifest.path,
-                                        false,
-                                        Some(&tx.recovery_boundary.clone()),
-                                    );
-                                }
-                            }
-                            for path in scope.paths {
-                                if !tx.add_scoped_path(&mut task, &path) {
-                                    continue;
-                                }
-                                let tree = mise::sidecar(&path);
-                                match FileGuard::capture(&tree).and_then(|guard| {
-                                    let paths =
-                                        mise::tree_files(&guard, &tx.recovery_boundary, None)?;
-                                    Ok((guard, paths))
-                                }) {
-                                    Ok((guard, paths)) => {
-                                        if !paths.errors.is_empty() {
-                                            task.command = Err(format!(
-                                                "Cannot snapshot mise metadata: {}",
-                                                paths.errors.join("; ")
-                                            ));
-                                        }
-                                        for path in paths.paths {
-                                            tx.add_scoped_path(&mut task, &path);
-                                        }
-                                        task.tree_links.extend(paths.links);
-                                        task.trees.push(guard);
-                                    }
-                                    Err(error) => {
-                                        task.command =
-                                            Err(format!("Cannot snapshot mise metadata: {error}"))
-                                    }
-                                }
-                            }
-                            match mise_lock::Preservation::capture(scope.locks, &tx.files) {
-                                Ok(preservation) => task.mise_locks = Some(preservation),
-                                Err(error) => task.command = Err(error),
-                            }
-                        }
-                        Err(error) => task.command = Err(error),
-                    }
-                }
-                if job.language == Language::Java {
-                    let root = gradle_root(&effective_dir, boundary);
-                    for name in [
-                        "gradle/wrapper/gradle-wrapper.properties",
-                        "gradle/wrapper/gradle-wrapper.jar",
-                        "gradlew",
-                        "gradlew.bat",
-                    ] {
-                        tx.add_path(&mut task, &root.join(name), true);
-                    }
-                }
-                for path in managed_files(manager, &effective_dir) {
-                    tx.add_path(&mut task, &path, true);
-                }
-                if job.language == Language::Node {
-                    // 変更のないマニフェストも含め、実際の pnpm メンバーを対象にする。
-                    for manifest in detect_manifests(&directory).into_iter().filter(|manifest| {
-                        manifest.language == Language::Node
-                            && node_resolution_directory(&manifest.path) == directory
-                    }) {
-                        tx.add_path(&mut task, &manifest.path, true);
-                    }
-                }
-            }
-            tx.tasks.push(task);
         }
-        tx.group(result);
-        tx
+        if job.language == Language::Node {
+            task.node_root = Some(directory.clone());
+            if matches!(job.scope, Ok(InstallScope::Refresh)) {
+                self.add_path(&mut task, &directory.join("pnpm-workspace.yaml"), true);
+            }
+        }
+        // 全体を解決する Cargo のジョブは、同じ Cargo.lock を使うマニフェストをすべて受け持つ。
+        let shares_cargo_lock =
+            job.language == Language::Rust && task.rust_root.is_some() && full_scope;
+        for (index, manifest) in result.summary.manifests.iter().enumerate() {
+            let applies = if shares_cargo_lock {
+                manifest.language == Language::Rust
+                    && roots
+                        .cargo(&manifest.path, boundary)
+                        .as_ref()
+                        .is_ok_and(|root| Some(root) == task.rust_root.as_ref())
+            } else {
+                job.manifests.contains(&manifest.path)
+            };
+            if applies {
+                task.summaries.insert(index);
+                self.add_path(&mut task, &manifest.path, false);
+            }
+        }
+        let Some((effective_dir, manager)) = selection else {
+            return task;
+        };
+        if job.language == Language::Node {
+            self.node_managers
+                .insert(identity(&job.directory), (effective_dir.clone(), manager));
+        }
+        if manager == "uv" {
+            self.attach_uv_scope(&mut task, &effective_dir, result, boundary, roots);
+        }
+        if manager == "mise" {
+            self.attach_mise_scope(&mut task, &effective_dir, &job.manifests, result, boundary);
+        }
+        if job.language == Language::Java {
+            let root = gradle_root(&effective_dir, boundary);
+            for name in GRADLE_WRAPPER_FILES {
+                self.add_path(&mut task, &root.join(name), true);
+            }
+        }
+        for path in managed_files(manager, &effective_dir) {
+            self.add_path(&mut task, &path, true);
+        }
+        if job.language == Language::Node {
+            // 変更のないマニフェストも含め、実際の pnpm メンバーを対象にする。
+            for manifest in detect_manifests(&directory).into_iter().filter(|manifest| {
+                manifest.language == Language::Node
+                    && node_resolution_directory(&manifest.path) == directory
+            }) {
+                self.add_path(&mut task, &manifest.path, true);
+            }
+        }
+        task
+    }
+
+    /// uv の workspace のルートの設定と lock、同じ lock を使うメンバーのマニフェストを保存する。
+    fn attach_uv_scope(
+        &mut self,
+        task: &mut Task,
+        effective_dir: &Path,
+        result: &OrchestratorResult,
+        boundary: &Path,
+        roots: &mut ResolutionRoots,
+    ) {
+        let scope = match roots.uv(effective_dir, boundary).clone() {
+            Ok(scope) => scope,
+            Err(error) => {
+                task.command = Err(error);
+                return;
+            }
+        };
+        if let Ok(Some(command)) = &mut task.command {
+            task.uv_lock = uv_lock::Normalization::prepare(scope.root.join("uv.lock"), command);
+        }
+        for name in ["pyproject.toml", "uv.lock"] {
+            self.add_scoped_path(task, &scope.root.join(name));
+        }
+        // uv は、各メンバーで選ばれたコマンドが pip である場合や準備に失敗した場合も含め、
+        // 確定したすべてのメンバーの要件を解決する。
+        for (index, manifest) in result
+            .summary
+            .manifests
+            .iter()
+            .enumerate()
+            .filter(|(_, manifest)| manifest.language == Language::Python)
+        {
+            let Some(parent) = manifest.path.parent() else {
+                continue;
+            };
+            // 除外や非メンバーと確定した場合、子の設定を解析する必要はない。
+            if !scope.members.contains(&identity(parent)) {
+                continue;
+            }
+            match roots.uv(parent, boundary) {
+                Ok(member_scope) if member_scope.root == scope.root => {
+                    task.summaries.insert(index);
+                    self.add_path(task, &manifest.path, false);
+                }
+                Err(error) => {
+                    task.command = Err(error.clone());
+                    task.summaries.insert(index);
+                    self.add_path(task, &manifest.path, false);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// mise の install が読む設定と lock、ツールのメタデータを保存する。
+    fn attach_mise_scope(
+        &mut self,
+        task: &mut Task,
+        effective_dir: &Path,
+        manifests: &[PathBuf],
+        result: &OrchestratorResult,
+        boundary: &Path,
+    ) {
+        let scope = match mise::managed_paths(effective_dir, manifests, boundary) {
+            Ok(scope) => scope,
+            Err(error) => {
+                task.command = Err(error);
+                return;
+            }
+        };
+        for config in &scope.configs {
+            self.add_guarded_path(task, config, false, Some(&identity(boundary)));
+        }
+        // このマニフェスト自身のジョブの準備に失敗しても、別のジョブによって、
+        // 共有コマンドが読む設定を確定できる場合がある。
+        for (index, manifest) in result.summary.manifests.iter().enumerate() {
+            if manifest.language == Language::Mise
+                && scope.configs.contains(&identity(&manifest.path))
+            {
+                task.summaries.insert(index);
+                self.add_guarded_path(
+                    task,
+                    &manifest.path,
+                    false,
+                    Some(&self.recovery_boundary.clone()),
+                );
+            }
+        }
+        for path in scope.paths {
+            if !self.add_scoped_path(task, &path) {
+                continue;
+            }
+            let tree = mise::sidecar(&path);
+            match FileGuard::capture(&tree).and_then(|guard| {
+                let paths = mise::tree_files(&guard, &self.recovery_boundary, None)?;
+                Ok((guard, paths))
+            }) {
+                Ok((guard, paths)) => {
+                    if !paths.errors.is_empty() {
+                        task.command = Err(format!(
+                            "Cannot snapshot mise metadata: {}",
+                            paths.errors.join("; ")
+                        ));
+                    }
+                    for path in paths.paths {
+                        self.add_scoped_path(task, &path);
+                    }
+                    task.tree_links.extend(paths.links);
+                    task.trees.push(guard);
+                }
+                Err(error) => task.command = Err(format!("Cannot snapshot mise metadata: {error}")),
+            }
+        }
+        match mise_lock::Preservation::capture(scope.locks, &self.files) {
+            Ok(preservation) => task.mise_locks = Some(preservation),
+            Err(error) => task.command = Err(error),
+        }
     }
 
     fn add_path(&mut self, task: &mut Task, path: &Path, managed: bool) {
@@ -1112,12 +1146,7 @@ fn managed_files(manager: &str, directory: &Path) -> Vec<PathBuf> {
         "bundle" => &["Gemfile", "Gemfile.lock"],
         "composer" => &["composer.json", "composer.lock"],
         "swift" => &["Package.swift", "Package.resolved"],
-        "./gradlew" | "./gradlew.bat" => &[
-            "gradle/wrapper/gradle-wrapper.properties",
-            "gradle/wrapper/gradle-wrapper.jar",
-            "gradlew",
-            "gradlew.bat",
-        ],
+        "./gradlew" | "./gradlew.bat" => &GRADLE_WRAPPER_FILES,
         _ => &[],
     };
     let files: Vec<_> = names.iter().map(|name| directory.join(name)).collect();

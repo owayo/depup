@@ -45,6 +45,7 @@ pub use gemfile::GemfileParser;
 pub use go_mod::GoModParser;
 pub use gradle::GradleParser;
 pub use gradle_wrapper::GRADLE_WRAPPER_PACKAGE;
+pub(crate) use gradle_wrapper::{GRADLE_WRAPPER_FILES, GRADLE_WRAPPER_PROPERTIES};
 pub use mise::MiseParser;
 pub use mise_settings::{MISE_CONFIG_FILENAMES, MiseSettings, has_mise_config, mise_config_paths};
 pub use package_json::PackageJsonParser;

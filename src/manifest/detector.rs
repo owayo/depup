@@ -156,7 +156,7 @@ pub fn detect_manifests(dir: &Path) -> Vec<ManifestInfo> {
         push_unique_manifest(&mut manifests, catalog_path, Language::Java);
     }
 
-    let wrapper_properties = dir.join("gradle/wrapper/gradle-wrapper.properties");
+    let wrapper_properties = dir.join(super::GRADLE_WRAPPER_PROPERTIES);
     if wrapper_properties.is_file() {
         push_unique_manifest(&mut manifests, wrapper_properties, Language::Java);
     }

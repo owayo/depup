@@ -72,7 +72,7 @@ impl InstallPlan {
             .filter(|manifest| {
                 manifest
                     .path
-                    .ends_with("gradle/wrapper/gradle-wrapper.properties")
+                    .ends_with(crate::manifest::GRADLE_WRAPPER_PROPERTIES)
                     && result.write_results.iter().any(|write| {
                         write.path == manifest.path && write.file_modified && !write.has_errors()
                     })
