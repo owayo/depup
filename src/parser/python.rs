@@ -227,12 +227,35 @@ fn parse_poetry_bare_pin(version_str: &str) -> Option<VersionSpec> {
     ))
 }
 
+/// 末尾のカンマの前の、単一の制約 (`>=2.28,` の `>=2.28`)。末尾にカンマがない・前に別の
+/// カンマがある (複数の制約) ときは `None`。
+fn single_constraint_before_trailing_comma(trimmed: &str) -> Option<&str> {
+    let single = trimmed.strip_suffix(',')?.trim_end();
+    (!single.is_empty() && !single.contains(',')).then_some(single)
+}
+
 impl VersionParser for PythonVersionParser {
     fn parse(&self, version_str: &str) -> Option<VersionSpec> {
         let trimmed = version_str.trim();
 
         if trimmed.is_empty() {
             return None;
+        }
+
+        // PEP 508 の version_many は末尾のカンマを許す。単一の制約に付いた末尾のカンマ
+        // (`requests>=2.28,`) は要件を足さないので、カンマを除いた制約として分類し
+        // (`==1.2.3,` は固定指定のまま)、書き戻しでカンマを保つ。以前はカンマ区切りの
+        // 複数の要件として Range にし、書き換えられずに毎回スキップしていた (#105)。
+        // Range の書き換え (`format_range_like`) は `raw` の末尾のカンマを保つので、それ以外の
+        // 種類だけ接尾辞として付け直す。
+        if let Some(single) = single_constraint_before_trailing_comma(trimmed) {
+            let mut spec = self.parse(single)?;
+            spec.raw = trimmed.to_string();
+            return Some(if spec.kind == VersionSpecKind::Range {
+                spec
+            } else {
+                spec.with_suffix(&trimmed[single.len()..])
+            });
         }
 
         // Poetry の Caret
@@ -543,8 +566,43 @@ mod tests {
     fn test_parse_single_constraint_with_trailing_comma() {
         // version_many は単一指定でも末尾カンマを許容する
         let spec = parse(">=1.0,").unwrap();
-        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.kind, VersionSpecKind::GreaterOrEqual);
         assert_eq!(spec.version, "1.0");
+        assert_eq!(spec.raw, ">=1.0,");
+    }
+
+    /// Issue #105: 単一の制約の末尾のカンマを保ったまま、単一の制約として更新する。
+    /// 以前はカンマ区切りの複数の要件として扱い、書き換えられずに毎回スキップしていた。
+    #[test]
+    fn test_single_constraint_with_trailing_comma_keeps_its_kind_and_comma() {
+        for (raw, kind, new_version, expected) in [
+            (
+                ">=2.28,",
+                VersionSpecKind::GreaterOrEqual,
+                "2.32.3",
+                ">=2.32.3,",
+            ),
+            (
+                ">=2.28 ,",
+                VersionSpecKind::GreaterOrEqual,
+                "2.32.3",
+                ">=2.32.3 ,",
+            ),
+            ("==1.2.3,", VersionSpecKind::Exact, "1.4.0", "==1.4.0,"),
+            ("~=1.2,", VersionSpecKind::Range, "1.9.0", "~=1.9,"),
+            ("==1.2.*,", VersionSpecKind::Range, "1.3.5", "==1.3.*,"),
+        ] {
+            let spec = parse(raw).unwrap();
+            assert_eq!(spec.kind, kind, "{raw}");
+            assert_eq!(spec.raw, raw);
+            assert_eq!(
+                spec.try_format_updated(new_version).as_deref(),
+                Some(expected),
+                "{raw}"
+            );
+        }
+        // 固定指定は末尾のカンマがあっても固定指定 (`--include-pinned` のときだけ更新する)
+        assert!(parse("==1.2.3,").unwrap().is_pinned());
     }
 
     #[test]
