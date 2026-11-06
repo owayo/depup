@@ -21,14 +21,24 @@ impl DepupConfig {
             return None;
         }
 
-        let content = std::fs::read_to_string(&config_path).ok()?;
-        match Self::parse(&content, dir) {
+        match Self::load(&config_path, dir) {
             Ok(config) => Some(config),
             Err(e) => {
                 eprintln!("Warning: failed to parse .depup: {}", e);
                 None
             }
         }
+    }
+
+    /// `.depup` を読んで解析する。読めない・UTF-8 でない内容も、解析できない内容と同じく
+    /// エラーにする (呼び出し側が警告して `.depup` 全体を無視する)。以前は
+    /// `read_to_string(...).ok()?` で読み、Windows PowerShell 5.1 の `>` が書く UTF-16 などを
+    /// 「`.depup` がない」と同じに扱って、警告なしにルートだけを処理していた (#104)。
+    fn load(path: &Path, base_dir: &Path) -> Result<Self, String> {
+        let bytes = std::fs::read(path).map_err(|error| format!("failed to read: {error}"))?;
+        let content = String::from_utf8(bytes)
+            .map_err(|_| "the file is not UTF-8 text; save it as UTF-8".to_string())?;
+        Self::parse(&content, base_dir)
     }
 
     /// スキャン対象のディレクトリ一覧を構築する (ルートディレクトリを常に含む)
@@ -60,6 +70,8 @@ impl DepupConfig {
             )
         })?;
 
+        // 先頭の UTF-8 の BOM は文字コードの印で、1 行目のパスの一部ではない (#104)
+        let (_, content) = crate::manifest::split_utf8_bom(content);
         for line in content.lines() {
             // インラインコメントを除去
             let stripped = match line.find('#') {
@@ -160,6 +172,44 @@ mod tests {
         assert_eq!(config.directories[0], dir.path().join("gui"));
         assert_eq!(config.directories[1], dir.path().join("web"));
         assert_eq!(config.directories[2], dir.path().join("cli"));
+    }
+
+    /// Issue #104: 先頭の UTF-8 の BOM を 1 行目のパスの一部として読まない。以前は
+    /// `\u{feff}gui` を探して見つからず、そのディレクトリを処理から外していた。
+    #[test]
+    fn test_parse_skips_a_leading_utf8_bom() {
+        let dir = create_test_dir();
+        fs::create_dir(dir.path().join("gui")).unwrap();
+        fs::create_dir(dir.path().join("web")).unwrap();
+        let config = DepupConfig::parse("\u{feff}gui\nweb\n", dir.path()).unwrap();
+        assert_eq!(
+            config.directories,
+            [dir.path().join("gui"), dir.path().join("web")]
+        );
+    }
+
+    /// Issue #104: UTF-8 として読めない `.depup` (PowerShell 5.1 の `>` が書く UTF-16 など) は
+    /// `.depup` がないのと同じに扱わず、解析できない `.depup` と同じくエラーにする
+    /// (呼び出し側が警告して無視する)。
+    #[test]
+    fn test_load_rejects_a_file_that_is_not_utf8() {
+        let dir = create_test_dir();
+        fs::create_dir(dir.path().join("gui")).unwrap();
+        let path = dir.path().join(".depup");
+        let utf16: Vec<u8> = [0xFEFF_u16]
+            .into_iter()
+            .chain("gui\r\n".encode_utf16())
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        fs::write(&path, utf16).unwrap();
+        let error = DepupConfig::load(&path, dir.path()).unwrap_err();
+        assert!(error.contains("not UTF-8"), "{error}");
+        // UTF-8 なら同じ内容を読める
+        fs::write(&path, "\u{feff}gui\r\n").unwrap();
+        assert_eq!(
+            DepupConfig::load(&path, dir.path()).unwrap().directories,
+            [dir.path().join("gui")]
+        );
     }
 
     #[test]
