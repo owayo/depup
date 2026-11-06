@@ -195,6 +195,8 @@ Swift で対象になるのは、GitHub の URL で指定し、バージョン�
 
 mise（[jdx/mise](https://mise.jdx.dev)）の設定ファイルに書かれたツールバージョンも、他の言語と同じワークフロー（検出 → 解析 → 判定 → 書き込み）で更新します。バージョン一覧は `mise ls-remote <tool> --json` から取得するため、mise が対応するすべてのバックエンド（core / aqua / ubi / asdf / npm: / cargo: / go: / pipx: など）をそのまま扱えます。
 
+depup は mise の確認を自動では承認しません（`MISE_YES` を渡しません）。未信頼の設定ファイルを信頼するかどうかや、プラグインを導入するかどうかの確認が必要な場合、`mise ls-remote` は失敗し、そのツールは取得の失敗として表示されます。`mise trust` やプラグインの導入を自分で済ませてから実行してください。版の一覧を取るだけの実行（`--dry-run` を含む）で、mise の信頼の記録を変えたり、確認なしでプラグインを導入したりしないためです。
+
 #### 対象ファイル
 
 `mise.toml` / `.mise.toml` / `mise/config.toml` / `.mise/config.toml` / `.config/mise.toml` / `.config/mise/config.toml` / `.tool-versions`
