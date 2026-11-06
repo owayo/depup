@@ -52,8 +52,9 @@ src/
     go_mod.rs        - Go パーサ
     gemfile.rs       - Ruby パーサ
     composer_json.rs - PHP パーサ
-    gradle.rs        - Java パーサ
+    gradle.rs        - Java パーサ (build スクリプト。`GradleFile::of` がファイル名から build スクリプト / version catalog / Wrapper のパーサを選ぶ)
     gradle_version_catalog.rs - Gradle version catalog パーサ
+    gradle_wrapper.rs - Gradle Wrapper (`gradle/wrapper/gradle-wrapper.properties`) パーサ
     json_sections.rs - JSON マニフェストの依存セクション限定書き換え補助 (ネストした object 範囲の抽出含む)
     line_utils.rs    - 行末改行分離 (split_line_ending)・クォート判定 (captured_quote_and_version)・クォート考慮の # 行コメント除去 (strip_hash_line_comment、HashCommentMode でバックスラッシュエスケープ解釈を Gemfile/TOML で切替)・TOML セクションヘッダ字句解析 (parse_toml_section_header、`[key]` / `[[key]]` / ヘッダ内空白 / 行末コメントを解釈)・文字列外の TOML 字句走査と複数行文字列の開始判定の共通ヘルパ。CRLF 保持と TOML クォート種別判定・セクション追跡の単一情報源で、cargo_toml / gemfile / gradle / gradle_version_catalog / pyproject_toml / mise_toml が共用する
     package_swift.rs - Swift パーサ
@@ -186,6 +187,7 @@ make ci                # CI と同じ検査 (fmt-check + lint + test、書き換
 - Gradle の文字列記法では `group:name:version:classifier@extension` と `group:name:version@extension` を解析・更新でき、更新時は classifier / extension サフィックスを維持する
 - Gradle の宣言ラッパ `platform(...)` / `enforcedPlatform(...)` / `testFixtures(...)` を挟んだ依存も解析・更新できる (`implementation platform('com.google.cloud:libraries-bom:26.1.0')` / `implementation(platform("org.springframework.boot:spring-boot-dependencies:3.2.0"))` / `testImplementation(platform("org.junit:junit-bom:5.10.0"))`)。BOM は推移依存のバージョンを一括決定する要となる宣言なので、取りこぼすとプロジェクト全体のバージョンが古いまま放置される。ラッパは configuration 名の後に来るため、素朴な正規表現では `platform` 自体が configuration 名と解釈されて dev 判定 (`testImplementation` か否か) も壊れる。共通の `DEP_WRAPPER` パターンを文字列記法 / map 記法 / 変数展開 / rich version の各正規表現で共有して防ぐ
 - Gradle の `ext.<name> = '...'` / `project.ext.<name> = "..."` のドット代入も変数として解決・書き戻しできる (`ext { ... }` ブロック形式と意味が同じなのに挙動が割れていた)。`${Versions.retrofit}` / `${rootProject.ext.springVersion}` のような修飾付き変数参照も最終セグメントで解決する。ただし同じ短名が異なる値で複数定義されている場合 (`object Versions` と `object Legacy` が同名の定数を持つ等) は別オブジェクトの値を拾う誤更新を避けて解決しない (安全側のスキップ)
+- Gradle のパーサはファイル名で選ぶ (`manifest::parser_for` / `GradleFile::of`。`*.versions.toml` は version catalog、`gradle-wrapper.properties` は Wrapper、それ以外は build スクリプト)。中身からは推測しない。以前はすべての Gradle ファイルに Wrapper の判定をかけ、build スクリプトに `wrapper { distributionUrl = ... }` のような行があるとそのファイルの依存を 0 件にし、2 行あると解析エラーにしていた (#92)。`get_parser(Language::Java)` は build スクリプトのパーサなので、検出したマニフェストを読み書きするときは `parser_for` を使う (orchestrator の解析と `ManifestWriter::apply_all_updates` はそうしている)
 - Gradle version catalog (`gradle/*.versions.toml`) は `[libraries]` の `alias = "group:name:version"`、`module = "group:name"`、`group` / `name` / `version`、`version.ref` を解析・更新できる。`[versions]` 参照先も更新し、rich version table の `strictly` / `require` / `prefer` / `reject` / `rejectAll` も Gradle ファイル本体と同じルールで扱う。`[plugins]` は Gradle plugin ID で Maven Central 座標と一致しないため更新対象から除外する
 - Gradle の変数定義 (`def x = '...'` / `val x = "..."`) / rich version ブロック / version catalog (`*.versions.toml`) 経由の更新でも CRLF (`\r\n`) を保持する。以前はこれらの経路が `content.lines()` + `join("\n")` でファイル全行を LF 化しており、文字列記法・map 記法経路 (`split_inclusive` で CRLF 保持) と挙動が食い違っていた (共通ヘルパ `split_line_ending` で行末を退避・再付与する)
 - Maven の Hard requirement (例: `[1.0]`, `[1.2.3]`, `[1.2.3.Final]`) は完全一致 (Exact) として解釈され、ブラケットを保持したまま更新される (例: `[1.0]` → `[1.5]`)。`[A,B]` のようにカンマを含むレンジ記法とは区別される

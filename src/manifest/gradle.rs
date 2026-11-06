@@ -16,11 +16,99 @@ use crate::manifest::{
 use crate::parser::get_parser;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 /// build.gradle / build.gradle.kts 用パーサ
 pub struct GradleParser;
+
+/// `gradle/*.versions.toml` (version catalog) 用パーサ
+pub struct GradleVersionCatalogParser;
+
+/// `gradle/wrapper/gradle-wrapper.properties` 用パーサ
+pub struct GradleWrapperParser;
+
+/// Gradle のマニフェストの種類。中身ではなくファイル名で決める (検出器と同じ規則)。
+/// build スクリプトの `wrapper { distributionUrl = ... }` を Wrapper の宣言と取り違えると、
+/// そのファイルの依存をすべて見落とす (#92)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GradleFile {
+    /// build.gradle / build.gradle.kts などの Groovy / Kotlin のスクリプト
+    Script,
+    /// `*.versions.toml`
+    VersionCatalog,
+    /// `gradle-wrapper.properties`
+    Wrapper,
+}
+
+impl GradleFile {
+    pub fn of(path: &Path) -> Self {
+        match path.file_name().and_then(|name| name.to_str()) {
+            Some(name) if name.ends_with(".versions.toml") => Self::VersionCatalog,
+            Some("gradle-wrapper.properties") => Self::Wrapper,
+            _ => Self::Script,
+        }
+    }
+
+    /// この種類のファイルを読むパーサ
+    pub fn parser(self) -> Box<dyn ManifestParser> {
+        match self {
+            Self::Script => Box::new(GradleParser),
+            Self::VersionCatalog => Box::new(GradleVersionCatalogParser),
+            Self::Wrapper => Box::new(GradleWrapperParser),
+        }
+    }
+}
+
+/// 書き換え先が見つからなかったときのエラー
+fn not_found(file: &str, package: &str) -> ManifestError {
+    ManifestError::InvalidVersionSpec {
+        path: PathBuf::from(file),
+        spec: package.to_string(),
+        message: "dependency not found or version could not be updated".to_string(),
+    }
+}
+
+impl ManifestParser for GradleVersionCatalogParser {
+    fn parse(&self, content: &str) -> Result<Vec<Dependency>, ManifestError> {
+        // セクションのないカタログは依存 0 件
+        Ok(gradle_version_catalog::parse(content)?.unwrap_or_default())
+    }
+
+    fn language(&self) -> Language {
+        Language::Java
+    }
+
+    fn update_version(
+        &self,
+        content: &str,
+        package: &str,
+        new_version: &str,
+    ) -> Result<String, ManifestError> {
+        gradle_version_catalog::update_version(content, package, new_version)?
+            .ok_or_else(|| not_found("version catalog", package))
+    }
+}
+
+impl ManifestParser for GradleWrapperParser {
+    fn parse(&self, content: &str) -> Result<Vec<Dependency>, ManifestError> {
+        Ok(gradle_wrapper::parse(content)?.unwrap_or_default())
+    }
+
+    fn language(&self) -> Language {
+        Language::Java
+    }
+
+    fn update_version(
+        &self,
+        content: &str,
+        package: &str,
+        new_version: &str,
+    ) -> Result<String, ManifestError> {
+        gradle_wrapper::update_version(content, package, new_version)?
+            .ok_or_else(|| not_found("gradle-wrapper.properties", package))
+    }
+}
 
 /// 変数定義情報
 #[derive(Debug, Clone)]
@@ -878,13 +966,6 @@ impl GradleParser {
 
 impl ManifestParser for GradleParser {
     fn parse(&self, content: &str) -> Result<Vec<Dependency>, ManifestError> {
-        if let Some(dependencies) = gradle_version_catalog::parse(content)? {
-            return Ok(dependencies);
-        }
-        if let Some(dependencies) = gradle_wrapper::parse(content)? {
-            return Ok(dependencies);
-        }
-
         let mut dependencies = Vec::new();
         // 同一座標を複数の configuration へ書く Gradle の正式な作法を 1 依存へ畳むための集合
         let mut seen_declarations: HashSet<DeclarationKey> = HashSet::new();
@@ -969,14 +1050,6 @@ impl ManifestParser for GradleParser {
         package: &str,
         new_version: &str,
     ) -> Result<String, ManifestError> {
-        if let Some(result) = gradle_version_catalog::update_version(content, package, new_version)?
-        {
-            return Ok(result);
-        }
-        if let Some(result) = gradle_wrapper::update_version(content, package, new_version)? {
-            return Ok(result);
-        }
-
         let parser = get_parser(Language::Java);
         let variables = self.extract_variables(content);
         // コメントアウトされた宣言に変数バインドを誘導されないよう、除去済みの行で判定する
@@ -1323,6 +1396,63 @@ mod tests {
 
     fn parse(content: &str) -> Result<Vec<Dependency>, ManifestError> {
         GradleParser.parse(content)
+    }
+
+    fn parse_catalog(content: &str) -> Result<Vec<Dependency>, ManifestError> {
+        GradleVersionCatalogParser.parse(content)
+    }
+
+    /// Issue #92: build スクリプトの `distributionUrl` (wrapper タスクの設定など) を
+    /// Wrapper の宣言と取り違えず、同じファイルの依存を検出する。以前は版を読めない
+    /// `distributionUrl` の行があると依存が 0 件になり、2 行あると解析エラーになっていた。
+    #[test]
+    fn distribution_url_in_a_build_script_does_not_hide_its_dependencies() {
+        for wrapper in [
+            "wrapper {\n    distributionUrl = 'https://services.gradle.org/distributions/gradle-8.5-bin.zip'\n}\n",
+            "tasks.wrapper {\n    distributionUrl = \"https://services.gradle.org/distributions/gradle-8.5-bin.zip\"\n}\n",
+            "wrapper {\n    distributionUrl = distributionUrl.replace(\"bin\", \"all\")\n}\n",
+            "wrapper {\n    distributionUrl = 'a'\n    distributionUrl = 'b'\n}\n",
+        ] {
+            let content = format!(
+                "dependencies {{\n    implementation 'com.google.guava:guava:31.0-jre'\n}}\n\n{wrapper}"
+            );
+            let dependencies = parse(&content).unwrap();
+            let names: Vec<_> = dependencies.iter().map(|dep| dep.name.as_str()).collect();
+            assert_eq!(names, ["com.google.guava:guava"], "{wrapper}");
+            let updated = GradleParser
+                .update_version(&content, "com.google.guava:guava", "33.0.0-jre")
+                .unwrap();
+            assert!(updated.contains("guava:33.0.0-jre"), "{updated}");
+            assert!(updated.contains(wrapper), "{updated}");
+        }
+    }
+
+    #[test]
+    fn gradle_files_are_classified_by_their_name() {
+        for (path, kind) in [
+            ("build.gradle", GradleFile::Script),
+            ("app/build.gradle.kts", GradleFile::Script),
+            ("settings.gradle", GradleFile::Script),
+            ("gradle/libs.versions.toml", GradleFile::VersionCatalog),
+            ("gradle/tools.versions.toml", GradleFile::VersionCatalog),
+            (
+                "gradle/wrapper/gradle-wrapper.properties",
+                GradleFile::Wrapper,
+            ),
+        ] {
+            assert_eq!(GradleFile::of(Path::new(path)), kind, "{path}");
+        }
+        // 書き換え先が見つからなければ、どの種類もエラーにする。
+        assert!(
+            GradleWrapperParser
+                .update_version("distributionBase=GRADLE_USER_HOME\n", "a:b", "1.0")
+                .is_err()
+        );
+        assert!(
+            GradleVersionCatalogParser
+                .update_version("[libraries]\n", "a:b", "1.0")
+                .is_err()
+        );
     }
 
     // 基本的な依存関係パースのテスト
@@ -1771,7 +1901,7 @@ dependencies {
     fn test_update_version_catalog_preserves_crlf() {
         // 回帰: version catalog (.versions.toml) の version.ref 経由更新でも CRLF を保持する。
         let content = "[versions]\r\njunit = \"4.13.2\"\r\n\r\n[libraries]\r\njunit-core = { module = \"junit:junit\", version.ref = \"junit\" }\r\n";
-        let result = GradleParser
+        let result = GradleVersionCatalogParser
             .update_version(content, "junit:junit", "4.13.3")
             .unwrap();
         assert!(result.contains("junit = \"4.13.3\""));
@@ -2096,7 +2226,7 @@ dependencies {
 [libraries]
 junit = "junit:junit:4.13.2"
 "#;
-        let deps = parse(content).unwrap();
+        let deps = parse_catalog(content).unwrap();
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].name, "junit:junit");
         assert_eq!(deps[0].version_spec.version, "4.13.2");
@@ -2113,7 +2243,7 @@ groovy = "3.0.5"
 groovy-core = { module = "org.codehaus.groovy:groovy", version.ref = "groovy" }
 commons-lang3 = { group = "org.apache.commons", name = "commons-lang3", version = "3.12.0" }
 "#;
-        let deps = parse(content).unwrap();
+        let deps = parse_catalog(content).unwrap();
         assert_eq!(deps.len(), 2);
 
         let groovy = deps
@@ -2137,7 +2267,7 @@ commons-lang3 = { group = "org.apache.commons", name = "commons-lang3", version 
 [libraries]
 commons-lang3 = { group = "org.apache.commons", name = "commons-lang3", version = { strictly = "[3.8, 4.0[", prefer = "3.9", reject = ["3.10"] } }
 "#;
-        let deps = parse(content).unwrap();
+        let deps = parse_catalog(content).unwrap();
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].name, "org.apache.commons:commons-lang3");
         assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Range);
@@ -2155,12 +2285,12 @@ spring = { strictly = "5.3.+" }
 [libraries]
 spring-core = { module = "org.springframework:spring-core", version.ref = "spring" }
 "#;
-        let deps = parse(content).unwrap();
+        let deps = parse_catalog(content).unwrap();
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].version_spec.kind, VersionSpecKind::Wildcard);
         assert_eq!(deps[0].version_spec.version, "5.3");
 
-        let result = GradleParser
+        let result = GradleVersionCatalogParser
             .update_version(content, "org.springframework:spring-core", "6.1.2")
             .unwrap();
         assert!(result.contains(r#"strictly = "6.1.+""#));
@@ -2172,7 +2302,7 @@ spring-core = { module = "org.springframework:spring-core", version.ref = "sprin
 [plugins]
 versions = { id = "com.github.ben-manes.versions", version = "0.45.0" }
 "#;
-        let deps = parse(content).unwrap();
+        let deps = parse_catalog(content).unwrap();
         assert_eq!(deps.len(), 1);
         assert_eq!(
             deps[0].name,
@@ -2186,7 +2316,7 @@ versions = { id = "com.github.ben-manes.versions", version = "0.45.0" }
 [libraries]
 junit = { module = "junit:junit", version = "4.13.2"
 "#;
-        let err = parse(content).unwrap_err();
+        let err = parse_catalog(content).unwrap_err();
         assert!(matches!(err, ManifestError::TomlParseError { .. }));
     }
 
@@ -2196,7 +2326,7 @@ junit = { module = "junit:junit", version = "4.13.2"
 [libraries]
 junit = "junit:junit:4.13.2"
 "#;
-        let result = GradleParser
+        let result = GradleVersionCatalogParser
             .update_version(content, "junit:junit", "4.13.3")
             .unwrap();
         assert!(result.contains(r#"junit = "junit:junit:4.13.3""#));
@@ -2209,7 +2339,7 @@ junit = "junit:junit:4.13.2"
 [libraries]
 commons-lang3 = { group = "org.apache.commons", name = "commons-lang3", version = "3.12.0" }
 "#;
-        let result = GradleParser
+        let result = GradleVersionCatalogParser
             .update_version(content, "org.apache.commons:commons-lang3", "3.14.0")
             .unwrap();
         assert!(result.contains(r#"version = "3.14.0""#));
@@ -2224,7 +2354,7 @@ groovy = "3.0.5"
 [libraries]
 groovy-core = { module = "org.codehaus.groovy:groovy", version.ref = "groovy" }
 "#;
-        let result = GradleParser
+        let result = GradleVersionCatalogParser
             .update_version(content, "org.codehaus.groovy:groovy", "3.0.6")
             .unwrap();
         assert!(result.contains(r#"groovy = "3.0.6""#));
@@ -2240,7 +2370,7 @@ commons = { strictly = "[3.8, 4.0[", prefer = "3.9" }
 [libraries]
 commons-lang3 = { group = "org.apache.commons", name = "commons-lang3", version.ref = "commons" }
 "#;
-        let result = GradleParser
+        let result = GradleVersionCatalogParser
             .update_version(content, "org.apache.commons:commons-lang3", "3.13.0")
             .unwrap();
         assert!(result.contains(r#"strictly = "[3.8, 4.0[""#));
@@ -2257,7 +2387,7 @@ commons-lang3 = {
     version = "3.12.0"
 }
 "#;
-        let result = GradleParser
+        let result = GradleVersionCatalogParser
             .update_version(content, "org.apache.commons:commons-lang3", "3.14.0")
             .unwrap();
         assert!(result.contains(r#"    version = "3.14.0""#));
@@ -2271,7 +2401,7 @@ group = "org.apache.commons"
 name = "commons-lang3"
 version = "3.12.0"
 "#;
-        let result = GradleParser
+        let result = GradleVersionCatalogParser
             .update_version(content, "org.apache.commons:commons-lang3", "3.14.0")
             .unwrap();
         assert!(result.contains(r#"version = "3.14.0""#));
@@ -2287,7 +2417,7 @@ prefer = "3.9"
 [libraries]
 commons-lang3 = { group = "org.apache.commons", name = "commons-lang3", version.ref = "commons" }
 "#;
-        let result = GradleParser
+        let result = GradleVersionCatalogParser
             .update_version(content, "org.apache.commons:commons-lang3", "3.13.0")
             .unwrap();
         assert!(result.contains(r#"strictly = "[3.8, 4.0[""#));
