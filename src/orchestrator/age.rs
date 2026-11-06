@@ -84,8 +84,11 @@ pub(super) fn resolve(
 }
 
 impl ResolvedAge {
-    pub(super) fn emit_notice(&self) {
+    /// 利用者に知らせる age の設定の通知 (色付きの 1 行ずつ)。出すのは呼び出し側で、
+    /// 同じ通知を実行全体で 1 回だけ、進捗バーを避けて出す (#108)。
+    pub(super) fn notices(&self) -> Vec<String> {
         use colored::Colorize as _;
+        let mut notices = Vec::new();
         if let Some(project) = &self.project {
             let seconds = project.duration.as_secs();
             let duration = if seconds.is_multiple_of(86400) {
@@ -95,19 +98,19 @@ impl ResolvedAge {
                 format!("{seconds}s")
             };
             let source = project.source.display();
-            if let Some(cli) = self.cli_label {
-                eprintln!("{}", format!("⚠ {cli} ignored: project's minimumReleaseAge ({duration} from {source}) takes precedence").yellow());
-            } else {
-                eprintln!(
-                    "{}",
-                    format!("ℹ Using project's minimumReleaseAge ({duration} from {source})")
-                        .cyan()
-                );
-            }
+            notices.push(match self.cli_label {
+                Some(cli) => format!("⚠ {cli} ignored: project's minimumReleaseAge ({duration} from {source}) takes precedence").yellow().to_string(),
+                None => format!("ℹ Using project's minimumReleaseAge ({duration} from {source})")
+                    .cyan()
+                    .to_string(),
+            });
         }
         if self.suppressed_exemptions {
-            eprintln!("Warning: project minimumReleaseAge takes precedence over age_exempt");
+            notices.push(
+                "Warning: project minimumReleaseAge takes precedence over age_exempt".to_string(),
+            );
         }
+        notices
     }
 }
 
