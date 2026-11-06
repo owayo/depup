@@ -58,6 +58,8 @@ tauri: 2.9.0 → 2.10.1
 
 `package.json` で更新するのは `dependencies`、`devDependencies`、`peerDependencies`、`optionalDependencies` です。`overrides` などのセクションは変更しません。
 
+プロジェクトの設定で公開の npm レジストリ以外から取ることにしている依存は、対象外にします（`non-public source`）。scope のレジストリ（`.npmrc` / `.yarnrc` の `@scope:registry`、`.yarnrc.yml` の `npmScopes`、`bunfig.toml` の `install.scopes`、`pnpm-workspace.yaml` の `registries`）はその scope のパッケージを、既定のレジストリの差し替え（`registry`、`npmRegistryServer`、`install.registry`）は公開のレジストリを明示した scope 以外のすべてのパッケージを外します。depup は registry.npmjs.org しか問い合わせないため、更新すると同名の公開パッケージの版を書き込むおそれがあります（dependency confusion）。ミラーは私設のレジストリと区別できないので、同じく外します。これらのファイルは、マニフェストのディレクトリからリポジトリのルート（リポジトリの外なら実行のルート）までを読み、ホームディレクトリの設定や環境変数は読みません。読めない設定や、URL に環境変数を使うなど解釈できない設定があれば、影響しうる依存を外します（`source could not be verified`）。npm alias は参照先のパッケージの scope で判定します。
+
 npm レジストリのメタデータで、空でない `deprecated` メッセージが付いた版は更新候補から外します。プレリリースや `latest` タグが指す版も対象です。空のメッセージは非推奨指定の解除として扱います。文字列以外の値は npm と同じ JavaScript の真偽値で判定し、`null`・`false`・数値のゼロは非推奨とみなしません。候補が残らない場合は、その依存をスキップして現在のバージョンを維持します。 レジストリのフィルタですべての版が除外された場合、既存のスキップ理由 `fetch failed: no versions available` を表示します。このスキップは終了コードに影響しません。
 
 チルダの従来形式 `~>1.2.3`（node-semver 互換）も受け付け、更新後も `~>` を保持します。
@@ -147,6 +149,8 @@ Bundler の `git_source(:name) { ... }` で登録したカスタムの git sourc
 ### PHP
 
 `composer.json` で更新するのは `require` と `require-dev` です。`replace` / `provide` / `conflict` などのセクションは変更しません。明示的な等価演算子（`=1.2.3` / `==1.2.3`）は、演算子を保ったまま更新します。「等しくない」を `<>` で書いた除外制約（`<>1.2.3` など）は、解析しますが書き換えず、スキップします（[自動更新しない制約](usage.ja.md#自動更新しない制約)）。
+
+Packagist 以外のリポジトリが供給しうる依存は、対象外にします（`non-public source`）。`repositories` で Packagist を無効にした場合（`"packagist.org": false`）はすべての依存を、`package` と `path` のリポジトリはそこで定義するパッケージ（`provide` と `replace` を含む）を、それ以外のリポジトリ（私設の `composer` リポジトリ、`vcs`、`artifact` など）は `only` に一致するもの、`exclude` に一致しないもの、どちらもなければすべての依存を外します。depup は Packagist しか問い合わせないため、更新すると同名の公開パッケージの版を書き込むおそれがあります。`canonical: false` でも同じです。解釈できないリポジトリの設定があれば、すべての依存を外します（`source could not be verified`）。Composer のグローバルの設定は読みません。
 
 Composer のプラットフォームパッケージ（`php`、`hhvm`、`ext-*`、`lib-*`、Composer API パッケージなど）は対象外です。`1.0.0 as 1.1.0` のようなインラインエイリアスも対象外です。レジストリの最新版で上書きすると、エイリアスの宣言が壊れてしまうためです。
 

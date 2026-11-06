@@ -52,6 +52,12 @@ pub enum SkipReason {
     NotInOnlyList,
     /// 実効的な pnpm override がこの宣言を制御している。override 自体は変更しない。
     PnpmOverride(String),
+    /// プロジェクトの設定が、公開レジストリ以外 (私設レジストリ・ミラー・Packagist 以外の
+    /// リポジトリ) を取得元にしている。公開レジストリの版で判定・更新しない (#91)。
+    /// 内側の値はどの設定か (`.npmrc: @example:registry` など)
+    NonPublicSource(String),
+    /// 取得元の設定を読めない・解釈できないため、公開レジストリとみなせない
+    SourceUnverified(String),
     /// レジストリからのバージョン情報取得に失敗
     FetchFailed(String),
     /// 適切なバージョンが見つからない (例: 経過日数フィルタで全バージョンが除外)
@@ -81,6 +87,10 @@ impl fmt::Display for SkipReason {
             SkipReason::Excluded => write!(f, "excluded by --exclude"),
             SkipReason::NotInOnlyList => write!(f, "not in --only list"),
             SkipReason::PnpmOverride(message) => write!(f, "{message}"),
+            SkipReason::NonPublicSource(origin) => write!(f, "non-public source ({origin})"),
+            SkipReason::SourceUnverified(reason) => {
+                write!(f, "source could not be verified ({reason})")
+            }
             SkipReason::FetchFailed(msg) => write!(f, "fetch failed: {}", msg),
             SkipReason::NoSuitableVersion => write!(f, "no suitable version"),
             SkipReason::KnownVulnerabilities(_) => {
