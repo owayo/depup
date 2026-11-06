@@ -2852,6 +2852,25 @@ mod tests {
         );
     }
 
+    /// Issue #126: age の通知に出す設定ファイルのパスは、正規化した Windows の `\\?\` を付けない。
+    #[test]
+    fn age_notices_show_paths_without_the_verbatim_prefix() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages: []\nminimumReleaseAge: 14400\n",
+        )
+        .unwrap();
+        let orchestrator =
+            Orchestrator::new(make_args_with_path(dir.path(), &["--age", "2w"])).unwrap();
+        let (_, notices) = orchestrator.build_filter_for(dir.path());
+        let notice = notices
+            .iter()
+            .find(|notice| notice.contains("pnpm-workspace.yaml"))
+            .unwrap();
+        assert!(!notice.contains(r"\\?\"), "{notice}");
+    }
+
     #[test]
     fn explicit_project_age_overrides_global_publisher_exemptions() {
         use crate::domain::{VersionSpec, VersionSpecKind};
