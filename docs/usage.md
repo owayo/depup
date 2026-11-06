@@ -491,7 +491,7 @@ With `--verbose`, depup prints a note naming the package managers used in the ru
 
 #### Auditing Node Lockfiles
 
-With an active age policy, `--install` checks the actual resolved versions of direct and transitive dependencies, including dev dependencies. It also checks unchanged locks on subsequent runs and in independent projects after another install fails. If no lock exists and no install is needed, no lock audit runs.
+With an active age policy, `--install` checks the actual resolved versions of direct and transitive dependencies, including dev dependencies. It also checks unchanged locks on subsequent runs and after another install fails, including an install of another language in the same directory (such as a Gemfile next to `Cargo.toml`). Only the locks of a failed unit, which depup restores, are skipped. If no lock exists and no install is needed, no lock audit runs.
 
 - pnpm: reads the lock graph using `pnpm list --depth Infinity --lockfile-only --json`. Shared workspaces include all projects and the root, with the strictest member policy. Missing required dependencies or CLI warnings make the graph unverified.
 - npm: reads the `packages` table of `npm-shrinkwrap.json` (preferred) or `package-lock.json`, format 2 or 3, and verifies required dependencies across packages and workspaces.

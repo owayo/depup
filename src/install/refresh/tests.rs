@@ -637,6 +637,71 @@ async fn tauri_linked_units_restore_together_and_an_independent_unit_completes()
     );
 }
 
+/// Issue #89: 同じディレクトリの Cargo の再解決が失敗しても、pnpm の再解決はその lock を
+/// 受け持つ単位で判断し、検証してから入れる。以前はディレクトリが重なるだけで検証を飛ばし、
+/// 検証していない lock を入れたうえで失敗と報告していた。
+#[tokio::test]
+async fn a_cargo_failure_in_the_same_directory_still_verifies_the_pnpm_refresh() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut result, plan) = fixture(
+        temp.path(),
+        &[
+            (temp.path().into(), Language::Node),
+            (temp.path().into(), Language::Rust),
+        ],
+    );
+    let args = args(temp.path());
+    let orchestrator = Orchestrator::new(args.clone()).unwrap();
+    let verifier = FakeVerification::default();
+    let mut commands = Vec::new();
+    let outcome = run_with(
+        &args,
+        &orchestrator,
+        &plan,
+        &mut result,
+        &verifier,
+        |command| {
+            commands.push(command.argv.clone());
+            if command.language == Language::Rust {
+                InstallResult::failure(
+                    command.language,
+                    "cargo update".into(),
+                    String::new(),
+                    "resolver failed".into(),
+                )
+            } else {
+                resolved(command)
+            }
+        },
+    )
+    .await;
+    assert!(outcome.install_failed);
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("Cargo.lock")).unwrap(),
+        lock("1.0.0")
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("pnpm-lock.yaml")).unwrap(),
+        lock("1.2.0")
+    );
+    assert_eq!(verifier.seen.lock().unwrap().as_slice(), ["example@1.2.0"]);
+    assert!(
+        commands
+            .iter()
+            .any(|argv| argv.contains(&"--frozen-lockfile".into()))
+    );
+    let status = |language| {
+        result
+            .summary
+            .lock_refreshes
+            .iter()
+            .find(|refresh| refresh.language == Some(language))
+            .map(|refresh| refresh.status.clone())
+    };
+    assert_eq!(status(Language::Node).as_deref(), Some("completed"));
+    assert_eq!(status(Language::Rust).as_deref(), Some("failed"));
+}
+
 #[tokio::test]
 async fn external_lock_change_during_osv_is_kept_and_reported() {
     let temp = tempfile::tempdir().unwrap();

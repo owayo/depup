@@ -51,6 +51,7 @@ fn normal_recovery_report_keeps_the_cause_once_and_does_not_claim_unrestored_fil
                         },
                     ),
                 ]),
+                held: BTreeSet::from([path.clone(), lock.clone()]),
                 policy_failure: true,
                 skipped: !recovered,
             }],
@@ -1431,7 +1432,8 @@ fn failed_node_install_restores_unchanged_partial_deleted_and_new_locks() {
         assert_eq!(result.summary.total_updates(), 0);
         assert_eq!(result.summary.total_failed(), 1);
         assert!(!result.summary.manifests[0].modified);
-        assert!(report.covers_directory(directory));
+        assert!(report.holds(&directory.join("package.json")));
+        assert!(report.holds(&directory.join("package-lock.json")));
     }
 }
 
@@ -2378,6 +2380,97 @@ fn failed_cargo_unit_is_excluded_from_existing_and_missing_lock_audits() {
     assert!(audit.missing_lock_dirs.is_empty());
 }
 
+/// Issue #89: 監査から外すのは、その lock を受け持つ単位が失敗したときだけ。同じディレクトリの
+/// 独立した install (Bundler) が失敗しても、Cargo と Node の lock は監査の対象に残す。
+#[test]
+fn an_independent_failure_in_the_same_directory_keeps_other_locks_audited() {
+    let temp = tempfile::tempdir().unwrap();
+    let directory = temp.path();
+    let mut result = result();
+    cargo(&mut result, &directory.join("Cargo.toml"), "app");
+    fs::write(
+        directory.join("Cargo.lock"),
+        "version = 4\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    node(&mut result, directory);
+    let gemfile = directory.join("Gemfile");
+    update(
+        &mut result,
+        &gemfile,
+        Language::Ruby,
+        "source \"https://rubygems.org\"\ngem \"example\", \"1.0.0\"\n",
+        "example",
+    );
+    let plan = plan(vec![
+        job(directory, Language::Rust, &[directory.join("Cargo.toml")]),
+        job(directory, Language::Node, &[directory.join("package.json")]),
+        job(directory, Language::Ruby, std::slice::from_ref(&gemfile)),
+    ]);
+    let mut tx = InstallTransactions::begin(&plan, &result, directory);
+    tx.execute(|command| {
+        if command.language == Language::Ruby {
+            failure(command)
+        } else {
+            success(command)
+        }
+    });
+    let mut args = crate::cli::CliArgs::parse_from(["depup", "--age", "2w"]);
+    args.path = directory.into();
+    let orchestrator = crate::orchestrator::Orchestrator::new(args).unwrap();
+    // install の直後の判定 (監査の前) と、復元の後の判定の両方で同じ結論になる。
+    for report in [tx.pending_report(), tx.rollback()] {
+        assert!(report.holds(&gemfile));
+        assert!(report.holds(&directory.join("Gemfile.lock")));
+        for independent in [
+            "Cargo.lock",
+            "Cargo.toml",
+            "package.json",
+            "package-lock.json",
+        ] {
+            assert!(!report.holds(&directory.join(independent)), "{independent}");
+        }
+        let mut audit = plan.rust_audit_plan(&orchestrator, &result);
+        assert_eq!(audit.locks.len(), 1);
+        report.exclude_rust_audits(&mut audit);
+        assert_eq!(audit.locks.len(), 1);
+        assert!(audit.missing_lock_dirs.is_empty());
+    }
+    assert!(fs::read_to_string(&gemfile).unwrap().contains("\"1.0.0\""));
+    assert!(
+        fs::read_to_string(directory.join("Cargo.toml"))
+            .unwrap()
+            .contains("2.0.0")
+    );
+}
+
+/// 保存できなかったファイルも、受け持つ単位が失敗すれば、その単位のものとして監査から外す。
+#[test]
+fn a_lock_that_could_not_be_saved_still_belongs_to_its_failed_unit() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut result = result();
+    cargo(&mut result, &temp.path().join("Cargo.toml"), "app");
+    // ディレクトリはファイルとして読めないので、Cargo.lock の保存に失敗する。
+    fs::create_dir(temp.path().join("Cargo.lock")).unwrap();
+    let plan = plan(vec![job(
+        temp.path(),
+        Language::Rust,
+        &[temp.path().join("Cargo.toml")],
+    )]);
+    let mut tx = InstallTransactions::begin(&plan, &result, temp.path());
+    tx.execute(|_| panic!("a unit that could not save its files ran"));
+    let report = tx.rollback();
+    assert!(report.holds(&temp.path().join("Cargo.lock")));
+    assert!(report.holds(&temp.path().join("Cargo.toml")));
+    let mut args = crate::cli::CliArgs::parse_from(["depup", "--age", "2w"]);
+    args.path = temp.path().into();
+    let orchestrator = crate::orchestrator::Orchestrator::new(args).unwrap();
+    let mut audit = plan.rust_audit_plan(&orchestrator, &result);
+    report.exclude_rust_audits(&mut audit);
+    assert!(audit.locks.is_empty());
+    assert!(audit.missing_lock_dirs.is_empty());
+}
+
 #[test]
 fn mise_monorepo_migration_restores_child_locks_and_shared_destination() {
     let temp = tempfile::tempdir().unwrap();
@@ -2527,8 +2620,10 @@ fn parent_symlink_replacement_after_pm_preserves_both_locations() {
             .contains("2.0.0")
     );
     assert_eq!(aliased.summary.total_failed(), 1);
-    assert!(report.covers_directory(&alias));
-    assert!(report.covers_directory(&foreign));
+    // 別名が差し替わった後も、別名から辿れるファイルは失敗した単位のものとして扱う。
+    assert!(report.holds(&alias.join("package.json")));
+    assert!(report.holds(&foreign.join("package.json")));
+    assert!(report.holds(&original.join("package.json")));
     for outcome in report.units[0].files.values() {
         if let FileOutcome::Conflict {
             backup: Ok(path), ..

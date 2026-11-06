@@ -24,6 +24,8 @@ struct Task {
     command: Result<Option<PreparedInstall>, String>,
     label: PathBuf,
     files: BTreeSet<PathBuf>,
+    /// 保存できたかにかかわらず、このタスクが受け持つファイル (指定されたパスの絶対パス)
+    claimed: BTreeSet<PathBuf>,
     scope_paths: BTreeSet<PathBuf>,
     managed: BTreeSet<PathBuf>,
     summaries: BTreeSet<usize>,
@@ -36,6 +38,7 @@ struct Task {
 }
 struct Unit {
     files: BTreeSet<PathBuf>,
+    claimed: BTreeSet<PathBuf>,
     summaries: BTreeSet<usize>,
     directories: BTreeSet<PathBuf>,
     failure: Option<String>,
@@ -103,6 +106,9 @@ struct FailedUnit {
     summaries: BTreeSet<usize>,
     reason: String,
     files: BTreeMap<PathBuf, FileOutcome>,
+    /// 単位が受け持つファイル。保存した実体と、保存できなかったものも含めて指定されたパス、
+    /// そのパスの報告の時点の解決先を持つ ([`RollbackReport::holds`])
+    held: BTreeSet<PathBuf>,
     policy_failure: bool,
     /// 外部の変更を検出したため、どのファイルも戻さなかった。
     skipped: bool,
@@ -445,6 +451,9 @@ impl InstallTransactions {
         managed: bool,
         boundary: Option<&Path>,
     ) -> bool {
+        // 保存に失敗しても、このファイルを受け持つ単位は変わらない (監査の除外に使う)。
+        task.claimed
+            .insert(std::path::absolute(path).unwrap_or_else(|_| path.into()));
         match FileGuard::capture(path).and_then(|guard| {
             if let Some(boundary) = boundary {
                 if !guard.target.starts_with(boundary) {
@@ -496,6 +505,8 @@ impl InstallTransactions {
     }
 
     fn add_scoped_path(&mut self, task: &mut Task, path: &Path) -> bool {
+        task.claimed
+            .insert(std::path::absolute(path).unwrap_or_else(|_| path.into()));
         let boundary = self.recovery_boundary.clone();
         let logical = path
             .parent()
@@ -556,6 +567,7 @@ impl InstallTransactions {
             let unit = *indices.entry(representative).or_insert_with(|| {
                 self.units.push(Unit {
                     files: BTreeSet::new(),
+                    claimed: BTreeSet::new(),
                     summaries: BTreeSet::new(),
                     directories: BTreeSet::new(),
                     failure: None,
@@ -567,6 +579,7 @@ impl InstallTransactions {
             let task = &self.tasks[index];
             let unit = &mut self.units[unit];
             unit.files.extend(task.files.iter().cloned());
+            unit.claimed.extend(task.claimed.iter().cloned());
             unit.summaries.extend(&task.summaries);
             unit.directories.insert(identity(&task.label));
             unit.directories
@@ -767,6 +780,7 @@ impl InstallTransactions {
                         summaries: unit.summaries.clone(),
                         reason: reason.clone(),
                         files: BTreeMap::new(),
+                        held: Self::held_paths(unit),
                         policy_failure: unit.policy_failure,
                         skipped: false,
                     })
@@ -795,6 +809,17 @@ impl InstallTransactions {
             }
         }
         out
+    }
+
+    /// 単位が受け持つファイルを、保存した実体・指定されたパス・そのパスのいまの解決先で表す。
+    /// 解決し直すのは、install の間にディレクトリが差し替わっても同じファイルと分かるようにするため
+    fn held_paths(unit: &Unit) -> BTreeSet<PathBuf> {
+        let mut held = unit.files.clone();
+        for path in &unit.claimed {
+            held.insert(path.clone());
+            held.insert(identity(path));
+        }
+        held
     }
 
     /// ファイルが準備済みの install 単位に含まれるか。監査だけの lock は含まれない。
@@ -1091,6 +1116,7 @@ impl InstallTransactions {
                 directories: unit.directories.clone(),
                 summaries: unit.summaries.clone(),
                 files,
+                held: Self::held_paths(unit),
                 policy_failure: unit.policy_failure,
                 skipped,
             });
@@ -1106,6 +1132,7 @@ impl Task {
             label: label.into(),
             command,
             files: BTreeSet::new(),
+            claimed: BTreeSet::new(),
             scope_paths: BTreeSet::new(),
             managed: BTreeSet::new(),
             summaries: BTreeSet::new(),
@@ -1301,23 +1328,24 @@ impl RollbackReport {
     pub fn has_failures(&self) -> bool {
         !self.units.is_empty()
     }
-    pub fn covers_directory(&self, directory: &Path) -> bool {
-        let absolute = std::path::absolute(directory).unwrap_or_else(|_| directory.into());
-        let directory = identity(directory);
+    /// `path` (lockfile やマニフェスト) を受け持つ単位が失敗したか (#89)。
+    ///
+    /// 失敗した単位は受け持つファイルを元に戻すので、その lock は監査も照合もしない。
+    /// 同じディレクトリにある独立した install (Cargo の隣の Bundler・Go・uv など) の失敗では
+    /// 真にならず、install 後のまま残る別の単位の lock は通常どおり監査する。
+    /// `InstallTransactions::fail_holder` と同じく、ディレクトリではなくファイルで判定する。
+    pub fn holds(&self, path: &Path) -> bool {
+        let absolute = std::path::absolute(path).unwrap_or_else(|_| path.into());
+        let key = identity(path);
         self.units.iter().any(|unit| {
-            unit.directories.contains(&directory)
-                || unit.directories.contains(&absolute)
-                || unit
-                    .directories
-                    .iter()
-                    .any(|alias| identity(alias) == directory)
+            unit.held.contains(path) || unit.held.contains(&absolute) || unit.held.contains(&key)
         })
     }
     pub fn exclude_rust_audits(&self, plan: &mut RustAuditPlan) {
         plan.locks
-            .retain(|lock| !self.covers_directory(&lock.directory));
+            .retain(|lock| !self.holds(&lock.directory.join("Cargo.lock")));
         plan.missing_lock_dirs
-            .retain(|directory| !self.covers_directory(directory));
+            .retain(|directory| !self.holds(&directory.join("Cargo.lock")));
     }
     pub fn mark_summary(&self, summary: &mut UpdateSummary) {
         for unit in &self.units {
