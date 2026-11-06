@@ -91,7 +91,7 @@ src/
     report.rs        - 監査結果の表示と lock の突き合わせ (表示した更新先と Cargo.lock に入った版の食い違いの注記)
     scratch.rs       - workspace の一時写しと cargo の起動設定
     series.rs        - semver 互換系列の判定
-  test_support/    - テスト専用: local-registry 形式の偽 crates.io と公開日を固定する偽 adapter、決めた応答を順に返す HTTP サーバ (`http::serve_responses`。Maven と GitHub のアダプタのテストが使う)、偽のコマンドを書く関数 (`exec::write_script`)
+  test_support/    - テスト専用: local-registry 形式の偽 crates.io と公開日を固定する偽 adapter、決めた応答を順に返す HTTP サーバ (`http::serve_responses`) と要求のパスごとに決めた応答を返す HTTP サーバ (`http::serve_routes`。並列の要求を受けるテスト用。どちらも crates.io・GitHub Tags・Go proxy・Maven のアダプタのテストが使う)、偽のコマンドを書く関数 (`exec::write_script`)
 tests/
   integration_tests.rs - 統合テスト (マニフェスト検出・パース・パイプライン)
   e2e_tests.rs         - E2Eテスト (バイナリ実行)
@@ -236,7 +236,7 @@ make ci                # CI と同じ検査 (fmt-check + lint + test、書き換
 - Go Proxy は上流モジュールの生の最新安定版（安定版がなければ最新プレリリース）の `go.mod` を読み、単一版・包含範囲の `retract` を更新候補から除外する。`@v/list` が空なら `@latest` へフォールバックする。`.info` の `Time` は仕様上省略可能なため、欠落または不正値では `UNIX_EPOCH` を使い、age フィルタで公開日不明の版を永久除外しない
 - go.mod の `) // comment` のようなコメント付きブロック終端も、`require` / `replace` / `exclude` ブロックの終端として扱う
 - go.mod の quoted module path / version（例: `require "golang.org/x/text" "v0.14.0"`）も解析・更新し、引用符を維持する
-- Maven Central は `numFound` を読んで `start` でページングし、最大 10 ページ (2000 版) まで取得する。`core=gav` は timestamp 降順で返すため 1 ページ (旧実装は `rows=100`) で打ち切ると「最新 100 版」しか得られず、古い系列に固定した依存 (`[1.11,1.12)` / `1.11.+` / `--max-change patch`) の後継版が候補に 1 件も入らず AlreadyLatest と誤判定して無言で取りこぼしていた (`org.slf4j:slf4j-api` は numFound 106、`com.amazonaws:aws-java-sdk-s3` は 1955)
+- Gradle の依存の版一覧は、リポジトリごとのアーティファクト単位の `maven-metadata.xml` から取る (`registry/maven_central.rs`)。最も近い `settings.gradle` / `settings.gradle.kts` の組み込みリポジトリ宣言 (ライブラリは `dependencyResolutionManagement`、プラグインは `pluginManagement`) の順に、宣言がなければ Maven Central・Google Maven・Gradle Plugin Portal の順に試し、全リポジトリの一覧を統合して同じ版を除く。公開日は、各版を最初に掲載したリポジトリの POM の `Last-Modified` を、judge が選ぶ候補にだけ問い合わせる (`Orchestrator::resolve_java_release_dates`)。404 の取得先は飛ばし、その他の HTTP エラー・不正な XML・座標の不一致は、一部だけの一覧を使わずに取得の失敗にする。以前の Maven Central の検索 API (`core=gav` の `numFound` / `start` によるページング) は使っていない
 - Maven Central のクエリはグループID/アーティファクトIDの文字種を検証し、不正な文字によるURLインジェクションを防止する。GitHub Tags (Swift) も owner/repo の文字種を `[A-Za-z0-9._-]` に限定して検証し、`?` / `#` / `..` 等を含む URL によるクエリ汚染・パストラバーサルを防止する (`extract_github_owner_repo` と `validate_package_name` の二層で検証)
 - npm/Composer/Cargo は semver の prerelease (`-...`) と build metadata (`+...`) を同時に含むバージョン（例: `^1.2.3-rc.1+build123`）も正しくパースする。ビルドメタデータはバージョン比較時には無視される (semver 仕様)
 - Rust (Cargo) の git 依存 (`{ git = "...", branch/tag/rev = "..." }` / 省略形) を検出し、`git ls-remote` でリモート HEAD / タグを取得して更新判定する。branch / 省略形 (デフォルトブランチ) は最新コミットへ更新 (Cargo.toml は書き換えず、Cargo.lock を `--install` の `cargo update` で再解決)、tag は最新 semver タグへ更新 (Cargo.toml の tag 文字列を書き換え)、rev は常にスキップ (pinned 扱い)
