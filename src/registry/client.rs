@@ -7,7 +7,13 @@
 
 use crate::error::RegistryError;
 use reqwest::{Client, StatusCode};
+use std::future::{Ready, ready};
 use std::time::Duration;
+
+/// 送信の前に何も待たない (`get_response_paced` の `before_send` の既定)
+fn no_pacing() -> Ready<()> {
+    ready(())
+}
 
 /// HTTP リクエストのデフォルトタイムアウト (30秒)
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -203,8 +209,24 @@ impl HttpClient {
         package: &str,
         registry: &str,
     ) -> Result<reqwest::Response, RegistryError> {
+        self.get_with_context_paced(url, package, registry, no_pacing)
+            .await
+    }
+
+    /// `get_with_context` と同じだが、再試行を含む各送信の前に `before_send` を待つ
+    async fn get_with_context_paced<F, Fut>(
+        &self,
+        url: &str,
+        package: &str,
+        registry: &str,
+        before_send: F,
+    ) -> Result<reqwest::Response, RegistryError>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = ()>,
+    {
         let response = self
-            .get_response_with_retry(|| self.client.get(url), package, registry)
+            .get_response_paced(|| self.client.get(url), before_send, package, registry)
             .await?;
 
         // 恒久的なエラーステータス (404 等) と、リトライを使い切った 429/5xx を
@@ -238,7 +260,27 @@ impl HttpClient {
         package: &str,
         registry: &str,
     ) -> Result<reqwest::Response, RegistryError> {
-        let attempts = self.get_response_with_retry_inner(build_request, package, registry);
+        self.get_response_paced(build_request, no_pacing, package, registry)
+            .await
+    }
+
+    /// `get_response_with_retry` と同じだが、再試行を含む各送信の前に `before_send` を待つ。
+    /// 送信の間隔を決めているレジストリ (crates.io の API は 1 リクエスト/秒) は、ここで
+    /// 間隔を待つ。問い合わせの前に 1 回だけ待つと、再試行がバックオフ (100 ms〜) だけで
+    /// 送られ、間隔を守れない (#100)。待つ時間も `TOTAL_DEADLINE` に含める。
+    async fn get_response_paced<F, Fut>(
+        &self,
+        build_request: impl Fn() -> reqwest::RequestBuilder,
+        before_send: F,
+        package: &str,
+        registry: &str,
+    ) -> Result<reqwest::Response, RegistryError>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let attempts =
+            self.get_response_with_retry_inner(build_request, before_send, package, registry);
         match tokio::time::timeout(TOTAL_DEADLINE, attempts).await {
             Ok(result) => result,
             Err(_) => Err(RegistryError::Timeout {
@@ -248,17 +290,23 @@ impl HttpClient {
         }
     }
 
-    /// `get_response_with_retry` のリトライ本体 (総デッドラインの適用前)
-    async fn get_response_with_retry_inner(
+    /// `get_response_paced` のリトライ本体 (総デッドラインの適用前)
+    async fn get_response_with_retry_inner<F, Fut>(
         &self,
         build_request: impl Fn() -> reqwest::RequestBuilder,
+        before_send: F,
         package: &str,
         registry: &str,
-    ) -> Result<reqwest::Response, RegistryError> {
+    ) -> Result<reqwest::Response, RegistryError>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = ()>,
+    {
         let mut last_error = None;
         let mut delay = BASE_DELAY_MS;
 
         for attempt in 0..=self.max_retries {
+            before_send().await;
             match build_request().send().await {
                 Ok(response) => {
                     let status = response.status();
@@ -309,7 +357,26 @@ impl HttpClient {
         package: &str,
         registry: &str,
     ) -> Result<T, RegistryError> {
-        let response = self.get_with_context(url, package, registry).await?;
+        self.get_json_paced(url, package, registry, no_pacing).await
+    }
+
+    /// `get_json` と同じだが、再試行を含む各送信の前に `before_send` を待つ
+    /// (`get_response_paced` を参照)
+    pub async fn get_json_paced<T, F, Fut>(
+        &self,
+        url: &str,
+        package: &str,
+        registry: &str,
+        before_send: F,
+    ) -> Result<T, RegistryError>
+    where
+        T: serde::de::DeserializeOwned,
+        F: Fn() -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let response = self
+            .get_with_context_paced(url, package, registry, before_send)
+            .await?;
 
         response
             .json::<T>()
