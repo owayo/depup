@@ -159,11 +159,14 @@ impl VersionFetcher {
         Ok(date)
     }
 
-    /// install がキャッシュにない版を選んだ場合に、共有レート制限付きで一覧を更新する。
+    /// install がキャッシュにない版 (`required`) を選んだ場合に、一覧を取り直して
+    /// キャッシュを更新する。`required` の版が速い取得元にまだ無ければ、アダプタは
+    /// 別の取得元を使う (crates.io は sparse index の代わりに API)。
     pub(crate) async fn refresh(
         &self,
         adapter: &(dyn RegistryAdapter + Send + Sync),
         package: &str,
+        required: &[String],
     ) -> Result<Vec<VersionInfo>, String> {
         let _permit = self
             .crates_io_semaphore
@@ -171,7 +174,7 @@ impl VersionFetcher {
             .await
             .map_err(|error| error.to_string())?;
         let versions = adapter
-            .fetch_versions(package)
+            .fetch_versions_including(package, required)
             .await
             .map_err(|error| error.to_string())?;
         self.cache

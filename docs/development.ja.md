@@ -49,6 +49,19 @@ mise exec -- cargo run --release --locked --example manifest_update_bench -- 100
 
 ウォームアップ・時間計測・確保量の集計は JSON のケースと共通です。単純指定は依存 1・100・1,000 件、inline table・dotted key・複数行テーブルは各 100 件を測ります。3 つのテーブル形式では git tag の更新も測ります。入力は単一引用符・CRLF・最終行の改行なしとし、出力全体の一致と TOML の妥当性を確認します。測定記録と対象範囲は [benchmarks/cargo-manifest](../benchmarks/cargo-manifest/README.ja.md) にあります。
 
+## crates.io の取得の性能計測
+
+crates.io から版の一覧を取る時間を含め、CLI 全体の所要時間を測れます。結果はネットワークとレジストリの状態に左右されるため、変更前と変更後の release ビルドを交互に実行して比べます。
+
+```bash
+bash benchmarks/crates-io-fetch/measure.sh before ./depup-before 3 > before-a.csv
+bash benchmarks/crates-io-fetch/measure.sh after ./depup-after 3 > after-a.csv
+bash benchmarks/crates-io-fetch/measure.sh after ./depup-after 3 > after-b.csv
+bash benchmarks/crates-io-fetch/measure.sh before ./depup-before 3 > before-b.csv
+```
+
+引数は実装名、depup の実行ファイル、入力ごとの実行回数です。入力は depup 自身の `Cargo.toml`（直接依存 22 件、既定の設定）と、依存 60 件の合成マニフェスト（`--no-osv`）で、どちらも `--dry-run` で実行します。Unix では `HOME` を一時ディレクトリに向け、利用者のグローバル設定を読ませません。測定記録は [benchmarks/crates-io-fetch](../benchmarks/crates-io-fetch/README.ja.md) にあります。
+
 ## リリース
 
 リリースは GitHub Actions から行います。**Actions > Release > Run workflow** を開いて実行してください。

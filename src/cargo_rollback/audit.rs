@@ -846,7 +846,12 @@ impl<'a> LockAgeAuditor<'a> {
             }) {
                 // check と install の間に公開された版を、古いキャッシュだけで未確認にしない。
                 let remaining = budget.saturating_sub(state.elapsed());
-                match tokio::time::timeout(remaining, self.versions.refresh(adapter, name)).await {
+                match tokio::time::timeout(
+                    remaining,
+                    self.versions.refresh(adapter, name, versions),
+                )
+                .await
+                {
                     Ok(Ok(fresh)) => all_versions = fresh,
                     Ok(Err(_)) => {}
                     Err(_) => {

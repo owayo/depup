@@ -68,7 +68,7 @@ src/
     versions.rs      - フェーズ間で共有するバージョン取得 (キャッシュ・single-flight・並行数制御)
     npm.rs           - npm Registry
     pypi.rs          - PyPI
-    crates_io.rs     - crates.io
+    crates_io.rs     - crates.io (版の一覧は sparse index を先に引き、一覧を確定できないときと公開者が要るときは API)
     go_proxy.rs      - Go Module Proxy
     rubygems.rs      - RubyGems
     packagist.rs     - Packagist
@@ -143,6 +143,7 @@ make ci                # CI と同じ検査 (fmt-check + lint + test、書き換
 
 - JSON マニフェスト更新の性能は `mise exec -- cargo run --release --locked --example manifest_update_bench -- 1000 7` で測る。入力・依存・ツールチェーン・release 設定をそろえ、ビルドやテストを並行実行しない。確保バイト数は再確保を含む要求量で、ピークメモリではない。生データと比較条件は `benchmarks/json-manifest/` に保存する。
 - Cargo の更新性能は同じコマンドの末尾に `cargo` を付けて測り、生データと比較条件を `benchmarks/cargo-manifest/` に保存する。単純指定・inline table・dotted key・複数行テーブルと git tag の更新を含む。Cargo のレジストリ依存はパッケージ名を文字列として照合し、後続の構文を固定の正規表現で読む。ソース除外と書き換えで同じ名前照合を使い、名前入りの正規表現を更新ごとにコンパイルしない。
+- crates.io の版の取得を含む CLI 全体の時間は `bash benchmarks/crates-io-fetch/measure.sh <実装名> <depup の実行ファイル> <回数>` で測る。ネットワークに左右されるので、変更前後の release ビルドを before → after → after → before の順に交互に測り、生データと比較条件を `benchmarks/crates-io-fetch/` に保存する。
 - **Unit tests**: 各モジュール内に `#[cfg(test)]` で配置
 - **Integration tests**: `tests/integration_tests.rs` - マニフェスト検出、パース、パイプラインテスト
 - **E2E tests**: `tests/e2e_tests.rs` - バイナリ実行テスト (dry-run、JSON出力、exit code)
@@ -236,7 +237,7 @@ make ci                # CI と同じ検査 (fmt-check + lint + test、書き換
 - npm/Composer/Cargo は semver の prerelease (`-...`) と build metadata (`+...`) を同時に含むバージョン（例: `^1.2.3-rc.1+build123`）も正しくパースする。ビルドメタデータはバージョン比較時には無視される (semver 仕様)
 - Rust (Cargo) の git 依存 (`{ git = "...", branch/tag/rev = "..." }` / 省略形) を検出し、`git ls-remote` でリモート HEAD / タグを取得して更新判定する。branch / 省略形 (デフォルトブランチ) は最新コミットへ更新 (Cargo.toml は書き換えず、Cargo.lock を `--install` の `cargo update` で再解決)、tag は最新 semver タグへ更新 (Cargo.toml の tag 文字列を書き換え)、rev は常にスキップ (pinned 扱い)
 - Cargo.lock の git source 末尾 `#<hash>` から現在コミットハッシュを抽出し、`git ls-remote` の結果と比較して差分があれば更新として扱う
-- バージョンチェックはマニフェストごとに並列処理される (`futures::stream::buffered`)。並列度は依存数に応じて `clamp(dep_count, 1, 4)` で適応 (最大 4)。内部では各レジストリ別のセマフォ (crates.io は 1、他は 10) が効くため、レート制限は従来どおり尊重される。結果は入力順で返るため表示順は安定する
+- バージョンチェックはマニフェストごとに並列処理される (`futures::stream::buffered`)。並列度は依存数に応じて `clamp(dep_count, 1, 4)` で適応 (最大 4)。内部では各レジストリ別のセマフォ (crates.io は 8、他は 10) が効く。crates.io の API を使う場合の 1 リクエスト/秒は、アダプタ内の `CratesIoRateLimit` が実行全体で守る。結果は入力順で返るため表示順は安定する
 - `--only` が指定されている場合は `--exclude` より優先される。Cargo リネーム依存では実パッケージ名・マニフェスト名のどちらで指定しても同じ優先順位で判定する
 - `.depup` にルートとサブディレクトリが両方含まれる場合、`--install` と Rust の `--age --install` 後処理は、更新されたマニフェストに最も近い（最も深い）対象ディレクトリで実行する
 - age が有効な場合 (CLI `--age` / プロジェクト `minimumReleaseAge` / グローバル設定 / 組み込みデフォルト 1w のいずれか) の transitive 依存への適用方法は PM ごとに異なる。install フェーズも judge と同じ解決済み age を使うため、CLI `--age` を明示しなくてもプロジェクト設定やデフォルト 1w が transitive へ反映される:
@@ -336,6 +337,7 @@ make ci                # CI と同じ検査 (fmt-check + lint + test、書き換
 - テキスト / JSON 出力の「現在のバージョン」は `VersionSpec::display_version()` を使い、`v` / `V` 接頭辞を復元する。更新先はレジストリが返す生の値なので、Go では `1.3.0 → v1.6.0` という不揃いな表示になり JSON の `from` / `to` も書式が食い違っていた。`^` / `~` / `>=` は制約を表す演算子であってバージョンの一部ではないため含めない
 - `--age` の transitive 対応可否の通知は**言語単位ではなく実際に選ばれる PM 単位**で判定する (`Language::native_transitive_age_package_managers`)。Node の transitive age は pnpm、Python は uv だけの機能なので、言語で判定すると npm / yarn / bun / pip / poetry / rye / pipenv のプロジェクトで通知が出ず、「transitive にも cooldown が効いた」と誤解させる
 - crates.io の 1 リクエスト/秒 間隔は `CratesIoRateLimit` を `Orchestrator` が 1 つ持って全アダプタへ配り、実行全体で共有する。アダプタのインスタンスに閉じ込めるとマニフェスト境界やフェーズ境界 (check → post-install の lock 監査) で間隔がリセットされ、直前のリクエストから 1 秒経たずに次が飛ぶ
+- crates.io の版の一覧 (`CratesIoAdapter::fetch_versions`) は、cargo と同じ sparse index (`index.crates.io`) を先に引く。sparse index は静的配信で並列に取ってよく、全版に `pubtime` (秒単位の公開日) がある。以前は API (1 リクエスト/秒) だけを使っていたため、依存 22 件で約 24 秒、60 件で約 62 秒の大半が API の間隔待ちだった (`benchmarks/crates-io-fetch/`)。候補用の解析 (`index_candidates`) は yank 済みを除いて昇順に並べ、空の応答・壊れた行・別名の行・yank されていない版の `pubtime` の欠落や不正では `None` を返して API へ戻る (公開日を欠いた版を黙って落とすと age の判定が API と食い違う)。全版 yank 済みは空の一覧が正しい答え。API にしかない公開者 (`published_by` / `trustpub_data`) が要るのはグローバル設定の `[age_exempt].github` があるときだけなので、`Orchestrator::crates_io_adapter` がその有無で `requiring_publishers` を決め、check と lock 監査の両方のアダプタに同じ値を渡す。スコープごとに切り替えると、公開者の無い一覧のキャッシュ (`VersionFetcher`) を免除が有効なスコープで使い回してしまう。install 後の再取得 (`VersionFetcher::refresh`) は `fetch_versions_including` に lock の版を渡し、index にまだ無ければ (配信の反映待ち) API で取り直す
 - Tauri バージョン同期の「既に一致」判定は npm パッケージ**全件**で行う。`@tauri-apps/api` と `@tauri-apps/cli` はパッチ集合差や age フィルタで judge 結果が非対称になりうるため、先頭 1 件 (依存はキー順に並ぶので通常 `api`) の一致で打ち切ると残りのずれが同期されない。OSV フォールバックで脆弱な候補を退けた結果 (`osv_skipped` が非空) も同期の上書きから保護する — 同期先はレジストリの生の一覧から最新を選ぶため、保護しないと judge が除外した脆弱版を選び直して OSV チェックを無効化してしまう
 - `--install` を走らせるディレクトリの順序はパス順に固定する。`HashMap` の `RandomState` 由来で実行のたびに入れ替わると、verbose 出力や失敗時の stderr の行順が変わって CI のログ比較で偽の差分になる
 - Rust の post-install age 監査では、fetch 失敗時も進捗位置を進める (末尾の数件が失敗するとバーが手前で止まったままになる)。差し戻しの `cargo update` は残り予算が `MIN_CARGO_UPDATE_SLICE` (10 秒) 未満なら着手しない — タイムアウトは残り予算でクランプされるので予算末尾で着手すると必ず失敗し、試行済みとして記録された組合せは二度と再試行されないため、本来差し戻せた依存が恒久的に「失敗」で確定する

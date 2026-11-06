@@ -48,8 +48,10 @@ use std::time::Duration;
 /// レジストリリクエストのデフォルト同時実行数
 const DEFAULT_CONCURRENCY: usize = 10;
 
-/// crates.io 用の同時実行数 (レート制限あり)
-const CRATES_IO_CONCURRENCY: usize = 1;
+/// crates.io の版の一覧の同時取得数。sparse index は並列に取得してよい
+/// (Cargo.lock の監査も 8 件まで並列に取る)。API を使う場合の 1 リクエスト/秒は、
+/// アダプタ内の `CratesIoRateLimit` が実行全体で守る。
+const CRATES_IO_CONCURRENCY: usize = 8;
 
 /// バージョンチェックの並列度上限 (マニフェスト内の依存関係に対して)。
 /// 依存数が少ない場合はそれに合わせて並列度を下げる (`dep_count.clamp(1, 4)`)。
@@ -315,12 +317,7 @@ impl Orchestrator {
         let Some(cutoff) = policy.cutoff() else {
             return (LockAgeAuditResult::default(), None);
         };
-        // check フェーズと同じレート制限状態を使う。別インスタンスにすると
-        // 直前のリクエストから 1 秒経たずに監査の 1 発目が飛ぶ
-        let adapter = CratesIoAdapter::with_rate_limit(
-            self.client.clone(),
-            self.crates_io_rate_limit.clone(),
-        );
+        let adapter = self.crates_io_adapter();
         let audit = LockAgeAudit {
             project_dir,
             cutoff,
@@ -1114,15 +1111,28 @@ impl Orchestrator {
         }
     }
 
+    /// crates.io のアダプタ。check フェーズと lock 監査で、同じレート制限状態を使う
+    /// (別インスタンスにすると、直前の API リクエストから 1 秒経たずに次が飛ぶ)。
+    ///
+    /// 公開者で age を免除する設定 (グローバル設定の `age_exempt.github`) があれば、
+    /// 公開者を返す API で版の一覧を取る。設定はグローバル設定だけにあるので、
+    /// 実行全体で同じ取得方法になり、キャッシュした一覧を別のスコープで使っても
+    /// 公開者の情報は欠けない。
+    fn crates_io_adapter(&self) -> CratesIoAdapter {
+        let publishers_required = self
+            .global_config
+            .as_ref()
+            .is_some_and(|config| !config.age_exempt.is_empty());
+        CratesIoAdapter::with_rate_limit(self.client.clone(), self.crates_io_rate_limit.clone())
+            .requiring_publishers(publishers_required)
+    }
+
     /// 言語に対応するレジストリアダプタを取得する
     fn get_adapter(&self, language: Language) -> Box<dyn RegistryAdapter + Send + Sync> {
         match language {
             Language::Node => Box::new(NpmAdapter::new(self.client.clone())),
             Language::Python => Box::new(PyPIAdapter::new(self.client.clone())),
-            Language::Rust => Box::new(CratesIoAdapter::with_rate_limit(
-                self.client.clone(),
-                self.crates_io_rate_limit.clone(),
-            )),
+            Language::Rust => Box::new(self.crates_io_adapter()),
             Language::Go => Box::new(GoProxyAdapter::new(self.client.clone())),
             Language::Ruby => Box::new(RubyGemsAdapter::new(self.client.clone())),
             Language::Php => Box::new(PackagistAdapter::new(self.client.clone())),
@@ -3529,7 +3539,23 @@ mod tests {
     fn test_orchestrator_config_default() {
         let config = OrchestratorConfig::default();
         assert_eq!(config.general_concurrency, 10);
-        assert_eq!(config.crates_io_concurrency, 1);
+        assert_eq!(config.crates_io_concurrency, 8);
+    }
+
+    #[test]
+    fn crates_io_listing_keeps_publishers_only_when_age_exemptions_are_configured() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let orchestrator =
+            Orchestrator::new(CliArgs::parse_from(["depup", dir.path().to_str().unwrap()]))
+                .unwrap();
+        assert!(!orchestrator.crates_io_adapter().publishers_required());
+        let orchestrator = orchestrator.with_global_config(Some(GlobalConfig::default()));
+        assert!(!orchestrator.crates_io_adapter().publishers_required());
+        let mut config = GlobalConfig::default();
+        config.age_exempt.github = vec!["example-dev".into()];
+        let orchestrator = orchestrator.with_global_config(Some(config));
+        // 公開者で age を免除する設定は、check と lock 監査のどちらの一覧にも公開者を要する
+        assert!(orchestrator.crates_io_adapter().publishers_required());
     }
 
     #[test]

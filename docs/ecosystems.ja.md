@@ -102,6 +102,8 @@ PEP 440 のプレリリースは、区切り文字なしで書かれた場合（
 
 path 依存（`{ path = "../common" }`）は、公開用に `version` を併記していても対象外です。ローカルのクレートで解決されるためです。crates.io 以外のレジストリを指す依存（`crates-io` 以外の `registry = "..."`、または `registry-index = "..."`）も、depup が crates.io しか問い合わせないため対象外です。
 
+crates.io の版の一覧と公開日は、cargo と同じ[公式の sparse index](https://doc.rust-lang.org/cargo/reference/registry-index.html) から取得します。sparse index は並列に取得でき、マニフェストごとに最大 4 件を同時に問い合わせます。index を取得できない場合と、内容から一覧を確定できない場合（yank されていない版の公開日の欠落など）は、1 秒に 1 回までに抑えた crates.io API を使います。グローバル設定の `[age_exempt]` で公開者の例外を設定している場合は、版ごとの公開者を確認できる API だけで一覧を取得します。index の公開日は秒単位です。
+
 git 依存は、レジストリの代わりに `git ls-remote` で確認します。
 
 | 指定 | 動作 |

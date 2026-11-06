@@ -102,6 +102,8 @@ A dependency is often declared in `[dependencies]` and again in `[dev-dependenci
 
 Path dependencies (`{ path = "../common" }`) are not processed, even when they also declare a `version` for publishing, because they resolve to the local crate. Dependencies that point at a registry other than crates.io — a non-`crates-io` `registry = "..."` or any `registry-index = "..."` — are not processed either, because depup only queries crates.io.
 
+Crate versions and publication dates come from the [official sparse index](https://doc.rust-lang.org/cargo/reference/registry-index.html), the same source Cargo uses. The sparse index can be fetched concurrently, and depup queries up to four crates of a manifest at a time. When the index cannot be fetched, or its content cannot settle the version list (for example, a non-yanked version without a publication date), depup uses the crates.io API, limited to one request per second. When the global `[age_exempt]` setting lists publishers, depup fetches the list only from the API, which reports who published each version. Index publication dates have one-second precision.
+
 Git dependencies are checked with `git ls-remote` instead of a registry:
 
 | Reference | Behavior |

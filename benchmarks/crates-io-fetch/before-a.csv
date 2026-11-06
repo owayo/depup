@@ -1,0 +1,7 @@
+implementation,scenario,run,seconds,exit_code
+before,depup-own,1,23.566,0
+before,depup-own,2,23.692,0
+before,depup-own,3,22.377,0
+before,sixty,1,61.864,0
+before,sixty,2,63.360,0
+before,sixty,3,61.881,0

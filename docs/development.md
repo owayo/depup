@@ -49,6 +49,19 @@ mise exec -- cargo run --release --locked --example manifest_update_bench -- 100
 
 This uses the same warmup, timing, and allocation counters as the JSON cases. It covers simple versions with 1, 100, and 1,000 dependencies, and inline tables, dotted keys, and multiline tables with 100 dependencies. The three table forms also have git tag cases. Inputs use single quotes, CRLF, and a final line without a newline; each case checks the complete output and validates the TOML. Recorded measurements and scope limits are in [benchmarks/cargo-manifest](../benchmarks/cargo-manifest/README.md).
 
+## crates.io Fetch Benchmark
+
+This measures the whole CLI run, including fetching version lists from crates.io. Results depend on the network and the registry, so build release binaries before and after a change and run them alternately.
+
+```bash
+bash benchmarks/crates-io-fetch/measure.sh before ./depup-before 3 > before-a.csv
+bash benchmarks/crates-io-fetch/measure.sh after ./depup-after 3 > after-a.csv
+bash benchmarks/crates-io-fetch/measure.sh after ./depup-after 3 > after-b.csv
+bash benchmarks/crates-io-fetch/measure.sh before ./depup-before 3 > before-b.csv
+```
+
+The arguments are an implementation label, the depup executable, and the number of runs per input. The inputs are depup's own `Cargo.toml` (22 direct dependencies, default settings) and a synthetic manifest with 60 dependencies (`--no-osv`); both run with `--dry-run`. On Unix, the script points `HOME` to a temporary directory so the user's global configuration is not read. Recorded measurements are in [benchmarks/crates-io-fetch](../benchmarks/crates-io-fetch/README.md).
+
 ## Release
 
 Releases are published from GitHub Actions: open **Actions > Release > Run workflow**.

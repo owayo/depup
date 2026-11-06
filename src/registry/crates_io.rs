@@ -1,10 +1,13 @@
-//! crates.io API アダプタ
+//! crates.io アダプタ
 //!
-//! crates.io からクレートのバージョン情報を取得する。
-//! API エンドポイント: https://crates.io/api/v1/crates/{crate}
+//! crates.io からクレートのバージョン情報を取得する。版の一覧と公開日は、
+//! cargo と同じ sparse index (https://index.crates.io/{path}) から先に取る。
+//! sparse index は静的なファイルの配信で、並列に取得してよい。
+//! index で一覧を確定できないときと、公開者の確認が要るときは
+//! API (https://crates.io/api/v1/crates/{crate}) を使う。
 //!
-//! 注意: crates.io は User-Agent ヘッダが必要 (HttpClient で処理済み)
-//! かつレート制限あり (1リクエスト/秒)。
+//! 注意: crates.io は User-Agent ヘッダが必要 (HttpClient で処理済み)。
+//! API はレート制限あり (1リクエスト/秒)。
 
 use crate::domain::Language;
 use crate::error::RegistryError;
@@ -19,6 +22,9 @@ use tokio::time::{Duration, Instant};
 
 /// crates.io API のベース URL
 const CRATES_IO_API_URL: &str = "https://crates.io/api/v1/crates";
+
+/// crates.io の sparse index のベース URL
+const CRATES_IO_INDEX_URL: &str = "https://index.crates.io";
 
 /// レート制限: 1リクエスト/秒
 const RATE_LIMIT_INTERVAL: Duration = Duration::from_secs(1);
@@ -57,6 +63,10 @@ impl Default for CratesIoRateLimit {
 pub struct CratesIoAdapter {
     client: HttpClient,
     rate_limit: Arc<CratesIoRateLimit>,
+    /// 版の一覧に、API だけが返す公開者の情報が要るか (`requiring_publishers`)
+    publishers_required: bool,
+    api_url: String,
+    index_url: String,
 }
 
 /// crates.io クレートレスポンス
@@ -89,11 +99,13 @@ impl CratesIoResponse {
     }
 }
 
-/// Sparse index の公開日は yank によって変わらない。
+/// Sparse index の 1 行 (1 版)。公開日は yank によって変わらない。
 #[derive(Deserialize)]
 struct IndexRelease {
     name: String,
     vers: String,
+    #[serde(default)]
+    yanked: bool,
     #[serde(default)]
     pubtime: Option<String>,
 }
@@ -122,6 +134,34 @@ fn index_release_dates(content: &str, package: &str) -> Option<Vec<VersionInfo>>
             versions.push(VersionInfo::new(release.vers, date));
         }
     }
+    Some(versions)
+}
+
+/// sparse index の内容から、更新候補 (yank 済みを除く版) を API の経路と同じ昇順で返す。
+///
+/// 一覧を確定できない内容では `None` を返し、呼び出し側は API を使う。空の応答、
+/// 壊れた行、別の名前の行、yank されていない版の公開日の欠落・不正が該当する。
+/// 公開日を欠いた版を黙って落とすと、age の判定と候補が API の結果と食い違うため。
+/// 全版が yank 済みの正常な応答は、空の一覧として返す。
+fn index_candidates(content: &str, package: &str) -> Option<Vec<VersionInfo>> {
+    let mut versions = Vec::new();
+    let mut releases = 0;
+    for line in content.lines().filter(|line| !line.trim().is_empty()) {
+        releases += 1;
+        let release: IndexRelease = serde_json::from_str(line).ok()?;
+        if !release.name.eq_ignore_ascii_case(package) {
+            return None;
+        }
+        if release.yanked {
+            continue;
+        }
+        let released_at = release.pubtime?.parse::<DateTime<Utc>>().ok()?;
+        versions.push(VersionInfo::new(release.vers, released_at));
+    }
+    if releases == 0 {
+        return None;
+    }
+    versions.sort();
     Some(versions)
 }
 
@@ -179,12 +219,54 @@ impl CratesIoAdapter {
 
     /// レート制限状態を共有する crates.io アダプタを作成する
     pub fn with_rate_limit(client: HttpClient, rate_limit: Arc<CratesIoRateLimit>) -> Self {
-        Self { client, rate_limit }
+        Self {
+            client,
+            rate_limit,
+            publishers_required: false,
+            api_url: CRATES_IO_API_URL.to_string(),
+            index_url: CRATES_IO_INDEX_URL.to_string(),
+        }
+    }
+
+    /// 版の一覧に公開者の情報が要るかを設定する。
+    ///
+    /// 公開者は API だけが返す。公開者で age を免除する設定があるときは、版の一覧を
+    /// sparse index ではなく API から取る。設定の有無は実行全体で一律に決めること。
+    /// スコープごとに切り替えると、公開者のない一覧のキャッシュを、免除が有効な
+    /// スコープで使い回してしまう。
+    pub fn requiring_publishers(mut self, required: bool) -> Self {
+        self.publishers_required = required;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publishers_required(&self) -> bool {
+        self.publishers_required
     }
 
     /// クレート用の URL を構築
     fn build_url(&self, crate_name: &str) -> String {
-        format!("{}/{}", CRATES_IO_API_URL, crate_name)
+        format!("{}/{}", self.api_url, crate_name)
+    }
+
+    /// クレートの sparse index のファイルの URL
+    fn index_file_url(&self, crate_name: &str) -> String {
+        format!("{}/{}", self.index_url, index_path(crate_name))
+    }
+
+    /// sparse index から更新候補を取る。取得に失敗したとき (404 を含む) と、
+    /// 内容から一覧を確定できないときは `None`。
+    async fn index_versions(&self, crate_name: &str) -> Option<Vec<VersionInfo>> {
+        let content = self
+            .client
+            .get_text(
+                &self.index_file_url(crate_name),
+                crate_name,
+                self.registry_name(),
+            )
+            .await
+            .ok()?;
+        index_candidates(&content, crate_name)
     }
 
     /// クレート名が crates.io の命名規則に収まっていることを検証する。
@@ -268,6 +350,26 @@ impl RegistryAdapter for CratesIoAdapter {
     }
 
     async fn fetch_versions(&self, crate_name: &str) -> Result<Vec<VersionInfo>, RegistryError> {
+        self.fetch_versions_including(crate_name, &[]).await
+    }
+
+    /// 公開者が要らなければ sparse index を先に引く。index で一覧を確定できないとき、
+    /// または `required` の版が index にまだ無いとき (配信の反映待ち) は API を使い、
+    /// エラーも API のものを返す。
+    async fn fetch_versions_including(
+        &self,
+        crate_name: &str,
+        required: &[String],
+    ) -> Result<Vec<VersionInfo>, RegistryError> {
+        self.validate_crate_name(crate_name)?;
+        if !self.publishers_required
+            && let Some(versions) = self.index_versions(crate_name).await
+            && required
+                .iter()
+                .all(|required| versions.iter().any(|info| info.version == *required))
+        {
+            return Ok(versions);
+        }
         self.api_versions(crate_name, false).await
     }
 
@@ -285,7 +387,7 @@ impl RegistryAdapter for CratesIoAdapter {
         publisher_cutoff: Option<DateTime<Utc>>,
     ) -> Result<Vec<VersionInfo>, RegistryError> {
         self.validate_crate_name(crate_name)?;
-        let url = format!("https://index.crates.io/{}", index_path(crate_name));
+        let url = self.index_file_url(crate_name);
         if let Ok(content) = self
             .client
             .get_text(&url, crate_name, self.registry_name())
@@ -355,6 +457,169 @@ mod tests {
         ] {
             assert_eq!(index_path(name), path);
         }
+    }
+
+    #[test]
+    fn index_candidates_exclude_yanked_sort_and_reject_unusable_content() {
+        let content = r#"{"name":"Library","vers":"1.10.0","pubtime":"2026-01-03T00:00:00Z"}
+{"name":"library","vers":"1.2.0","pubtime":"2026-01-02T00:00:00Z","yanked":false}
+{"name":"library","vers":"1.1.0","pubtime":"2026-01-01T00:00:00Z","yanked":true}
+{"name":"library","vers":"1.0.0","yanked":true}
+"#;
+        let versions = index_candidates(content, "library").unwrap();
+        // yank 済みを除き、API の経路と同じ順に並べる。yank 済みの版は公開日を欠いてもよい
+        assert_eq!(
+            versions
+                .iter()
+                .map(|info| info.version.as_str())
+                .collect::<Vec<_>>(),
+            ["1.2.0", "1.10.0"]
+        );
+        assert_eq!(
+            versions[0].released_at,
+            Some("2026-01-02T00:00:00Z".parse::<DateTime<Utc>>().unwrap())
+        );
+        // 全版が yank 済みなら、空の一覧が正しい答え
+        let yanked =
+            r#"{"name":"library","vers":"1.0.0","pubtime":"2026-01-01T00:00:00Z","yanked":true}"#;
+        assert_eq!(
+            index_candidates(yanked, "library").map(|versions| versions.len()),
+            Some(0)
+        );
+        // 一覧を確定できない内容は API に任せる
+        for unusable in [
+            "",
+            "\n",
+            "not json",
+            r#"{"name":"other","vers":"1.0.0","pubtime":"2026-01-01T00:00:00Z"}"#,
+            r#"{"name":"library","vers":"1.0.0"}"#,
+            r#"{"name":"library","vers":"1.0.0","pubtime":null}"#,
+            r#"{"name":"library","vers":"1.0.0","pubtime":"2026-13-01T00:00:00Z"}"#,
+        ] {
+            assert!(
+                index_candidates(unusable, "library").is_none(),
+                "{unusable:?}"
+            );
+        }
+    }
+
+    /// 決めた応答を返すサーバを、sparse index と API の両方の起点にする。
+    fn served_adapter(base: &str) -> CratesIoAdapter {
+        let mut adapter = CratesIoAdapter::new(HttpClient::new().unwrap());
+        adapter.index_url = base.to_string();
+        adapter.api_url = format!("{base}/api/v1/crates");
+        adapter
+    }
+
+    const SERVED_INDEX: &str = concat!(
+        r#"{"name":"library","vers":"1.0.0","pubtime":"2026-01-01T00:00:00Z"}"#,
+        "\n",
+        r#"{"name":"library","vers":"1.1.0","pubtime":"2026-02-01T00:00:00Z","yanked":true}"#,
+        "\n",
+    );
+
+    const SERVED_API: &str = r#"{"versions":[{"num":"1.2.0","created_at":"2026-03-01T00:00:00.5Z","yanked":false,"published_by":{"login":"example-dev","github_username_matches":true}}]}"#;
+
+    #[tokio::test]
+    async fn versions_come_from_the_sparse_index_without_the_api() {
+        use crate::test_support::http::serve_responses;
+        // サーバは決めた要求だけに答えるので、API へ問い合わせると取得が失敗する
+        let (base, handle) =
+            serve_responses(vec![("GET /li/br/library ", "200 OK\r\n", SERVED_INDEX)]);
+        let versions = served_adapter(&base)
+            .fetch_versions("library")
+            .await
+            .unwrap();
+        assert_eq!(
+            versions
+                .iter()
+                .map(|info| info.version.as_str())
+                .collect::<Vec<_>>(),
+            ["1.0.0"]
+        );
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn unusable_sparse_index_falls_back_to_the_api() {
+        use crate::test_support::http::serve_responses;
+        for (status, body) in [
+            ("404 Not Found\r\n", ""),
+            ("200 OK\r\n", ""),
+            ("200 OK\r\n", "not json"),
+            (
+                "200 OK\r\n",
+                r#"{"name":"other","vers":"1.0.0","pubtime":"2026-01-01T00:00:00Z"}"#,
+            ),
+            ("200 OK\r\n", r#"{"name":"library","vers":"1.0.0"}"#),
+        ] {
+            let (base, handle) = serve_responses(vec![
+                ("GET /li/br/library ", status, body),
+                ("GET /api/v1/crates/library ", "200 OK\r\n", SERVED_API),
+            ]);
+            let versions = served_adapter(&base)
+                .fetch_versions("library")
+                .await
+                .unwrap();
+            assert_eq!(versions.len(), 1, "{status:?} {body:?}");
+            assert_eq!(versions[0].version, "1.2.0");
+            handle.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn publishers_and_unpublished_required_versions_use_the_api() {
+        use crate::test_support::http::serve_responses;
+        use crate::update::PublisherEvidence;
+        // 公開者が要る実行は sparse index を引かない
+        let (base, handle) = serve_responses(vec![(
+            "GET /api/v1/crates/library ",
+            "200 OK\r\n",
+            SERVED_API,
+        )]);
+        let versions = served_adapter(&base)
+            .requiring_publishers(true)
+            .fetch_versions("library")
+            .await
+            .unwrap();
+        assert_eq!(
+            versions[0].publisher,
+            PublisherEvidence::GithubUser {
+                login: "example-dev".into()
+            }
+        );
+        handle.join().unwrap();
+
+        // install が入れた版が index にまだ無ければ、API で取り直す
+        let (base, handle) = serve_responses(vec![
+            ("GET /li/br/library ", "200 OK\r\n", SERVED_INDEX),
+            ("GET /api/v1/crates/library ", "200 OK\r\n", SERVED_API),
+        ]);
+        let versions = served_adapter(&base)
+            .fetch_versions_including("library", &["1.2.0".into()])
+            .await
+            .unwrap();
+        assert_eq!(versions[0].version, "1.2.0");
+        handle.join().unwrap();
+
+        // index にあれば API は使わない
+        let (base, handle) =
+            serve_responses(vec![("GET /li/br/library ", "200 OK\r\n", SERVED_INDEX)]);
+        let versions = served_adapter(&base)
+            .fetch_versions_including("library", &["1.0.0".into()])
+            .await
+            .unwrap();
+        assert_eq!(versions[0].version, "1.0.0");
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_crate_names_are_rejected_before_any_request() {
+        let error = CratesIoAdapter::new(HttpClient::new().unwrap())
+            .fetch_versions("a/../serde")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, RegistryError::InvalidPackageName { .. }));
     }
 
     #[test]

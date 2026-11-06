@@ -57,6 +57,16 @@ pub trait RegistryAdapter: Send + Sync {
     /// パッケージの利用可能なバージョンを取得
     async fn fetch_versions(&self, package: &str) -> Result<Vec<VersionInfo>, RegistryError>;
 
+    /// `required` の版を含む一覧を取得する。一覧の取得元が複数あり、速い取得元の反映が
+    /// 遅れうるレジストリは、`required` が無ければ別の取得元を使う。既定は `fetch_versions`。
+    async fn fetch_versions_including(
+        &self,
+        package: &str,
+        _required: &[String],
+    ) -> Result<Vec<VersionInfo>, RegistryError> {
+        self.fetch_versions(package).await
+    }
+
     /// レジストリで yank 済みと確認した版。通常候補とは分け、実行前の lock の復元だけに使う。
     async fn fetch_yanked_versions(
         &self,
