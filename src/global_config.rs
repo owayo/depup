@@ -149,18 +149,36 @@ impl GlobalConfig {
             return None;
         }
 
-        let content = std::fs::read_to_string(path).ok()?;
-        match toml::from_str::<GlobalConfig>(&content) {
+        match Self::read_from(path) {
             Ok(config) => Some(config),
-            Err(e) => {
-                eprintln!(
-                    "Warning: failed to parse global config '{}': {}",
-                    path.display(),
-                    e
-                );
+            Err(message) => {
+                eprintln!("Warning: {message}");
                 None
             }
         }
+    }
+
+    /// 設定ファイルを読んで解釈する。読めない・UTF-8 でない・TOML として解釈できないときは、
+    /// 警告の文言を返す (呼び出し側が警告して組み込みの既定値を使う)。以前は
+    /// `read_to_string(...).ok()?` で読み、読み込みに失敗したファイルや、Windows PowerShell 5.1 の
+    /// `>` が書く UTF-16 を、警告なしに「設定がない」と同じに扱っていた。`age` を既定より長く
+    /// していても、黙って既定の age で更新先を選んでいた (#123)。
+    fn read_from(path: &Path) -> Result<Self, String> {
+        let bytes = std::fs::read(path).map_err(|error| {
+            format!("failed to read global config '{}': {error}", path.display())
+        })?;
+        let content = String::from_utf8(bytes).map_err(|_| {
+            format!(
+                "failed to read global config '{}': the file is not UTF-8 text; save it as UTF-8",
+                path.display()
+            )
+        })?;
+        toml::from_str::<GlobalConfig>(&content).map_err(|error| {
+            format!(
+                "failed to parse global config '{}': {error}",
+                path.display()
+            )
+        })
     }
 
     /// 設定の `age` を [`Duration`] に変換する。
@@ -249,6 +267,29 @@ pub fn resolve_osv(cli_osv: bool, no_osv: bool, config: Option<&GlobalConfig>) -
 
 #[cfg(test)]
 mod tests {
+    /// Issue #123: 読めない・UTF-8 でないグローバル設定も、解釈できない設定と同じく警告の
+    /// 文言を返す (読めた内容は、BOM 付きの UTF-8 でも読める)。
+    #[test]
+    fn unreadable_or_non_utf8_global_config_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let utf16: Vec<u8> = [0xFEFF_u16]
+            .into_iter()
+            .chain("age = \"2w\"\r\n".encode_utf16())
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        std::fs::write(&path, utf16).unwrap();
+        let error = super::GlobalConfig::read_from(&path).err().unwrap();
+        assert!(error.contains("not UTF-8"), "{error}");
+        // 読み込みに失敗したとき (ディレクトリを指すなど)
+        let error = super::GlobalConfig::read_from(dir.path()).err().unwrap();
+        assert!(error.starts_with("failed to read global config"), "{error}");
+        // 同じ内容の UTF-8 (BOM 付き) は読める
+        std::fs::write(&path, "\u{feff}age = \"2w\"\r\n").unwrap();
+        let config = super::GlobalConfig::read_from(&path).unwrap();
+        assert_eq!(config.age.as_deref(), Some("2w"));
+    }
+
     #[test]
     fn age_exempt_normalizes_logins_and_preserves_other_settings_on_errors() {
         let config: super::GlobalConfig = toml::from_str("age = '2w'\nosv = true\n[age_exempt]\ngithub = ['EXAMPLE-dev', 'example-dev', 'bad/name']").unwrap();
