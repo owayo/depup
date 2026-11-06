@@ -548,6 +548,13 @@ fn contains_not_equal_operator(raw: &str) -> bool {
 }
 
 fn format_range_like(raw: &str, new_version: &str) -> Option<String> {
+    // PEP 508 の末尾のカンマ (`~=1.2,` / `>=1.0,<2.0,`) は要件を足さない区切りなので、外して
+    // 書き換え、後ろに付け直す。外さないと、カンマ区切りの複数の要件として扱い、上限のない
+    // 組として書き換えを断るか (`~=1.2,`)、`~=` の書き換えの経路に入らない (#105)
+    if let Some(body) = raw.trim_end().strip_suffix(',') {
+        let tail = &raw[body.len()..];
+        return format_range_like(body, new_version).map(|formatted| format!("{formatted}{tail}"));
+    }
     let trimmed = raw.trim();
     let leading_ws_len = raw.len() - raw.trim_start().len();
 

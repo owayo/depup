@@ -1682,6 +1682,24 @@ dependencies = [
         );
     }
 
+    /// Issue #105: 単一の制約の末尾のカンマ (`requests>=2.28,`) も保ったまま更新する。
+    #[test]
+    fn test_update_pep508_single_constraint_preserves_trailing_comma() {
+        let content = "[project]\ndependencies = [\"requests>=2.28,\", \"rich~=13.1,\"]\n";
+        let deps = PyprojectTomlParser.parse(content).unwrap();
+        assert_eq!(deps.len(), 2);
+        let result = PyprojectTomlParser
+            .update_version(content, "requests", "2.32.3")
+            .unwrap();
+        let result = PyprojectTomlParser
+            .update_version(&result, "rich", "13.9.4")
+            .unwrap();
+        assert_eq!(
+            result,
+            "[project]\ndependencies = [\"requests>=2.32.3,\", \"rich~=13.9,\"]\n"
+        );
+    }
+
     #[test]
     fn test_update_pep508_single_quoted_dependency_preserves_quote() {
         // TOML のリテラル文字列でも、依存指定を更新して引用符を維持する
