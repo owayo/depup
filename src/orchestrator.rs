@@ -710,7 +710,9 @@ impl Orchestrator {
                     continue;
                 }
             };
-            let mut dependencies = match parser.parse(&content) {
+            // 書き換え (`ManifestWriter`) と同じく、先頭の UTF-8 の BOM を除いた本文を parse する (#103)
+            let (_, body) = crate::manifest::split_utf8_bom(&content);
+            let mut dependencies = match parser.parse(body) {
                 Ok(deps) => deps,
                 Err(e) => {
                     errors.push(parse_error(e.to_string()));
@@ -2776,6 +2778,29 @@ mod tests {
             }
             assert!(manifest.has_updates());
         }
+    }
+
+    /// Issue #103: UTF-8 の BOM で始まるマニフェストも、BOM を除いて parse する。以前は行ごとに
+    /// 読む mise.toml のパーサが 1 行目の `\u{feff}[tools]` をセクションと見ず、ツールを
+    /// 警告なしに検出しなかった。
+    #[test]
+    fn manifests_starting_with_a_utf8_bom_are_parsed_without_it() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("mise.toml");
+        fs::write(&path, "\u{feff}[tools]\nshellcheck = \"0.10.0\"\n").unwrap();
+        let orchestrator = Orchestrator::new(make_args_with_path(dir.path(), &[])).unwrap();
+        let manifests = [ManifestInfo::new(&path, Language::Mise)];
+        let mut errors = Vec::new();
+        let parsed = orchestrator.parse_phase(&manifests, &mut Progress::new(false), &mut errors);
+        assert!(errors.is_empty(), "{}", errors.len());
+        assert_eq!(
+            parsed[0]
+                .dependencies
+                .iter()
+                .map(|dependency| dependency.name.as_str())
+                .collect::<Vec<_>>(),
+            ["shellcheck"]
+        );
     }
 
     #[test]
