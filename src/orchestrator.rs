@@ -279,7 +279,7 @@ impl Orchestrator {
     }
 
     /// Rust プロジェクトの Cargo.lock を走査し、`--age` を満たさない crate を
-    /// 期間を満たす版へ差し戻す。
+    /// 期間を満たす版へ差し戻す。`policy` は共有 lock の全メンバーから解決済みの制約。
     ///
     /// 典型的な用途: `depup --age 2w --install` 実行時、`cargo update` が
     /// semver 解決で 2 週間以内にリリースされた版 (直接依存・推移依存とも) を
@@ -299,35 +299,8 @@ impl Orchestrator {
     ///
     /// 戻り値: 期間を満たさなかった組ごとの最終結果、監査を終えた時点の Cargo.lock で
     /// 公開日を確かめられなかった版の数、利用者に必ず知らせるべき問題 (まとめ解きの後に
-    /// 元の Cargo.lock を戻せなかった等)。結果は最終の Cargo.lock の状態から組み立て直す
-    pub async fn enforce_lock_age_rust(
-        &self,
-        project_dir: &Path,
-        min_age: Duration,
-        baseline: &RegistryLockEntries,
-        preferred: &PreferredVersions,
-        bar: Option<&ProgressBar>,
-    ) -> LockAgeAuditResult {
-        let mut policy = self.resolved_age_policy_for(project_dir);
-        policy.min_age = Some(min_age);
-        self.enforce_lock_age_rust_with_policy(project_dir, &policy, baseline, preferred, bar)
-            .await
-    }
-
-    /// 共有 lock の全メンバーから解決済みの制約を使って監査する。
-    pub async fn enforce_lock_age_rust_with_policy(
-        &self,
-        project_dir: &Path,
-        policy: &AgePolicy,
-        baseline: &RegistryLockEntries,
-        preferred: &PreferredVersions,
-        bar: Option<&ProgressBar>,
-    ) -> LockAgeAuditResult {
-        self.enforce_lock_age_rust_tracked(project_dir, policy, baseline, preferred, bar)
-            .await
-            .0
-    }
-
+    /// 元の Cargo.lock を戻せなかった等) と、監査した Cargo 操作が書いた lock の
+    /// 前後のバイト列 (`AuditReceipt`)。結果は最終の Cargo.lock の状態から組み立て直す
     pub(crate) async fn enforce_lock_age_rust_tracked(
         &self,
         project_dir: &Path,
