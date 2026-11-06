@@ -51,6 +51,28 @@ impl CratesIoRateLimit {
             last_request: std::sync::Mutex::new(None),
         }
     }
+
+    /// API へ問い合わせる順番を取る。呼び出し元は、再試行を含む問い合わせが終わるまで
+    /// この許可を保持すること (並行する問い合わせの送信が間に挟まらないように)。
+    async fn acquire(&self) -> tokio::sync::SemaphorePermit<'_> {
+        self.semaphore.acquire().await.unwrap()
+    }
+
+    /// 前の送信から `RATE_LIMIT_INTERVAL` たつまで待ち、この送信の時刻を記録する。
+    /// 再試行を含む API への各送信の前に、`acquire` の許可を持ったまま呼ぶ (#100)。
+    async fn wait_for_interval(&self) {
+        let elapsed = self
+            .last_request
+            .lock()
+            .unwrap()
+            .map(|last_request| last_request.elapsed());
+        if let Some(elapsed) = elapsed
+            && elapsed < RATE_LIMIT_INTERVAL
+        {
+            tokio::time::sleep(RATE_LIMIT_INTERVAL - elapsed).await;
+        }
+        *self.last_request.lock().unwrap() = Some(Instant::now());
+    }
 }
 
 impl Default for CratesIoRateLimit {
@@ -292,29 +314,6 @@ impl CratesIoAdapter {
         }
     }
 
-    /// レート制限を適用し、セマフォ許可を返す。
-    /// 呼び出し元は HTTP リクエスト完了までこの許可を保持すること。
-    async fn apply_rate_limit(&self) -> tokio::sync::SemaphorePermit<'_> {
-        let permit = self.rate_limit.semaphore.acquire().await.unwrap();
-
-        // 待機が必要か確認
-        let elapsed = {
-            let last_request = self.rate_limit.last_request.lock().unwrap();
-            last_request.map(|t| t.elapsed())
-        };
-
-        if let Some(elapsed) = elapsed
-            && elapsed < RATE_LIMIT_INTERVAL
-        {
-            tokio::time::sleep(RATE_LIMIT_INTERVAL - elapsed).await;
-        }
-
-        // 最終リクエスト時刻を更新
-        *self.rate_limit.last_request.lock().unwrap() = Some(Instant::now());
-
-        permit
-    }
-
     async fn api_versions(
         &self,
         crate_name: &str,
@@ -326,14 +325,18 @@ impl CratesIoAdapter {
             .into_versions(include_yanked))
     }
 
+    /// API の応答。再試行を含む各送信の前に、実行全体で共有する 1 リクエスト/秒の間隔を
+    /// 待つ (#100)。問い合わせの前に 1 回だけ待つと、503 などの再試行をバックオフ
+    /// (100 ms〜) だけで送ってしまう。
     async fn api_response(&self, crate_name: &str) -> Result<CratesIoResponse, RegistryError> {
         self.validate_crate_name(crate_name)?;
-        let _permit = self.apply_rate_limit().await;
+        let _permit = self.rate_limit.acquire().await;
         self.client
-            .get_json(
+            .get_json_paced(
                 &self.build_url(crate_name),
                 crate_name,
                 self.registry_name(),
+                || self.rate_limit.wait_for_interval(),
             )
             .await
     }
@@ -537,6 +540,30 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["1.0.0"]
         );
+        handle.join().unwrap();
+    }
+
+    /// Issue #100: API への再試行も、前の送信から 1 秒の間隔を空けて送る。以前は間隔を
+    /// 問い合わせの前に 1 回だけ確かめ、503 の再試行を 100 ms・200 ms の待ちで送っていた。
+    #[tokio::test]
+    async fn api_retries_keep_the_one_second_interval() {
+        use crate::test_support::http::serve_responses;
+        let request = "GET /api/v1/crates/library ";
+        let unavailable = "503 Service Unavailable\r\n";
+        let (base, handle) = serve_responses(vec![
+            (request, unavailable, ""),
+            (request, unavailable, ""),
+            (request, "200 OK\r\n", SERVED_API),
+        ]);
+        let started = Instant::now();
+        let yanked = served_adapter(&base)
+            .fetch_yanked_versions("library")
+            .await
+            .unwrap();
+        // 3 回の送信の間が 1 秒ずつ空く (再試行のバックオフは合わせても 1 秒に満たない)
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(1900), "{elapsed:?}");
+        assert!(yanked.is_empty());
         handle.join().unwrap();
     }
 
