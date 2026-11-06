@@ -24,7 +24,7 @@ pnpm の `--install` 後は、更新した本番・開発・任意依存が、�
 
 ### Gradle マルチプロジェクト
 
-`settings.gradle` / `settings.gradle.kts` の `include ':app', ':core'`（Groovy 形式と Kotlin DSL 形式の両方）を展開し、各サブプロジェクトの `build.gradle` / `build.gradle.kts` と `buildSrc/` を処理します。依存宣言の大半はサブプロジェクト側にあるため、ルートのビルドファイルだけを見ていると取りこぼします。
+`settings.gradle` / `settings.gradle.kts` の `include ':app', ':core'`（Groovy 形式と Kotlin DSL 形式の両方。`gradle init` が書く `include("app")` のように先頭の `:` を省いた形も）を展開し、各サブプロジェクトの `build.gradle` / `build.gradle.kts` と `buildSrc/` を処理します。依存宣言の大半はサブプロジェクト側にあるため、ルートのビルドファイルだけを見ていると取りこぼします。
 
 `go.work` や `settings.gradle` から展開したパスには、`.depup` と同じ安全性の検査を適用します。絶対パス、`..` による親ディレクトリの参照、プロジェクトの外へ解決されるシンボリックリンクは拒否します。
 

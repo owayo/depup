@@ -24,7 +24,7 @@ depup expands the `use` directives in `go.work` (both the single-line and `use (
 
 ### Gradle Multi-Project Builds
 
-depup expands `include ':app', ':core'` from `settings.gradle` / `settings.gradle.kts` (both the Groovy and Kotlin DSL forms) and processes each subproject's `build.gradle` / `build.gradle.kts`, plus `buildSrc/`. Most dependency declarations live in subprojects, so scanning only the root build file would miss them.
+depup expands `include ':app', ':core'` from `settings.gradle` / `settings.gradle.kts` (both the Groovy and Kotlin DSL forms, with or without the leading `:` as in `include("app")`, the form `gradle init` writes) and processes each subproject's `build.gradle` / `build.gradle.kts`, plus `buildSrc/`. Most dependency declarations live in subprojects, so scanning only the root build file would miss them.
 
 Paths expanded from `go.work` and `settings.gradle` are subject to the same containment checks as `.depup`: absolute paths, `..` traversal, and symlinks resolving outside the project are rejected.
 
