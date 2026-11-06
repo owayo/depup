@@ -4,14 +4,27 @@
 //! ブランチ・タグ・HEAD のコミットハッシュを取得する。
 //!
 //! 認証は `GIT_ASKPASS` / SSH 鍵 / `.netrc` などの非対話的手段に任せる (passthrough)。
-//! `GIT_TERMINAL_PROMPT=0` を付与するため、端末での対話プロンプトは発生せず、
-//! 認証が必要な場合は即エラーになる。
+//! `GIT_TERMINAL_PROMPT=0` を付与するため、git の端末での対話プロンプトは発生せず、
+//! 認証が必要な場合は即エラーになる。ssh はホスト鍵の確認やパスフレーズを端末から
+//! 直接読むので、利用者が ssh の起動方法を決めていなければ `BATCH_SSH_COMMAND` を使う。
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
+
+/// 利用者が ssh の起動方法を決めていないときに `GIT_SSH_COMMAND` へ渡す ssh のコマンド
+/// (Go の cmd/go と同じ)。`BatchMode=yes` は、ホスト鍵の確認やパスフレーズの入力を端末に
+/// 求めずに失敗させる (`GIT_TERMINAL_PROMPT` が止めるのは git 自身の認証だけで、ssh は
+/// 端末から直接読むので、タイムアウトまで止まっていた。#102)。`ControlMaster=no` は、
+/// 接続を共有する ssh の常駐プロセスが出力のパイプを持ち続け、読み取りが終わらなくなる
+/// のを防ぐ。
+const BATCH_SSH_COMMAND: &str = "ssh -o ControlMaster=no -o BatchMode=yes";
+
+/// `git config` の読み取りのタイムアウト
+const GIT_CONFIG_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `git ls-remote` 実行全体のタイムアウト
 ///
@@ -222,6 +235,64 @@ fn redact_secrets(text: &str, url: &str) -> String {
     redacted
 }
 
+/// `git ls-remote` のコマンド。`ssh_command` があれば `GIT_SSH_COMMAND` に渡す。
+fn ls_remote_command(url: &str, ssh_command: Option<&str>) -> Command {
+    let mut command = Command::new("git");
+    command
+        .arg("ls-remote")
+        .arg("--")
+        .arg(url)
+        // 端末での認証プロンプトを禁止する。プロンプトが必要な場合は即エラーになり、
+        // 認証情報の入力待ちで無期限にブロックしない (非対話的な認証手段は引き続き有効)。
+        .env("GIT_TERMINAL_PROMPT", "0")
+        // タイムアウトで future が drop された際に子プロセスを残さない
+        .kill_on_drop(true);
+    if let Some(ssh_command) = ssh_command {
+        command.env("GIT_SSH_COMMAND", ssh_command);
+    }
+    command
+}
+
+/// `git ls-remote` に渡す `GIT_SSH_COMMAND`。利用者が ssh の起動方法を決めていれば
+/// (環境変数の `GIT_SSH` / `GIT_SSH_COMMAND` か git の設定の `core.sshCommand`)、それを
+/// 尊重して `None`。空の環境変数は Go の cmd/go と同じく決めていないものとして扱う。
+fn batch_ssh_command(
+    git_ssh: Option<&OsStr>,
+    git_ssh_command: Option<&OsStr>,
+    core_ssh_command: bool,
+) -> Option<&'static str> {
+    let set = |value: Option<&OsStr>| value.is_some_and(|value| !value.is_empty());
+    (!set(git_ssh) && !set(git_ssh_command) && !core_ssh_command).then_some(BATCH_SSH_COMMAND)
+}
+
+/// この実行の環境で `git ls-remote` に渡す `GIT_SSH_COMMAND` (`batch_ssh_command`)。
+/// git の設定は、環境変数で決まらないときに、実行の中で 1 回だけ読む。
+async fn ls_remote_ssh_command() -> Option<&'static str> {
+    static CORE_SSH_COMMAND: OnceCell<bool> = OnceCell::const_new();
+    let git_ssh = std::env::var_os("GIT_SSH");
+    let git_ssh_command = std::env::var_os("GIT_SSH_COMMAND");
+    batch_ssh_command(git_ssh.as_deref(), git_ssh_command.as_deref(), false)?;
+    let core_ssh_command = *CORE_SSH_COMMAND.get_or_init(has_core_ssh_command).await;
+    batch_ssh_command(
+        git_ssh.as_deref(),
+        git_ssh_command.as_deref(),
+        core_ssh_command,
+    )
+}
+
+/// git の設定に `core.sshCommand` があるか。`git config --get` は設定がなければ終了コード 1
+/// を返す。読めないときは無いものとして扱う (その場合は `git ls-remote` も失敗する)。
+async fn has_core_ssh_command() -> bool {
+    let output = Command::new("git")
+        .args(["config", "--get", "core.sshCommand"])
+        .kill_on_drop(true)
+        .output();
+    matches!(
+        tokio::time::timeout(GIT_CONFIG_TIMEOUT, output).await,
+        Ok(Ok(output)) if output.status.success() && !output.stdout.trim_ascii().is_empty()
+    )
+}
+
 async fn run_ls_remote(url: &str) -> Result<GitRemoteRefs, GitRemoteError> {
     // 許可リスト外のスキーム (ext:: 等) は実行せず警告してスキップ
     // (呼び出し側がこのエラーを fetch failed として警告付きスキップ扱いにする)
@@ -235,16 +306,7 @@ async fn run_ls_remote(url: &str) -> Result<GitRemoteRefs, GitRemoteError> {
         });
     }
 
-    let output_future = Command::new("git")
-        .arg("ls-remote")
-        .arg("--")
-        .arg(url)
-        // 端末での認証プロンプトを禁止する。プロンプトが必要な場合は即エラーになり、
-        // 認証情報の入力待ちで無期限にブロックしない (非対話的な認証手段は引き続き有効)。
-        .env("GIT_TERMINAL_PROMPT", "0")
-        // タイムアウトで future が drop された際に子プロセスを残さない
-        .kill_on_drop(true)
-        .output();
+    let output_future = ls_remote_command(url, ls_remote_ssh_command().await).output();
 
     let output = match tokio::time::timeout(LS_REMOTE_TIMEOUT, output_future).await {
         Ok(result) => result.map_err(|e| GitRemoteError::SpawnFailed {
@@ -313,6 +375,48 @@ pub fn parse_ls_remote_output(text: &str) -> GitRemoteRefs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #102: 利用者が ssh の起動方法を決めていなければ、ホスト鍵の確認やパスフレーズの
+    /// 入力を求めない ssh を使う。決めていれば (環境変数か core.sshCommand) 尊重する。
+    #[test]
+    fn ssh_prompts_are_disabled_unless_the_user_configures_ssh() {
+        let set = |value: &'static str| Some(OsStr::new(value));
+        assert_eq!(
+            batch_ssh_command(None, None, false),
+            Some(BATCH_SSH_COMMAND)
+        );
+        assert_eq!(
+            batch_ssh_command(set(""), set(""), false),
+            Some(BATCH_SSH_COMMAND)
+        );
+        assert_eq!(batch_ssh_command(set("plink"), None, false), None);
+        assert_eq!(batch_ssh_command(None, set("ssh -i key"), false), None);
+        assert_eq!(batch_ssh_command(None, None, true), None);
+    }
+
+    #[test]
+    fn ls_remote_disables_git_prompts_and_passes_the_batch_ssh_command() {
+        let envs = |command: &Command| -> Vec<(String, Option<String>)> {
+            command
+                .as_std()
+                .get_envs()
+                .map(|(key, value)| {
+                    (
+                        key.to_string_lossy().into_owned(),
+                        value.map(|value| value.to_string_lossy().into_owned()),
+                    )
+                })
+                .collect()
+        };
+        let url = "ssh://git@git.example.com/org/foo.git";
+        let batch = envs(&ls_remote_command(url, Some(BATCH_SSH_COMMAND)));
+        assert!(batch.contains(&("GIT_TERMINAL_PROMPT".into(), Some("0".into()))));
+        assert!(batch.contains(&("GIT_SSH_COMMAND".into(), Some(BATCH_SSH_COMMAND.into()))));
+        // 利用者の ssh の設定を尊重するときは GIT_SSH_COMMAND を上書きしない
+        let user = envs(&ls_remote_command(url, None));
+        assert!(user.contains(&("GIT_TERMINAL_PROMPT".into(), Some("0".into()))));
+        assert!(!user.iter().any(|(key, _)| key == "GIT_SSH_COMMAND"));
+    }
 
     #[test]
     fn test_parse_basic() {
