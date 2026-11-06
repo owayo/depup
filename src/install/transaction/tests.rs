@@ -347,6 +347,137 @@ fn uv_normalization_failure_restores_files_before_syncing() {
     }
 }
 
+/// Poetry 1.8 以降は lock の不一致で `poetry install` が失敗するので、install の前に版を
+/// 確かめ、lock 済みの版を保つ引数で lock を更新する (#87)
+#[test]
+fn poetry_install_refreshes_the_lock_for_the_detected_version_first() {
+    for (version, lock_args) in [
+        ("Poetry (version 2.1.3)\n", vec!["poetry", "lock"]),
+        (
+            "Poetry (version 1.8.5)\n",
+            vec!["poetry", "lock", "--no-update"],
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path();
+        let mut result = result();
+        let manifest = directory.join("pyproject.toml");
+        update(
+            &mut result,
+            &manifest,
+            Language::Python,
+            "[project]\nname = 'example'\nversion = '0.1.0'\ndependencies = ['example==1.0.0']\n",
+            "example",
+        );
+        let lock = directory.join("poetry.lock");
+        fs::write(&lock, "# original lock\n").unwrap();
+        let plan = plan(vec![job(
+            directory,
+            Language::Python,
+            std::slice::from_ref(&manifest),
+        )]);
+        let mut tx = InstallTransactions::begin(&plan, &result, directory);
+        let mut calls = Vec::new();
+        tx.execute(|command| {
+            calls.push(command.argv.clone());
+            match command.argv[1].as_str() {
+                "--version" => InstallResult::success(
+                    command.language,
+                    command.argv.join(" "),
+                    version.into(),
+                    String::new(),
+                ),
+                "lock" => {
+                    fs::write(&lock, "# refreshed lock\n").unwrap();
+                    success(command)
+                }
+                _ => success(command),
+            }
+        });
+        let report = tx.rollback();
+        assert!(!report.has_failures(), "{version}");
+        assert_eq!(
+            calls,
+            [
+                vec!["poetry", "--version"],
+                lock_args,
+                vec!["poetry", "install"]
+            ],
+            "{version}"
+        );
+        assert_eq!(fs::read_to_string(&lock).unwrap(), "# refreshed lock\n");
+    }
+}
+
+/// 版を確かめられない、または lock の更新に失敗したら、install を実行せずに戻す (#87)
+#[test]
+fn poetry_version_or_lock_failure_restores_files_without_installing() {
+    for failure_kind in ["version-command", "version-output", "lock"] {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path();
+        let mut result = result();
+        let manifest = directory.join("pyproject.toml");
+        let original =
+            "[project]\nname = 'example'\nversion = '0.1.0'\ndependencies = ['example==1.0.0']\n";
+        update(
+            &mut result,
+            &manifest,
+            Language::Python,
+            original,
+            "example",
+        );
+        let lock = directory.join("poetry.lock");
+        fs::write(&lock, "# original lock\n").unwrap();
+        let plan = plan(vec![job(
+            directory,
+            Language::Python,
+            std::slice::from_ref(&manifest),
+        )]);
+        let mut tx = InstallTransactions::begin(&plan, &result, directory);
+        let mut calls = Vec::new();
+        tx.execute(|command| {
+            calls.push(command.argv[1].clone());
+            let output = |stdout: &str| {
+                InstallResult::success(
+                    command.language,
+                    command.argv.join(" "),
+                    stdout.into(),
+                    String::new(),
+                )
+            };
+            match (failure_kind, command.argv[1].as_str()) {
+                ("version-command", "--version") => failure(command),
+                ("version-output", "--version") => output("Poetry (version unknown)"),
+                (_, "--version") => output("Poetry (version 2.1.3)"),
+                ("lock", "lock") => {
+                    fs::write(&lock, "# partially written lock\n").unwrap();
+                    failure(command)
+                }
+                _ => success(command),
+            }
+        });
+        let report = tx.rollback();
+        report.mark_summary(&mut result.summary);
+        assert!(report.has_install_failures(), "{failure_kind}");
+        assert!(
+            !calls.iter().any(|call| call == "install"),
+            "{failure_kind}: {calls:?}"
+        );
+        assert_eq!(fs::read_to_string(&lock).unwrap(), "# original lock\n");
+        assert_eq!(fs::read_to_string(&manifest).unwrap(), original);
+        assert_eq!(result.summary.total_failed(), 1);
+        if failure_kind == "version-output" {
+            let reason = result.summary.manifests[0].results[0]
+                .write_error()
+                .unwrap();
+            assert!(
+                reason.contains("Cannot determine the Poetry version"),
+                "{reason}"
+            );
+        }
+    }
+}
+
 #[test]
 #[ignore = "requires uv and a local Python interpreter; runs offline"]
 fn uv_real_install_leaves_a_lock_usable_with_native_settings() {

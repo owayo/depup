@@ -659,9 +659,43 @@ impl InstallTransactions {
                 }
             }
         }
+        if command.package_manager == "poetry" && !self.lock_poetry(index, &command, runner) {
+            return;
+        }
         if self.run_step(index, &command, runner) {
             self.repair_mise_locks(index, &command, runner);
         }
+    }
+
+    /// Poetry 1.8 以降の `poetry install` は、pyproject.toml の依存と poetry.lock の
+    /// content-hash が合わないと失敗する (#87)。install の前に、同じ実行ファイル・作業
+    /// ディレクトリ・環境で版を確かめ、lock 済みの版を保ったまま lock を更新する。
+    /// 版の確認と lock の更新も install と同じ単位で実行するので、失敗すれば install を
+    /// 実行せずに単位ごと元のファイルへ戻す。
+    fn lock_poetry(
+        &mut self,
+        index: usize,
+        install: &PreparedInstall,
+        runner: &mut impl FnMut(&PreparedInstall) -> InstallResult,
+    ) -> bool {
+        let unit = self.task_units[index];
+        let mut probe = install.clone();
+        probe.argv = vec![install.argv[0].clone(), "--version".into()];
+        let Some(version) = self.run_step_output(index, &probe, runner) else {
+            return false;
+        };
+        let arguments = match crate::package_manager::poetry_lock_args(&version.stdout) {
+            Ok(arguments) => arguments,
+            Err(error) => {
+                self.units[unit].failure = Some(error);
+                return false;
+            }
+        };
+        let mut lock = install.clone();
+        lock.argv = std::iter::once(install.argv[0].clone())
+            .chain(arguments)
+            .collect();
+        self.run_step(index, &lock, runner)
     }
 
     fn run_step(
@@ -670,11 +704,21 @@ impl InstallTransactions {
         command: &PreparedInstall,
         runner: &mut impl FnMut(&PreparedInstall) -> InstallResult,
     ) -> bool {
+        self.run_step_output(index, command, runner).is_some()
+    }
+
+    /// 管理するファイルの変化を前後で確かめながらコマンドを実行し、成功したときは結果を返す。
+    fn run_step_output(
+        &mut self,
+        index: usize,
+        command: &PreparedInstall,
+        runner: &mut impl FnMut(&PreparedInstall) -> InstallResult,
+    ) -> Option<InstallResult> {
         let unit = self.task_units[index];
         self.observe_trees(index, false);
         self.observe(unit, &BTreeSet::new());
         if self.units[unit].failure.is_some() {
-            return false;
+            return None;
         }
         let result = runner(command);
         self.observe_trees(index, true);
@@ -685,7 +729,7 @@ impl InstallTransactions {
                 format!("{} failed: {}", result.command, result.stderr.trim())
             });
         }
-        self.units[unit].failure.is_none()
+        self.units[unit].failure.is_none().then_some(result)
     }
 
     pub(super) fn materialize_nodes(

@@ -59,6 +59,34 @@ fn resolve_program(program: &str, working_dir: &Path) -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(program))
 }
 
+/// `poetry --version` の出力から、lock 済みの版を保ったまま lock を更新する引数を決める (#87)。
+///
+/// Poetry 1.8 以降の `poetry install` は、pyproject.toml の依存と poetry.lock の content-hash が
+/// 合わないと失敗する。depup は直前に pyproject.toml を書き換えるので、install の前に lock を
+/// 更新する。Poetry 2 以降の `poetry lock` は既定で lock 済みの版を保ち、`--no-update` を持たない。
+/// 1.x の `poetry lock` は既定ですべてを更新するので、保つには `--no-update` が要る。
+/// 版を読めなければ、推測した引数で lock を書き換えずに失敗させる。
+pub(crate) fn poetry_lock_args(version_output: &str) -> Result<Vec<String>, String> {
+    let major = version_output
+        .split(|c: char| c.is_whitespace() || matches!(c, '(' | ')'))
+        .find_map(|token| {
+            let (major, rest) = token.split_once('.')?;
+            (!major.is_empty()
+                && major.bytes().all(|byte| byte.is_ascii_digit())
+                && rest.starts_with(|c: char| c.is_ascii_digit()))
+            .then_some(major)
+        })
+        .and_then(|major| major.parse::<u64>().ok());
+    match major {
+        Some(major) if major >= 2 => Ok(vec!["lock".into()]),
+        Some(1) => Ok(vec!["lock".into(), "--no-update".into()]),
+        _ => Err(format!(
+            "Cannot determine the Poetry version to update poetry.lock (poetry --version printed {:?})",
+            version_output.trim()
+        )),
+    }
+}
+
 /// パッケージマネージャのインストール結果
 #[derive(Debug, Clone)]
 pub struct InstallResult {
@@ -1372,6 +1400,31 @@ mod tests {
         let pm = SystemPackageManager::new();
         let cmd = pm.get_install_command("npm");
         assert_eq!(cmd, vec!["npm", "install"]);
+    }
+
+    /// Poetry 2 は lock 済みの版を既定で保ち、1.x は `--no-update` が要る (#87)
+    #[test]
+    fn poetry_lock_args_keep_locked_versions_for_each_major_version() {
+        for (output, expected) in [
+            ("Poetry (version 2.1.3)\n", vec!["lock"]),
+            ("Poetry (version 3.0.0)", vec!["lock"]),
+            ("Poetry (version 1.8.5)\n", vec!["lock", "--no-update"]),
+            ("Poetry version 1.1.15", vec!["lock", "--no-update"]),
+        ] {
+            assert_eq!(poetry_lock_args(output).unwrap(), expected, "{output:?}");
+        }
+        for output in [
+            "",
+            "Poetry",
+            "Poetry (version unknown)",
+            "Poetry (version 0.12.17)",
+        ] {
+            let error = poetry_lock_args(output).unwrap_err();
+            assert!(
+                error.contains("Cannot determine the Poetry version"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
