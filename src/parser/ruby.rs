@@ -68,6 +68,19 @@ fn extract_first_version(raw: &str) -> String {
         .unwrap_or_default()
 }
 
+/// 演算子付きの単一の制約。接頭辞は元の表記 (演算子と、その後の空白の有無) をそのまま
+/// 保つ。`"~> "` のように固定すると、`~>2.2` を範囲内の版しかなくても `~> 2.2` に書き換え、
+/// 空白だけの差分を更新として報告していた (書き換え後の表記が元の表記と一致しないので、
+/// 何も変わらない更新の判定が働かない。#107)。
+fn operator_spec(
+    kind: VersionSpecKind,
+    trimmed: &str,
+    caps: &regex::Captures<'_>,
+) -> Option<VersionSpec> {
+    let version = caps.get(1)?;
+    Some(VersionSpec::new(kind, trimmed, version.as_str()).with_prefix(&trimmed[..version.start()]))
+}
+
 impl RubyVersionParser {
     /// 単一のバージョン制約を解釈する（複合制約ではない）
     fn parse_single(&self, version_str: &str) -> Option<VersionSpec> {
@@ -79,51 +92,32 @@ impl RubyVersionParser {
 
         // ペシミスティック制約 (~> 1.2.3)
         if let Some(caps) = PESSIMISTIC_RE.captures(trimmed) {
-            let version = caps.get(1)?.as_str();
-            return Some(
-                VersionSpec::new(VersionSpecKind::Tilde, trimmed, version).with_prefix("~> "),
-            );
+            return operator_spec(VersionSpecKind::Tilde, trimmed, &caps);
         }
 
         // = 接頭辞付き固定 (= 1.2.3)
         if let Some(caps) = EXACT_EQ_RE.captures(trimmed) {
-            let version = caps.get(1)?.as_str();
-            return Some(
-                VersionSpec::new(VersionSpecKind::Exact, trimmed, version).with_prefix("= "),
-            );
+            return operator_spec(VersionSpecKind::Exact, trimmed, &caps);
         }
 
         // 以上 (>= 1.2.3)
         if let Some(caps) = GTE_RE.captures(trimmed) {
-            let version = caps.get(1)?.as_str();
-            return Some(
-                VersionSpec::new(VersionSpecKind::GreaterOrEqual, trimmed, version)
-                    .with_prefix(">= "),
-            );
+            return operator_spec(VersionSpecKind::GreaterOrEqual, trimmed, &caps);
         }
 
         // より大きい (> 1.2.3)
         if let Some(caps) = GT_RE.captures(trimmed) {
-            let version = caps.get(1)?.as_str();
-            return Some(
-                VersionSpec::new(VersionSpecKind::Greater, trimmed, version).with_prefix("> "),
-            );
+            return operator_spec(VersionSpecKind::Greater, trimmed, &caps);
         }
 
         // 以下 (<= 1.2.3)
         if let Some(caps) = LTE_RE.captures(trimmed) {
-            let version = caps.get(1)?.as_str();
-            return Some(
-                VersionSpec::new(VersionSpecKind::LessOrEqual, trimmed, version).with_prefix("<= "),
-            );
+            return operator_spec(VersionSpecKind::LessOrEqual, trimmed, &caps);
         }
 
         // より小さい (< 1.2.3)
         if let Some(caps) = LT_RE.captures(trimmed) {
-            let version = caps.get(1)?.as_str();
-            return Some(
-                VersionSpec::new(VersionSpecKind::Less, trimmed, version).with_prefix("< "),
-            );
+            return operator_spec(VersionSpecKind::Less, trimmed, &caps);
         }
 
         if let Some(caps) = NOT_EQUAL_RE.captures(trimmed) {
@@ -206,6 +200,38 @@ mod tests {
         let spec = parse("~>1.2.3").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Tilde);
         assert_eq!(spec.version, "1.2.3");
+        assert_eq!(spec.prefix, Some("~>".to_string()));
+    }
+
+    /// Issue #107: 演算子の後の空白の有無を、書き戻しでも保つ。以前は接頭辞を `"~> "` などに
+    /// 固定していたので、`~>2.2` を `~> 2.3` に書き換えていた。
+    #[test]
+    fn test_operator_spacing_is_preserved_when_updated() {
+        for (raw, new_version, expected) in [
+            ("~>2.2", "2.3.1", "~>2.3"),
+            ("~>  2.2", "2.3.1", "~>  2.3"),
+            ("~> 2.2", "2.3.1", "~> 2.3"),
+            (">=1.0", "1.5.0", ">=1.5.0"),
+            ("=1.2.3", "1.2.4", "=1.2.4"),
+        ] {
+            let spec = parse(raw).unwrap();
+            assert_eq!(spec.format_updated(new_version), expected, "{raw}");
+        }
+    }
+
+    /// Issue #107: 空白のない `~>2.2` も、範囲内の版しかなければ最新として扱う (書き換え後の
+    /// 表記が元の表記と同じなので、何も変わらない更新を報告しない)。
+    #[test]
+    fn test_pessimistic_without_space_is_latest_within_its_range() {
+        use crate::domain::{Dependency, UpdateResult};
+        use crate::update::{UpdateFilter, UpdateJudge, VersionInfo};
+        let dependency = Dependency::production("rack", parse("~>2.2").unwrap(), Language::Ruby);
+        let released = chrono::Utc::now() - chrono::Duration::days(30);
+        let versions: Vec<_> = (0..=9)
+            .map(|patch| VersionInfo::new(format!("2.2.{patch}"), released))
+            .collect();
+        let result = UpdateJudge::new(UpdateFilter::new()).judge(&dependency, &versions);
+        assert!(!matches!(result, UpdateResult::Update { .. }), "{result:?}");
     }
 
     // 固定バージョンのテスト
