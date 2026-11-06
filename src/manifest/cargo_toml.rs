@@ -12,7 +12,10 @@ use crate::domain::{Dependency, GitReference, GitSource, Language, VersionSpec, 
 use crate::error::ManifestError;
 use crate::manifest::{
     ManifestParser,
-    line_utils::{captured_quote_and_version, parse_toml_section_header, split_line_ending},
+    line_utils::{
+        captured_quote_and_version, parse_toml_section_header, split_line_ending,
+        toml_inline_table_end, toml_inline_table_string_value,
+    },
 };
 use crate::parser::{VersionParser, get_parser};
 use regex::Regex;
@@ -107,6 +110,64 @@ static DOTTED_REGISTRY_INDEX_RE: LazyLock<Regex> =
 fn cargo_package_line<'a>(line: &'a str, package: &str) -> Option<(&'a str, &'a str)> {
     let remainder = line.trim_start().strip_prefix(package)?;
     Some((&line[..line.len() - remainder.len()], remainder))
+}
+
+/// `package = { ...` の宣言が、閉じないまま次の行へ続く inline table なら、`content` の中の
+/// `{` の位置と inline table の終わり (`}` の次) を返す。parse (toml クレート) は複数行の
+/// inline table も依存として読むので、書き換えも同じ範囲を扱う (#98)。
+fn multiline_inline_table(
+    content: &str,
+    line_start: usize,
+    line: &str,
+    package: &str,
+) -> Option<(usize, usize)> {
+    let (_, remainder) = cargo_package_line(line, package)?;
+    let value = remainder.trim_start().strip_prefix('=')?.trim_start();
+    if !value.starts_with('{') {
+        return None;
+    }
+    let open = line_start + line.len() - value.len();
+    let end = toml_inline_table_end(content, open)?;
+    (end > line_start + line.len()).then_some((open, end))
+}
+
+/// 複数行の inline table が crates.io 以外 (path / 別レジストリ) を指すか。parse と同じく
+/// inline table の直下のキーだけを見る。
+fn inline_table_declares_non_crates_io_source(content: &str, open: usize, end: usize) -> bool {
+    let string = |key: &str| {
+        toml_inline_table_string_value(content, open, end, key)
+            .map(|(start, end)| &content[start + 1..end - 1])
+    };
+    string("path").is_some()
+        || string("registry-index").is_some()
+        || string("registry").is_some_and(|registry| registry != "crates-io")
+}
+
+/// `end` を含む行の終わり (改行の次) の位置
+fn line_end_after(content: &str, end: usize) -> usize {
+    content[end..]
+        .find('\n')
+        .map_or(content.len(), |offset| end + offset + 1)
+}
+
+/// 複数行の inline table の直下の `key` の文字列を、`replacement` で書き換えた宣言の全体
+/// (宣言の行の頭から、inline table が閉じる行の終わりまで)。書き換えられなければ `None`。
+fn rewrite_multiline_inline_table(
+    content: &str,
+    line_start: usize,
+    (open, end): (usize, usize),
+    key: &str,
+    replacement: impl FnOnce(&str) -> Option<String>,
+) -> Option<String> {
+    let (value_start, value_end) = toml_inline_table_string_value(content, open, end, key)?;
+    let new_value = replacement(&content[value_start + 1..value_end - 1])?;
+    let quote = &content[value_start..value_start + 1];
+    let block_end = line_end_after(content, end);
+    Some(format!(
+        "{}{quote}{new_value}{quote}{}",
+        &content[line_start..value_start],
+        &content[value_end..block_end]
+    ))
 }
 
 /// 宣言形式の判定後は、旧制約の解析・更新先の整形を同じ経路で行う。
@@ -341,7 +402,15 @@ impl ManifestParser for CargoTomlParser {
         let excluded_sections = non_crates_io_dependency_sections(content, package);
         let mut section = "";
         let mut rebuilt = String::with_capacity(content.len());
+        let mut line_start = 0usize;
+        // 複数行の宣言として書き写した範囲の終わり
+        let mut written_until = 0usize;
         for segment in content.split_inclusive('\n') {
+            let segment_start = line_start;
+            line_start += segment.len();
+            if segment_start < written_until {
+                continue;
+            }
             let (line, newline) = split_line_ending(segment);
 
             if let Some(name) = cargo_section_name(line) {
@@ -355,6 +424,31 @@ impl ManifestParser for CargoTomlParser {
                     || cargo_package_line(line, package).is_none()
                 {
                     rebuilt.push_str(segment);
+                    continue;
+                }
+                // 複数行の inline table (`tokio = { features = [\n "rt",\n], version = "1" }`) は、
+                // 閉じる行までをまとめて扱う。1 行目しか見ないと、後の行の `version` に届かない。
+                if let Some(table) = multiline_inline_table(content, segment_start, line, package) {
+                    written_until = line_end_after(content, table.1);
+                    let rewritten =
+                        (!inline_table_declares_non_crates_io_source(content, table.0, table.1))
+                            .then(|| {
+                                rewrite_multiline_inline_table(
+                                    content,
+                                    segment_start,
+                                    table,
+                                    "version",
+                                    |old| parser.parse(old)?.try_format_updated(new_version),
+                                )
+                            })
+                            .flatten();
+                    match rewritten {
+                        Some(rewritten) => {
+                            rebuilt.push_str(&rewritten);
+                            updated = true;
+                        }
+                        None => rebuilt.push_str(&content[segment_start..written_until]),
+                    }
                     continue;
                 }
                 // インラインテーブル が path / 別レジストリを指す場合は parse も依存として
@@ -429,12 +523,36 @@ impl ManifestParser for CargoTomlParser {
         // 依存セクション外の同名キーを誤って書き換えず、TOML の単一引用符も保持する。
         let mut section = "";
         let mut rebuilt = String::with_capacity(content.len());
+        let mut line_start = 0usize;
+        let mut written_until = 0usize;
         for segment in content.split_inclusive('\n') {
+            let segment_start = line_start;
+            line_start += segment.len();
+            if segment_start < written_until {
+                continue;
+            }
             let (line, newline) = split_line_ending(segment);
 
             if let Some(name) = cargo_section_name(line) {
                 section = name;
                 rebuilt.push_str(segment);
+                continue;
+            }
+
+            // 複数行の inline table の `tag` も、閉じる行までをまとめて扱う (#98)。
+            if is_cargo_git_tag_inline_section(section)
+                && let Some(table) = multiline_inline_table(content, segment_start, line, package)
+            {
+                written_until = line_end_after(content, table.1);
+                match rewrite_multiline_inline_table(content, segment_start, table, "tag", |_| {
+                    Some(new_tag.to_string())
+                }) {
+                    Some(rewritten) => {
+                        rebuilt.push_str(&rewritten);
+                        updated = true;
+                    }
+                    None => rebuilt.push_str(&content[segment_start..written_until]),
+                }
                 continue;
             }
 
@@ -658,6 +776,53 @@ mod tests {
 
     fn parse(content: &str) -> Result<Vec<Dependency>, ManifestError> {
         CargoTomlParser.parse(content)
+    }
+
+    /// Issue #98: 複数行に分けた inline table の依存も書き換える。parse (toml クレート) は
+    /// 依存として報告するのに、以前は宣言の 1 行目しか見ず、後の行の `version` / `tag` に
+    /// 届かずに書き込みが失敗していた。
+    #[test]
+    fn multiline_inline_tables_are_updated() {
+        let content = "[dependencies]\ntokio = { features = [\n  \"rt\",\n], version = \"1.40.0\" }\nserde = \"1.0\"\n";
+        let deps = parse(content).unwrap();
+        assert!(deps.iter().any(|dep| dep.name == "tokio"));
+        let updated = CargoTomlParser
+            .update_version(content, "tokio", "1.48.0")
+            .unwrap();
+        assert_eq!(updated, content.replace("\"1.40.0\"", "\"1.48.0\""));
+        // TOML 1.1 の、改行を含む inline table
+        let content =
+            "[dependencies]\nreqwest = {\n  default-features = false,\n  version = '0.12.0',\n}\n";
+        let updated = CargoTomlParser
+            .update_version(content, "reqwest", "0.12.9")
+            .unwrap();
+        assert_eq!(updated, content.replace("'0.12.0'", "'0.12.9'"));
+        // git の tag も同じ
+        let content = "[dependencies]\nmylib = { git = \"https://example.com/mylib.git\",\n  tag = \"v1.0.0\" }\n";
+        let updated = CargoTomlParser
+            .update_git_tag(content, "mylib", "v1.1.0")
+            .unwrap();
+        assert_eq!(updated, content.replace("v1.0.0", "v1.1.0"));
+    }
+
+    /// 複数行の inline table でも、path や別レジストリを指す宣言は書き換えない (parse と同じ)。
+    #[test]
+    fn multiline_inline_tables_with_other_sources_are_not_updated() {
+        for source in [
+            "path = \"../local\"",
+            "registry = \"internal\"",
+            "registry-index = \"https://example.com/index\"",
+        ] {
+            let content = format!(
+                "[dependencies]\nmylib = {{ features = [\n  \"a\",\n], version = \"1.0.0\", {source} }}\n"
+            );
+            assert!(
+                CargoTomlParser
+                    .update_version(&content, "mylib", "1.1.0")
+                    .is_err(),
+                "{source}"
+            );
+        }
     }
 
     #[test]
