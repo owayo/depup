@@ -180,10 +180,14 @@ impl ManifestWriter {
                 source: std::io::Error::new(std::io::ErrorKind::InvalidData, error),
             })?;
 
+        // BOM は構文ではないので、BOM を除いた本文を parse して書き換え、書き戻すときに
+        // 付け直す (#103)
+        let (bom, body) = super::split_utf8_bom(&content);
+
         // 現行のパーサAPIは依存名だけで書き換えるため、同じキーが複数箇所にあると
         // 更新対象外の宣言まで変更してしまう。位置情報付き編集へ移行するまでは、
         // 曖昧な更新を拒否してマニフェスト破壊を防ぐ。
-        let parsed_dependencies = parser.parse(&content)?;
+        let parsed_dependencies = parser.parse(body)?;
         let mut declaration_counts = HashMap::new();
         let mut variable_counts = HashMap::new();
         for dependency in &parsed_dependencies {
@@ -232,7 +236,7 @@ impl ManifestWriter {
             .collect();
 
         // 更新は順番に適用する
-        let mut current_content = content.clone();
+        let mut current_content = body.to_string();
         // 曖昧として拒否した依存キー。版や取得元の食い違う宣言が別々の更新になっても、
         // 同じ依存のエラーは 1 行だけ出す
         let mut refused_ambiguous: HashSet<&str> = HashSet::new();
@@ -312,10 +316,11 @@ impl ManifestWriter {
 
         // dry-run でなく、実際に変更がある場合のみ書き戻す
         if result.updates_applied > 0 && !self.dry_run {
+            let written = format!("{bom}{current_content}");
             if let Err(source) = write_checked(
                 &guard,
                 &before,
-                current_content.as_bytes(),
+                written.as_bytes(),
                 before.permissions.as_ref(),
             ) {
                 let error = ManifestError::WriteError {
@@ -332,7 +337,7 @@ impl ManifestWriter {
             result.journal = Some(ManifestJournal {
                 target: guard.target.clone(),
                 before: content.into_bytes(),
-                written: current_content.into_bytes(),
+                written: written.into_bytes(),
                 permissions: before.permissions.unwrap(),
                 guard,
             });
@@ -637,6 +642,57 @@ tokio_v1 = { package = "tokio", version = "1.0", features = ["rt"] }
         assert_eq!(result.updates_applied, 1);
         let content = fs::read_to_string(&path).unwrap();
         assert!(content.contains(r#"tokio_v1 = { package = "tokio", version = "1.45.0""#));
+    }
+
+    /// Issue #103: UTF-8 の BOM で始まるマニフェストも、BOM を除いた本文を書き換え、書き戻す
+    /// ときに BOM を保つ。以前は行ごとに読む Cargo.toml の書き換えが 1 行目の
+    /// `\u{feff}[dependencies]` をセクションと見ず、更新を報告した後に書き込みに失敗していた。
+    #[test]
+    fn manifests_starting_with_a_utf8_bom_keep_it_when_updated() {
+        let temp_dir = TempDir::new().unwrap();
+        for (content, language, parser, name) in [
+            (
+                "\u{feff}[dependencies]\nserde = \"1.0.0\"\n",
+                Language::Rust,
+                &crate::manifest::CargoTomlParser as &dyn ManifestParser,
+                "Cargo.toml",
+            ),
+            (
+                "\u{feff}[tools]\nshellcheck = \"1.0.0\"\n",
+                Language::Mise,
+                &crate::manifest::MiseParser,
+                "mise.toml",
+            ),
+            (
+                "\u{feff}{\n  \"dependencies\": {\n    \"serde\": \"1.0.0\"\n  }\n}\n",
+                Language::Node,
+                &crate::manifest::PackageJsonParser,
+                "package.json",
+            ),
+        ] {
+            let path = temp_dir.path().join(name);
+            fs::write(&path, content).unwrap();
+            let mut manifest_result = ManifestUpdateResult::new(&path, language);
+            manifest_result.add_result(UpdateResult::update(
+                sample_dependency("serde", "1.0.0", language).with_manifest_name(
+                    if language == Language::Mise {
+                        "shellcheck"
+                    } else {
+                        "serde"
+                    },
+                ),
+                "1.2.0",
+            ));
+            let result = ManifestWriter::new(false)
+                .apply_updates(&manifest_result, parser)
+                .unwrap();
+            assert_eq!(result.updates_applied, 1, "{name}: {:?}", result.errors);
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                content.replace("1.0.0", "1.2.0"),
+                "{name}"
+            );
+        }
     }
 
     #[test]

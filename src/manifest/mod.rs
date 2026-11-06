@@ -112,6 +112,22 @@ pub fn parser_for(path: &Path, language: Language) -> Box<dyn ManifestParser> {
     }
 }
 
+/// UTF-8 の BOM (`U+FEFF`)
+const UTF8_BOM: &str = "\u{feff}";
+
+/// ファイルの内容を、先頭の UTF-8 の BOM (なければ空) と、それを除いた本文に分ける。
+///
+/// BOM は文字コードの印で、TOML や JSON の構文ではない。パーサは本文を受け取り、書き戻す
+/// ときに BOM を付け直す。行ごとに読むパーサは 1 行目の `\u{feff}[tools]` をセクションと
+/// 見ないので、BOM のまま渡すと mise.toml のツールを検出せず、Cargo.toml は更新を報告した
+/// 後に書き換えに失敗していた (#103)。
+pub(crate) fn split_utf8_bom(content: &str) -> (&'static str, &str) {
+    match content.strip_prefix(UTF8_BOM) {
+        Some(body) => (UTF8_BOM, body),
+        None => ("", content),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
