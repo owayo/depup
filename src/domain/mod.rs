@@ -26,4 +26,6 @@ pub use summary::{LanguageCounts, LockRefreshResult, ManifestUpdateResult, Updat
 pub use update_result::{
     AgeWaitingVersion, OsvBlocked, SkipReason, UpdateCancellation, UpdateResult,
 };
-pub use version_spec::{VersionSpec, VersionSpecKind, range_lower_bound_version};
+pub use version_spec::{
+    VersionSpec, VersionSpecKind, range_lower_bound_span, range_lower_bound_version,
+};

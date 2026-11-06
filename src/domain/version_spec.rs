@@ -523,10 +523,17 @@ fn find_bare_lower_bound_token(raw: &str) -> Option<(usize, usize)> {
 /// 更新取りこぼしを防ぐ。包含下限が無い場合 (厳密下限 `>1.0` のみ等) は `None` を返し、
 /// 呼び出し側の従来ロジックにフォールバックさせる。
 pub fn range_lower_bound_version(raw: &str) -> Option<String> {
-    let (start, end) = find_inclusive_lower_bound_token(raw)
-        .map(|(_, start, end)| (start, end))
-        .or_else(|| find_bare_lower_bound_token(raw))?;
+    let (start, end) = range_lower_bound_span(raw)?;
     Some(raw[start..end].to_string())
+}
+
+/// [`range_lower_bound_version`] が返す包含下限の、`raw` の中のバイト範囲 (版の部分)。
+/// 書き換え (`format_range_like`) はこの版を置き換えるので、上限の判定 (#99) は、置き換わる
+/// 比較子の暗黙の上限 (`^1.2` の `<2.0.0` など) を見ないためにこの範囲を使う。
+pub fn range_lower_bound_span(raw: &str) -> Option<(usize, usize)> {
+    find_inclusive_lower_bound_token(raw)
+        .map(|(_, start, end)| (start, end))
+        .or_else(|| find_bare_lower_bound_token(raw))
 }
 
 fn contains_not_equal_operator(raw: &str) -> bool {
