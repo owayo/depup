@@ -2,93 +2,16 @@
 use super::*;
 use crate::cargo_rollback::scratch::workspace_manifest_paths;
 use crate::file_snapshot::{FileGuard, FileState, save_recovery_copy, write_checked};
-use std::path::PathBuf;
+use inventory::{Inventory, manifest_inventory};
+
+mod inventory;
 
 pub(super) struct AuditSnapshot {
     lock: FileGuard,
     start: FileState,
     manifests: Vec<(FileGuard, FileState)>,
-    inventory: Vec<PathBuf>,
-}
-
-// 各 glob の固定接頭辞の配下にある Cargo.toml をすべて列挙する。この広めの集合なら、
-// 入れ子や繰り返しの glob も対象になり、検出器の限定的なパターン展開に頼らず、
-// 緊急復元中に Cargo を再実行せずに済む。
-fn manifest_inventory(root: &Path) -> Result<Vec<PathBuf>, String> {
-    use std::fs;
-    let root = fs::canonicalize(root).map_err(|error| error.to_string())?;
-    let content = match fs::read_to_string(root.join("Cargo.toml")) {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error.to_string()),
-    };
-    let manifest: toml::Value = toml::from_str(&content).map_err(|error| error.to_string())?;
-    let mut pending = Vec::new();
-    for pattern in manifest
-        .get("workspace")
-        .and_then(|workspace| workspace.get("members"))
-        .and_then(toml::Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let pattern = pattern.as_str().ok_or("invalid workspace member pattern")?;
-        let mut prefix = root.clone();
-        for component in Path::new(pattern).components() {
-            match component {
-                std::path::Component::Normal(part) => {
-                    if part
-                        .to_string_lossy()
-                        .contains(['*', '?', '[', ']', '{', '}'])
-                    {
-                        pending.push(prefix);
-                        break;
-                    }
-                    prefix.push(part);
-                }
-                std::path::Component::CurDir => {}
-                _ => return Err("workspace inventory would leave the project root".into()),
-            }
-        }
-    }
-    let mut visited = HashSet::new();
-    let mut paths = Vec::new();
-    let mut examined = 0;
-    while let Some(directory) = pending.pop() {
-        let directory = match fs::canonicalize(&directory) {
-            Ok(directory) => directory,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error.to_string()),
-        };
-        if !directory.starts_with(&root) {
-            return Err("workspace inventory follows a directory outside the project root".into());
-        }
-        if !visited.insert(directory.clone()) {
-            continue;
-        }
-        for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
-            examined += 1;
-            if examined > 100_000 {
-                return Err("workspace inventory exceeded 100000 entries".into());
-            }
-            let entry = entry.map_err(|error| error.to_string())?;
-            let kind = entry.file_type().map_err(|error| error.to_string())?;
-            let path = entry.path();
-            if kind.is_dir() || (kind.is_symlink() && path.is_dir()) {
-                pending.push(path);
-            } else if entry.file_name() == "Cargo.toml" {
-                let path = fs::canonicalize(path).map_err(|error| error.to_string())?;
-                if !path.starts_with(&root) {
-                    return Err(
-                        "workspace inventory follows a manifest outside the project root".into(),
-                    );
-                }
-                paths.push(path);
-            }
-        }
-    }
-    paths.sort();
-    paths.dedup();
-    Ok(paths)
+    /// workspace のメンバーの集合。戻す直前に取り直し、監査の間に変わっていれば戻さない。
+    inventory: Inventory,
 }
 
 impl AuditSnapshot {
