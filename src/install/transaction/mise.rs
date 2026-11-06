@@ -44,7 +44,17 @@ pub(super) fn managed_paths(
     {
         return Err("Cannot safely prepare mise recovery with custom config paths".into());
     }
-    check_parent_scope(&directory, &boundary, &environments)?;
+    // ホームは `HOME` だけでなく Windows の `USERPROFILE` からも求める (`native_age` と同じ)。
+    // `HOME` がない Windows では、ホームのグローバルな設定を親のプロジェクトの設定と誤認していた (#97)。
+    let home = dirs::home_dir().map(|home| identity(&home));
+    let global = crate::manifest::native_age::global_config_path(Language::Mise);
+    check_parent_scope(
+        &directory,
+        &boundary,
+        &environments,
+        home.as_deref(),
+        global.as_deref(),
+    )?;
     let mut configs = BTreeSet::new();
     let mut monorepo = None;
     for ancestor in directory
@@ -264,15 +274,15 @@ pub(super) fn managed_paths(
     })
 }
 
-/// mise は、Cargo から得た許可境界より上の親プロジェクト設定を読むことがある。
+/// mise は、Cargo から得た許可境界より上の親プロジェクト設定を読むことがある。`home` の
+/// `.config/mise` の設定と、mise のグローバルな設定 `global` は、親のプロジェクトとみなさない。
 fn check_parent_scope(
     directory: &Path,
     boundary: &Path,
     environments: &[String],
+    home: Option<&Path>,
+    global: Option<&Path>,
 ) -> Result<(), String> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|path| identity(&path));
     for ancestor in directory
         .ancestors()
         .filter(|ancestor| !ancestor.starts_with(boundary))
@@ -323,7 +333,10 @@ fn check_parent_scope(
                     .transpose()?
                     == Some(true);
             // 標準のホーム設定はグローバルなので、その install 生成物は対象外にする。
-            let global = home.as_deref() == Some(ancestor) && name.starts_with(".config/mise");
+            let is_global = (home == Some(ancestor) && name.starts_with(".config/mise"))
+                || global.is_some_and(|global| {
+                    crate::manifest::native_age::same_config_path(&config, global)
+                });
             let stem = config
                 .file_stem()
                 .and_then(|stem| stem.to_str())
@@ -341,7 +354,7 @@ fn check_parent_scope(
                         return Err(format!("Cannot confirm parent mise lock scope: {error}"));
                     }
                 };
-            if parent_monorepo || (!global && (value.get("tools").is_some() || existing_lock)) {
+            if parent_monorepo || (!is_global && (value.get("tools").is_some() || existing_lock)) {
                 return Err("Parent mise project scope is outside the recovery boundary; run from the project root".into());
             }
         }
@@ -515,3 +528,6 @@ fn visit(
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
