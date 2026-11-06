@@ -48,7 +48,7 @@ osv_risk_tradeoff = true
 # github = ["example-dev"]
 ```
 
-A key that is missing from the file falls back to the built-in default (`age = "1w"`, `osv = true`, `osv_risk_tradeoff = true`, no `max_change` limit). If the file cannot be created or parsed, depup prints a warning and uses the built-in defaults. If a single value is invalid (such as `age = "abc"`), depup prints a warning and uses the built-in default for that setting only.
+A key that is missing from the file falls back to the built-in default (`age = "1w"`, `osv = true`, `osv_risk_tradeoff = true`, no `max_change` limit). If the file cannot be created, read, or parsed, depup prints a warning and uses the built-in defaults. Write the file as UTF-8 text; a file that is not UTF-8 (such as the UTF-16 that `>` writes in Windows PowerShell 5.1) is reported the same way. If a single value is invalid (such as `age = "abc"`), depup prints a warning and uses the built-in default for that setting only.
 
 Updates that fix existing vulnerabilities may still be allowed under severity and count limits, even when an existing configuration file has no `osv_risk_tradeoff` key. See [Vulnerability Check](usage.md#vulnerability-check-osvdev) for the counting rules and baseline requirements.
 
