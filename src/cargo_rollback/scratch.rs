@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt::Display;
 use std::io;
-use std::path::{Component, Path, PathBuf, Prefix};
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -980,31 +980,7 @@ fn path_string(path: &Path) -> Result<String, String> {
 
 /// `fs::canonicalize` した上で、Windows の `\\?\C:\...` を `C:\...` に戻す
 fn canonical_path(path: &Path) -> io::Result<PathBuf> {
-    std::fs::canonicalize(path).map(strip_verbatim_prefix)
-}
-
-/// Windows の `\\?\C:\...` を `C:\...` に、`\\?\UNC\server\share\...` を `\\server\share\...` に
-/// 戻す (それ以外はそのまま)。`\\?\` の `?` は cargo が workspace の member を展開する glob の
-/// ワイルドカードになるため、写しの root に使えない (一時ディレクトリがネットワーク共有に
-/// ある環境では UNC 形式になる)
-fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
-    let mut components = path.components();
-    let Some(Component::Prefix(prefix)) = components.next() else {
-        return path;
-    };
-    let mut plain = match prefix.kind() {
-        Prefix::VerbatimDisk(disk) => PathBuf::from(format!("{}:", char::from(disk))),
-        Prefix::VerbatimUNC(server, share) => {
-            let mut root = OsString::from(r"\\");
-            root.push(server);
-            root.push(r"\");
-            root.push(share);
-            PathBuf::from(root)
-        }
-        _ => return path,
-    };
-    plain.push(components.as_path());
-    plain
+    std::fs::canonicalize(path).map(crate::user_path::strip_verbatim_prefix)
 }
 
 /// 存在する最も深い祖先までを canonicalize し、残りの要素をそのままつなぐ。
@@ -1880,25 +1856,6 @@ serde = {{ path = "../../../outside" }}
         assert_eq!(
             canonicalize_lenient(&dir.path().join("missing/file.rs")),
             canonical_path(dir.path()).unwrap().join("missing/file.rs")
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn test_strip_verbatim_prefix_on_windows() {
-        assert_eq!(
-            strip_verbatim_prefix(PathBuf::from(r"\\?\C:\work\ws")),
-            PathBuf::from(r"C:\work\ws")
-        );
-        // verbatim の UNC は通常の UNC に戻す
-        assert_eq!(
-            strip_verbatim_prefix(PathBuf::from(r"\\?\UNC\server\share\ws")),
-            PathBuf::from(r"\\server\share\ws")
-        );
-        // verbatim でないものはそのまま
-        assert_eq!(
-            strip_verbatim_prefix(PathBuf::from(r"C:\work\ws")),
-            PathBuf::from(r"C:\work\ws")
         );
     }
 }

@@ -97,7 +97,9 @@ impl ResolvedAge {
             } else {
                 format!("{seconds}s")
             };
-            let source = project.source.display();
+            // 正規化したパスなので、Windows の `\\?\` を外して見せる (#126)
+            let source = crate::user_path::for_display(&project.source);
+            let source = source.display();
             notices.push(match self.cli_label {
                 Some(cli) => format!("⚠ {cli} ignored: project's minimumReleaseAge ({duration} from {source}) takes precedence").yellow().to_string(),
                 None => format!("ℹ Using project's minimumReleaseAge ({duration} from {source})")

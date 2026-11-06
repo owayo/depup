@@ -34,3 +34,4 @@ pub mod tauri_sync;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod update;
+mod user_path;

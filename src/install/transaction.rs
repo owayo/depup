@@ -8,6 +8,8 @@ use crate::manifest::{GRADLE_WRAPPER_FILES, GRADLE_WRAPPER_PROPERTIES, detect_ma
 use crate::node_scope::node_resolution_directory;
 use crate::orchestrator::OrchestratorResult;
 use crate::package_manager::{InstallResult, InstallScope, PreparedInstall, SystemPackageManager};
+// 報告に出すパスは Windows の `\\?\` を外して見せる (#126)
+use crate::user_path::for_display;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Write};
@@ -1405,7 +1407,7 @@ impl RollbackReport {
                     &unit
                         .directories
                         .iter()
-                        .map(|path| path.display().to_string())
+                        .map(|path| for_display(path).display().to_string())
                         .collect::<Vec<_>>()
                         .join(", "),
                 )?;
@@ -1434,19 +1436,19 @@ impl RollbackReport {
                 match outcome {
                     FileOutcome::Unchanged => {}
                     FileOutcome::Restored => {
-                        writeln!(out, "  restored {}", display_path.display())?
+                        writeln!(out, "  restored {}", for_display(display_path).display())?
                     }
                     FileOutcome::Removed => writeln!(
                         out,
                         "  removed {} (created during install)",
-                        display_path.display()
+                        for_display(display_path).display()
                     )?,
                     FileOutcome::Conflict { reason, backup }
                     | FileOutcome::Failed { reason, backup } => {
                         writeln!(
                             out,
                             "  recovery failed for {}: {reason}; current file kept",
-                            path.display()
+                            for_display(path).display()
                         )?;
                         print_backup(out, path, backup)?;
                     }
@@ -1454,7 +1456,7 @@ impl RollbackReport {
                         writeln!(
                             out,
                             "  kept {} unrestored: another file of this install could not be restored",
-                            path.display()
+                            for_display(path).display()
                         )?;
                         print_backup(out, path, backup)?;
                     }
@@ -1554,15 +1556,15 @@ fn print_backup(
             writeln!(
                 out,
                 "    Original file was absent (receipt: {}). Review and remove {} after resolving the conflict.",
-                backup.display(),
-                path.display()
+                for_display(backup).display(),
+                for_display(path).display()
             )
         }
         Ok(backup) => writeln!(
             out,
             "    Pre-write copy: {}. Restore it to {} after resolving the conflict.",
-            backup.display(),
-            path.display()
+            for_display(backup).display(),
+            for_display(path).display()
         ),
         Err(error) => writeln!(out, "    Recovery copy failed: {error}"),
     }
