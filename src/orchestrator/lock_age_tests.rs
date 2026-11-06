@@ -912,6 +912,10 @@ async fn test_exhausted_budget_leaves_everything_unchecked() {
 }
 
 /// 差し戻しの照会が予算切れになっても、全件検証には独立した枠がある。
+///
+/// 時間は `std::time::Instant` で測るので、枠は負荷が高くても最終の検証の照会が枠の中で始まる
+/// 長さにし、最初の照会はそれよりずっと長く待たせて、枠で打ち切られることを保つ。以前は枠が
+/// 100 ms で、負荷が高いと照会を始める前に枠を使い切って失敗することがあった (#128)。
 #[tokio::test]
 async fn final_verification_has_an_independent_time_budget() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -929,7 +933,7 @@ async fn final_verification_has_an_independent_time_budget() {
             _: &str,
         ) -> Result<Vec<VersionInfo>, crate::error::RegistryError> {
             if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::time::sleep(Duration::from_secs(60)).await;
             }
             Ok(vec![VersionInfo::new("1.0.0", old())])
         }
@@ -948,7 +952,7 @@ async fn final_verification_has_an_independent_time_budget() {
                 preferred: &Default::default(),
                 adapter: &dates,
                 cargo: &CargoCommand::new(),
-                budget: Duration::from_millis(100),
+                budget: Duration::from_secs(1),
             },
             None,
         )
