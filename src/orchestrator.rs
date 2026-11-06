@@ -41,7 +41,7 @@ use crate::update::{
 };
 use futures::stream::{self, StreamExt};
 use indicatif::ProgressBar;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -219,6 +219,14 @@ impl std::fmt::Display for OrchestratorError {
 }
 
 impl std::error::Error for OrchestratorError {}
+
+/// `notices` のうち、まだ出していない通知 (`shown` に記録して返す)。同じ通知は 1 回だけ返す。
+fn unseen_notices(shown: &mut HashSet<String>, notices: Vec<String>) -> Vec<String> {
+    notices
+        .into_iter()
+        .filter(|notice| shown.insert(notice.clone()))
+        .collect()
+}
 
 impl Orchestrator {
     pub(crate) fn live_osv_details(&self) -> bool {
@@ -742,10 +750,16 @@ impl Orchestrator {
         let progress_bar = progress.bar();
 
         let mut pnpm_settings = BTreeMap::new();
+        // 出した通知。同じ通知をマニフェストごとに繰り返さない (#108)
+        let mut shown_notices = HashSet::new();
         for ParsedManifest { info, dependencies } in parsed {
             let osv_baselines = self.osv_baselines(info, &dependencies).await;
             let dir = info.path.parent().unwrap_or(&self.args.path);
-            let mut filter = self.build_filter_for(dir);
+            let (mut filter, notices) = self.build_filter_for(dir);
+            for notice in unseen_notices(&mut shown_notices, notices) {
+                // 進捗バーの表示中は、バーと混ざらないように出す
+                progress.suspend(|| eprintln!("{notice}"));
+            }
             let policy = match self.resolved_age_policy_for_language(dir, info.language) {
                 Ok(policy) => policy,
                 Err(message) => {
@@ -945,10 +959,15 @@ impl Orchestrator {
     /// CLI引数からUpdateFilterを構築する
     #[cfg(test)]
     fn build_filter(&self) -> UpdateFilter {
-        self.build_filter_for(&self.args.path)
+        self.build_filter_for(&self.args.path).0
     }
 
-    fn build_filter_for(&self, dir: &Path) -> UpdateFilter {
+    /// `dir` のマニフェストに使う `UpdateFilter` と、利用者に知らせる通知 (age の設定の優先
+    /// 順位と、mise の excludes を depup が解釈しないこと)。check の段階はマニフェストごとに
+    /// 呼ぶので、通知はここで出さずに返し、呼び出し側が同じ通知を 1 回だけ、進捗バーを避けて
+    /// 出す。以前はここで出していたので、マニフェストの数だけ繰り返し、進捗バーと混ざって
+    /// いた (#108)。
+    fn build_filter_for(&self, dir: &Path) -> (UpdateFilter, Vec<String>) {
         let mut filter = UpdateFilter::new();
 
         // 言語フィルタ
@@ -976,18 +995,18 @@ impl Orchestrator {
             dir,
             self.evaluated_at,
         );
-        resolved.emit_notice();
+        let mut notices = resolved.notices();
         filter.min_age = resolved.policy.min_age;
         filter.age_exempt = resolved.policy.exemptions;
         // mise の除外設定は depup 側で解釈しないため、食い違いを通知する
-        self.warn_mise_age_excludes();
+        notices.extend(self.mise_age_excludes_warning());
 
         // 変更レベル上限
         if let Some(level) = self.args.max_change {
             filter = filter.with_max_change(level);
         }
 
-        filter
+        (filter, notices)
     }
 
     /// ディレクトリの明示設定と実行ルート内の祖先設定から age を解決する。
@@ -1085,20 +1104,20 @@ impl Orchestrator {
     /// 全ツールへ一律に age を適用する。両者の食い違い (depup では「更新なし」
     /// なのに `mise install` では新しい版が入る、など) を黙って起こさないよう、
     /// 差があること自体を伝える。
-    fn warn_mise_age_excludes(&self) {
+    fn mise_age_excludes_warning(&self) -> Option<String> {
         use colored::Colorize as _;
         if !has_mise_config(&self.args.path) {
-            return;
+            return None;
         }
         let mise = MiseSettings::from_dir(&self.args.path);
         if mise.minimum_release_age_excludes.is_empty() {
-            return;
+            return None;
         }
         let msg = format!(
             "⚠ mise's minimum_release_age_excludes ({}) is not applied by depup: age is enforced for all tools",
             mise.minimum_release_age_excludes.join(", ")
         );
-        eprintln!("{}", msg.yellow());
+        Some(msg.yellow().to_string())
     }
 
     /// CLI引数に基づいて言語を処理すべきかチェックする
@@ -2800,6 +2819,36 @@ mod tests {
                 .map(|dependency| dependency.name.as_str())
                 .collect::<Vec<_>>(),
             ["shellcheck"]
+        );
+    }
+
+    /// Issue #108: age の設定の通知は、`build_filter_for` が出さずに返し、check の段階が同じ
+    /// 通知を 1 回だけ出す。以前はマニフェストの数だけ出し、進捗バーと混ざっていた。
+    #[test]
+    fn filter_notices_are_returned_once_instead_of_printed_per_manifest() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages: []\nminimumReleaseAge: 14400\n",
+        )
+        .unwrap();
+        let orchestrator =
+            Orchestrator::new(make_args_with_path(dir.path(), &["--age", "2w"])).unwrap();
+        let (_, notices) = orchestrator.build_filter_for(dir.path());
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.contains("ignored: project's minimumReleaseAge")),
+            "{notices:?}"
+        );
+        // 2 つ目以降のマニフェストの同じ通知は出さない
+        let mut shown = HashSet::new();
+        assert_eq!(unseen_notices(&mut shown, notices.clone()), notices);
+        let (_, again) = orchestrator.build_filter_for(dir.path());
+        assert!(unseen_notices(&mut shown, again).is_empty());
+        assert_eq!(
+            unseen_notices(&mut shown, vec!["other".to_string()]),
+            ["other"]
         );
     }
 
