@@ -793,16 +793,52 @@ fn apply_range_upper_bound<'a>(
     else {
         return candidates;
     };
+    // 排他的な上限 `<V` は、V 自身がプレリリースでない限り V のプレリリースを含まない
+    // (PEP 440・Composer・node-semver・Cargo の semver)。版の大小だけで比べると、上限と同じ版の
+    // プレリリース (`<3` に対する 3.0.0rc1) が範囲内に見え、範囲外や充足できない制約を書く (#94)。
+    let excludes_upper_prereleases = !inclusive
+        && upper_bound_excludes_its_prereleases(dependency.language)
+        && !is_prerelease_version(&upper_bound);
     candidates
         .into_iter()
-        .filter(
-            |v| match compare_dependency_versions(dependency, &v.version, &upper_bound) {
+        .filter(|v| {
+            if excludes_upper_prereleases
+                && v.is_prerelease()
+                && same_release_core(&v.version, &upper_bound)
+            {
+                return false;
+            }
+            match compare_dependency_versions(dependency, &v.version, &upper_bound) {
                 std::cmp::Ordering::Less => true,
                 std::cmp::Ordering::Equal => inclusive,
                 std::cmp::Ordering::Greater => false,
-            },
-        )
+            }
+        })
         .collect()
+}
+
+/// 排他的な上限 `<V` が V のプレリリースを含まない言語。RubyGems と Maven は、版の順序の
+/// とおり `3.0.0.rc1 < 3.0` を範囲内とする。
+fn upper_bound_excludes_its_prereleases(language: Language) -> bool {
+    matches!(
+        language,
+        Language::Python | Language::Php | Language::Node | Language::Rust
+    )
+}
+
+/// 数値の部分 (末尾の 0 を除く) が同じか。`3` と `3.0.0rc1` / `3.0` と `3.0.0-RC2` は同じ。
+fn same_release_core(a: &str, b: &str) -> bool {
+    let core = |version: &str| {
+        let mut core = version_info::numeric_core(version);
+        while core
+            .last()
+            .is_some_and(|segment| *segment == Default::default())
+        {
+            core.pop();
+        }
+        core
+    };
+    core(a) == core(b)
 }
 
 fn matches_rejected_version(dependency: &Dependency, candidate: &str, rejected: &str) -> bool {
@@ -2961,6 +2997,70 @@ mod tests {
     ) -> Dependency {
         let spec = VersionSpec::new(VersionSpecKind::Range, raw, version);
         Dependency::new(name, spec, false, language)
+    }
+
+    /// Issue #94: 排他的な上限 `<V` と同じ版のプレリリースを、上限の内側とみなさない
+    /// (PEP 440・Composer・node-semver・Cargo)。現在版がプレリリースでも、上の系列の
+    /// プレリリースへ移って範囲外 (npm / Cargo) や充足できない (Python / Composer) 制約を書かない。
+    #[test]
+    fn test_judge_exclusive_upper_bound_excludes_its_own_prereleases() {
+        let judge = UpdateJudge::new(UpdateFilter::new());
+        for (language, raw, current, versions) in [
+            (
+                Language::Python,
+                ">=2.0.0rc1,<3",
+                "2.0.0rc1",
+                ["2.0.0rc1", "2.0.0", "2.1.0", "3.0.0rc1", "3.0.0"],
+            ),
+            (
+                Language::Node,
+                ">=2.0.0-rc.1 <3.0.0",
+                "2.0.0-rc.1",
+                ["2.0.0-rc.1", "2.0.0", "2.1.0", "3.0.0-rc.1", "3.0.0"],
+            ),
+            (
+                Language::Rust,
+                ">=2.0.0-rc.1, <3.0.0",
+                "2.0.0-rc.1",
+                ["2.0.0-rc.1", "2.0.0", "2.1.0", "3.0.0-rc.1", "3.0.0"],
+            ),
+            (
+                Language::Php,
+                ">=2.0.0-RC1 <3.0",
+                "2.0.0-RC1",
+                ["2.0.0-RC1", "2.0.0", "2.1.0", "3.0.0-RC2", "3.0.0"],
+            ),
+        ] {
+            let dep = make_range_dependency("example", raw, current, language);
+            let versions: Vec<_> = versions
+                .iter()
+                .zip([50, 40, 30, 20, 10])
+                .map(|(version, days_ago)| make_version_info(version, days_ago))
+                .collect();
+            match judge.judge(&dep, &versions) {
+                UpdateResult::Update { new_version, .. } => {
+                    assert_eq!(new_version, "2.1.0", "{language:?} {raw}")
+                }
+                other => panic!("{language:?} {raw}: {other:?}"),
+            }
+        }
+        // 上限そのものがプレリリースなら、それより前の同じ版のプレリリースは範囲内
+        let dep = make_range_dependency(
+            "example",
+            ">=2.0.0-rc.1 <3.0.0-rc.2",
+            "2.0.0-rc.1",
+            Language::Node,
+        );
+        let versions = vec![
+            make_version_info("2.0.0-rc.1", 50),
+            make_version_info("2.1.0", 40),
+            make_version_info("3.0.0-rc.1", 30),
+            make_version_info("3.0.0-rc.2", 20),
+        ];
+        match judge.judge(&dep, &versions) {
+            UpdateResult::Update { new_version, .. } => assert_eq!(new_version, "3.0.0-rc.1"),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
