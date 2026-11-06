@@ -494,7 +494,7 @@ uv では age が有効な場合、`uv lock --exclude-newer <日時>`、一時�
 
 #### Node の lock の監査
 
-age が有効な `--install` では、直接依存・推移依存・開発依存の実際の解決版を検証します。更新がない再実行でも、ほかの install が失敗した場合でも既存 lock を検証します。lock がなく、install も不要な場合は監査しません。
+age が有効な `--install` では、直接依存・推移依存・開発依存の実際の解決版を検証します。更新がない再実行でも、ほかの install が失敗した場合でも既存 lock を検証します。同じディレクトリにある別の言語の install（`Cargo.toml` の隣の Gemfile など）が失敗した場合も同じです。検証しないのは、失敗して元に戻す単位の lock だけです。lock がなく、install も不要な場合は監査しません。
 
 - pnpm: `pnpm list --depth Infinity --lockfile-only --json` で lock の依存グラフを読みます。共有 workspace はルートと全メンバーを含め、最も厳しい設定を使います。必須依存の欠落や CLI の警告があれば未確認扱いにします。
 - npm: 優先される `npm-shrinkwrap.json`、または `package-lock.json` の形式 2/3 の `packages` テーブルを読み、各パッケージと workspace の必須依存の解決先も確認します。

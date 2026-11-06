@@ -186,6 +186,8 @@ pub(crate) async fn run_with(
         outcome
     });
     let mut audit_plan = plan.rust_audit_plan(orchestrator, result);
+    // Cargo.lock を受け持つ単位がすでに失敗していれば、その lock は復元されるので監査しない。
+    // 同じディレクトリの別の言語の単位 (Bundler・Go・uv など) の失敗では外さない (#89)。
     tx.pending_report().exclude_rust_audits(&mut audit_plan);
     let mut rollback_osv = RollbackOsvChecks::default();
     let mut audit_failed =
@@ -205,11 +207,9 @@ pub(crate) async fn run_with(
     rollback_osv.warn(orchestrator, result, args.quiet).await;
     // pnpm の更新先の不一致は調査用にファイルを残す（age 違反ではない）。
     let mut verification = Progress::new(!args.quiet);
-    for job in plan
-        .jobs
-        .iter()
-        .filter(|job| job.language == Language::Node && !recovery.covers_directory(&job.directory))
-    {
+    for job in plan.jobs.iter().filter(|job| {
+        job.language == Language::Node && !recovery.holds(&job.directory.join("package.json"))
+    }) {
         let manager = recovery.node_manager(&job.directory).or_else(|| {
             SystemPackageManager::new().resolve_package_manager(job.language, &job.directory)
         });
@@ -287,7 +287,7 @@ async fn node_baselines(
             install.language == Language::Node && install.directory == job.directory
         });
         if !installs
-            || pending.covers_directory(&job.directory)
+            || pending.holds(&job.directory.join("package.json"))
             || !(if osv {
                 checks.osv_enabled()
             } else {
@@ -405,8 +405,9 @@ async fn audit_node_locks(
     let mut progress = Progress::new(!args.quiet);
     for job in &plan.node_audits {
         // install 自体や Tauri の Cargo.lock ですでに失敗した単位も、どのみち復元される。
+        // 同じディレクトリの別の言語の単位 (Cargo・Bundler など) の失敗では飛ばさない (#89)。
         let pending = tx.pending_report();
-        if pending.covers_directory(&job.directory) {
+        if pending.holds(&job.directory.join("package.json")) {
             continue;
         }
         let has_lock = [

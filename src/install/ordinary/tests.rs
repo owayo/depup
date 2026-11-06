@@ -334,6 +334,11 @@ fn rust_run_with(requirement: &str, locked_leaf: &str, repointing: bool) -> Rust
 
 impl RustRun {
     async fn install(&mut self) -> InstallOutcome {
+        self.install_failing(None).await
+    }
+
+    /// `failing` の言語の install だけを失敗させる。
+    async fn install_failing(&mut self, failing: Option<Language>) -> InstallOutcome {
         let args = args(self.project.path());
         let orchestrator = Orchestrator::new(args.clone()).unwrap();
         let plan = InstallPlan::new(&orchestrator, &self.result, &None, self.project.path());
@@ -345,6 +350,9 @@ impl RustRun {
             &mut self.result,
             &self.checks,
             |command| {
+                if Some(command.language) == failing {
+                    return failed_install(command);
+                }
                 if command.language == Language::Rust {
                     project.cargo_ok(&["update"]);
                 }
@@ -394,12 +402,18 @@ async fn a_rollback_that_repoints_another_dependent_still_restores_the_lockfile(
     run.project.cargo_ok(&["update", "--workspace", "--locked"]);
 }
 
-/// 復元は Cargo.lock を保持する単位に従い、同じディレクトリの独立した
-/// install の更新は保持する。
-#[tokio::test]
-async fn a_cargo_restore_keeps_an_independent_install_in_the_same_directory() {
-    let mut run = rust_run("^1.2", "1.0.0");
-    let gemfile = run.project.path().join("Gemfile");
+fn failed_install(command: &PreparedInstall) -> InstallResult {
+    InstallResult::failure(
+        command.language,
+        command.argv.join(" "),
+        String::new(),
+        "simulated failure".into(),
+    )
+}
+
+/// `directory` に、独立した install の単位になる Gemfile の更新を足す。
+fn bundler_update(result: &mut OrchestratorResult, directory: &Path) -> PathBuf {
+    let gemfile = directory.join("Gemfile");
     std::fs::write(
         &gemfile,
         "source \"https://rubygems.org\"\ngem \"example\", \"1.0.0\"\n",
@@ -418,13 +432,41 @@ async fn a_cargo_restore_keeps_an_independent_install_in_the_same_directory() {
     let write = ManifestWriter::new(false)
         .apply_updates(&manifest, get_parser(Language::Ruby).as_ref())
         .unwrap();
-    run.result.write_results.push(write);
-    run.result.summary.add_manifest(manifest);
+    result.write_results.push(write);
+    result.summary.add_manifest(manifest);
+    gemfile
+}
+
+/// 復元は Cargo.lock を保持する単位に従い、同じディレクトリの独立した
+/// install の更新は保持する。
+#[tokio::test]
+async fn a_cargo_restore_keeps_an_independent_install_in_the_same_directory() {
+    let mut run = rust_run("^1.2", "1.0.0");
+    bundler_update(&mut run.result, run.project.path());
     let outcome = run.install().await;
     assert!(!outcome.install_failed && outcome.audit_failed);
     assert_eq!(run.project.read("Cargo.toml"), run.manifest);
     assert_eq!(run.project.read("Cargo.lock"), run.lock);
     assert!(run.project.read("Gemfile").contains("\"2.0.0\""));
+}
+
+/// Issue #89: 逆に、同じディレクトリの独立した install (Bundler) が失敗しても、成功した
+/// Cargo の install の Cargo.lock は監査する。以前は失敗した単位とディレクトリが重なるだけで
+/// 監査から外し、--age を満たさない版が警告なしに Cargo.lock に残っていた。
+#[tokio::test]
+async fn an_independent_install_failure_in_the_same_directory_still_audits_cargo_lock() {
+    let mut run = rust_run("^1.2", "1.0.0");
+    let gemfile = bundler_update(&mut run.result, run.project.path());
+    let outcome = run.install_failing(Some(Language::Ruby)).await;
+    assert!(outcome.install_failed && outcome.audit_failed);
+    assert_eq!(run.project.read("Cargo.toml"), run.manifest);
+    assert_eq!(run.project.read("Cargo.lock"), run.lock);
+    assert!(run.canceled());
+    assert!(
+        std::fs::read_to_string(gemfile)
+            .unwrap()
+            .contains("\"1.0.0\"")
+    );
 }
 
 #[tokio::test]
@@ -674,6 +716,72 @@ async fn node_units_are_restored_only_for_versions_the_run_added() {
             assert_eq!(locked, "lockfileVersion: '9.0'\n# installed\n");
         }
     }
+}
+
+/// Issue #89: 同じディレクトリの独立した install (Bundler) が失敗しても、Node の lock を監査し、
+/// この実行で追加した版が --age を満たさなければ package.json と lockfile を戻す。
+#[tokio::test]
+async fn an_independent_install_failure_in_the_same_directory_still_audits_the_node_lock() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("package.json");
+    let manifest = "{\"dependencies\":{\"example\":\"1.0.0\"}}";
+    std::fs::write(&path, manifest).unwrap();
+    let lock = temp.path().join("pnpm-lock.yaml");
+    let before = "lockfileVersion: '9.0'\n# before the run\n";
+    std::fs::write(&lock, before).unwrap();
+    let example = PackageJsonParser.parse(manifest).unwrap().remove(0);
+    let mut update = ManifestUpdateResult::new(&path, Language::Node);
+    update.add_result(UpdateResult::update(example, "2.0.0"));
+    let write = ManifestWriter::new(false)
+        .apply_updates(&update, &PackageJsonParser)
+        .unwrap();
+    let mut summary = UpdateSummary::new(false);
+    summary.add_manifest(update);
+    let mut result = OrchestratorResult {
+        summary,
+        write_results: vec![write],
+        errors: vec![],
+    };
+    let gemfile = bundler_update(&mut result, temp.path());
+    let args = args(temp.path());
+    let orchestrator = Orchestrator::new(args.clone()).unwrap();
+    let plan = InstallPlan::new(&orchestrator, &result, &None, temp.path());
+    let checks = Fixed::node(
+        NodeBaseline::Known([("example".to_string(), "1.0.0".to_string())].into()),
+        NodeLockAuditResult {
+            checked: 1,
+            violations: vec![violation("example", "2.0.0")],
+            ..Default::default()
+        },
+    );
+    let outcome = run_with(
+        &args,
+        &orchestrator,
+        &plan,
+        &mut result,
+        &checks,
+        |command| {
+            if command.language == Language::Ruby {
+                return failed_install(command);
+            }
+            std::fs::write(&lock, "lockfileVersion: '9.0'\n# installed\n").unwrap();
+            InstallResult::success(
+                command.language,
+                command.argv.join(" "),
+                String::new(),
+                String::new(),
+            )
+        },
+    )
+    .await;
+    assert!(outcome.install_failed && outcome.audit_failed);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), manifest);
+    assert_eq!(std::fs::read_to_string(&lock).unwrap(), before);
+    assert!(
+        std::fs::read_to_string(gemfile)
+            .unwrap()
+            .contains("\"1.0.0\"")
+    );
 }
 
 mod yanked;

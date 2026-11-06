@@ -326,7 +326,7 @@ async fn run_with(
     let mut rollback_osv = RollbackOsvChecks::default();
     let manifests = tx.declaration_snapshots();
     for job in &jobs {
-        if tx.pending_report().covers_directory(&job.directory) {
+        if tx.pending_report().holds(&lock_path(job)) {
             continue;
         }
         progress.spinner(&format!("Reading {} lock refresh baseline", job.language));
@@ -348,7 +348,7 @@ async fn run_with(
     });
     let rust_plan = plan.rust_audit_plan(orchestrator, result);
     for job in &jobs {
-        if tx.pending_report().covers_directory(&job.directory) {
+        if tx.pending_report().holds(&lock_path(job)) {
             continue;
         }
         let key = (job.directory.clone(), job.language.to_string());
@@ -419,7 +419,7 @@ async fn run_with(
     }
     // 共有 lock の全コピーではなく、アプリの直接の importer と Cargo root の辺を照合する。
     for job in &jobs {
-        if tx.pending_report().covers_directory(&job.directory) {
+        if tx.pending_report().holds(&lock_path(job)) {
             continue;
         }
         if let Err(error) =
@@ -435,7 +435,7 @@ async fn run_with(
     });
     // lifecycle script が検証後に別の解決結果へ差し替えることを許さない。
     for job in &jobs {
-        if tx.pending_report().covers_directory(&job.directory) {
+        if tx.pending_report().holds(&lock_path(job)) {
             continue;
         }
         if let Some(snapshot) = admitted.get(&(job.directory.clone(), job.language.to_string()))
@@ -461,7 +461,7 @@ async fn run_with(
     }
     for job in jobs {
         let key = (job.directory.clone(), job.language.to_string());
-        let failed = report.covers_directory(&job.directory);
+        let failed = report.holds(&lock_path(job));
         if !failed && let Some(notices) = osv_notices.remove(&key) {
             audit_failed |=
                 super::security::print_notices(notices, result, orchestrator.live_osv_details());
