@@ -29,6 +29,9 @@ pub(super) fn plan_jobs(
                 .map_or(Ok(InstallScope::Refresh), Err),
         }
     }));
+    // 事前検査で止めた範囲は `node` に入っていない。再解決はしないが、結果から抜け落ちて
+    // 「再解決できる範囲がない」と報告しないよう、止めた理由つきの失敗として残す。
+    jobs.extend(preflight_stopped_node_jobs(orchestrator, result));
     let mut roots: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
     let boundary = orchestrator.rust_lock_boundary();
     let stopped = stopped_cargo_roots(result);
@@ -310,6 +313,15 @@ async fn run_with(
     let mut admitted = BTreeMap::new();
     let mut osv_notices = BTreeMap::new();
     let mut errors = BTreeMap::new();
+    // 計画の段階で止めた範囲 (宣言の更新の失敗や事前検査) は再解決しないので、その理由を
+    // 結果のエラーに残す。残さないと、共有の install 単位の失敗という一般的な文になる。
+    for job in &jobs {
+        if let Err(reason) = &job.scope {
+            errors
+                .entry(job.directory.clone())
+                .or_insert_with(|| reason.clone());
+        }
+    }
     let mut audit_failed = false;
     let mut rollback_osv = RollbackOsvChecks::default();
     let manifests = tx.declaration_snapshots();
