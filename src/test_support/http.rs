@@ -28,3 +28,36 @@ pub(crate) fn serve_responses(
     });
     (format!("http://{address}"), handle)
 }
+
+/// 要求のパスごとに決めた (ステータス行の残りとヘッダ, 本文) を返すサーバを立て、その起点の
+/// URL を返す。要求の順に依らない (並列の要求を受ける) テスト用で、決めていないパスには
+/// 404 を返す。サーバはテストの終わりまで動き続ける。
+pub(crate) fn serve_routes(routes: Vec<(&'static str, &'static str, &'static str)>) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            let mut request = [0_u8; 4096];
+            let Ok(read) = stream.read(&mut request) else {
+                continue;
+            };
+            let request = String::from_utf8_lossy(&request[..read]);
+            let path = request.split_whitespace().nth(1).unwrap_or_default();
+            let (status_and_headers, body) = routes
+                .iter()
+                .find(|(route, _, _)| *route == path)
+                .map_or(("404 Not Found\r\n", ""), |(_, status, body)| {
+                    (*status, *body)
+                });
+            let response = format!(
+                "HTTP/1.1 {status_and_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    format!("http://{address}")
+}

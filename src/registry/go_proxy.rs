@@ -17,7 +17,7 @@ use crate::registry::{HttpClient, RegistryAdapter};
 use crate::update::{VersionInfo, compare_semver_versions};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use futures::stream::{self, StreamExt};
+use futures::stream::{self, StreamExt, TryStreamExt};
 use serde::Deserialize;
 
 /// Go Module Proxy のベース URL
@@ -34,6 +34,8 @@ const INFO_FETCH_CONCURRENCY: usize = 8;
 /// Go Module Proxy アダプタ
 pub struct GoProxyAdapter {
     client: HttpClient,
+    /// proxy の起点の URL (テストではローカルのサーバー)
+    base_url: String,
 }
 
 /// バージョン情報レスポンス
@@ -56,13 +58,24 @@ enum Retraction {
 impl GoProxyAdapter {
     /// 新しい Go Proxy アダプタを作成
     pub fn new(client: HttpClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            base_url: GO_PROXY_URL.to_string(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_base_url(client: HttpClient, base_url: &str) -> Self {
+        Self {
+            client,
+            base_url: base_url.to_string(),
+        }
     }
 
     /// バージョン一覧用の URL を構築
     fn build_list_url(&self, module: &str) -> String {
         // モジュールパスを URL エンコード (大文字小文字を区別しない検索のため)
-        let encoded_module = Self::encode_module_path(module);
+        let encoded_module = self.module_url(module);
         format!("{}/@v/list", encoded_module)
     }
 
@@ -73,24 +86,24 @@ impl GoProxyAdapter {
     /// 適用しないと `v1.0.0-RC1` のような大文字入りバージョンの `.info` 取得が
     /// 404 になり、そのバージョンが候補から silent に欠落する。
     fn build_info_url(&self, module: &str, version: &str) -> String {
-        let encoded_module = Self::encode_module_path(module);
+        let encoded_module = self.module_url(module);
         format!("{}/@v/{}.info", encoded_module, Self::case_encode(version))
     }
 
     /// 指定バージョンの `go.mod` 取得 URL を構築する。
     fn build_mod_url(&self, module: &str, version: &str) -> String {
-        let encoded_module = Self::encode_module_path(module);
+        let encoded_module = self.module_url(module);
         format!("{}/@v/{}.mod", encoded_module, Self::case_encode(version))
     }
 
     /// タグ付きバージョンがないモジュール向けの `@latest` URL を構築する。
     fn build_latest_url(&self, module: &str) -> String {
-        format!("{}/@latest", Self::encode_module_path(module))
+        format!("{}/@latest", self.module_url(module))
     }
 
-    /// Go Proxy URL 用にモジュールパスをエンコード
-    fn encode_module_path(module: &str) -> String {
-        format!("{}/{}", GO_PROXY_URL, Self::case_encode(module))
+    /// モジュールの URL (モジュールパスは case-encode する)
+    fn module_url(&self, module: &str) -> String {
+        format!("{}/{}", self.base_url, Self::case_encode(module))
     }
 
     /// Go Module Proxy プロトコルの case-encoding (ASCII 大文字 → `!` + 小文字)
@@ -518,19 +531,24 @@ impl RegistryAdapter for GoProxyAdapter {
         let client = &self.client;
         let registry_name = self.registry_name();
 
-        let mut versions: Vec<VersionInfo> = stream::iter(info_urls)
+        // `.info` がない (404) 版は proxy が持たない版なので飛ばす。それ以外の失敗 (再試行の切れた
+        // 429 / 5xx・タイムアウト) を飛ばすと、新しい版だけが欠けた一覧で「更新なし」や古い版への
+        // 更新に見えるので、部分的な一覧で判定せずに依存の取得の失敗にする (#95)。
+        let fetched: Vec<Option<VersionInfo>> = stream::iter(info_urls)
             .map(|info_url| async move {
-                // 特定バージョンの情報が取得できない場合はスキップ
-                client
+                match client
                     .get_json::<VersionInfoResponse>(&info_url, module, registry_name)
                     .await
-                    .ok()
-                    .map(into_version_info)
+                {
+                    Ok(info) => Ok(Some(into_version_info(info))),
+                    Err(RegistryError::PackageNotFound { .. }) => Ok(None),
+                    Err(error) => Err(error),
+                }
             })
             .buffer_unordered(INFO_FETCH_CONCURRENCY)
-            .filter_map(std::future::ready)
-            .collect()
-            .await;
+            .try_collect()
+            .await?;
+        let mut versions: Vec<VersionInfo> = fetched.into_iter().flatten().collect();
 
         // バージョンでソート
         versions.sort();
@@ -559,8 +577,9 @@ mod tests {
 
     #[test]
     fn test_encode_module_path_simple() {
+        let adapter = GoProxyAdapter::new(HttpClient::new().unwrap());
         assert_eq!(
-            GoProxyAdapter::encode_module_path("github.com/gin-gonic/gin"),
+            adapter.module_url("github.com/gin-gonic/gin"),
             "https://proxy.golang.org/github.com/gin-gonic/gin"
         );
     }
@@ -568,10 +587,52 @@ mod tests {
     #[test]
     fn test_encode_module_path_with_uppercase() {
         // 大文字は !小文字 にエンコードされるべき
+        let adapter = GoProxyAdapter::new(HttpClient::new().unwrap());
         assert_eq!(
-            GoProxyAdapter::encode_module_path("github.com/Azure/azure-sdk-for-go"),
+            adapter.module_url("github.com/Azure/azure-sdk-for-go"),
             "https://proxy.golang.org/github.com/!azure/azure-sdk-for-go"
         );
+    }
+
+    /// `v1.0.0` と `v1.1.0` を持ち、`v1.1.0` の `.info` に `status` を返す proxy
+    fn proxy_with_info_status(status: &'static str) -> GoProxyAdapter {
+        use crate::test_support::http::serve_routes;
+        let base = serve_routes(vec![
+            ("/example.com/mod/@v/list", "200 OK\r\n", "v1.0.0\nv1.1.0\n"),
+            (
+                "/example.com/mod/@v/v1.1.0.mod",
+                "200 OK\r\n",
+                "module example.com/mod\n",
+            ),
+            (
+                "/example.com/mod/@v/v1.0.0.info",
+                "200 OK\r\n",
+                r#"{"Version":"v1.0.0","Time":"2026-01-01T00:00:00Z"}"#,
+            ),
+            ("/example.com/mod/@v/v1.1.0.info", status, ""),
+        ]);
+        GoProxyAdapter::with_base_url(HttpClient::new().unwrap(), &base)
+    }
+
+    /// Issue #95: 404 以外の理由で `.info` を取れない版があれば、部分的な一覧で判定せず、
+    /// 依存の取得の失敗にする。以前は黙って一覧から外し、新しい版が欠けて「更新なし」に見えた。
+    #[tokio::test]
+    async fn a_failed_info_request_fails_the_whole_lookup() {
+        let adapter = proxy_with_info_status("403 Forbidden\r\n");
+        let result = adapter.fetch_versions("example.com/mod").await;
+        assert!(
+            matches!(result, Err(RegistryError::NetworkError { .. })),
+            "{result:?}"
+        );
+    }
+
+    /// `.info` がない (404) 版は proxy が持たない版なので、一覧から外して続ける。
+    #[tokio::test]
+    async fn a_missing_info_skips_only_that_version() {
+        let adapter = proxy_with_info_status("404 Not Found\r\n");
+        let versions = adapter.fetch_versions("example.com/mod").await.unwrap();
+        let names: Vec<_> = versions.iter().map(|v| v.version.as_str()).collect();
+        assert_eq!(names, ["v1.0.0"]);
     }
 
     #[test]
