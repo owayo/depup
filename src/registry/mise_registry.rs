@@ -240,8 +240,10 @@ impl RegistryAdapter for MiseAdapter {
             .arg("--")
             .arg(package)
             .env("MISE_MINIMUM_RELEASE_AGE", &age)
-            // 対話プロンプト (未信頼 config の確認など) で止まらないようにする
-            .env("MISE_YES", "1")
+            // `MISE_YES` は渡さない。mise の yes はすべての確認に答え、未信頼の config の
+            // 信頼を記録し、コミュニティのプラグインの導入の確認も省く。版の一覧を取るだけの
+            // 実行 (dry-run を含む) で利用者の mise の状態を変えず、第三者のコードも動かさない。
+            // 子プロセスの stdin は開かないので、確認が要る場合も止まらずに失敗として返る
             .env("MISE_QUIET", "1")
             .kill_on_drop(true)
             .output();
@@ -394,7 +396,7 @@ mod tests {
         let script = dir.path().join("mise-test");
         crate::test_support::exec::write_script(
             &script,
-            "#!/bin/sh\nprintf '%s\\n' \"$PWD\" \"$@\" > invocation\nprintf '[]'\n",
+            "#!/bin/sh\nprintf '%s\\n' \"${MISE_YES-unset}\" \"$PWD\" \"$@\" > invocation\nprintf '[]'\n",
             0o700,
         );
         let cutoff = "2026-09-17T00:00:00Z".parse().unwrap();
@@ -405,12 +407,17 @@ mod tests {
         adapter.fetch_versions("node").await.unwrap();
         let invocation = std::fs::read_to_string(dir.path().join("invocation")).unwrap();
         let lines: Vec<_> = invocation.lines().collect();
+        // depup は mise の確認を自動で承認しない (利用者が自分で設定した値だけが届く)
         assert_eq!(
-            std::fs::canonicalize(lines[0]).unwrap(),
+            lines[0],
+            std::env::var("MISE_YES").unwrap_or_else(|_| "unset".into())
+        );
+        assert_eq!(
+            std::fs::canonicalize(lines[1]).unwrap(),
             std::fs::canonicalize(dir.path()).unwrap()
         );
         assert_eq!(
-            &lines[1..],
+            &lines[2..],
             [
                 "ls-remote",
                 "--json",
