@@ -440,8 +440,8 @@ pnpm の更新先の不一致 (override や解決の結果、直接依存が別�
 
 | 言語 | 判定に使うファイル | 実行するコマンド |
 |------|--------------------|------------------|
-| Node.js | `pnpm-lock.yaml` | `pnpm install` |
-| | `yarn.lock` | `yarn install` |
+| Node.js | `pnpm-lock.yaml` | `pnpm install --no-frozen-lockfile` |
+| | `yarn.lock` | `yarn install`（`YARN_ENABLE_IMMUTABLE_INSTALLS=false` を付ける） |
 | | `bun.lock` / `bun.lockb` | `bun install` |
 | | `npm-shrinkwrap.json` / `package-lock.json`、または `package.json` のみ | `npm install` |
 | Python | `uv.lock` | `uv sync` |
@@ -459,6 +459,8 @@ pnpm の更新先の不一致 (override や解決の結果、直接依存が別�
 | mise | [mise の設定ファイル](ecosystems.ja.md#対象ファイル)のいずれか | `mise install` |
 
 表のファイルがどれもなければ、その言語の install は実行せず、何も表示しません。age フィルターが有効なときは、pnpm・uv・mise に age の値も渡します（[推移的依存と age フィルター](#推移的依存と-age-フィルター)）。`uv sync` には常に `UV_MALWARE_CHECK=1` を付けます（[uv のマルウェアチェック](#uv-のマルウェアチェックpreview)）。
+
+pnpm と Yarn 2 以降は、CI の環境（`CI=true`）では既定で lockfile を変えない install になります。depup は直前にマニフェストを書き換えているので、そのままでは install が必ず失敗します。そのため pnpm には `--no-frozen-lockfile` を、Yarn には `YARN_ENABLE_IMMUTABLE_INSTALLS=false` を渡し、書き換えた指定に合わせて lockfile を更新します（Yarn 1 はこの設定を読みません）。
 
 PHP プロジェクトを `--install` で処理するとき、depup は `composer install` ではなく `composer update` を実行します。`composer install` は既存のロックファイルを再利用するため、depup が直前に `composer.json` へ書いた制約を反映できません。`composer update` で制約を解決し直し、`composer.lock` を更新します。
 

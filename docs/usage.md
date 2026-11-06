@@ -439,8 +439,8 @@ The package manager is detected from files in the directory where the install ru
 
 | Language | Detected by | Command |
 |----------|-------------|---------|
-| Node.js | `pnpm-lock.yaml` | `pnpm install` |
-| | `yarn.lock` | `yarn install` |
+| Node.js | `pnpm-lock.yaml` | `pnpm install --no-frozen-lockfile` |
+| | `yarn.lock` | `yarn install` (with `YARN_ENABLE_IMMUTABLE_INSTALLS=false`) |
 | | `bun.lock` / `bun.lockb` | `bun install` |
 | | `package-lock.json`, or `package.json` alone | `npm install` |
 | Python | `uv.lock` | `uv sync` |
@@ -458,6 +458,8 @@ The package manager is detected from files in the directory where the install ru
 | mise | any of the [mise config files](ecosystems.md#files) | `mise install` |
 
 If none of the listed files is present, no install runs for that language, and nothing is printed. When the age filter is active, pnpm, uv, and mise also receive the age setting ([below](#transitive-dependencies-and-the-age-filter)), and `uv sync` always runs with `UV_MALWARE_CHECK=1` ([uv Malware Check](#uv-malware-check-preview)).
+
+In CI (`CI=true`), pnpm and Yarn 2+ default to installs that do not change the lockfile. depup has just rewritten the manifest, so such an install would always fail. depup therefore passes `--no-frozen-lockfile` to pnpm and `YARN_ENABLE_IMMUTABLE_INSTALLS=false` to Yarn, so the lockfile follows the rewritten requirements (Yarn 1 ignores this setting).
 
 When `--install` processes a PHP project, depup runs `composer update` rather than `composer install`. `composer install` reuses the existing lock file and cannot reflect constraints that depup has just changed in `composer.json`; `composer update` resolves those constraints and refreshes `composer.lock`.
 
