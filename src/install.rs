@@ -463,19 +463,66 @@ fn nearest_monorepo_dir(
 }
 
 fn node_audit_jobs(orchestrator: &Orchestrator, result: &OrchestratorResult) -> Vec<InstallJob> {
+    node_jobs(orchestrator, result)
+        .into_iter()
+        .filter_map(|(job, preflight_error)| preflight_error.is_none().then_some(job))
+        .collect()
+}
+
+/// 事前検査で止めた Node の範囲。監査と install の対象 (`node_audit_jobs`) からは外れるため、
+/// lock の再解決ではここから、止めた理由つきの失敗として結果に残す (owayo/depup#83)。
+fn preflight_stopped_node_jobs(
+    orchestrator: &Orchestrator,
+    result: &OrchestratorResult,
+) -> Vec<InstallJob> {
+    node_jobs(orchestrator, result)
+        .into_iter()
+        .filter_map(|(mut job, preflight_error)| {
+            let message = preflight_error?;
+            job.scope = Err(format!(
+                "lock refresh was stopped because the pnpm preflight failed: {message}"
+            ));
+            Some(job)
+        })
+        .collect()
+}
+
+/// Node の解決範囲ごとの install 単位と、その範囲を止めた事前検査のエラー。
+fn node_jobs<'a>(
+    orchestrator: &Orchestrator,
+    result: &'a OrchestratorResult,
+) -> Vec<(InstallJob, Option<&'a str>)> {
     node_scopes(&result.summary.manifests, |directory| {
         orchestrator.resolved_age_policy_for_language(directory, Language::Node)
     })
     .into_iter()
-    .filter(|scope| !result.errors.iter().any(|error| {
-        matches!(error, crate::orchestrator::OrchestratorError::NodePreflightError { directory, .. } if directory == &scope.directory)
-    }))
-    .map(|scope| InstallJob {
-        directory: scope.directory.clone(),
-        language: Language::Node,
-        policy: scope.policy,
-        scope: Ok(InstallScope::Full),
-        manifests: result.summary.manifests.iter().filter(|manifest| manifest.language == Language::Node && node_resolution_directory(&manifest.path) == scope.directory).map(|manifest| manifest.path.clone()).collect(),
+    .map(|scope| {
+        let preflight_error = result.errors.iter().find_map(|error| match error {
+            crate::orchestrator::OrchestratorError::NodePreflightError { directory, message }
+                if directory == &scope.directory =>
+            {
+                Some(message.as_str())
+            }
+            _ => None,
+        });
+        let manifests = result
+            .summary
+            .manifests
+            .iter()
+            .filter(|manifest| {
+                manifest.language == Language::Node
+                    && node_resolution_directory(&manifest.path) == scope.directory
+            })
+            .map(|manifest| manifest.path.clone())
+            .collect();
+        let job = InstallJob {
+            directory: scope.directory,
+            language: Language::Node,
+            policy: scope.policy,
+            scope: Ok(InstallScope::Full),
+            manifests,
+        };
+        (job, preflight_error)
     })
     .collect()
 }

@@ -1114,3 +1114,70 @@ async fn a_changed_private_package_is_rejected_without_a_public_osv_lookup() {
     assert!(verifier.seen.lock().unwrap().is_empty());
     assert_eq!(std::fs::read_to_string(path).unwrap(), private("1.0.0"));
 }
+
+/// 事前検査で止めた pnpm の範囲 (lockfile の age 違反など) は再解決しないが、結果からは
+/// 抜け落ちず、止めた理由つきの失敗として報告する (owayo/depup#83)。
+#[tokio::test]
+async fn a_preflight_stopped_pnpm_scope_is_reported_as_a_failed_refresh_with_its_reason() {
+    let temp = tempfile::tempdir_in(".").unwrap();
+    let manifest = temp.path().join("package.json");
+    std::fs::write(&manifest, "{}").unwrap();
+    std::fs::write(
+        temp.path().join("pnpm-lock.yaml"),
+        "lockfileVersion: '9.0'\n",
+    )
+    .unwrap();
+    let directory = crate::node_scope::node_resolution_directory(&manifest);
+    let mut result = OrchestratorResult {
+        summary: UpdateSummary::new(false),
+        write_results: Vec::new(),
+        errors: vec![crate::orchestrator::OrchestratorError::NodePreflightError {
+            directory: directory.clone(),
+            message: "the existing pnpm-lock.yaml violates --age".into(),
+        }],
+    };
+    result
+        .summary
+        .add_manifest(ManifestUpdateResult::new(&manifest, Language::Node));
+    let args = args(temp.path());
+    let orchestrator = Orchestrator::new(args.clone()).unwrap();
+    let plan = InstallPlan::new(&orchestrator, &result, &None, temp.path());
+    let node = plan
+        .jobs
+        .iter()
+        .find(|job| job.language == Language::Node && job.directory == directory)
+        .expect("the stopped pnpm scope must stay in the refresh plan");
+    assert!(
+        node.scope
+            .as_ref()
+            .is_err_and(|reason| reason.contains("violates --age")),
+        "{:?}",
+        node.scope
+    );
+
+    let outcome = run_with(
+        &args,
+        &orchestrator,
+        &plan,
+        &mut result,
+        &FakeVerification::default(),
+        |_| panic!("a scope stopped by the preflight must not be refreshed"),
+    )
+    .await;
+    assert!(outcome.install_failed || outcome.audit_failed);
+    assert_eq!(result.summary.lock_refreshes.len(), 1);
+    let refresh = &result.summary.lock_refreshes[0];
+    assert_eq!(refresh.directory, directory);
+    assert_eq!(refresh.language, Some(Language::Node));
+    assert_eq!(refresh.status, "failed");
+    assert!(!refresh.changed);
+    let error = refresh.error.as_deref().unwrap();
+    assert!(
+        error.contains("preflight") && error.contains("violates --age"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("pnpm-lock.yaml")).unwrap(),
+        "lockfileVersion: '9.0'\n"
+    );
+}
