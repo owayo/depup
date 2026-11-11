@@ -8,6 +8,85 @@ use std::fs;
 use std::process::Command;
 
 #[test]
+fn lockless_pnpm_install_uses_workspace_hint_and_reports_it_before_creating_the_lock() {
+    let project = tempfile::tempdir().unwrap();
+    let commands = tempfile::tempdir().unwrap();
+    let graph = json!([{
+        "path": project.path(),
+        "dependencies": {
+            "ms": {
+                "from": "ms",
+                "version": "2.1.3",
+                "resolved": "https://registry.npmjs.org/ms/-/ms-2.1.3.tgz"
+            }
+        }
+    }]);
+    let graph = serde_json::to_string(&graph)
+        .unwrap()
+        .replace('\'', "'\\''");
+    support::write_script(
+        &commands.path().join("pnpm"),
+        &format!(
+            "#!/bin/sh\ncase \"$1\" in\nconfig) printf null;;\ninstall) printf '%s\\n' \"$*\" > pnpm-invocation; printf \"lockfileVersion: '9.0'\\n\" > pnpm-lock.yaml;;\nlist) printf '%s' '{graph}';;\n--version) printf '12.9.1';;\n*) exit 1;;\nesac\n"
+        ),
+        0o755,
+    );
+    support::write_script(
+        &commands.path().join("npm"),
+        "#!/bin/sh\nprintf 'unexpected npm invocation' > package-lock.json\nexit 1\n",
+        0o755,
+    );
+    let mut paths = vec![commands.path().to_path_buf()];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let path = std::env::join_paths(paths).unwrap();
+    for verbose in [false, true] {
+        fs::write(
+            project.path().join("package.json"),
+            r#"{"name":"example","private":true,"dependencies":{"ms":">=2.1.1 <=2.1.3"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            project.path().join("pnpm-workspace.yaml"),
+            "allowBuilds: {}\n",
+        )
+        .unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_depup"));
+        command
+            .args(["--node", "--install", "--no-age", "--no-osv", "--json"])
+            .env("PATH", &path)
+            .env("NO_COLOR", "1")
+            .arg(project.path());
+        if verbose {
+            command.arg("--verbose");
+        }
+        let output = command.output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "{}\n{stderr}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["summary"]["updates"], 1, "{value}");
+        assert!(project.path().join("pnpm-lock.yaml").is_file());
+        assert!(!project.path().join("package-lock.json").exists());
+        assert!(
+            fs::read_to_string(project.path().join("pnpm-invocation"))
+                .unwrap()
+                .contains("install --no-frozen-lockfile")
+        );
+        assert_eq!(
+            stderr.contains("pnpm (detected from pnpm-workspace.yaml)"),
+            verbose,
+            "{stderr}"
+        );
+        fs::remove_file(project.path().join("pnpm-lock.yaml")).unwrap();
+    }
+}
+
+#[test]
 fn pnpm_stale_final_lock_reports_failure_in_every_output_format() {
     let project = tempfile::tempdir().unwrap();
     let commands = tempfile::tempdir().unwrap();

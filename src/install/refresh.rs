@@ -308,6 +308,7 @@ async fn run_with(
         .filter(|job| matches!(job.language, Language::Node | Language::Rust))
         .collect();
     let mut tx = InstallTransactions::begin(plan, result, &orchestrator.rust_lock_boundary());
+    note_node_package_managers(args, &tx);
     let mut progress = Progress::new(!args.quiet);
     let mut baselines = BTreeMap::new();
     let mut admitted = BTreeMap::new();
