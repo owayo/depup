@@ -164,27 +164,64 @@ impl SystemPackageManager {
 
     /// 使用する Node.js パッケージマネージャを検出する
     fn detect_node_pm(&self, working_dir: &Path) -> Option<&'static str> {
-        // ロックファイルを優先順位に従ってチェック
-        if working_dir.join("pnpm-lock.yaml").exists() {
-            return Some("pnpm");
+        self.detect_node_pm_with_source(working_dir)
+            .map(|(pm, _)| pm)
+    }
+
+    /// 選択結果と根拠を同じ判定から返す。lockfile があれば従来の優先順位を保つ。
+    pub(crate) fn detect_node_pm_with_source(
+        &self,
+        working_dir: &Path,
+    ) -> Option<(&'static str, &'static str)> {
+        for (file, pm) in [
+            ("pnpm-lock.yaml", "pnpm"),
+            ("yarn.lock", "yarn"),
+            ("bun.lock", "bun"),
+            ("bun.lockb", "bun"),
+            ("npm-shrinkwrap.json", "npm"),
+            ("package-lock.json", "npm"),
+        ] {
+            if working_dir.join(file).exists() {
+                return Some((pm, file));
+            }
         }
-        if working_dir.join("yarn.lock").exists() {
-            return Some("yarn");
+        let manifest = working_dir.join("package.json");
+        let has_manifest = manifest.is_file();
+        let declared = std::fs::read_to_string(manifest)
+            .ok()
+            .and_then(|content| {
+                serde_json::from_str::<serde_json::Value>(
+                    crate::manifest::split_utf8_bom(&content).1,
+                )
+                .ok()
+            })
+            .and_then(|value| {
+                let (name, version) = value.get("packageManager")?.as_str()?.split_once('@')?;
+                if version.is_empty() {
+                    return None;
+                }
+                match name {
+                    "npm" => Some("npm"),
+                    "pnpm" => Some("pnpm"),
+                    "yarn" => Some("yarn"),
+                    "bun" => Some("bun"),
+                    _ => None,
+                }
+            });
+        if let Some(pm) = declared {
+            return Some((pm, "package.json#packageManager"));
         }
-        // bun.lock はテキスト形式 (Bun 1.2+ のデフォルト)、bun.lockb は旧バイナリ形式
-        if working_dir.join("bun.lock").exists() || working_dir.join("bun.lockb").exists() {
-            return Some("bun");
+        for (file, pm) in [
+            ("pnpm-workspace.yaml", "pnpm"),
+            (".yarnrc.yml", "yarn"),
+            ("bunfig.toml", "bun"),
+        ] {
+            // pnpm workspace のルートは、メンバーの package.json だけでも install できる。
+            if (has_manifest || pm == "pnpm") && working_dir.join(file).is_file() {
+                return Some((pm, file));
+            }
         }
-        if working_dir.join("npm-shrinkwrap.json").exists()
-            || working_dir.join("package-lock.json").exists()
-        {
-            return Some("npm");
-        }
-        // package.json があるがロックファイルがない場合は npm をデフォルトにする
-        if working_dir.join("package.json").exists() {
-            return Some("npm");
-        }
-        None
+        has_manifest.then_some(("npm", "package.json"))
     }
 
     /// 使用する Python パッケージマネージャを検出する
@@ -723,32 +760,6 @@ impl SystemPackageManager {
         working_dir: &Path,
         scope: &InstallScope,
     ) -> Option<(PathBuf, &'static str)> {
-        if language == Language::Node
-            && *scope == InstallScope::Refresh
-            && ![
-                "pnpm-lock.yaml",
-                "yarn.lock",
-                "bun.lock",
-                "bun.lockb",
-                "npm-shrinkwrap.json",
-                "package-lock.json",
-            ]
-            .iter()
-            .any(|name| working_dir.join(name).exists())
-            && (working_dir.join("pnpm-workspace.yaml").is_file()
-                || std::fs::read(working_dir.join("package.json"))
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-                    .and_then(|value| {
-                        value
-                            .get("packageManager")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_owned)
-                    })
-                    .is_some_and(|pm| pm.starts_with("pnpm@")))
-        {
-            return Some((working_dir.to_path_buf(), "pnpm"));
-        }
         if language == Language::Rust && *scope != InstallScope::Full {
             // 計画側がすでに Cargo 自身からこのルートを取得している。
             // Tauri のサブディレクトリを再検出すると、別の workspace を選ぶ場合がある。
@@ -1922,6 +1933,116 @@ mod tests {
 
         let pm = SystemPackageManager::new();
         assert_eq!(pm.detect_node_pm(temp_dir.path()), Some("npm"));
+    }
+
+    #[test]
+    fn node_pm_uses_package_manager_before_config_files_without_a_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let pm = SystemPackageManager::new();
+        for file in ["pnpm-workspace.yaml", ".yarnrc.yml", "bunfig.toml"] {
+            std::fs::write(dir.path().join(file), "").unwrap();
+        }
+        for manager in ["pnpm", "yarn", "bun", "npm"] {
+            std::fs::write(
+                dir.path().join("package.json"),
+                format!(r#"{{"packageManager":"{manager}@1.2.3+sha224.example"}}"#),
+            )
+            .unwrap();
+            assert_eq!(pm.detect_node_pm(dir.path()), Some(manager));
+        }
+    }
+
+    #[test]
+    fn node_pm_uses_config_files_in_order_without_a_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let pm = SystemPackageManager::new();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("mise.toml"), "[tools]\npnpm='1.2.3'\n").unwrap();
+        assert_eq!(pm.detect_node_pm(dir.path()), Some("npm"));
+        for (file, manager) in [
+            ("bunfig.toml", "bun"),
+            (".yarnrc.yml", "yarn"),
+            ("pnpm-workspace.yaml", "pnpm"),
+        ] {
+            std::fs::write(dir.path().join(file), "").unwrap();
+            assert_eq!(pm.detect_node_pm(dir.path()), Some(manager));
+        }
+        std::fs::remove_file(dir.path().join("package.json")).unwrap();
+        assert_eq!(pm.detect_node_pm(dir.path()), Some("pnpm"));
+        std::fs::remove_file(dir.path().join("pnpm-workspace.yaml")).unwrap();
+        assert_eq!(pm.detect_node_pm(dir.path()), None);
+    }
+
+    #[test]
+    fn node_pm_keeps_lockfile_priority_over_conflicting_hints() {
+        let dir = tempfile::tempdir().unwrap();
+        let pm = SystemPackageManager::new();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"packageManager":"pnpm@1.2.3"}"#,
+        )
+        .unwrap();
+        for file in ["pnpm-workspace.yaml", ".yarnrc.yml", "bunfig.toml"] {
+            std::fs::write(dir.path().join(file), "").unwrap();
+        }
+        for (file, manager) in [
+            ("package-lock.json", "npm"),
+            ("npm-shrinkwrap.json", "npm"),
+            ("bun.lockb", "bun"),
+            ("bun.lock", "bun"),
+            ("yarn.lock", "yarn"),
+            ("pnpm-lock.yaml", "pnpm"),
+        ] {
+            std::fs::write(dir.path().join(file), "").unwrap();
+            assert_eq!(pm.detect_node_pm(dir.path()), Some(manager));
+        }
+    }
+
+    #[test]
+    fn node_pm_ignores_unknown_or_invalid_package_manager_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let pm = SystemPackageManager::new();
+        std::fs::write(dir.path().join(".yarnrc.yml"), "").unwrap();
+        for content in [
+            "not json",
+            r#"{"packageManager":42}"#,
+            r#"{"packageManager":"other@1.2.3"}"#,
+            r#"{"packageManager":"pnpm"}"#,
+            r#"{"packageManager":"pnpm@"}"#,
+            r#"{"devEngines":{"packageManager":{"name":"pnpm"}}}"#,
+        ] {
+            std::fs::write(dir.path().join("package.json"), content).unwrap();
+            assert_eq!(pm.detect_node_pm(dir.path()), Some("yarn"), "{content}");
+        }
+    }
+
+    #[test]
+    fn node_pm_hints_apply_to_ordinary_and_refresh_installs() {
+        let dir = tempfile::tempdir().unwrap();
+        let pm = SystemPackageManager::new();
+        std::fs::write(
+            dir.path().join("package.json"),
+            "\u{feff}{\"packageManager\":\"pnpm@1.2.3\"}",
+        )
+        .unwrap();
+        let policy = crate::update::AgePolicy {
+            min_age: Some(Duration::from_secs(86400)),
+            evaluated_at: chrono::Utc::now(),
+            exemptions: Default::default(),
+        };
+        for scope in [InstallScope::Full, InstallScope::Refresh] {
+            let prepared = pm
+                .prepare_install(Language::Node, dir.path(), &policy, &scope)
+                .unwrap()
+                .unwrap();
+            assert_eq!(prepared.package_manager, "pnpm", "{scope:?}");
+            assert!(
+                prepared
+                    .env
+                    .iter()
+                    .any(|(key, _)| key == "pnpm_config_minimum_release_age")
+            );
+        }
     }
 
     #[test]

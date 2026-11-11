@@ -444,7 +444,12 @@ The package manager is detected from files in the directory where the install ru
 | Node.js | `pnpm-lock.yaml` | `pnpm install --no-frozen-lockfile` |
 | | `yarn.lock` | `yarn install` (with `YARN_ENABLE_IMMUTABLE_INSTALLS=false`) |
 | | `bun.lock` / `bun.lockb` | `bun install` |
-| | `package-lock.json`, or `package.json` alone | `npm install` |
+| | `npm-shrinkwrap.json` / `package-lock.json` | `npm install` |
+| | No lockfile: `package.json` `packageManager` (`npm@…`, `pnpm@…`, `yarn@…`, or `bun@…`) | The declared manager's command above |
+| | No lockfile or recognized `packageManager`: `pnpm-workspace.yaml` | `pnpm install --no-frozen-lockfile` |
+| | Otherwise, `package.json` with `.yarnrc.yml` | `yarn install` (with `YARN_ENABLE_IMMUTABLE_INSTALLS=false`) |
+| | Otherwise, `package.json` with `bunfig.toml` | `bun install` |
+| | Otherwise, `package.json` alone | `npm install` |
 | Python | `uv.lock` | `uv sync` |
 | | `poetry.lock` | `poetry lock`, then `poetry install` (below) |
 | | `requirements.lock` / `requirements-dev.lock` | `rye sync` |
@@ -458,6 +463,8 @@ The package manager is detected from files in the directory where the install ru
 | | `build.gradle` / `build.gradle.kts` | `gradle dependencies` |
 | Swift | `Package.swift` | `swift package resolve` |
 | mise | any of the [mise config files](ecosystems.md#files) | `mise install` |
+
+Node lockfiles take precedence over `packageManager` and configuration files, even when they disagree. Without a lockfile, the hints above apply to ordinary installs, `--only`, and `--refresh-lock` alike. Unsupported or malformed `packageManager` fields fall through to the configuration files. Tools listed in `mise.toml` do not select the Node package manager. `--verbose` reports the file or field used for the selection before install starts, for example `pnpm (detected from pnpm-workspace.yaml)`.
 
 If none of the listed files is present, no install runs for that language, and nothing is printed. When the age filter is active, pnpm, uv, and mise also receive the age setting ([below](#transitive-dependencies-and-the-age-filter)), and `uv sync` always runs with `UV_MALWARE_CHECK=1` ([uv Malware Check](#uv-malware-check-preview)).
 

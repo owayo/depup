@@ -155,6 +155,7 @@ pub(crate) async fn run_with(
     mut runner: impl FnMut(&PreparedInstall) -> InstallResult,
 ) -> InstallOutcome {
     let mut tx = InstallTransactions::begin(plan, result, &orchestrator.rust_lock_boundary());
+    note_node_package_managers(args, &tx);
     note_direct_only_age(args, plan, &tx);
     // パッケージマネージャーが lockfile を書き換える前に読む。
     let baselines = node_baselines(plan, &tx, checks, false).await;

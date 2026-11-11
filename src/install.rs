@@ -15,6 +15,27 @@ use crate::update::AgePolicy;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
+/// install が lockfile を作る前に、選択に使った元の印を表示する。
+fn note_node_package_managers(args: &crate::cli::CliArgs, tx: &transaction::InstallTransactions) {
+    if !args.verbose {
+        return;
+    }
+    let pm = crate::package_manager::SystemPackageManager::new();
+    for command in tx
+        .commands()
+        .filter(|command| command.language == Language::Node)
+    {
+        if let Some((manager, source)) = pm.detect_node_pm_with_source(&command.directory)
+            && manager == command.package_manager
+        {
+            eprintln!(
+                "  Node.js package manager: {manager} (detected from {source}) ({})",
+                crate::user_path::for_display(&command.directory).display()
+            );
+        }
+    }
+}
+
 /// install の結果。終了コードに対応する
 pub struct InstallOutcome {
     /// パッケージマネージャが失敗した、または準備できなかった (終了コード 1)

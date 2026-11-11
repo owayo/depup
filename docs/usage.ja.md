@@ -445,7 +445,12 @@ pnpm の更新先の不一致 (override や解決の結果、直接依存が別�
 | Node.js | `pnpm-lock.yaml` | `pnpm install --no-frozen-lockfile` |
 | | `yarn.lock` | `yarn install`（`YARN_ENABLE_IMMUTABLE_INSTALLS=false` を付ける） |
 | | `bun.lock` / `bun.lockb` | `bun install` |
-| | `npm-shrinkwrap.json` / `package-lock.json`、または `package.json` のみ | `npm install` |
+| | `npm-shrinkwrap.json` / `package-lock.json` | `npm install` |
+| | lockfile がない場合: `package.json` の `packageManager`（`npm@…` / `pnpm@…` / `yarn@…` / `bun@…`） | 上記の該当するコマンド |
+| | lockfile と認識できる `packageManager` がない場合: `pnpm-workspace.yaml` | `pnpm install --no-frozen-lockfile` |
+| | 上記以外で `package.json` と `.yarnrc.yml` がある場合 | `yarn install`（`YARN_ENABLE_IMMUTABLE_INSTALLS=false` を付ける） |
+| | 上記以外で `package.json` と `bunfig.toml` がある場合 | `bun install` |
+| | 上記以外で `package.json` のみ | `npm install` |
 | Python | `uv.lock` | `uv sync` |
 | | `poetry.lock` | `poetry lock` の後に `poetry install`（下記） |
 | | `requirements.lock` / `requirements-dev.lock` | `rye sync` |
@@ -459,6 +464,8 @@ pnpm の更新先の不一致 (override や解決の結果、直接依存が別�
 | | `build.gradle` / `build.gradle.kts` | `gradle dependencies` |
 | Swift | `Package.swift` | `swift package resolve` |
 | mise | [mise の設定ファイル](ecosystems.ja.md#対象ファイル)のいずれか | `mise install` |
+
+Node の lockfile は、`packageManager` や設定ファイルと食い違っていても優先します。lockfile がない場合の上記の判定は、通常の install・`--only`・`--refresh-lock` で共通です。`packageManager` が未対応または不正な場合は、設定ファイルの判定へ進みます。`mise.toml` のツール一覧は Node のパッケージマネージャーの判定には使いません。`--verbose` では、install の開始前に判定に使ったファイルやフィールドを表示します（例: `pnpm (detected from pnpm-workspace.yaml)`）。
 
 表のファイルがどれもなければ、その言語の install は実行せず、何も表示しません。age フィルターが有効なときは、pnpm・uv・mise に age の値も渡します（[推移的依存と age フィルター](#推移的依存と-age-フィルター)）。`uv sync` には常に `UV_MALWARE_CHECK=1` を付けます（[uv のマルウェアチェック](#uv-のマルウェアチェックpreview)）。
 

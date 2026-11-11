@@ -2098,6 +2098,49 @@ fn wrapper_second_pass_failure_restores_binary_scripts_properties_and_skips_java
 }
 
 #[test]
+fn lockless_pnpm_install_tracks_and_recovers_the_created_pnpm_lock() {
+    for succeeds in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = identity(temp.path());
+        let mut result = result();
+        node(&mut result, &directory);
+        fs::write(directory.join("pnpm-workspace.yaml"), "allowBuilds: {}\n").unwrap();
+        let plan = plan(vec![job(
+            &directory,
+            Language::Node,
+            &[directory.join("package.json")],
+        )]);
+        let mut tx = InstallTransactions::begin(&plan, &result, temp.path());
+        let mut calls = 0;
+        tx.execute(|command| {
+            calls += 1;
+            assert_eq!(command.package_manager, "pnpm");
+            assert!(command.argv.contains(&"--no-frozen-lockfile".into()));
+            fs::write(directory.join("pnpm-lock.yaml"), "generated lock").unwrap();
+            if succeeds {
+                success(command)
+            } else {
+                failure(command)
+            }
+        });
+        assert_eq!(calls, 1);
+        let report = tx.rollback();
+        report.mark_summary(&mut result.summary);
+        assert_eq!(directory.join("pnpm-lock.yaml").exists(), succeeds);
+        assert!(!directory.join("package-lock.json").exists());
+        assert_eq!(result.summary.total_updates(), usize::from(succeeds));
+        assert_eq!(
+            fs::read_to_string(directory.join("package.json")).unwrap(),
+            if succeeds {
+                "{\"dependencies\":{\"example\":\"2.0.0\"}}\n"
+            } else {
+                "{\"dependencies\":{\"example\":\"1.0.0\"}}\n"
+            }
+        );
+    }
+}
+
+#[test]
 fn pnpm_workspace_restores_all_members_and_keeps_an_unrelated_project() {
     let temp = tempfile::tempdir().unwrap();
     let directory = temp.path().join("workspace");
