@@ -26,48 +26,6 @@ fn dep(name: &str, requirement: &str) -> Dependency {
 }
 
 #[test]
-fn default_cargo_install_keeps_unselected_lock_entries() {
-    use crate::test_support::local_registry::{LocalRegistry, TestProject};
-
-    let registry = LocalRegistry::new();
-    for name in ["selected", "untouched"] {
-        registry.publish(name, "1.0.0", &[]);
-    }
-    let manifest = |version| {
-        format!(
-            "[package]\nname = 'app'\nversion = '0.1.0'\nedition = '2024'\n\
-         [dependencies]\nselected = '{version}'\nuntouched = '1'\n"
-        )
-    };
-    let project = TestProject::new(&registry, &manifest("1"));
-    project.cargo_ok(&["generate-lockfile"]);
-    registry.publish("selected", "2.0.0", &[]);
-    // 公開日や脆弱性の検査で更新対象から外れた依存を想定する。
-    registry.publish("untouched", "1.1.0", &[]);
-    project.write("Cargo.toml", &manifest("2"));
-    let result = result(
-        &project.path().join("Cargo.toml"),
-        vec![dep("selected", "1")],
-    );
-    let mut args = CliArgs::parse_from(["depup", "--install"]);
-    args.path = project.path().to_path_buf();
-    let orchestrator = Orchestrator::new(args).unwrap();
-    let plan = InstallPlan::new(&orchestrator, &result, &None, project.path());
-    assert_eq!(plan.jobs.len(), 1);
-    let InstallScope::Packages(selectors) = plan.jobs[0].scope.as_ref().unwrap() else {
-        panic!("既定の install も適用した依存だけを更新すること");
-    };
-    let mut command = vec!["update"];
-    for selector in selectors {
-        command.extend(["--package", selector.as_str()]);
-    }
-    project.cargo_ok(&command);
-    assert_eq!(project.locked_versions("selected"), ["2.0.0"]);
-    assert_eq!(project.locked_versions("untouched"), ["1.0.0"]);
-    project.cargo_ok(&["update", "--workspace", "--locked"]);
-}
-
-#[test]
 fn scope_uses_applied_real_names_and_pre_install_versions() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(

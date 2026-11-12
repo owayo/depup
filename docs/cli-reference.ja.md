@@ -38,7 +38,7 @@ depup [OPTIONS] [PATH]
 | `--max-change <LEVEL>` | | 許容する更新の上限。`patch`（patch のみ）/ `minor`（patch と minor）/ `major`（すべて許可、デフォルト） |
 | `--json` | | JSON 形式で出力 |
 | `--diff` | | 変更内容を diff 形式で表示 |
-| `--install` | | 更新後にパッケージマネージャーの install を実行。Cargo は適用した依存だけを更新し、無関係な lock の版を維持 |
+| `--install` | | 更新後にパッケージマネージャーの install を実行 |
 | `--refresh-lock` | | pnpm/Cargo の間接依存を含め lock を再解決。`--install` が必須。`--only`・`--exclude`・`--max-change`（グローバル設定を含む）とは併用不可 |
 | `--version` | `-V` | バージョンを表示 |
 | `--help` | `-h` | ヘルプを表示 |

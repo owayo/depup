@@ -115,7 +115,7 @@ Git dependencies are checked with `git ls-remote` instead of a registry:
 | Reference | Behavior |
 |-----------|----------|
 | `tag` | Updated to the newest stable semver tag. If that tag exceeds the `--max-change` cap, the dependency is skipped with `max-change=<LEVEL>`; older tags within the cap are not considered |
-| `branch`, or none (default branch) | Reported as updated when the remote head differs from the commit recorded in `Cargo.lock`, or when none is recorded. `Cargo.toml` stays as written; the new commit is picked up only when `--install` runs a source-qualified `cargo update --package <old-package-ID>`, and without `--install` nothing is written |
+| `branch`, or none (default branch) | Reported as updated when the remote head differs from the commit recorded in `Cargo.lock`, or when none is recorded. `Cargo.toml` stays as written; the new commit is picked up only when `--install` runs `cargo update`, and without `--install` nothing is written |
 | `rev` | Always skipped as `pinned`, even with `--include-pinned` |
 
 Tag updates are limited to the same dependency tables as version updates and to `[patch.<registry>]` / `[patch.<registry>.<package>]`, and they preserve single or double quotes in both inline and multiline tables. Git dependencies are not subject to the age filter or the OSV check, and a failed `git ls-remote` skips the dependency without changing the exit code. `git ls-remote` never asks for credentials or a host key confirmation on the terminal: unless `GIT_SSH`, `GIT_SSH_COMMAND`, or `core.sshCommand` sets how ssh runs, depup uses `ssh -o BatchMode=yes`, so a remote that needs such a prompt fails right away.

@@ -764,7 +764,7 @@ impl<'a> LockAgeAuditor<'a> {
         receipt: &mut Option<AuditReceipt>,
     ) -> LockAgeAuditResult {
         if state.problems.is_empty() {
-            self.restore_mixed(&mut state).await;
+            self.recover_partial(&mut state, bar).await;
         }
         if !state.problems.is_empty() {
             snapshot.restore(&mut state);

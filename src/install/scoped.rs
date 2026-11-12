@@ -5,6 +5,76 @@ use crate::cargo_scope::rust_resolution_directory;
 use crate::domain::{Dependency, GitReference, ManifestUpdateResult};
 use crate::manifest::{LockPackage, is_crates_io_source, parse_lock_packages};
 
+/// 全体を解き直す意味を保ちつつ、検出によって停止済みのルートを復活させない。
+pub(super) fn replace_full_rust_jobs(
+    jobs: &mut Vec<InstallJob>,
+    orchestrator: &Orchestrator,
+    result: &OrchestratorResult,
+) {
+    jobs.retain(|job| job.language != Language::Rust);
+    let boundary = orchestrator.rust_lock_boundary();
+    let stopped_paths = stopped_cargo_paths(result);
+    let stopped_roots = stopped_cargo_roots(result);
+    let mut locations = BTreeMap::new();
+    let mut roots = BTreeSet::new();
+    for manifest in result
+        .summary
+        .manifests
+        .iter()
+        .filter(|manifest| manifest.language == Language::Rust && manifest.has_updates())
+    {
+        let key = std::fs::canonicalize(&manifest.path).unwrap_or_else(|_| manifest.path.clone());
+        let location = locations
+            .entry(key.clone())
+            .or_insert_with(|| rust_resolution_directory(&manifest.path, &boundary));
+        let (directory, scope) = match location {
+            Ok(root) => (
+                root.clone(),
+                if stopped_roots.contains(root) || stopped_paths.contains(&key) {
+                    Err("Cargo root was stopped by the pnpm preflight".into())
+                } else {
+                    Ok(InstallScope::CargoFull)
+                },
+            ),
+            Err(error) => (
+                manifest.path.parent().unwrap_or(Path::new(".")).into(),
+                Err(error.clone()),
+            ),
+        };
+        if !roots.insert(directory.clone()) {
+            continue;
+        }
+        jobs.push(InstallJob {
+            manifests: result
+                .summary
+                .manifests
+                .iter()
+                .filter(|manifest| {
+                    manifest.language == Language::Rust
+                        && locations
+                            .entry(
+                                std::fs::canonicalize(&manifest.path)
+                                    .unwrap_or_else(|_| manifest.path.clone()),
+                            )
+                            .or_insert_with(|| rust_resolution_directory(&manifest.path, &boundary))
+                            .as_ref()
+                            .is_ok_and(|root| root == &directory)
+                })
+                .map(|manifest| manifest.path.clone())
+                .collect(),
+            policy: install_age_policy(orchestrator, result, &directory, Language::Rust),
+            directory,
+            language: Language::Rust,
+            scope,
+        });
+    }
+    jobs.sort_by(|left, right| {
+        left.directory
+            .cmp(&right.directory)
+            .then_with(|| left.language.to_string().cmp(&right.language.to_string()))
+    });
+}
+
 pub(super) fn replace_scoped_jobs(
     jobs: &mut Vec<InstallJob>,
     orchestrator: &Orchestrator,
@@ -13,15 +83,6 @@ pub(super) fn replace_scoped_jobs(
 ) {
     jobs.retain(|job| !languages.contains(&job.language));
     let boundary = orchestrator.rust_lock_boundary();
-    let normalize = |path: PathBuf| std::fs::canonicalize(&path).unwrap_or(path);
-    let stopped_paths: BTreeSet<_> = stopped_cargo_paths(result)
-        .into_iter()
-        .map(normalize)
-        .collect();
-    let stopped_roots: BTreeSet<_> = stopped_cargo_roots(result)
-        .into_iter()
-        .map(normalize)
-        .collect();
     let mut groups: BTreeMap<(PathBuf, String), Vec<&ManifestUpdateResult>> = BTreeMap::new();
     let mut rust_roots: BTreeMap<PathBuf, Result<PathBuf, String>> = BTreeMap::new();
     for manifest in &result.summary.manifests {
@@ -59,18 +120,6 @@ pub(super) fn replace_scoped_jobs(
     for ((directory, _), manifests) in groups {
         let language = manifests[0].language;
         let scope = match language {
-            // 別言語の preflight で止めた Cargo ルートを、共有 lock の別の
-            // マニフェストに更新があるという理由で実行し直してはならない。
-            Language::Rust
-                if stopped_roots.contains(&directory)
-                    || manifests.iter().any(|manifest| {
-                        let key = std::fs::canonicalize(&manifest.path)
-                            .unwrap_or_else(|_| manifest.path.clone());
-                        stopped_paths.contains(&key)
-                    }) =>
-            {
-                Err("Cargo root was stopped by the preflight".into())
-            }
             Language::Rust => cargo_scope(&directory, &manifests),
             Language::Php => composer_scope(&directory, &manifests),
             _ => unreachable!(),

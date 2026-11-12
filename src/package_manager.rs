@@ -321,8 +321,6 @@ impl SystemPackageManager {
                     "--no-save".into(),
                     "--lockfile-only".into(),
                     "--ignore-scripts".into(),
-                    "--no-include-github-actions".into(),
-                    "--no-changeset".into(),
                 ];
             }
             (_, InstallScope::Refresh) => {
@@ -1049,7 +1047,7 @@ mod tests {
     }
 
     #[test]
-    fn install_without_only_preserves_unselected_packages() {
+    fn install_without_only_still_refreshes_unselected_packages() {
         use crate::test_support::local_registry::{LocalRegistry, TestProject};
         let registry = LocalRegistry::new();
         registry.publish("selected", "1.0.0", &[]);
@@ -1062,18 +1060,9 @@ mod tests {
         registry.publish("selected", "1.0.1", &[]);
         registry.publish("untouched", "1.0.1", &[]);
         let args = planned_cargo_args(&project, "selected", "1.0.0", false);
-        assert_eq!(
-            args,
-            [
-                "cargo",
-                "update",
-                "--package",
-                "registry+https://github.com/rust-lang/crates.io-index#selected@1.0.0"
-            ]
-        );
+        assert_eq!(args, ["cargo", "update"]);
         project.cargo_ok(&args[1..].iter().map(String::as_str).collect::<Vec<_>>());
-        assert_eq!(project.locked_versions("selected"), ["1.0.1"]);
-        assert_eq!(project.locked_versions("untouched"), ["1.0.0"]);
+        assert_eq!(project.locked_versions("untouched"), ["1.0.1"]);
     }
 
     #[test]
@@ -1159,11 +1148,7 @@ mod tests {
             )
             .with_manifest_name("alias")
             .with_git_source(GitSource::new(&url, reference));
-            let args = planned_cargo_dependency_args(project, dependency.clone(), false);
-            assert_eq!(
-                args,
-                planned_cargo_dependency_args(project, dependency, true)
-            );
+            let args = planned_cargo_dependency_args(project, dependency, true);
             local_cargo(project, &args[1..]);
             let packages = crate::manifest::parse_lock_packages(&project.read("Cargo.lock"));
             assert_eq!(
