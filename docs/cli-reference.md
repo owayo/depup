@@ -38,7 +38,7 @@ depup [OPTIONS] [PATH]
 | `--max-change <LEVEL>` | | Limit allowed bumps: `patch` (patch only), `minor` (patch + minor), `major` (default — all) |
 | `--json` | | Output results in JSON format |
 | `--diff` | | Show changes in diff format |
-| `--install` | | Run package manager install after update |
+| `--install` | | Run package manager install after update; Cargo selects applied dependencies and retains unrelated locked versions |
 | `--refresh-lock` | | Re-resolve pnpm/Cargo lockfiles, including transitive dependencies; requires `--install`; incompatible with `--only`, `--exclude`, and `--max-change` (including global defaults) |
 | `--version` | `-V` | Show version |
 | `--help` | `-h` | Show help |

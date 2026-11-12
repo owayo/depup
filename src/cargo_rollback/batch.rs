@@ -16,11 +16,14 @@ use super::graph::{LockGraph, PackageKey};
 use super::lock_entries::lock_tables;
 use super::scratch::{AgePin, CargoCommand, CargoError, ScratchWorkspace};
 use super::series::same_series;
-use crate::manifest::{RegistryLockEntries, parse_registry_entries, write_manifest};
+use crate::manifest::{
+    RegistryLockEntries, is_crates_io_source, parse_lock_packages, parse_registry_entries,
+    write_manifest,
+};
 use crate::update::compare_versions;
 use std::cmp::Ordering;
 use std::collections::HashSet;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -62,15 +65,32 @@ pub(crate) async fn restore_installed(
             requirement: format!("={}", member.installed),
         })
         .collect();
-    let specs: Vec<_> = scope
+    let selected: HashSet<_> = scope
         .members
         .iter()
         .filter_map(|member| {
             member
                 .current
                 .as_ref()
-                .map(|current| format!("{}@{current}", member.name))
+                .map(|current| (member.name.clone(), current.clone()))
         })
+        // 巻き戻しで追加された別系列も解き直す。残したままだと広い版要求が
+        // その版を再利用し、一時固定を外したときに復元先の版が消えてしまう。
+        .chain(scope.discarded.iter().cloned())
+        .collect();
+    // 現在の lock にある crates.io の ID だけを、取得元付きで一度ずつ指定する。
+    // 同名・同版の私設レジストリ依存を選んだり、消えた版を指定したりしない。
+    let specs: Vec<_> = parse_lock_packages(scratch.original_lock())
+        .into_iter()
+        .filter(|package| selected.contains(&(package.name.clone(), package.version.clone())))
+        .filter_map(|package| {
+            package
+                .source
+                .filter(|source| is_crates_io_source(source))
+                .map(|source| format!("{source}#{}@{}", package.name, package.version))
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect();
     let resolved = re_resolve(
         &mut scratch,
@@ -113,7 +133,6 @@ fn check_restoration(
     discarded: &[PackageKey],
     installed: &str,
 ) -> Result<(), String> {
-    use crate::manifest::{is_crates_io_source, parse_lock_packages};
     let before_tables = lock_tables(before);
     let after_tables = lock_tables(after);
     // 一時依存の追加は crates.io の lock をすべて無効化しうる。その再解決では、
@@ -992,6 +1011,72 @@ mod tests {
                 .unwrap_err()
                 .contains("remained alongside")
         );
+    }
+
+    #[tokio::test]
+    async fn restoration_unlocks_discarded_series_before_removing_temporary_pins() {
+        use crate::test_support::local_registry::{LocalRegistry, TestProject};
+
+        let registry = LocalRegistry::new();
+        registry.publish("shared", "0.14.0", &[]);
+        registry.publish("shared", "0.15.0", &[]);
+        for version in ["1.0.0", "1.1.0"] {
+            registry.publish("holder", version, &[("shared", ">=0.14, <0.16")]);
+            registry.publish("solo", version, &[]);
+        }
+        let manifest = "[package]\nname = 'app'\nversion = '0.1.0'\nedition = '2024'\n\
+                        [dependencies]\nholder = '1'\nsolo = '1'\n";
+        let project = TestProject::new(&registry, manifest);
+        project.cargo_ok(&["generate-lockfile"]);
+        let installed = project.read("Cargo.lock");
+        project.cargo_ok(&["update", "-p", "holder", "--precise", "1.0.0"]);
+        project.cargo_ok(&["update", "-p", "shared", "--precise", "0.14.0"]);
+        project.cargo_ok(&["update", "-p", "solo", "--precise", "1.0.0"]);
+        let before = project.read("Cargo.lock");
+        let cargo = project.cargo_envs().into_iter().fold(
+            CargoCommand::new().program(TestProject::cargo_program()),
+            |cargo, (key, value)| cargo.env(key, value),
+        );
+
+        // holder は両系列を許す。shared 0.14 を解き直さないと、その版が残り、
+        // 一時固定を外すときに shared 0.15 が不要として消える (#141)。
+        let restored = restore_installed(
+            project.path(),
+            RestorationScope {
+                members: &[
+                    RestoreCandidate {
+                        name: "holder".into(),
+                        current: Some("1.0.0".into()),
+                        installed: "1.1.0".into(),
+                    },
+                    RestoreCandidate {
+                        name: "shared".into(),
+                        current: None,
+                        installed: "0.15.0".into(),
+                    },
+                ],
+                // 同じ ID の重複や、すでに消えた版で復元を妨げない。
+                discarded: &[
+                    key("shared", "0.14.0"),
+                    key("shared", "0.14.0"),
+                    key("absent", "1.0.0"),
+                ],
+                installed: &installed,
+                expected_lock: &before,
+            },
+            &cargo,
+            Instant::now() + Duration::from_secs(120),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("巻き戻しで追加された別系列も解き直して復元すること");
+        assert_eq!(project.read("Cargo.lock"), restored);
+        assert_eq!(project.read("Cargo.toml"), manifest);
+        assert_eq!(project.locked_versions("holder"), ["1.1.0"]);
+        assert_eq!(project.locked_versions("shared"), ["0.15.0"]);
+        // 独立した依存の差し戻しは保持する。
+        assert_eq!(project.locked_versions("solo"), ["1.0.0"]);
+        project.cargo_ok(&["update", "--workspace", "--locked"]);
     }
 
     #[tokio::test]

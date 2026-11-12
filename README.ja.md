@@ -37,6 +37,8 @@ depup は、プロジェクトにあるマニフェストを見つけ、レジ�
 
 `--install` を付けると、更新のあとで各プロジェクトのパッケージマネージャーを実行し、ロックファイルも新しいバージョンに合わせます。
 
+Rust では適用した依存だけを更新し、無関係な lock の版を維持します。推移依存も含めて Cargo の lock 全体を再解決するには `--install --refresh-lock` を指定します。
+
 ## 機能
 
 - **複数言語対応**: Node.js、Python、Rust、Go、Ruby、PHP、Java、Swift の依存関係に加え、`mise.toml` / `.tool-versions` のツールバージョンも同じワークフローで更新

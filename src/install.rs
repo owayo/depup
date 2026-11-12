@@ -162,15 +162,10 @@ impl InstallPlan {
                 result,
                 &[Language::Rust, Language::Php],
             );
-        } else if orchestrator.package_exclusions_requested() {
+        } else {
+            // マニフェストへ適用した依存だけを更新する。lock 全体を解き直すと、
+            // 選ばなかった若い版まで入り、無関係な更新の取消につながる (#141)。
             scoped::replace_scoped_jobs(&mut jobs, orchestrator, result, &[Language::Rust]);
-        } else if result.errors.iter().any(|error| {
-            matches!(
-                error,
-                crate::orchestrator::OrchestratorError::NodePreflightError { .. }
-            )
-        }) {
-            scoped::replace_full_rust_jobs(&mut jobs, orchestrator, result);
         }
         let groups = RustLockGroups::collect(orchestrator, result);
         let baselines = groups

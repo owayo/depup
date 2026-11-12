@@ -37,6 +37,8 @@ It is conservative by default: a new version becomes a candidate only after it h
 
 Add `--install` to let each project's package manager refresh its lock file after the update.
 
+For Rust, this updates applied dependencies while keeping unrelated locked versions. Use `--install --refresh-lock` to re-resolve the entire Cargo lockfile, including transitive dependencies.
+
 ## Features
 
 - **Multi-Language Support**: Node.js, Python, Rust, Go, Ruby, PHP, Java, and Swift dependencies, plus mise tool versions in `mise.toml` / `.tool-versions`, through the same workflow

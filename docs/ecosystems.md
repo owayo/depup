@@ -102,6 +102,8 @@ An inline table may span several lines, for example when its `features` array is
 
 Cargo renamed dependencies such as `alias = { package = "actual-crate", version = "1" }` are fetched by the real package name and written back through the manifest key. `--only` and `--exclude` accept either name.
 
+Operator wildcards allow spaces after the operator, such as `= 1.*`, `^  1.x`, and `~ 1.2.X`. Updates preserve those spaces, the operator, and the wildcard positions. Tabs and Unicode whitespace after the operator are not accepted for these Cargo wildcards.
+
 A dependency is often declared in `[dependencies]` and again in `[dev-dependencies]` to add `features` for tests. When such declarations point to the same source — the same crates.io version requirement written the same way, or the same git URL and reference — depup treats them as one dependency: it looks the dependency up once, shows one update, and rewrites every declaration. The version requirement is compared as written, so `"1.0"` and `"^1.0"` count as different. Declarations that differ in version requirement, git URL or reference, the `version` written beside `git`, or the `package` they point to are not combined, and an update to them is refused as ambiguous.
 
 Path dependencies (`{ path = "../common" }`) are not processed, even when they also declare a `version` for publishing, because they resolve to the local crate. Dependencies that point at a registry other than crates.io — a non-`crates-io` `registry = "..."` or any `registry-index = "..."` — are not processed either, because depup only queries crates.io.
@@ -113,7 +115,7 @@ Git dependencies are checked with `git ls-remote` instead of a registry:
 | Reference | Behavior |
 |-----------|----------|
 | `tag` | Updated to the newest stable semver tag. If that tag exceeds the `--max-change` cap, the dependency is skipped with `max-change=<LEVEL>`; older tags within the cap are not considered |
-| `branch`, or none (default branch) | Reported as updated when the remote head differs from the commit recorded in `Cargo.lock`, or when none is recorded. `Cargo.toml` stays as written; the new commit is picked up only when `--install` runs `cargo update`, and without `--install` nothing is written |
+| `branch`, or none (default branch) | Reported as updated when the remote head differs from the commit recorded in `Cargo.lock`, or when none is recorded. `Cargo.toml` stays as written; the new commit is picked up only when `--install` runs a source-qualified `cargo update --package <old-package-ID>`, and without `--install` nothing is written |
 | `rev` | Always skipped as `pinned`, even with `--include-pinned` |
 
 Tag updates are limited to the same dependency tables as version updates and to `[patch.<registry>]` / `[patch.<registry>.<package>]`, and they preserve single or double quotes in both inline and multiline tables. Git dependencies are not subject to the age filter or the OSV check, and a failed `git ls-remote` skips the dependency without changing the exit code. `git ls-remote` never asks for credentials or a host key confirmation on the terminal: unless `GIT_SSH`, `GIT_SSH_COMMAND`, or `core.sshCommand` sets how ssh runs, depup uses `ssh -o BatchMode=yes`, so a remote that needs such a prompt fails right away.

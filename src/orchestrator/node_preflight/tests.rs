@@ -899,37 +899,10 @@ impl MembershipFixture {
         for only in [false, true] {
             let plan =
                 InstallPlan::new_scoped(orchestrator, result, &directories, self.temp.path(), only);
-            let rust_dirs: Vec<PathBuf> = if only
-                || result
-                    .errors
-                    .iter()
-                    .any(|error| matches!(error, OrchestratorError::NodePreflightError { .. }))
-            {
-                roots
-                    .iter()
-                    .map(|path| std::fs::canonicalize(path).unwrap())
-                    .collect()
-            } else {
-                result
-                    .summary
-                    .manifests
-                    .iter()
-                    .filter(|manifest| {
-                        manifest.language == Language::Rust && manifest.has_updates()
-                    })
-                    .map(|manifest| {
-                        let parent = manifest.path.parent().unwrap();
-                        let project = if manifest.path.ends_with("src-tauri/Cargo.toml") {
-                            parent.parent().unwrap()
-                        } else {
-                            parent
-                        };
-                        std::fs::canonicalize(project).unwrap()
-                    })
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect()
-            };
+            let rust_dirs: Vec<PathBuf> = roots
+                .iter()
+                .map(|path| std::fs::canonicalize(path).unwrap())
+                .collect();
             assert_eq!(plan.jobs.len(), nodes.len() + rust_dirs.len());
             for (language, expected) in nodes.iter().map(|path| (Language::Node, *path)).chain(
                 rust_dirs
@@ -1711,19 +1684,12 @@ async fn normal_install_does_not_redirect_independent_cargo_updates_to_stopped_t
         let args = pm
             .scoped_install_args(manager, job.policy.as_ref().unwrap(), scope)
             .unwrap();
-        assert_eq!(
-            args,
-            if only {
-                vec!["cargo", "update", "--workspace"]
-            } else {
-                vec!["cargo", "update"]
-            }
-        );
+        assert_eq!(args, vec!["cargo", "update", "--workspace"]);
     }
 }
 
 #[tokio::test]
-async fn normal_full_install_keeps_tauri_redirect_when_preflight_does_not_stop_a_scope() {
+async fn normal_install_plans_independent_cargo_and_tauri_roots() {
     let temp = tempfile::tempdir().unwrap();
     write_tauri(temp.path(), "app");
     write_rust(temp.path(), "independent", false);
@@ -1738,14 +1704,31 @@ async fn normal_full_install_keeps_tauri_redirect_when_preflight_does_not_stop_a
     let job = plan
         .jobs
         .iter()
-        .find(|job| job.language == Language::Rust)
+        .find(|job| job.language == Language::Rust && job.directory.ends_with("src-tauri"))
         .unwrap();
-    assert_eq!(job.scope, Ok(crate::package_manager::InstallScope::Full));
+    let rust_jobs: Vec<_> = plan
+        .jobs
+        .iter()
+        .filter(|job| job.language == Language::Rust)
+        .collect();
+    assert_eq!(rust_jobs.len(), 2);
+    assert!(
+        rust_jobs
+            .iter()
+            .any(|job| job.directory == std::fs::canonicalize(temp.path()).unwrap())
+    );
+    assert_eq!(
+        job.scope,
+        Ok(crate::package_manager::InstallScope::CargoWorkspace)
+    );
     let pm = SystemPackageManager::new();
     let (directory, _) = pm
         .resolve_scoped_package_manager(job.language, &job.directory, job.scope.as_ref().unwrap())
         .unwrap();
-    assert_eq!(directory, temp.path().join("src-tauri"));
+    assert_eq!(
+        directory,
+        std::fs::canonicalize(temp.path().join("src-tauri")).unwrap()
+    );
     assert_eq!(
         pm.scoped_install_args(
             "cargo",
@@ -1753,7 +1736,7 @@ async fn normal_full_install_keeps_tauri_redirect_when_preflight_does_not_stop_a
             job.scope.as_ref().unwrap()
         )
         .unwrap(),
-        ["cargo", "update"]
+        ["cargo", "update", "--workspace"]
     );
 }
 
@@ -1826,7 +1809,7 @@ async fn stopped_cargo_locks_and_missing_locks_are_not_reintroduced_by_post_inst
 }
 
 #[tokio::test]
-async fn independent_full_cargo_install_associates_only_its_actual_new_lock_and_keeps_php_full() {
+async fn independent_cargo_install_associates_only_its_actual_new_lock_and_keeps_php_full() {
     for monorepo in [false, true] {
         let temp = tempfile::tempdir().unwrap();
         write_tauri(temp.path(), "app");
@@ -1863,7 +1846,7 @@ async fn independent_full_cargo_install_associates_only_its_actual_new_lock_and_
                 .find(|job| job.language == Language::Rust)
                 .unwrap()
                 .scope,
-            Ok(crate::package_manager::InstallScope::CargoFull)
+            Ok(crate::package_manager::InstallScope::CargoWorkspace)
         );
         assert_eq!(
             plan.jobs

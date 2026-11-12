@@ -54,7 +54,7 @@ static RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
 // 先頭の `=` / `^` / `~` 演算子付き (`=1.*` / `^1.*` / `~1.x`) も Cargo (semver crate) では
 // valid なので許容し、演算子を保持したまま形を保って更新する (npm の `^1.x` と対称)。
 static WILDCARD_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[=^~]?[\d]+(?:\.[\d]+)*(?:\.[*xX]){1,2}$").unwrap());
+    LazyLock::new(|| Regex::new(r"^[=^~]? *[\d]+(?:\.[\d]+)*(?:\.[*xX]){1,2}$").unwrap());
 // Range の先頭 comparison requirement からバージョン部を抽出する。
 // プレリリース (`-...`) とビルドメタデータ (`+...`) も比較基準として保持する。
 static RANGE_FIRST_VERSION_RE: LazyLock<Regex> =
@@ -186,7 +186,7 @@ impl VersionParser for RustVersionParser {
             return Some(VersionSpec::new(
                 VersionSpecKind::Wildcard,
                 trimmed,
-                trimmed.trim_start_matches(['=', '^', '~']),
+                trimmed.trim_start_matches(['=', '^', '~']).trim_start(),
             ));
         }
 
