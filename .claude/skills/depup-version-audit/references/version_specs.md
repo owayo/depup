@@ -353,3 +353,29 @@
 - 大きな release segment: `==18446744073709551616.1.*` の上限計算が `u64` への変換に失敗し、別majorを選んでいた。prefix・compatible release・部分上限の加算を10進文字列で共有し、epoch と桁上がりも検証する。
 
 Node の上記の軽微な未対応は、安全に書き換える新規実装の対象にせず、現状の検出範囲として記録する。各言語で意図的に除外する参照を、レジストリの版へ変換する変更は行っていない。
+
+## 2026-11-12 の仕様監査
+
+公式仕様と AST で確認した parser の構造、既存テスト、マニフェストの書き戻しを照合した。
+
+| 言語・公式仕様 | 対応済みの主な構文 | 自動更新から外す形式・制限 |
+|---|---|---|
+| [Node](https://github.com/npm/node-semver#ranges) | exact、partial、caret、tilde、x-range、比較、hyphen、alias | OR は解析して書き換えない。protocol・dist-tag は対象外。単独の比較付き x-range と `~>` 付き x-range は引き続き軽微な取りこぼし |
+| [Python](https://packaging.python.org/en/latest/specifications/version-specifiers/) | exact、比較、compatible、prefix matching、epoch、pre/post/dev、Poetry の bare pin | local 固定・除外、Poetry の複数条件配列は自動書き換えしない |
+| [Cargo](https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html) | 暗黙・明示 caret、tilde、exact、wildcard、複数要件、pre/build。今回、演算子と wildcard の間の半角スペースに対応 | path・別レジストリは対象外。安全に書き換えられない混合要件は検出後にスキップ |
+| [Go](https://go.dev/ref/mod) | SemVer、pseudo-version、`+incompatible`、pinned、exclude・retract | replace に該当する require は更新しない。Go の require に範囲構文はない |
+| [Ruby](https://guides.rubygems.org/patterns/#pessimistic-version-constraint) | exact、pessimistic、比較、複合制約、プレリリース | 除外制約・非レジストリ依存・動的な DSL は自動書き換えしない |
+| [Composer](https://getcomposer.org/doc/articles/versions.md) | exact、caret、tilde、wildcard、比較、hyphen、stability flag、patch alias | OR・除外・inline alias・開発ブランチは書き換えない |
+| [Gradle](https://docs.gradle.org/current/userguide/dependency_versions.html) | exact、prefix、Maven range、strict/prefer/reject、catalog、変数 | latest・SNAPSHOT は保持。解決できない計算値・plugin ID は対象外 |
+| [Swift](https://docs.swift.org/package-manager/PackageDescription/PackageDescription.html) | from、exact、upToNextMajor/Minor、開・閉範囲、pre/build | branch・revision・path・registry の id は対象外。GitHub の版付き URL を扱う |
+
+### 今回修正した実害
+
+Cargo の `= 1.*`、`^  1.x`、`~ 1.2.X` は `semver::VersionReq` が受理するが、
+従来の wildcard 用の正規表現は演算子直後の空白を許さず、依存を読み飛ばしていた。
+`src/parser/rust.rs` で半角スペースを受け入れ、`src/domain/version_spec.rs` で書き戻し時にも保持する。
+`tests/version_range_audit.rs` の `cargo_operator_wildcards_keep_spacing_through_manifest_round_trips` は、
+解析・候補選択・書き戻し・再解析・再実行で更新が発生しないことを検証する。
+Cargo が拒否するタブ・全角空白・wildcard の後の数値も、過剰に受理しないことを確かめる。
+
+Node の上記の取りこぼしと各言語の意図的なスキップは、今回の変更でも維持する。

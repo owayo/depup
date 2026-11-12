@@ -661,7 +661,7 @@ mod tests {
         let minor = parse("= 1.2.*").unwrap();
         assert_eq!(minor.kind, VersionSpecKind::Wildcard);
         assert_eq!(minor.version, "1.2.0");
-        assert_eq!(minor.format_updated("2.3.4"), "=2.3.*");
+        assert_eq!(minor.format_updated("2.3.4"), "= 2.3.*");
 
         let prefixed = parse("=v1.x").unwrap();
         assert_eq!(prefixed.format_updated("2.3.4"), "=v2.x");

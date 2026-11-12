@@ -122,8 +122,10 @@ fn format_wildcard_like(raw: &str, new_version: &str) -> Option<String> {
         .bytes()
         .take_while(|b| matches!(b, b'^' | b'~' | b'='))
         .count();
-    let op_prefix = &trimmed[..op_len];
     let body = trimmed[op_len..].trim_start();
+    // 演算子の後ろの空白も表記の一部として保つ。空白だけを詰めると、
+    // 同じ系列内の候補でも見かけの更新を報告してしまう。
+    let op_prefix = &trimmed[..trimmed.len() - body.len()];
 
     if matches!(body, "*" | "x" | "X") {
         return Some(format!("{op_prefix}{body}"));
