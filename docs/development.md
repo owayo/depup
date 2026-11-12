@@ -6,6 +6,8 @@ Notes for building and maintaining depup. The setup and the standard `make` targ
 
 The CI quality job runs `make setup` and `make ci` on Linux and macOS, so running `make ci` locally performs the same checks: formatting, clippy, and the full test suite. On Windows, the CI build job runs `cargo test --locked` directly. The build job also builds the five release targets, because a dry run of the release workflow does not build anything.
 
+Both CI jobs cache Cargo dependencies and build artifacts with `cache-bin: false`. Restoring `~/.cargo/bin` can overwrite the rustup executable used by mise and cause macOS to terminate it with SIGKILL.
+
 To use the tools on your `PATH` instead of mise, pass `SYSTEM_TOOLS=1`; their versions may then differ from CI.
 
 On Windows, run the `make` targets in Git Bash, since their recipes use a POSIX shell. From PowerShell, the equivalent checks with the pinned toolchain are:

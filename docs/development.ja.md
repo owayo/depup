@@ -6,6 +6,8 @@ depup をソースからビルドする人と、メンテナンスする人向�
 
 CI の quality ジョブは、Linux と macOS で `make setup` と `make ci` を実行します。手元の `make ci` も同じ検査です。整形の確認、clippy、全テストを行います。Windows では、CI の build ジョブが `cargo test --locked` を直接実行します。リリースのワークフローは dry_run では何もビルドしないため、配布する 5 つのターゲットのビルドも CI の build ジョブで確かめています。
 
+両方の CI ジョブで `cache-bin: false` を指定し、Cargo の依存とビルド結果をキャッシュします。`~/.cargo/bin` を復元すると mise が使う rustup を上書きし、macOS で SIGKILL されることがあるため、ここは対象から外しています。
+
 mise を使わずに `PATH` 上のツールで動かす場合は `SYSTEM_TOOLS=1` を付けてください。その場合、版が CI と一致する保証はありません。
 
 Windows では、レシピが POSIX シェルを使うため `make` のターゲットを Git Bash で実行します。PowerShell から固定ツールチェーンで同じ検査を行う場合は、次のコマンドを使います。
