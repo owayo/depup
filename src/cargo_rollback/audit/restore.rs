@@ -1,7 +1,10 @@
 //! install 時点の未解消の版と関係が残る、監査の部分的な変更だけを取り消す。
 
 use super::*;
-use crate::cargo_rollback::batch::{RestorationScope, RestoreCandidate, restore_installed};
+use crate::cargo_rollback::batch::{
+    CombinationError, RestorationScope, RestoreCandidate, resolve_combination_tracked,
+    restore_installed,
+};
 use crate::cargo_rollback::graph::PackageKey;
 use crate::cargo_rollback::lock_entries::{Edge, LockId, lock_tables};
 use crate::manifest::{is_crates_io_source, parse_lock_packages};
@@ -428,6 +431,7 @@ fn restore_plans(
                         name: node.installed.0.clone(),
                         current: node.current.as_ref().map(|key| key.1.clone()),
                         installed: node.installed.1.clone(),
+                        required: true,
                     },
                 );
                 // 再導入する依存も I に固定し、別の第3の版にはしない。
@@ -469,6 +473,7 @@ fn restore_plans(
                                 name: key.0.clone(),
                                 current: now,
                                 installed: key.1.clone(),
+                                required: false,
                             });
                     }
                 }
@@ -542,8 +547,196 @@ fn restore_plans(
 }
 
 impl LockAgeAuditor<'_> {
-    pub(super) async fn restore_mixed(&self, state: &mut AuditState) {
+    pub(super) async fn recover_partial(&self, state: &mut AuditState, bar: Option<&ProgressBar>) {
+        // 復元の既存予算を共有し、通常の反復で残った組合せを最後に一度解く。
+        // 解けなければ残り時間で従来の選択的復元を行う。
         let deadline = Instant::now() + LOCK_AGE_RESTORE_BUDGET;
+        // 最終解決が時間切れになっても、選択的復元を開始する分は残す。
+        self.resolve_age_combination(state, deadline - MIN_TOGETHER_SLICE, bar)
+            .await;
+        if state.problems.is_empty() {
+            self.restore_mixed_until(state, deadline).await;
+        }
+    }
+
+    async fn resolve_age_combination(
+        &self,
+        state: &mut AuditState,
+        deadline: Instant,
+        bar: Option<&ProgressBar>,
+    ) {
+        let Ok((content, entries)) = read_audit_lock(&self.input.project_dir.join("Cargo.lock"))
+        else {
+            return;
+        };
+        state.changes.observe(&content);
+        // 一時 workspace の再解決は取得元全体を動かしうる。以前に観測済みの
+        // 外部変更も、コマンド間の変更も、全体解きで上書きしない。
+        if !state
+            .changes
+            .allows_snapshot_restore(Some(content.as_bytes()))
+        {
+            return;
+        }
+        let mut candidates = BTreeMap::new();
+        for (name, versions) in changed_entries(&entries, self.input.baseline) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining < MIN_TOGETHER_SLICE {
+                return;
+            }
+            let Ok(Ok(known)) = tokio::time::timeout(
+                remaining - MIN_TOGETHER_SLICE,
+                self.versions.fetch(self.input.adapter, &name),
+            )
+            .await
+            else {
+                return;
+            };
+            for current in versions {
+                let Some(info) = known.iter().find(|info| info.version == current) else {
+                    return;
+                };
+                if self
+                    .input
+                    .exemptions
+                    .admits(Language::Rust, &name, info, self.input.cutoff)
+                {
+                    state.admitted.insert((name.clone(), current));
+                    continue;
+                }
+                let before = self.input.baseline.get(&name).map(Vec::as_slice);
+                let target = rollback_target(
+                    &known,
+                    &current,
+                    self.input.cutoff,
+                    self.input.preferred.get(&name).map(Vec::as_slice),
+                    before,
+                    self.input.exemptions,
+                )
+                .or_else(|| {
+                    state.yanked_before.get(&name).and_then(|known| {
+                        yanked_baseline_target(
+                            known,
+                            before.unwrap_or_default(),
+                            &current,
+                            self.input.cutoff,
+                        )
+                    })
+                });
+                let Some(target) =
+                    target.filter(|target| compare_versions(target, &current).is_lt())
+                else {
+                    // 解けない候補を無視した全体解きはせず、独立した成功を保持する
+                    // 従来の選択的復元へ戻す。
+                    return;
+                };
+                let minimum = version_floor(&known, before, &current).or_else(|| {
+                    state
+                        .yanked_before
+                        .contains_key(&name)
+                        .then(|| target.clone())
+                });
+                candidates.insert(
+                    (name.clone(), current.clone()),
+                    RollbackCandidate {
+                        name: name.clone(),
+                        current,
+                        target,
+                        minimum,
+                    },
+                );
+            }
+        }
+        if candidates.is_empty() {
+            return;
+        }
+        // 最後の解き直しが、先に成功した別の組の差し戻しを再び進めたり
+        // install 前の下限より古くしたりしないよう、現在の到達先も固定する。
+        for adjustment in state
+            .log
+            .entries
+            .values()
+            .filter(|entry| entry.status.is_resolved() || entry.status.is_restored())
+        {
+            let Some(target) = &adjustment.to else {
+                continue;
+            };
+            if entries
+                .get(&adjustment.name)
+                .is_some_and(|versions| versions.contains(target))
+            {
+                candidates
+                    .entry((adjustment.name.clone(), adjustment.from.clone()))
+                    .or_insert_with(|| RollbackCandidate {
+                        name: adjustment.name.clone(),
+                        current: adjustment.from.clone(),
+                        target: target.clone(),
+                        minimum: Some(target.clone()),
+                    });
+            }
+        }
+        let candidates: Vec<_> = candidates.into_values().collect();
+        if let Some(bar) = bar {
+            bar.set_message("Resolving the complete age-compatible Cargo.lock combination");
+        }
+        let change = match resolve_combination_tracked(
+            self.input.project_dir,
+            &candidates,
+            self.input.cargo,
+            deadline,
+            CARGO_UPDATE_TIMEOUT,
+        )
+        .await
+        {
+            Ok(change) => change,
+            Err(CombinationError::Broken(reason)) => {
+                state.problems.push(reason);
+                return;
+            }
+            Err(CombinationError::Unresolved(reason)) => {
+                if self.verbose {
+                    let message = format!(
+                        "  The complete age combination could not be resolved; restoring partial rollbacks: {reason}"
+                    );
+                    match bar {
+                        Some(bar) => bar.suspend(|| eprintln!("{message}")),
+                        None => eprintln!("{message}"),
+                    }
+                }
+                return;
+            }
+        };
+        state
+            .changes
+            .committed(&change.before, &change.after, &change.selected);
+        let after = parse_registry_entries(&change.after);
+        for candidate in candidates {
+            if let Some(to) = locked_after_rollback(&after, &candidate.name, &candidate.current) {
+                let status = if to.is_some() {
+                    LockAgeStatus::Downgraded
+                } else {
+                    LockAgeStatus::Removed
+                };
+                state
+                    .log
+                    .record(&candidate.name, &candidate.current, to, status);
+                state
+                    .log
+                    .entries
+                    .get_mut(&(candidate.name, candidate.current))
+                    .unwrap()
+                    .target = Some(candidate.target);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) async fn restore_mixed(&self, state: &mut AuditState) {
+        self.restore_mixed_until(state, Instant::now() + LOCK_AGE_RESTORE_BUDGET)
+            .await;
+    }
+
+    async fn restore_mixed_until(&self, state: &mut AuditState, deadline: Instant) {
         let (content, current) = match read_audit_lock(&self.input.project_dir.join("Cargo.lock")) {
             Ok(lock) => lock,
             Err(error) => {

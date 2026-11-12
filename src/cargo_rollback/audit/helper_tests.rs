@@ -304,6 +304,107 @@ mod retry_regressions {
         project.cargo_ok(&["update", "--workspace", "--locked"]);
     }
 
+    #[tokio::test]
+    async fn exhausted_singles_resolve_the_whole_age_combination_and_keep_the_direct_update() {
+        let registry = LocalRegistry::new();
+        registry
+            .publish("shared", "1.0.0", &[])
+            .publish("b-head", "1.0.0", &[("shared", "=1.0.0")])
+            .publish("c-head", "1.0.0", &[("shared", "=1.0.0")])
+            .publish("a-solo", "1.0.0", &[])
+            .publish("safe-direct", "1.0.0", &[("b-head", "1"), ("c-head", "1")]);
+        let manifest = |version: &str| {
+            format!(
+                "[package]\nname='example'\nversion='0.1.0'\nedition='2024'\n[dependencies]\nsafe-direct='={version}'\na-solo='1'\n"
+            )
+        };
+        let project = TestProject::new(&registry, &manifest("1.0.0"));
+        project.cargo_ok(&["generate-lockfile"]);
+        let baseline = parse_registry_entries(&project.read("Cargo.lock"));
+        registry
+            .publish("shared", "1.1.0", &[])
+            .publish("b-head", "1.1.0", &[("shared", "=1.1.0")])
+            .publish("c-head", "1.1.0", &[("shared", "=1.1.0")])
+            .publish("a-solo", "1.1.0", &[])
+            .publish("safe-direct", "1.1.0", &[("b-head", "1"), ("c-head", "1")]);
+        project.write("Cargo.toml", &manifest("1.1.0"));
+        project.cargo_ok(&["update"]);
+        let old = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let young = chrono::Utc.with_ymd_and_hms(2026, 1, 29, 0, 0, 0).unwrap();
+        let mut dates = FakeCratesIo::new();
+        for name in ["shared", "b-head", "c-head", "a-solo", "safe-direct"] {
+            dates = dates.release(name, "1.0.0", old).release(
+                name,
+                "1.1.0",
+                if name == "safe-direct" { old } else { young },
+            );
+        }
+        let cargo = project.cargo_envs().into_iter().fold(
+            CargoCommand::new().program(TestProject::cargo_program()),
+            |cargo, (key, value)| cargo.env(key, value),
+        );
+        let input = LockAgeAudit {
+            project_dir: project.path(),
+            cutoff: cutoff(),
+            exemptions: &Default::default(),
+            baseline: &baseline,
+            preferred: &PreferredVersions::new(),
+            adapter: &dates,
+            cargo: &cargo,
+            budget: Duration::from_secs(19),
+        };
+        let versions = VersionFetcher::new(4, 1);
+        let mut receipt = None;
+        let result = LockAgeAuditor::new(&input, &versions, false)
+            .with_frozen_clock()
+            .run_tracked(None, &mut receipt)
+            .await;
+        assert!(!result.has_unresolved(), "{result:?}");
+        assert!(result.problems.is_empty(), "{result:?}");
+        assert!(receipt.is_some(), "{result:?}");
+        assert_eq!(project.locked_versions("safe-direct"), ["1.1.0"]);
+        for name in ["shared", "b-head", "c-head", "a-solo"] {
+            assert_eq!(
+                project.locked_versions(name),
+                ["1.0.0"],
+                "{name}: {result:?}"
+            );
+        }
+        assert_eq!(project.read("Cargo.toml"), manifest("1.1.0"));
+        project.cargo_ok(&["update", "--workspace", "--locked"]);
+    }
+    #[tokio::test]
+    async fn the_last_combination_does_not_overwrite_prior_external_changes() {
+        let (_registry, project, baseline, dates, cargo) = fixture(false);
+        let input = LockAgeAudit {
+            project_dir: project.path(),
+            cutoff: cutoff(),
+            exemptions: &Default::default(),
+            baseline: &baseline,
+            preferred: &PreferredVersions::new(),
+            adapter: &dates,
+            cargo: &cargo,
+            budget: Duration::from_secs(19),
+        };
+        let versions = VersionFetcher::new(4, 1);
+        let auditor = LockAgeAuditor::new(&input, &versions, false);
+        let mut state = AuditState::new(input.budget);
+        state.installed_lock = project.read("Cargo.lock");
+        state.changes.observe(&state.installed_lock);
+        // 監査コマンドの間に、利用者が独立したパッケージを変更した。
+        project.cargo_ok(&["update", "-p", "s-solo", "--precise", "1.0.0"]);
+        let external = project.read("Cargo.lock");
+        auditor.recover_partial(&mut state, None).await;
+        assert_eq!(project.read("Cargo.lock"), external);
+        assert_eq!(project.locked_versions("z-top"), ["1.2.0"]);
+        assert!(
+            !state
+                .changes
+                .allows_snapshot_restore(Some(external.as_bytes()))
+        );
+        assert!(state.problems.is_empty(), "{:?}", state.problems);
+    }
+
     async fn new_edge_case(with_support: bool) {
         let registry = LocalRegistry::new();
         registry
@@ -589,6 +690,7 @@ mod retry_regressions {
             name: "z-top".into(),
             current: Some("1.2.0".into()),
             installed: "1.2.0".into(),
+            required: true,
         }];
         let scope = RestorationScope {
             members: &members,
