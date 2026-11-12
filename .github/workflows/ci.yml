@@ -42,8 +42,11 @@ jobs:
           minimum_release_age: 14d
           cache: false
 
-      # target/ と ~/.cargo のキャッシュ (鍵に rustc の版が入るので、mise.toml の rust を上げると作り直す)
+      # target/ と Cargo の依存をキャッシュする (鍵に rustc の版が入る)。~/.cargo/bin は戻さない。
+      # 導入済みの rustup を上書きすると macOS のコード署名キャッシュが不整合になり、SIGKILL されることがある
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
 
       - name: Show toolchain
         run: mise ls --current
@@ -90,8 +93,10 @@ jobs:
           minimum_release_age: 14d
           cache: false
 
+      # quality と同じく、mise が使う rustup をキャッシュから上書きしない
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-bin: false
           key: ${{ matrix.target }}
 
       # mise.toml の rust はホストのツールチェーンと components だけを入れるので、配布のターゲットを足す
