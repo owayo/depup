@@ -31,6 +31,8 @@ pub(crate) struct RestoreCandidate {
     pub name: String,
     pub current: Option<String>,
     pub installed: String,
+    /// 明示的な差し戻しの取消対象。依存範囲の補助とは違い、剪定を認めない。
+    pub required: bool,
 }
 
 pub(crate) struct RestorationScope<'a> {
@@ -132,6 +134,7 @@ fn check_restoration(
     };
     let before = ids(before);
     let after = ids(after);
+    let installed_graph = LockGraph::from_lock_content(installed);
     let installed = ids(installed);
     for member in members {
         if !after.iter().any(|(name, version, source)| {
@@ -139,6 +142,29 @@ fn check_restoration(
                 && version == &member.installed
                 && source.as_deref().is_some_and(is_crates_io_source)
         }) {
+            // 元の依存範囲へ補助的に再導入した版でも、固定を外した Cargo は
+            // 既存の別系列へ辺を付け替えて不要な版を除くことがある。
+            // 復元された依存元から元の lock で到達でき、対象の系列も残って
+            // いない場合だけ許す。主対象の欠落・同系列の別版への妥協は許さない。
+            let supporting = members.iter().any(|other| {
+                after.iter().any(|(name, version, source)| {
+                    name == &other.name
+                        && version == &other.installed
+                        && source.as_deref().is_some_and(is_crates_io_source)
+                }) && installed_graph
+                    .reachable(&(other.name.clone(), other.installed.clone()))
+                    .contains(&(member.name.clone(), member.installed.clone()))
+            });
+            if !member.required
+                && supporting
+                && !after.iter().any(|(name, version, source)| {
+                    name == &member.name
+                        && same_series(version, &member.installed)
+                        && source.as_deref().is_some_and(is_crates_io_source)
+                })
+            {
+                continue;
+            }
             return Err(format!(
                 "{} did not return to install-time version {}",
                 member.name, member.installed
@@ -310,6 +336,66 @@ pub(crate) struct ResolutionChange {
     pub before: String,
     pub after: String,
     pub selected: Vec<PackageKey>,
+}
+
+/// 最後の試行では、未解消分だけでなく先に戻せた目標も同時に保持する。
+/// ここで解けなくても実際の lock は変えず、呼び出し元の選択的復元へ戻す。
+pub(crate) async fn resolve_combination_tracked(
+    root: &Path,
+    candidates: &[RollbackCandidate],
+    cargo: &CargoCommand,
+    deadline: Instant,
+    per_command: Duration,
+) -> Result<ResolutionChange, CombinationError> {
+    let timeout = command_timeout(deadline, per_command)
+        .ok_or_else(|| CombinationError::Unresolved(BUDGET_EXHAUSTED.into()))?;
+    let mut scratch = ScratchWorkspace::create(root, cargo, timeout)
+        .await
+        .map_err(CombinationError::Unresolved)?;
+    for candidate in candidates {
+        if !same_series(&candidate.current, &candidate.target)
+            || blocking_requirement(&scratch, candidate).is_some()
+        {
+            return Err(CombinationError::Unresolved(
+                "the complete age combination is blocked by a version requirement".into(),
+            ));
+        }
+    }
+    let before = scratch.original_lock().to_string();
+    let selected: Vec<_> = candidates.iter().map(RollbackCandidate::key).collect();
+    let mut failure = String::new();
+    // 全候補を固定する。頂点だけの固定へ緩めると、先に成功した到達先や
+    // judge が OSV を考慮して選んだ目標より新しい版を再び選びうる。
+    for plan in pin_plans(candidates, &[]) {
+        match attempt(
+            &mut scratch,
+            root,
+            cargo,
+            candidates,
+            &plan,
+            deadline,
+            per_command,
+        )
+        .await
+        {
+            Ok(_) => {
+                return Ok(ResolutionChange {
+                    before,
+                    after: scratch.original_lock().to_string(),
+                    selected,
+                });
+            }
+            Err(AttemptError::Unresolved(reason)) => failure = reason,
+            Err(AttemptError::Broken(reason)) => return Err(CombinationError::Broken(reason)),
+            Err(error) => return Err(CombinationError::Unresolved(attempt_message(error))),
+        }
+    }
+    Err(CombinationError::Unresolved(failure))
+}
+
+pub(crate) enum CombinationError {
+    Unresolved(String),
+    Broken(String),
 }
 
 pub(crate) async fn resolve_together_tracked(
@@ -592,7 +678,16 @@ async fn attempt(
     deadline: Instant,
     per_command: Duration,
 ) -> Result<Vec<(PackageKey, TogetherOutcome)>, AttemptError> {
-    let specs: Vec<_> = group.iter().map(RollbackCandidate::spec).collect();
+    let entries = parse_registry_entries(scratch.original_lock());
+    let specs: Vec<_> = group
+        .iter()
+        .filter(|candidate| {
+            entries
+                .get(&candidate.name)
+                .is_some_and(|versions| versions.contains(&candidate.current))
+        })
+        .map(RollbackCandidate::spec)
+        .collect();
     let resolved_lock = re_resolve(
         scratch,
         root,
@@ -942,6 +1037,7 @@ mod tests {
             name: "foo".into(),
             current: Some("1.1.0".into()),
             installed: "1.2.0".into(),
+            required: true,
         }];
         let before = lock(&[("foo", "1.1.0"), ("solo", "1.0.0")]);
         let installed = lock(&[("foo", "1.2.0"), ("solo", "1.1.0")]);
@@ -1037,6 +1133,7 @@ mod tests {
                     name: "foo".into(),
                     current: Some("1.0.1".into()),
                     installed: "1.0.2".into(),
+                    required: true,
                 }],
                 discarded: &[],
                 installed: &installed,
@@ -1060,12 +1157,75 @@ mod tests {
         project.cargo_ok(&["update", "--workspace", "--locked"]);
     }
 
+    #[tokio::test]
+    async fn restoration_can_prune_a_reintroduced_supporting_dependency() {
+        use crate::test_support::local_registry::{LocalRegistry, TestProject};
+        let registry = LocalRegistry::new();
+        registry
+            .publish("shared", "0.1.0", &[])
+            .publish("shared", "0.2.0", &[])
+            .publish("foo", "1.0.0", &[("shared", ">=0.1, <0.3")])
+            .publish("foo", "1.1.0", &[("shared", ">=0.1, <0.3")])
+            .publish("keep-old", "1.0.0", &[("shared", "=0.1.0")]);
+        let manifest = "[package]\nname='example'\nversion='0.1.0'\nedition='2024'\n[dependencies]\nfoo='1'\nkeep-old='1'\n";
+        let project = TestProject::new(&registry, manifest);
+        project.cargo_ok(&["generate-lockfile"]);
+        let installed = project.read("Cargo.lock");
+        project.cargo_ok(&["update", "-p", "foo", "--precise", "1.0.0"]);
+        let before = project.read("Cargo.lock");
+        let cargo = project.cargo_envs().into_iter().fold(
+            CargoCommand::new().program(TestProject::cargo_program()),
+            |cargo, (key, value)| cargo.env(key, value),
+        );
+        let mut members = [
+            RestoreCandidate {
+                name: "foo".into(),
+                current: Some("1.0.0".into()),
+                installed: "1.1.0".into(),
+                required: true,
+            },
+            RestoreCandidate {
+                name: "shared".into(),
+                current: None,
+                installed: "0.2.0".into(),
+                required: false,
+            },
+        ];
+        let result = restore_installed(
+            project.path(),
+            RestorationScope {
+                members: &members,
+                discarded: &[],
+                installed: &installed,
+                expected_lock: &before,
+            },
+            &cargo,
+            Instant::now() + Duration::from_secs(60),
+            Duration::from_secs(20),
+        )
+        .await
+        .expect("a pruned supporting dependency must not abort restoration");
+        assert_eq!(project.read("Cargo.lock"), result);
+        assert_eq!(project.read("Cargo.toml"), manifest);
+        assert_eq!(project.locked_versions("foo"), ["1.1.0"]);
+        assert_eq!(project.locked_versions("shared"), ["0.1.0"]);
+        project.cargo_ok(&["update", "--workspace", "--locked"]);
+        // 到達可能でも、明示的な主対象の欠落へは同じ例外を広げない。
+        members[1].required = true;
+        assert!(
+            check_restoration(&before, &result, &members, &[], &installed)
+                .unwrap_err()
+                .contains("shared did not return")
+        );
+    }
+
     #[test]
     fn restoration_preserves_edge_multiplicity_and_sources() {
         let members = [RestoreCandidate {
             name: "foo".into(),
             current: Some("1.1.0".into()),
             installed: "1.2.0".into(),
+            required: true,
         }];
         let before = lock(&[("foo", "1.1.0"), ("shared", "0.1.0"), ("shared", "0.2.0")]);
         let after = before.replace("version = \"1.1.0\"", "version = \"1.2.0\"");
