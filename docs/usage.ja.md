@@ -371,7 +371,7 @@ depup が書き換えるのは、解析した依存宣言だけです。依存�
 
 `depup --install --refresh-lock` は、マニフェストの制約内で pnpm と Cargo のロックファイルを再解決します。直接依存の更新が 0 件でも、間接依存を更新できます。共有 workspace の lock は 1 回だけ処理します。通常の `--install` の動作は変わりません。
 
-pnpm は、先に `update --no-save --lockfile-only --ignore-scripts --no-include-github-actions --no-changeset` を実行します。workspace では全メンバーとルートを含めます。検査を通ったあと、`pnpm install --frozen-lockfile` で実体化します。この段階の script 実行はプロジェクトの通常の許可設定に従い、両コマンドに同じ age 設定を渡します。オプションに対応しない pnpm は明示的に失敗し、制限を外して再実行しません。ほかの Node パッケージマネージャーは再解決の対象外です。lock がまだない場合は、`pnpm-workspace.yaml` または `packageManager` フィールドで pnpm と判定できる必要があります。
+pnpm は、pnpm 10 と 12 が対応する引数で、先に `update --no-save --lockfile-only --ignore-scripts` を実行します。宣言済みの制約を保持し、再解決中は script を実行しません。workspace では全メンバーとルートを含めます。検査を通ったあと、`pnpm install --frozen-lockfile` で実体化します。この段階の script 実行はプロジェクトの通常の許可設定に従い、両コマンドに同じ age 設定を渡します。オプションに対応しない pnpm は明示的に失敗し、制限を外して再実行しません。ほかの Node パッケージマネージャーは再解決の対象外です。lock がまだない場合は、`pnpm-workspace.yaml` または `packageManager` フィールドで pnpm と判定できる必要があります。
 
 Cargo は `cargo update` のあと、既存の age 差し戻しと最終検証を行います。どちらの言語でも、age 検証後の lock に新しく入った公開レジストリ版を OSV で調べます。OSV の通信・解析失敗や age 検証の失敗があれば、その共有 install 単位を復元します。
 
