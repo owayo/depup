@@ -439,8 +439,16 @@ async fn direct_zero_refresh_runs_once_and_materializes_only_verified_pnpm() {
     .await;
     assert!(!outcome.install_failed && !outcome.audit_failed);
     assert_eq!(commands.len(), 2);
-    assert!(commands[0].contains(&"--lockfile-only".into()));
-    assert!(commands[0].contains(&"--ignore-scripts".into()));
+    assert_eq!(
+        commands[0],
+        [
+            "pnpm",
+            "update",
+            "--no-save",
+            "--lockfile-only",
+            "--ignore-scripts",
+        ]
+    );
     assert!(commands[1].contains(&"--frozen-lockfile".into()));
     assert!(!commands[1].contains(&"--ignore-scripts".into()));
     assert_eq!(verifier.seen.lock().unwrap().as_slice(), ["example@1.2.0"]);
@@ -1085,9 +1093,17 @@ fn workspace_refresh_plans_one_job_per_lock_and_preserves_stricter_unchanged_mem
         )
         .unwrap()
         .unwrap();
-    assert!(
-        command.argv.contains(&"--recursive".into())
-            && command.argv.contains(&"--include-workspace-root".into())
+    assert_eq!(
+        command.argv,
+        [
+            "pnpm",
+            "update",
+            "--no-save",
+            "--lockfile-only",
+            "--ignore-scripts",
+            "--recursive",
+            "--include-workspace-root",
+        ]
     );
     assert_eq!(command.env.len(), 2);
     assert_eq!(command.env[0].1, command.env[1].1);

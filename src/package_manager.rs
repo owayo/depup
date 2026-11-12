@@ -321,8 +321,6 @@ impl SystemPackageManager {
                     "--no-save".into(),
                     "--lockfile-only".into(),
                     "--ignore-scripts".into(),
-                    "--no-include-github-actions".into(),
-                    "--no-changeset".into(),
                 ];
             }
             (_, InstallScope::Refresh) => {
