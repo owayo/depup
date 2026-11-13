@@ -567,8 +567,9 @@ fn verify_pnpm_manifest_dependencies(directory: &Path, value: &Value) -> Result<
         }
         let manifest = std::fs::read(project_path.join("package.json"))
             .map_err(|error| format!("could not read pnpm graph project package.json: {error}"))?;
-        let manifest: Value = serde_json::from_slice(&manifest)
-            .map_err(|error| format!("invalid pnpm graph project package.json: {error}"))?;
+        let manifest: Value =
+            serde_json::from_slice(crate::manifest::strip_utf8_bom_bytes(&manifest))
+                .map_err(|error| format!("invalid pnpm graph project package.json: {error}"))?;
         for section in ["dependencies", "devDependencies"] {
             let Some(required) = manifest.get(section) else {
                 continue;
@@ -611,7 +612,7 @@ fn verify_pnpm_manifest_dependencies(directory: &Path, value: &Value) -> Result<
 fn verify_npm_manifest_dependencies(directory: &Path, value: &Value) -> Result<(), String> {
     let manifest = std::fs::read(directory.join("package.json"))
         .map_err(|error| format!("could not read package.json for npm lockfile audit: {error}"))?;
-    let manifest: Value = serde_json::from_slice(&manifest)
+    let manifest: Value = serde_json::from_slice(crate::manifest::strip_utf8_bom_bytes(&manifest))
         .map_err(|error| format!("invalid package.json for npm lockfile audit: {error}"))?;
     let packages = value
         .get("packages")

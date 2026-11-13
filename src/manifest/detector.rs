@@ -225,6 +225,8 @@ fn detect_gradle_version_catalogs(dir: &Path) -> Vec<PathBuf> {
 fn detect_pnpm_workspace_packages(dir: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
     let workspace_file = dir.join("pnpm-workspace.yaml");
     let content = std::fs::read_to_string(&workspace_file)?;
+    // 先頭の BOM を外さないと 1 行目の `packages:` を見落とし、メンバーを 1 件も見つけない (#159)
+    let (_, content) = super::split_utf8_bom(&content);
 
     let mut includes = Vec::new();
     let mut excludes: Vec<PathBuf> = Vec::new();
@@ -1212,6 +1214,29 @@ mod tests {
             !node_paths.contains(&dir.path().join("packages/legacy/package.json")),
             "否定パターンは除外されるべき: {:?}",
             node_paths
+        );
+    }
+
+    /// Issue #159: BOM 付きの pnpm-workspace.yaml でも、1 行目の `packages:` を読んでメンバーを見つける
+    #[test]
+    fn test_pnpm_workspace_with_a_utf8_bom_still_lists_its_packages() {
+        let dir = create_temp_dir();
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "\u{feff}packages:\n  - 'packages/*'\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("package.json"), "{}").unwrap();
+        let app = dir.path().join("packages/app");
+        fs::create_dir_all(&app).unwrap();
+        fs::write(app.join("package.json"), "{}").unwrap();
+
+        let manifests = detect_manifests(dir.path());
+        assert!(
+            manifests
+                .iter()
+                .any(|manifest| manifest.path == app.join("package.json")),
+            "{manifests:?}"
         );
     }
 

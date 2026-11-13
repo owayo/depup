@@ -128,6 +128,9 @@ fn checked_release_age(dir: &Path, source: &str) -> Result<Option<Duration>, Str
     }
     let content = std::fs::read_to_string(&path)
         .map_err(|error| format!("could not read {source}: {error}"))?;
+    // 先頭の BOM は 3 種のどれでも構文ではない。外さないと package.json は解析に失敗し、
+    // .npmrc と pnpm-workspace.yaml は 1 行目のキーを見落として age を黙って捨てる (#159)
+    let (_, content) = super::split_utf8_bom(&content);
     let raw = match source {
         ".npmrc" => content.lines().find_map(|line| {
             let line = line.trim();
@@ -143,7 +146,7 @@ fn checked_release_age(dir: &Path, source: &str) -> Result<Option<Duration>, Str
                 .map(|value| value.split('#').next().unwrap_or(value).trim().to_string())
         }),
         _ => {
-            let json: serde_json::Value = serde_json::from_str(&content)
+            let json: serde_json::Value = serde_json::from_str(content)
                 .map_err(|error| format!("invalid {source}: {error}"))?;
             json.get("pnpm")
                 .and_then(|pnpm| {
@@ -234,6 +237,36 @@ mod tests {
         assert_eq!(
             PnpmSettings::checked_minimum_release_age_with_source(temp.path()).unwrap(),
             Some((Duration::from_secs(30 * 86400), "package.json"))
+        );
+    }
+
+    /// Issue #159: 3 種の設定ファイルとも、先頭の UTF-8 の BOM を外して読む。以前は package.json の
+    /// 解析に失敗し、.npmrc と pnpm-workspace.yaml は 1 行目のキーを見落としていた。
+    #[test]
+    fn settings_files_with_a_utf8_bom_are_read_like_the_ones_without() {
+        for (source, content, days) in [
+            (".npmrc", "minimum-release-age=20160\n", 14),
+            ("pnpm-workspace.yaml", "minimumReleaseAge: 20160\n", 14),
+            ("package.json", r#"{"pnpm":{"minimumReleaseAge":10080}}"#, 7),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::write(temp.path().join(source), format!("\u{feff}{content}")).unwrap();
+            assert_eq!(
+                PnpmSettings::checked_minimum_release_age_with_source(temp.path()).unwrap(),
+                Some((Duration::from_secs(days * 86400), source)),
+                "{source}"
+            );
+        }
+        // age を書いていない BOM 付きの package.json も、エラーにしない
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("package.json"),
+            "\u{feff}{\"dependencies\":{\"is-number\":\"^6.0.0\"}}",
+        )
+        .unwrap();
+        assert_eq!(
+            PnpmSettings::checked_minimum_release_age_with_source(temp.path()).unwrap(),
+            None
         );
     }
     use std::fs;
