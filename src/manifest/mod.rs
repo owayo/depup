@@ -25,6 +25,7 @@ pub(crate) mod native_age;
 mod package_json;
 mod package_swift;
 mod pnpm_settings;
+mod pnpm_workspace;
 mod pyproject_toml;
 mod tool_versions;
 mod writer;
@@ -40,7 +41,9 @@ pub use cargo_lock::{
 pub use cargo_toml::CargoTomlParser;
 pub use composer_json::ComposerJsonParser;
 pub(crate) use detector::strip_gradle_comments;
-pub use detector::{ManifestFile, ManifestInfo, detect_manifests};
+pub use detector::{
+    ManifestDetection, ManifestFile, ManifestInfo, detect_manifests, detect_manifests_with_warnings,
+};
 pub use gemfile::GemfileParser;
 pub use go_mod::GoModParser;
 pub use gradle::{GradleFile, GradleParser, GradleVersionCatalogParser, GradleWrapperParser};

@@ -5,7 +5,9 @@
 //! - pnpm-workspace.yaml によるモノレポ検出のサポート
 //! - Tauri プロジェクト (src-tauri/Cargo.toml) のサポート
 
+use super::pnpm_workspace::{self, WorkspaceGlob};
 use crate::domain::Language;
+use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
 /// 検出されたマニフェストファイルの情報
@@ -67,7 +69,23 @@ fn push_unique_manifest(manifests: &mut Vec<ManifestInfo>, path: PathBuf, langua
         manifests.push(ManifestInfo::new(path, language));
     }
 }
-/// 指定ディレクトリ内の全マニフェストファイルを検出する
+/// マニフェストの検出の結果と、検出の途中で見つけた設定の問題。
+#[derive(Debug, Default)]
+pub struct ManifestDetection {
+    /// 検出したマニフェスト
+    pub manifests: Vec<ManifestInfo>,
+    /// 利用者に知らせる警告 (`Warning: ` を付けずに 1 行ずつ)
+    pub warnings: Vec<String>,
+}
+
+/// 指定ディレクトリ内の全マニフェストファイルを検出する。警告は捨てる
+/// (警告を出すのは、実行の始めに検出するオーケストレータだけ。
+/// [`detect_manifests_with_warnings`] を使う)。
+pub fn detect_manifests(dir: &Path) -> Vec<ManifestInfo> {
+    detect_manifests_with_warnings(dir).manifests
+}
+
+/// 指定ディレクトリ内の全マニフェストファイルを検出し、設定の問題を警告として返す
 ///
 /// この関数の処理:
 /// 1. 標準的なマニフェストファイル (package.json, pyproject.toml, Cargo.toml, go.mod, build.gradle) を探す
@@ -75,8 +93,9 @@ fn push_unique_manifest(manifests: &mut Vec<ManifestInfo>, path: PathBuf, langua
 /// 3. src-tauri/Cargo.toml の存在をチェックして Tauri プロジェクトを検出する
 /// 4. build.gradle.kts (Kotlin DSL) の存在をチェックして Gradle プロジェクトを検出する
 /// 5. gradle/*.versions.toml の Gradle version catalog を検出する
-pub fn detect_manifests(dir: &Path) -> Vec<ManifestInfo> {
+pub fn detect_manifests_with_warnings(dir: &Path) -> ManifestDetection {
     let mut manifests = Vec::new();
+    let mut warnings = Vec::new();
 
     // pnpm ワークスペースかどうかを確認する
     let is_pnpm_workspace = dir.join("pnpm-workspace.yaml").exists();
@@ -127,14 +146,24 @@ pub fn detect_manifests(dir: &Path) -> Vec<ManifestInfo> {
         add_cargo_workspace_manifests(&mut manifests, &dir.join("src-tauri"));
     }
 
-    // pnpm-workspace.yaml が存在する場合、pnpm ワークスペースパッケージを確認する
-    if is_pnpm_workspace && let Ok(workspace_packages) = detect_pnpm_workspace_packages(dir) {
-        for package_path in workspace_packages {
-            let package_json_path = package_path.join("package.json");
-            // ルートの package.json と既出のマニフェストは重複追加しない
-            if package_json_path.exists() && package_json_path != dir.join("package.json") {
-                push_unique_manifest(&mut manifests, package_json_path, Language::Node);
+    // pnpm-workspace.yaml が存在する場合、pnpm ワークスペースパッケージを確認する。
+    // 解釈できない除外のパターンがあれば、外したパッケージを書き換えないよう、メンバーを
+    // 1 件も足さずに警告する (ルートの package.json は上で足している、#163)
+    if is_pnpm_workspace {
+        match detect_pnpm_workspace_packages(dir) {
+            Ok(workspace_packages) => {
+                for package_path in workspace_packages {
+                    let package_json_path = package_path.join("package.json");
+                    // ルートの package.json と既出のマニフェストは重複追加しない
+                    if package_json_path.exists() && package_json_path != dir.join("package.json") {
+                        push_unique_manifest(&mut manifests, package_json_path, Language::Node);
+                    }
+                }
             }
+            Err(error) => warnings.push(format!(
+                "{}: {error}; the workspace packages are not updated",
+                crate::user_path::display(&dir.join("pnpm-workspace.yaml"))
+            )),
         }
     }
 
@@ -167,7 +196,10 @@ pub fn detect_manifests(dir: &Path) -> Vec<ManifestInfo> {
         push_unique_manifest(&mut manifests, mise_path, Language::Mise);
     }
 
-    manifests
+    ManifestDetection {
+        manifests,
+        warnings,
+    }
 }
 
 /// Cargo workspace の起点を問わず、同じ規則でメンバーを追加する。
@@ -221,141 +253,106 @@ fn detect_gradle_version_catalogs(dir: &Path) -> Vec<PathBuf> {
     catalogs
 }
 
-/// pnpm-workspace.yaml をパースしてパッケージディレクトリを返す
-fn detect_pnpm_workspace_packages(dir: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
+/// pnpm-workspace.yaml のメンバーを集められない理由。
+#[derive(Debug)]
+enum PnpmWorkspaceError {
+    /// ファイルを読めない
+    Read(std::io::Error),
+    /// `packages` の値を読めない (閉じていない引用符など)
+    Malformed(String),
+    /// 照合できない除外のパターン
+    UnsupportedExclusion {
+        pattern: String,
+        reason: &'static str,
+    },
+}
+
+impl fmt::Display for PnpmWorkspaceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read(error) => write!(f, "cannot read the file ({error})"),
+            Self::Malformed(message) => write!(f, "cannot read `packages` ({message})"),
+            Self::UnsupportedExclusion { pattern, reason } => {
+                write!(f, "cannot interpret the exclusion `{pattern}` ({reason})")
+            }
+        }
+    }
+}
+
+/// pnpm のワークスペースの既定の除外 (`**/node_modules/**` と `**/bower_components/**`)
+const PNPM_IGNORED_DIRECTORIES: [&str; 2] = ["node_modules", "bower_components"];
+
+/// pnpm-workspace.yaml をパースしてパッケージディレクトリを返す。
+///
+/// 含めるパターンは `expand_workspace_pattern` が展開できる形 (直接パス・末尾の `/*` など)
+/// だけを展開し、見つけたディレクトリを pnpm と同じ規則で絞る: 含めるパターンに一致すること
+/// (`*` と `**` は `.` で始まる名前に一致しない)、`node_modules` / `bower_components` の
+/// 下でないこと、どの除外のパターンにも一致しないこと (#163)。除外は `.` で始まる名前にも
+/// 一致させる (pnpm 9 の fast-glob と同じ。外すパッケージが pnpm より少なくならない)。
+///
+/// 除外のパターンを 1 つでも照合できなければ、途中まで集めたメンバーも返さない。
+fn detect_pnpm_workspace_packages(dir: &Path) -> Result<Vec<PathBuf>, PnpmWorkspaceError> {
     let workspace_file = dir.join("pnpm-workspace.yaml");
-    let content = std::fs::read_to_string(&workspace_file)?;
+    let content = std::fs::read_to_string(&workspace_file).map_err(PnpmWorkspaceError::Read)?;
     // 先頭の BOM を外さないと 1 行目の `packages:` を見落とし、メンバーを 1 件も見つけない (#159)
     let (_, content) = super::split_utf8_bom(&content);
+    let patterns =
+        pnpm_workspace::package_patterns(content).map_err(PnpmWorkspaceError::Malformed)?;
 
     let mut includes = Vec::new();
-    let mut excludes: Vec<PathBuf> = Vec::new();
-
-    // packages 配列の簡易 YAML パース
-    // 形式: packages:
-    //          - 'packages/*' というワークスペース設定例
-    //          - 'apps/*' というワークスペース設定例
-    let mut in_packages = false;
-    // flow-style 配列 (`packages: ['a/*', 'b/*']`) を複数行に跨って蓄積するバッファ
-    let mut flow_buffer: Option<String> = None;
-    for line in content.lines() {
-        let trimmed = line.trim();
-
-        // flow-style 配列を複数行で読んでいる途中なら `]` が現れるまで蓄積する
-        if let Some(buffer) = flow_buffer.as_mut() {
-            buffer.push(' ');
-            buffer.push_str(trimmed);
-            if let Some(end) = buffer.find(']') {
-                let inner = buffer[..end].to_string();
-                flow_buffer = None;
-                add_flow_workspace_patterns(&inner, dir, &mut includes, &mut excludes);
+    let mut exclusions = Vec::new();
+    for pattern in &patterns {
+        // `!(...)` は除外ではなく extglob (pnpm が使う tinyglobby と同じ扱い)
+        match pattern.strip_prefix('!') {
+            Some(negated) if !negated.starts_with('(') => {
+                let glob = WorkspaceGlob::parse(negated).map_err(|reason| {
+                    PnpmWorkspaceError::UnsupportedExclusion {
+                        pattern: pattern.clone(),
+                        reason,
+                    }
+                })?;
+                exclusions.push(glob);
             }
-            continue;
-        }
-
-        if let Some(rest) = trimmed.strip_prefix("packages:") {
-            let rest = rest.trim();
-            if let Some(after_bracket) = rest.strip_prefix('[') {
-                // フロー形式: `packages: ['packages/*', 'apps/*']`
-                if let Some(end) = after_bracket.find(']') {
-                    add_flow_workspace_patterns(
-                        &after_bracket[..end],
-                        dir,
-                        &mut includes,
-                        &mut excludes,
-                    );
-                } else {
-                    // `]` が次行以降にある複数行 flow-style
-                    flow_buffer = Some(after_bracket.to_string());
-                }
-            } else {
-                // block-style: 次行以降の `- 'pattern'` を読む
-                in_packages = true;
-            }
-            continue;
-        }
-
-        if in_packages {
-            // 新しいセクションに移ったかどうかを確認する
-            if !trimmed.is_empty() && !trimmed.starts_with('-') && !trimmed.starts_with('#') {
-                break;
-            }
-
-            // パッケージの glob パターンをパースする
-            if let Some(item) = trimmed.strip_prefix('-')
-                && let Some(pattern) = parse_yaml_list_value(item)
-            {
-                add_workspace_pattern(&pattern, dir, &mut includes, &mut excludes);
-            }
+            _ => includes.push(pattern.as_str()),
         }
     }
 
     let mut packages = Vec::new();
-    for path in includes {
-        if !excludes.contains(&path) && !packages.contains(&path) {
-            packages.push(path);
+    for pattern in includes {
+        // 照合できない含めるパターンは、これまでどおり何も足さない (取りこぼすだけで安全側)
+        let Ok(include) = WorkspaceGlob::parse(pattern) else {
+            continue;
+        };
+        for path in expand_workspace_pattern(dir, pattern) {
+            let Some(relative) = relative_segments(dir, &path) else {
+                continue;
+            };
+            let selected = include.matches(&relative, false)
+                && !relative
+                    .iter()
+                    .any(|segment| PNPM_IGNORED_DIRECTORIES.contains(segment))
+                && !exclusions
+                    .iter()
+                    .any(|exclusion| exclusion.matches(&relative, true));
+            if selected && !packages.contains(&path) {
+                packages.push(path);
+            }
         }
     }
 
     Ok(packages)
 }
 
-/// YAML リスト要素からインラインコメントとクォートを取り除いた値を返す
-fn parse_yaml_list_value(item: &str) -> Option<String> {
-    let item = item.trim();
-    let mut chars = item.chars();
-    let first = chars.next()?;
-    if first == '\'' || first == '"' {
-        // クォート付き: 閉じクォートまでが値 (以降はインラインコメント扱い)
-        let rest = chars.as_str();
-        let end = rest.find(first)?;
-        Some(rest[..end].to_string())
-    } else {
-        // クォートなし: 空白 + '#' 以降はインラインコメント
-        let value = match item.find(" #") {
-            Some(pos) => &item[..pos],
-            None => item,
-        };
-        let value = value.trim();
-        if value.is_empty() {
-            None
-        } else {
-            Some(value.to_string())
-        }
-    }
-}
-
-/// glob パターンを include / exclude へ振り分ける (`!pattern` は除外指定)。
-fn add_workspace_pattern(
-    pattern: &str,
-    dir: &Path,
-    includes: &mut Vec<PathBuf>,
-    excludes: &mut Vec<PathBuf>,
-) {
-    // `!pattern` は除外指定 (pnpm 公式サポート)
-    if let Some(negated) = pattern.strip_prefix('!') {
-        excludes.extend(expand_workspace_pattern(dir, negated));
-    } else {
-        includes.extend(expand_workspace_pattern(dir, pattern));
-    }
-}
-
-/// flow-style 配列の中身 (`'a/*', 'b/*'`) をカンマ区切りで分解して振り分ける。
-fn add_flow_workspace_patterns(
-    inner: &str,
-    dir: &Path,
-    includes: &mut Vec<PathBuf>,
-    excludes: &mut Vec<PathBuf>,
-) {
-    for raw_item in inner.split(',') {
-        let item = raw_item.trim();
-        if item.is_empty() {
-            continue;
-        }
-        if let Some(pattern) = parse_yaml_list_value(item) {
-            add_workspace_pattern(&pattern, dir, includes, excludes);
-        }
-    }
+/// `path` の `dir` からの相対パスを要素の並びで返す。`dir` の外や、UTF-8 でない名前なら `None`。
+fn relative_segments<'a>(dir: &Path, path: &'a Path) -> Option<Vec<&'a str>> {
+    path.strip_prefix(dir)
+        .ok()?
+        .components()
+        .map(|component| match component {
+            Component::Normal(name) => name.to_str(),
+            _ => None,
+        })
+        .collect()
 }
 
 /// ワークスペースの glob パターンをディレクトリ一覧へ展開する。
@@ -1262,6 +1259,142 @@ mod tests {
             .filter(|m| m.path == pkg_dir.join("package.json"))
             .count();
         assert_eq!(count, 1, "同一パッケージは1回だけ検出されるべき");
+    }
+
+    /// `dir` に、`members` の各ディレクトリの package.json を作る
+    fn write_packages(dir: &Path, members: &[&str]) {
+        for member in members {
+            let member_dir = dir.join(member);
+            fs::create_dir_all(&member_dir).unwrap();
+            fs::write(member_dir.join("package.json"), "{}").unwrap();
+        }
+    }
+
+    /// `dir` からの相対パス (`/` 区切り) で、検出した package.json のディレクトリを返す
+    fn node_members(dir: &Path, manifests: &[ManifestInfo]) -> Vec<String> {
+        let mut members: Vec<String> = manifests
+            .iter()
+            .filter(|manifest| manifest.language == Language::Node)
+            .filter_map(|manifest| manifest.path.parent()?.strip_prefix(dir).ok())
+            .map(|relative| {
+                relative
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            })
+            .collect();
+        members.sort();
+        members
+    }
+
+    /// 回帰テスト (#163): `**` を含む除外のパターン (pnpm の公式の例の `!**/test/**`) で、
+    /// pnpm と同じパッケージを外す。名前の一部が一致するだけのパッケージは残す
+    #[test]
+    fn pnpm_exclusions_with_globstars_remove_the_packages_pnpm_removes() {
+        let dir = create_temp_dir();
+        fs::write(dir.path().join("package.json"), "{}").unwrap();
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages:
+  - 'packages/*'
+  - '!**/test/**'
+",
+        )
+        .unwrap();
+        write_packages(
+            dir.path(),
+            &[
+                "packages/app",
+                "packages/test",
+                "packages/test-app",
+                "packages/mytest",
+            ],
+        );
+
+        let detection = detect_manifests_with_warnings(dir.path());
+        assert!(detection.warnings.is_empty(), "{:?}", detection.warnings);
+        assert_eq!(
+            node_members(dir.path(), &detection.manifests),
+            vec!["", "packages/app", "packages/mytest", "packages/test-app"]
+        );
+    }
+
+    /// 回帰テスト (#163): 照合できない除外のパターンがあれば、メンバーを 1 件も足さずに
+    /// 警告する (ルートの package.json は残す)。flow 形式の引用符の中の `,` で値が割れて
+    /// 除外が黙って消えることもない
+    #[test]
+    fn unsupported_pnpm_exclusions_stop_the_member_expansion_with_a_warning() {
+        for workspace in [
+            "packages:
+  - 'packages/*'
+  - '!packages/{test,legacy}'
+",
+            "packages: ['packages/*', '!packages/{test,legacy}']
+",
+            "packages: ['packages/*', '!packages/[tl]*']
+",
+            "packages:
+  - 'packages/*'
+  - '!packages/test
+",
+        ] {
+            let dir = create_temp_dir();
+            fs::write(dir.path().join("package.json"), "{}").unwrap();
+            fs::write(dir.path().join("pnpm-workspace.yaml"), workspace).unwrap();
+            write_packages(dir.path(), &["packages/app", "packages/test"]);
+
+            let detection = detect_manifests_with_warnings(dir.path());
+            assert_eq!(
+                node_members(dir.path(), &detection.manifests),
+                vec![""],
+                "{workspace:?}"
+            );
+            assert_eq!(detection.warnings.len(), 1, "{workspace:?}");
+            assert!(
+                detection.warnings[0].contains("pnpm-workspace.yaml")
+                    && detection.warnings[0].contains("the workspace packages are not updated"),
+                "{:?}",
+                detection.warnings
+            );
+            // 警告を捨てる入口でも、外したかったパッケージは足さない
+            assert_eq!(
+                node_members(dir.path(), &detect_manifests(dir.path())),
+                vec![""]
+            );
+        }
+    }
+
+    /// pnpm と同じく、`*` は `.` で始まるディレクトリに一致せず、`node_modules` と
+    /// `bower_components` の下のパッケージはメンバーにしない。名前を明示すれば `.` で始まって
+    /// いても含める
+    #[test]
+    fn pnpm_wildcards_skip_dot_directories_and_the_default_ignores() {
+        let dir = create_temp_dir();
+        fs::write(dir.path().join("package.json"), "{}").unwrap();
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages:
+  - 'packages/*'
+  - 'tools/.lint'
+",
+        )
+        .unwrap();
+        write_packages(
+            dir.path(),
+            &[
+                "packages/app",
+                "packages/.cache",
+                "packages/node_modules",
+                "packages/bower_components",
+                "tools/.lint",
+            ],
+        );
+
+        assert_eq!(
+            node_members(dir.path(), &detect_manifests(dir.path())),
+            vec!["", "packages/app", "tools/.lint"]
+        );
     }
 
     #[test]
