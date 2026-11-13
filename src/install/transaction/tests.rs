@@ -2481,6 +2481,51 @@ fn failed_cargo_unit_is_excluded_from_existing_and_missing_lock_audits() {
     assert!(audit.missing_lock_dirs.is_empty());
 }
 
+/// 回帰テスト (#178): Cargo.lock の無い workspace の install が失敗したとき、root だけでなく
+/// member のディレクトリも、lock の無いディレクトリの監査から外す
+#[test]
+fn failed_workspace_members_without_a_lock_are_excluded_from_missing_lock_audits() {
+    let temp = tempfile::tempdir().unwrap();
+    // install の単位のディレクトリと同じ形 (正規化したパス) でマニフェストを置く
+    let root = identity(temp.path());
+    let member = root.join("a");
+    let mut result = result();
+    update(
+        &mut result,
+        &root.join("Cargo.toml"),
+        Language::Rust,
+        "[workspace]\nmembers = [\"a\"]\n[package]\nname = \"root\"\nversion = \"0.1.0\"\n[dependencies]\nexample = \"1.0.0\"\n",
+        "example",
+    );
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "").unwrap();
+    cargo(&mut result, &member.join("Cargo.toml"), "a");
+    let plan = plan(vec![job(
+        &root,
+        Language::Rust,
+        &[root.join("Cargo.toml"), member.join("Cargo.toml")],
+    )]);
+    let mut tx = InstallTransactions::begin(&plan, &result, &root);
+    tx.execute(failure);
+    let report = tx.rollback();
+    let mut args = crate::cli::CliArgs::parse_from(["depup", "--age", "2w"]);
+    args.path = root.clone();
+    let orchestrator = crate::orchestrator::Orchestrator::new(args).unwrap();
+    let mut audit = plan.rust_audit_plan(&orchestrator, &result);
+    assert_eq!(
+        audit.missing_lock_dirs,
+        vec![root.clone(), member.clone()],
+        "lock の無いディレクトリとして root と member の両方を記録する"
+    );
+    report.exclude_rust_audits(&mut audit);
+    assert!(audit.locks.is_empty());
+    assert!(
+        audit.missing_lock_dirs.is_empty(),
+        "{:?}",
+        audit.missing_lock_dirs
+    );
+}
+
 /// Issue #89: 監査から外すのは、その lock を受け持つ単位が失敗したときだけ。同じディレクトリの
 /// 独立した install (Bundler) が失敗しても、Cargo と Node の lock は監査の対象に残す。
 #[test]

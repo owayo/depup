@@ -1352,8 +1352,13 @@ impl RollbackReport {
     pub fn exclude_rust_audits(&self, plan: &mut RustAuditPlan) {
         plan.locks
             .retain(|lock| !self.holds(&lock.directory.join("Cargo.lock")));
-        plan.missing_lock_dirs
-            .retain(|directory| !self.holds(&directory.join("Cargo.lock")));
+        // lock の無いディレクトリとして記録されるのはマニフェストの親 (workspace の member の
+        // ディレクトリ) で、単位が受け持つのは root の Cargo.lock なので、そのディレクトリの
+        // Cargo.toml を受け持つ単位でも判定する。以前は lock だけで判定し、install に失敗した
+        // member に `cannot audit --age: Cargo.lock not found` を余計に出していた (#178)
+        plan.missing_lock_dirs.retain(|directory| {
+            !self.holds(&directory.join("Cargo.lock")) && !self.holds(&directory.join("Cargo.toml"))
+        });
     }
     pub fn mark_summary(&self, summary: &mut UpdateSummary) {
         for unit in &self.units {
