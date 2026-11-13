@@ -377,23 +377,13 @@ impl Orchestrator {
     ) -> OnePassResult {
         // 早期スキップ判定
         if let Some(reason) = judge.should_skip(&dep) {
-            return OnePassResult {
-                name: dep.name.clone(),
-                outcome: UpdateResult::skip(dep, reason),
-                fetch_error: None,
-                osv_warnings: Vec::new(),
-            };
+            return OnePassResult::new(UpdateResult::skip(dep, reason));
         }
 
-        // git 依存は専用ロジック
+        // git 依存は専用ロジック。`git ls-remote` の失敗も FetchFailed の Skip になるが、
+        // レジストリの取得の失敗ではないので `fetch_error` は持たない
         if dep.is_git() {
-            let result = self.judge_git_dependency(&dep).await;
-            return OnePassResult {
-                name: dep.name.clone(),
-                outcome: result,
-                fetch_error: None,
-                osv_warnings: Vec::new(),
-            };
+            return OnePassResult::new(self.judge_git_dependency(&dep).await);
         }
 
         // registry 経由のフェッチ
@@ -404,14 +394,7 @@ impl Orchestrator {
                     .await
                 {
                     Ok(versions) => versions,
-                    Err(error) => {
-                        return OnePassResult {
-                            name: dep.name.clone(),
-                            outcome: UpdateResult::skip_fetch_failed(dep, error.clone()),
-                            fetch_error: Some(error),
-                            osv_warnings: Vec::new(),
-                        };
-                    }
+                    Err(error) => return OnePassResult::fetch_failed(dep, error),
                 };
                 let versions = match self
                     .resolve_tag_release_dates(&dep, adapter, judge, versions)
@@ -419,23 +402,13 @@ impl Orchestrator {
                 {
                     Ok(versions) => versions,
                     Err(TagDateError::Unchecked(version)) => {
-                        return OnePassResult {
-                            name: dep.name.clone(),
-                            outcome: UpdateResult::skip(
-                                dep,
-                                SkipReason::ReleaseDateUnchecked(version),
-                            ),
-                            fetch_error: None,
-                            osv_warnings: Vec::new(),
-                        };
+                        return OnePassResult::new(UpdateResult::skip(
+                            dep,
+                            SkipReason::ReleaseDateUnchecked(version),
+                        ));
                     }
                     Err(TagDateError::Failed(error)) => {
-                        return OnePassResult {
-                            name: dep.name.clone(),
-                            outcome: UpdateResult::skip_fetch_failed(dep, error.clone()),
-                            fetch_error: Some(error),
-                            osv_warnings: Vec::new(),
-                        };
+                        return OnePassResult::fetch_failed(dep, error);
                     }
                 };
                 // OSV チェック: judge で採用しようとした候補だけを問い合わせる。
@@ -459,12 +432,9 @@ impl Orchestrator {
                 let result = match result {
                     Ok(result) => result,
                     Err(error) => {
-                        return OnePassResult {
-                            name: dep.name.clone(),
-                            outcome: UpdateResult::skip_fetch_failed(dep, error.clone()),
-                            fetch_error: Some(error),
-                            osv_warnings,
-                        };
+                        // OSV の判定の途中で失敗しても、それまでの警告は残す
+                        return OnePassResult::fetch_failed(dep, error)
+                            .with_osv_warnings(osv_warnings);
                     }
                 };
                 let result = match result {
@@ -477,22 +447,9 @@ impl Orchestrator {
                     }
                     other => other,
                 };
-                OnePassResult {
-                    name: dep.name.clone(),
-                    outcome: result,
-                    fetch_error: None,
-                    osv_warnings,
-                }
+                OnePassResult::new(result).with_osv_warnings(osv_warnings)
             }
-            Err(e) => {
-                let err_msg = e.clone();
-                OnePassResult {
-                    name: dep.name.clone(),
-                    outcome: UpdateResult::skip(dep, SkipReason::FetchFailed(e)),
-                    fetch_error: Some(err_msg),
-                    osv_warnings: Vec::new(),
-                }
-            }
+            Err(error) => OnePassResult::fetch_failed(dep, error),
         }
     }
 
@@ -873,12 +830,7 @@ impl Orchestrator {
                             .or(source_reason)
                             .or_else(|| override_reason.map(SkipReason::PnpmOverride))
                         {
-                            OnePassResult {
-                                name: dep.name.clone(),
-                                outcome: UpdateResult::skip(dep, reason),
-                                fetch_error: None,
-                                osv_warnings: Vec::new(),
-                            }
+                            OnePassResult::new(UpdateResult::skip(dep, reason))
                         } else {
                             self.process_one_dependency(
                                 dep,
@@ -1700,6 +1652,36 @@ struct OnePassResult {
     fetch_error: Option<String>,
     /// OSV チェックで除外・問題が生じた version のメッセージ
     osv_warnings: Vec<OrchestratorError>,
+}
+
+impl OnePassResult {
+    /// 判定の結果 (版の取得の失敗も OSV の警告も無い)。名前は結果の依存の名前
+    fn new(outcome: UpdateResult) -> Self {
+        Self {
+            name: outcome.package_name().to_string(),
+            outcome,
+            fetch_error: None,
+            osv_warnings: Vec::new(),
+        }
+    }
+
+    /// 版の取得に失敗した依存。Skip の理由と `fetch_error` に同じ原因を持つ (呼び出し側が
+    /// `fetch_error` を RegistryError として記録する)。`SkipReason::FetchFailed` の Skip でも、
+    /// git の依存のようにレジストリの取得ではないものは [`Self::new`] で作る
+    fn fetch_failed(dependency: Dependency, error: String) -> Self {
+        Self {
+            name: dependency.name.clone(),
+            outcome: UpdateResult::skip_fetch_failed(dependency, error.clone()),
+            fetch_error: Some(error),
+            osv_warnings: Vec::new(),
+        }
+    }
+
+    /// OSV の判定で積んだ警告を持たせる
+    fn with_osv_warnings(mut self, warnings: Vec<OrchestratorError>) -> Self {
+        self.osv_warnings = warnings;
+        self
+    }
 }
 
 /// `judge` の判定結果に対し、採用しようとした候補だけ OSV.dev に問い合わせ、
