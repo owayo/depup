@@ -150,12 +150,39 @@ impl GlobalConfig {
         }
 
         match Self::read_from(path) {
-            Ok(config) => Some(config),
+            Ok(config) => {
+                for warning in config.value_warnings() {
+                    eprintln!("Warning: {warning}");
+                }
+                Some(config)
+            }
             Err(message) => {
                 eprintln!("Warning: {message}");
                 None
             }
         }
+    }
+
+    /// 解釈できない値 (`age` / `max_change`) の警告。設定は実行の始めに 1 回だけ読むので、
+    /// 警告も読み込みのとき (進捗の表示の前) に 1 回だけ出す。以前は `age_duration` が
+    /// 呼ばれるたびに警告し、マニフェストの数だけ同じ警告を、進捗バーと混ぜて出していた (#176)
+    fn value_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if let Some(raw) = self.age.as_deref()
+            && let Err(error) = parse_duration(raw)
+        {
+            warnings.push(format!(
+                "invalid 'age' value in global config: {raw} ({error})"
+            ));
+        }
+        if let Some(raw) = self.max_change.as_deref()
+            && let Err(error) = ChangeLevel::parse(raw)
+        {
+            warnings.push(format!(
+                "invalid 'max_change' value in global config: {raw} ({error})"
+            ));
+        }
+        warnings
     }
 
     /// 設定ファイルを読んで解釈する。読めない・UTF-8 でない・TOML として解釈できないときは、
@@ -183,36 +210,16 @@ impl GlobalConfig {
 
     /// 設定の `age` を [`Duration`] に変換する。
     ///
-    /// 未指定 or パース失敗の場合は `None`。パース失敗時は警告を出す。
+    /// 未指定 or パース失敗の場合は `None`。警告は読み込みのとき (`load_from`) に 1 回だけ出す。
     pub fn age_duration(&self) -> Option<Duration> {
-        let raw = self.age.as_deref()?;
-        match parse_duration(raw) {
-            Ok(d) => Some(d),
-            Err(e) => {
-                eprintln!(
-                    "Warning: invalid 'age' value in global config: {} ({})",
-                    raw, e
-                );
-                None
-            }
-        }
+        parse_duration(self.age.as_deref()?).ok()
     }
 
     /// 設定の `max_change` を [`ChangeLevel`] に変換する。
     ///
-    /// 未指定 or パース失敗の場合は `None`。パース失敗時は警告を出す。
+    /// 未指定 or パース失敗の場合は `None`。警告は読み込みのとき (`load_from`) に 1 回だけ出す。
     pub fn max_change_level(&self) -> Option<ChangeLevel> {
-        let raw = self.max_change.as_deref()?;
-        match ChangeLevel::parse(raw) {
-            Ok(level) => Some(level),
-            Err(e) => {
-                eprintln!(
-                    "Warning: invalid 'max_change' value in global config: {} ({})",
-                    raw, e
-                );
-                None
-            }
-        }
+        ChangeLevel::parse(self.max_change.as_deref()?).ok()
     }
 }
 
@@ -424,6 +431,30 @@ mod tests {
             ..Default::default()
         };
         assert!(cfg.age_duration().is_none());
+    }
+
+    /// 回帰テスト (#176): 解釈できない `age` / `max_change` は、読み込みのときの警告に 1 件ずつ
+    /// 出し、値は無いものとして扱う
+    #[test]
+    fn invalid_values_are_reported_as_load_warnings() {
+        let config = GlobalConfig {
+            age: Some("2weeks".to_string()),
+            max_change: Some("huge".to_string()),
+            ..Default::default()
+        };
+        let warnings = config.value_warnings();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].starts_with("invalid 'age' value in global config: 2weeks"));
+        assert!(warnings[1].starts_with("invalid 'max_change' value in global config: huge"));
+        assert_eq!(config.age_duration(), None);
+        assert_eq!(config.max_change_level(), None);
+
+        let valid = GlobalConfig {
+            age: Some("2w".to_string()),
+            max_change: Some("minor".to_string()),
+            ..Default::default()
+        };
+        assert!(valid.value_warnings().is_empty());
     }
 
     #[test]
