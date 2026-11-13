@@ -1032,6 +1032,11 @@ fn compare_language_versions(language: Language, a: &str, b: &str) -> std::cmp::
 }
 
 /// 順序が等しいだけの別ビルドから、現在版の日付を借りない。
+///
+/// `a` は一覧の版、`b` はマニフェストの現在版。semver の言語では、現在版に build metadata が
+/// 書かれていなければ、build metadata を除いた優先順位が等しい版を同じリリースとみなす
+/// (crates.io の toml は `1.2.0+spec-1.1.0` で公開され、Cargo.toml には `1.2.0` と書く。#149)。
+/// 該当する版が複数あれば、呼び出し元 (`current_version_info`) が決めない。
 fn is_same_release(dependency: &Dependency, a: &str, b: &str) -> bool {
     match dependency.language {
         Language::Python => matches!(
@@ -1049,7 +1054,10 @@ fn is_same_release(dependency: &Dependency, a: &str, b: &str) -> bool {
                 version_info::strip_ascii_v_prefix(b),
             );
             match (semver::Version::parse(a), semver::Version::parse(b)) {
-                (Ok(a), Ok(b)) => a == b,
+                (Ok(a), Ok(b)) => {
+                    a == b
+                        || (b.build.is_empty() && a.cmp_precedence(&b) == std::cmp::Ordering::Equal)
+                }
                 _ => a == b,
             }
         }
@@ -1598,6 +1606,20 @@ mod tests {
                 "{language:?}"
             );
 
+            // マニフェストに build metadata を書いていなければ、一覧の build metadata 付きの
+            // 唯一の版を同じリリースとみなす (#149。crates.io の toml は `+spec-1.1.0` 付きで出る)
+            let versions = [dated("1.0.0+spec-1.1.0")];
+            assert_eq!(
+                current_version_info(&dep, &versions).and_then(|info| info.released_at),
+                Some(date),
+                "{language:?}"
+            );
+            let versions = [dated("1.0.0+a"), dated("1.0.0+b")];
+            assert!(
+                current_version_info(&dep, &versions).is_none(),
+                "{language:?}"
+            );
+
             let build_dep = make_dependency("library", "1.0.0+a", language, false);
             let versions = [dated("1.0.0+b")];
             assert!(
@@ -1758,6 +1780,46 @@ mod tests {
                 "age={age:?} exempt={exempt}"
             );
         }
+    }
+
+    /// Issue #149: crates.io の版に build metadata が付いていても (`1.2.0+spec-1.1.0`)、
+    /// Cargo.toml の `1.2.0` の現在版の公開日を使う。
+    #[test]
+    fn current_version_with_unwritten_build_metadata_keeps_its_release_date() {
+        let now = fixed_time();
+        let older = make_version_info_at("1.1.0+spec-1.1.0", now - chrono::Duration::days(60));
+        let dep = make_dependency("toml", "1.2.0", Language::Rust, false);
+
+        let mature = now - chrono::Duration::days(30);
+        let versions = [
+            older.clone(),
+            make_version_info_at("1.2.0+spec-1.1.0", mature),
+        ];
+        let judge = UpdateJudge::with_time(UpdateFilter::new(), now);
+        assert!(matches!(
+            judge.judge(&dep, &versions),
+            UpdateResult::Skip {
+                reason: SkipReason::AlreadyLatest,
+                released_at: Some(actual),
+                ..
+            } if actual == mature
+        ));
+
+        // 現在版が age より新しければ、latest ではなくそれを理由にする
+        let young = now - chrono::Duration::days(2);
+        let versions = [older, make_version_info_at("1.2.0+spec-1.1.0", young)];
+        let judge = UpdateJudge::with_time(
+            UpdateFilter::new().with_min_age(Duration::from_secs(7 * 86400)),
+            now,
+        );
+        assert!(matches!(
+            judge.judge(&dep, &versions),
+            UpdateResult::Skip {
+                reason: SkipReason::CurrentVersionTooRecent,
+                released_at: Some(actual),
+                ..
+            } if actual == young
+        ));
     }
 
     #[test]
@@ -2123,14 +2185,17 @@ mod tests {
             let dependency = make_dependency("package", "1.1.3", language, false);
             let result = judge.judge(&dependency, &versions);
 
+            // build metadata の差だけでは更新しない。現在版は一覧の `1.1.3+spec-1.1.0` と
+            // 同じリリースなので、その公開日を付ける (#149)
             assert!(matches!(
                 result,
                 UpdateResult::Skip {
                     reason: SkipReason::AlreadyLatest,
-                    released_at: None,
+                    released_at,
                     ..
-                }
+                } if released_at == versions[0].released_at
             ));
+            assert!(versions[0].released_at.is_some());
         }
     }
 
