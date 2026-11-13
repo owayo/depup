@@ -79,6 +79,8 @@ An applicable `max-change` or `release date unavailable` reason is preserved. If
 - `pnpm-workspace.yaml` (`minimumReleaseAge: 14400` in minutes)
 - `package.json` (`pnpm.settings.minimumReleaseAge`)
 
+`.npmrc` is read with the same ini rules as npm and pnpm: text after an unquoted `;` or `#` is a comment, a later line for the same key wins, and keys under a `[section]` header are not top-level settings. A value that cannot be read or interpreted stops every manifest that inherits it, whatever its language, before an update is chosen (the run ends with exit code 2); it does not fall back to a lower-priority file or a weaker age.
+
 **Bun** (`bunfig.toml`):
 
 ```toml

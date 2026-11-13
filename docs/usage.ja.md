@@ -79,6 +79,8 @@ Swift パッケージの版は GitHub Tags API から取得しますが、タグ
 - `pnpm-workspace.yaml`（`minimumReleaseAge: 14400`、分単位）
 - `package.json`（`pnpm.settings.minimumReleaseAge`）
 
+`.npmrc` は npm・pnpm と同じ ini の規則で読みます。引用符で囲んでいない値の `;` / `#` から後ろはコメント、同じキーは後の行が勝ち、`[section]` の見出しの後ろのキーはトップレベルの設定ではありません。読めない・解釈できない値は、それを受け継ぐマニフェストを言語に関係なく、更新先を選ぶ前に止めます（終了コード 2）。順位の低いファイルの値や、より弱い age へは切り替えません。
+
 **Bun**（`bunfig.toml`）
 
 ```toml

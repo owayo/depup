@@ -34,18 +34,15 @@ impl PnpmSettings {
     /// minimumReleaseAge を値の出所 (ファイル名) 付きで読み取る
     ///
     /// 優先順は `from_dir` と同じ: .npmrc > pnpm-workspace.yaml > package.json。
-    /// 通知メッセージなどで「どのファイル由来の設定か」を表示する用途に使う
+    /// 通知メッセージなどで「どのファイル由来の設定か」を表示する用途に使う。
+    ///
+    /// 優先する設定を読めない・解釈できないときは `None` を返し、後の順位の設定へ黙って
+    /// 落ちない (#167。どの言語の処理でも、エラーは
+    /// [`Self::checked_minimum_release_age_with_source`] で報告する)。
     pub fn minimum_release_age_with_source(dir: &Path) -> Option<(Duration, &'static str)> {
-        if let Some(age) = read_npmrc_minimum_release_age(dir) {
-            return Some((age, ".npmrc"));
-        }
-        if let Some(age) = read_workspace_yaml_minimum_release_age(dir) {
-            return Some((age, "pnpm-workspace.yaml"));
-        }
-        if let Some(age) = read_package_json_minimum_release_age(dir) {
-            return Some((age, "package.json"));
-        }
-        None
+        Self::checked_minimum_release_age_with_source(dir)
+            .ok()
+            .flatten()
     }
 
     /// 指定なしと、設定の読取・解釈失敗を区別する。
@@ -105,18 +102,80 @@ fn parse_release_age_value(value: &str) -> Option<Duration> {
     parse_duration(value)
 }
 
-fn read_npmrc_minimum_release_age(dir: &Path) -> Option<Duration> {
-    checked_release_age(dir, ".npmrc").ok().flatten()
+/// `.npmrc` (npm と pnpm が `ini` パッケージで読む) の、セクションの外の `key` の値。
+///
+/// `ini` の `decode` と同じく、空白の後の `;` / `#` で始まる行はコメント、`[section]` の
+/// 後ろのキーはそのセクションのもの (トップレベルの設定ではない)、同じキーは後の行が勝つ。
+/// `=` の無い行の値は `true`。以前は最初の行の `=` の後ろをそのまま値にしていたので、
+/// `minimum-release-age=10080 # one week` を解釈できず、2 行あると pnpm と逆に最初の行を
+/// 採っていた (#167)。
+fn npmrc_value(content: &str, key: &str) -> Option<String> {
+    let mut value = None;
+    let mut in_section = false;
+    for line in content.split(['\r', '\n']) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with([';', '#']) {
+            continue;
+        }
+        // セクションの見出しは行頭の `[` から `]` までで、後ろは空白だけ (`^\[([^\]]*)\]\s*$`)
+        if let Some(rest) = line.strip_prefix('[')
+            && let Some(end) = rest.find(']')
+            && rest[end + 1..].trim().is_empty()
+        {
+            in_section = true;
+            continue;
+        }
+        let (raw_key, raw_value) = match line.split_once('=') {
+            Some((raw_key, raw_value)) => (raw_key, Some(raw_value)),
+            None => (line, None),
+        };
+        if !in_section && ini_unsafe(raw_key) == key {
+            value = Some(raw_value.map_or_else(|| "true".to_string(), ini_unsafe));
+        }
+    }
+    value
 }
 
-fn read_workspace_yaml_minimum_release_age(dir: &Path) -> Option<Duration> {
-    checked_release_age(dir, "pnpm-workspace.yaml")
-        .ok()
-        .flatten()
-}
+/// `ini` の `unsafe` と同じく、キーや値の前後の空白を除き、引用符を外す。引用符で囲んで
+/// いなければ、エスケープしていない `;` / `#` から後ろをコメントとして捨てる (`\;` / `\#` /
+/// `\\` はその文字)。
+fn ini_unsafe(raw: &str) -> String {
+    let value = raw.trim();
+    let quoted_by = |quote: char| value.starts_with(quote) && value.ends_with(quote);
+    if quoted_by('\'') {
+        // `ini` は単一引用符を外した中身を JSON として読み、読めればその値を使う
+        let inner = value.get(1..value.len().saturating_sub(1)).unwrap_or("");
+        return match serde_json::from_str::<serde_json::Value>(inner) {
+            Ok(serde_json::Value::String(text)) => text,
+            Ok(other) => other.to_string(),
+            Err(_) => inner.to_string(),
+        };
+    }
+    if quoted_by('"') {
+        return serde_json::from_str::<String>(value).unwrap_or_else(|_| value.to_string());
+    }
 
-fn read_package_json_minimum_release_age(dir: &Path) -> Option<Duration> {
-    checked_release_age(dir, "package.json").ok().flatten()
+    let mut unescaped = String::new();
+    let mut escaped = false;
+    for ch in value.chars() {
+        if escaped {
+            if !matches!(ch, '\\' | ';' | '#') {
+                unescaped.push('\\');
+            }
+            unescaped.push(ch);
+            escaped = false;
+        } else if matches!(ch, ';' | '#') {
+            break;
+        } else if ch == '\\' {
+            escaped = true;
+        } else {
+            unescaped.push(ch);
+        }
+    }
+    if escaped {
+        unescaped.push('\\');
+    }
+    unescaped.trim().to_string()
 }
 
 fn checked_release_age(dir: &Path, source: &str) -> Result<Option<Duration>, String> {
@@ -132,14 +191,7 @@ fn checked_release_age(dir: &Path, source: &str) -> Result<Option<Duration>, Str
     // .npmrc と pnpm-workspace.yaml は 1 行目のキーを見落として age を黙って捨てる (#159)
     let (_, content) = super::split_utf8_bom(&content);
     let raw = match source {
-        ".npmrc" => content.lines().find_map(|line| {
-            let line = line.trim();
-            if line.starts_with('#') || line.starts_with(';') {
-                return None;
-            }
-            let (key, value) = line.split_once('=')?;
-            (key.trim() == "minimum-release-age").then(|| value.trim().to_string())
-        }),
+        ".npmrc" => npmrc_value(content, "minimum-release-age"),
         "pnpm-workspace.yaml" => content.lines().find_map(|line| {
             line.trim()
                 .strip_prefix("minimumReleaseAge:")
@@ -180,6 +232,83 @@ pub fn has_pnpm_workspace(dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn read_npmrc_minimum_release_age(dir: &Path) -> Option<Duration> {
+        checked_release_age(dir, ".npmrc").ok().flatten()
+    }
+
+    fn read_workspace_yaml_minimum_release_age(dir: &Path) -> Option<Duration> {
+        checked_release_age(dir, "pnpm-workspace.yaml")
+            .ok()
+            .flatten()
+    }
+
+    fn read_package_json_minimum_release_age(dir: &Path) -> Option<Duration> {
+        checked_release_age(dir, "package.json").ok().flatten()
+    }
+
+    /// 回帰テスト (#167): `.npmrc` を npm / pnpm と同じ ini の規則で読む。行末のコメントを
+    /// 除き、同じキーは後の行が勝ち、セクションの中のキーはトップレベルの設定ではない
+    #[test]
+    fn npmrc_values_follow_the_ini_rules_npm_and_pnpm_use() {
+        let week = Some(Duration::from_secs(7 * 86_400));
+        let two_weeks = Some(Duration::from_secs(14 * 86_400));
+        for (content, expected) in [
+            ("minimum-release-age=10080 # one week\n", week),
+            ("minimum-release-age=10080 ; one week\n", week),
+            ("minimum-release-age = \"10080\"\n", week),
+            ("minimum-release-age='10080'\n", week),
+            (
+                "minimum-release-age=1440\r\nminimum-release-age=20160\r\n",
+                two_weeks,
+            ),
+            (
+                "minimum-release-age=20160\n[section]\nminimum-release-age=1\n",
+                two_weeks,
+            ),
+            ("[section]\nminimum-release-age=20160\n", None),
+            ("  # minimum-release-age=1\n; minimum-release-age=1\n", None),
+        ] {
+            let temp = create_temp_dir();
+            std::fs::write(temp.path().join(".npmrc"), content).unwrap();
+            assert_eq!(
+                PnpmSettings::checked_minimum_release_age_with_source(temp.path())
+                    .unwrap()
+                    .map(|(age, _)| age),
+                expected,
+                "{content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ini_values_drop_unescaped_comments_and_unquote() {
+        assert_eq!(ini_unsafe("  10080 # c "), "10080");
+        assert_eq!(ini_unsafe("a\\#b;c"), "a#b");
+        assert_eq!(ini_unsafe("a\\xb"), "a\\xb");
+        assert_eq!(ini_unsafe("\"a;b\""), "a;b");
+        assert_eq!(ini_unsafe("'a;b'"), "a;b");
+        assert_eq!(npmrc_value("key\n", "key").as_deref(), Some("true"));
+    }
+
+    /// 回帰テスト (#167): 優先する `.npmrc` の値を解釈できないときは、後の順位の
+    /// pnpm-workspace.yaml の値へ黙って落ちない (エラーは checked の経路で報告する)
+    #[test]
+    fn an_invalid_npmrc_age_does_not_fall_back_to_a_weaker_setting() {
+        let temp = create_temp_dir();
+        std::fs::write(temp.path().join(".npmrc"), "minimum-release-age=one week\n").unwrap();
+        std::fs::write(
+            temp.path().join("pnpm-workspace.yaml"),
+            "minimumReleaseAge: 1\n",
+        )
+        .unwrap();
+
+        assert!(PnpmSettings::checked_minimum_release_age_with_source(temp.path()).is_err());
+        assert_eq!(
+            PnpmSettings::minimum_release_age_with_source(temp.path()),
+            None
+        );
+    }
 
     #[test]
     fn checked_settings_distinguish_invalid_or_unreadable_from_absent() {
