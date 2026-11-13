@@ -28,7 +28,8 @@ use crate::manifest::{
         HashCommentMode, leading_whitespace_len, opens_unclosed_multiline_string,
         parse_assignment_key_path, parse_toml_section_header, quoted_value_span,
         read_key_assignment, scan_toml_line_outside_strings, skip_single_line_string,
-        split_toml_key_path, strip_hash_line_comment,
+        split_toml_key_path, strip_hash_line_comment, toml_inline_table_end,
+        toml_inline_table_string_value,
     },
 };
 use crate::parser::{VersionParser, get_parser};
@@ -211,7 +212,15 @@ impl ManifestParser for PyprojectTomlParser {
         // 依存配列 / inline table が次行以降へ続いている深さ
         let mut open_dependency_depth: i32 = 0;
 
+        // 改行した inline table として、まとめて書き写した範囲の終わり
+        let mut written_until = 0usize;
+        let mut line_start = 0usize;
         for line in content.split_inclusive('\n') {
+            let start = line_start;
+            line_start += line.len();
+            if start < written_until {
+                continue;
+            }
             // マルチライン文字列の内側は素通しする。docstring に依存配列風のテキスト
             // (`dependencies = [ "requests>=2.0" ]`) があっても誤書き換え・状態汚染しない。
             if let Some(delim) = multiline_delim {
@@ -269,9 +278,22 @@ impl ManifestParser for PyprojectTomlParser {
                             parser,
                             new_version,
                         ),
-                        Some(PoetryTarget::Entry) => {
-                            update_poetry_entry_value(line, value_start, parser, new_version)
-                        }
+                        Some(PoetryTarget::Entry) => match multiline_poetry_entry(
+                            content,
+                            start,
+                            value_start,
+                            parser,
+                            new_version,
+                        ) {
+                            MultilineEntry::SingleLine => {
+                                update_poetry_entry_value(line, value_start, parser, new_version)
+                            }
+                            MultilineEntry::Unwritable => None,
+                            MultilineEntry::Rewritten { end, block } => {
+                                written_until = end;
+                                Some(block)
+                            }
+                        },
                         Some(PoetryTarget::EntryVersion) => quoted_value_span(line, value_start)
                             .and_then(|span| {
                                 replace_quoted_version(line, span, parser, new_version)
@@ -480,6 +502,71 @@ fn replace_quoted_version(
     let spec = parser.parse_exact_pin(&line[start..end])?;
     let updated = spec.try_format_updated(new_version)?;
     Some(format!("{}{}{}", &line[..start], updated, &line[end..]))
+}
+
+/// Poetry の依存エントリの値が改行した inline table のときの書き換え
+enum MultilineEntry {
+    /// 値が 1 行で閉じる (行の中で書き換える)
+    SingleLine,
+    /// 改行した inline table だが、書き換えられる `version` が無いか、PyPI 以外の source を指す
+    Unwritable,
+    /// 宣言の行の頭から inline table が閉じる行の終わり (`end`) までを書き換えたもの
+    Rewritten { end: usize, block: String },
+}
+
+/// `requests = { extras = [\n "socks",\n], version = "^2.20.0" }` のように改行した inline table
+/// (TOML 1.0 の配列の改行、TOML 1.1 の inline table の改行) の、直下の `version` を書き換える。
+/// parse (toml クレート) はこの形も依存として読むので、宣言の範囲を扱って書き換える。以前は
+/// 宣言の 1 行目しか見ず、報告した後に書き換えに失敗していた (#169。Cargo と mise は #98)。
+/// `source` の判定も同じ範囲で行う。
+fn multiline_poetry_entry(
+    content: &str,
+    line_start: usize,
+    value_start: usize,
+    parser: &dyn VersionParser,
+    new_version: &str,
+) -> MultilineEntry {
+    let open = line_start + value_start;
+    if !content[open..].starts_with('{') {
+        return MultilineEntry::SingleLine;
+    }
+    let line_end = content[line_start..]
+        .find('\n')
+        .map_or(content.len(), |offset| line_start + offset);
+    let Some(end) = toml_inline_table_end(content, open) else {
+        return MultilineEntry::SingleLine;
+    };
+    if end <= line_end {
+        return MultilineEntry::SingleLine;
+    }
+    let string = |key: &str| {
+        toml_inline_table_string_value(content, open, end, key)
+            .map(|(start, end)| (start + 1, end - 1))
+    };
+    if string("source").is_some_and(|(start, end)| source_name_is_non_pypi(&content[start..end])) {
+        return MultilineEntry::Unwritable;
+    }
+    let Some((version_start, version_end)) = string("version") else {
+        return MultilineEntry::Unwritable;
+    };
+    // Poetry コンテキストでは演算子なしの bare バージョンも完全一致ピンとして扱う
+    let Some(updated) = parser
+        .parse_exact_pin(&content[version_start..version_end])
+        .and_then(|spec| spec.try_format_updated(new_version))
+    else {
+        return MultilineEntry::Unwritable;
+    };
+    let block_end = content[end..]
+        .find('\n')
+        .map_or(content.len(), |offset| end + offset + 1);
+    MultilineEntry::Rewritten {
+        end: block_end,
+        block: format!(
+            "{}{updated}{}",
+            &content[line_start..version_start],
+            &content[version_end..block_end]
+        ),
+    }
 }
 
 /// Poetry の依存エントリの値 (`"^1.0"` / `{ version = "^1.0", ... }`) を更新する。
@@ -2700,6 +2787,33 @@ version = "^7.0"
             .update_version(content, "pytest", "8.4.0")
             .unwrap();
         assert!(result.contains(r#"version = "^8.4.0""#), "{}", result);
+    }
+
+    /// 回帰テスト (#169): 配列を改行した inline table (TOML 1.0) と、改行を含む inline table
+    /// (TOML 1.1) の Poetry の依存も、直下の `version` を書き換える。PyPI 以外の source を
+    /// 指すものは、同じ範囲の `source` を見て書き換えない
+    #[test]
+    fn poetry_multiline_inline_tables_are_updated() {
+        for content in [
+            "[tool.poetry.dependencies]\nrequests = { extras = [\n    \"socks\",\n], version = \"^2.20.0\" }\nflask = \"^3.0\"\n",
+            "[tool.poetry.dependencies]\nrequests = {\n    extras = [\"socks\"],\n    version = \"^2.20.0\",\n}\nflask = \"^3.0\"\n",
+        ] {
+            let updated = PyprojectTomlParser
+                .update_version(content, "requests", "2.32.3")
+                .unwrap_or_else(|error| panic!("{content:?}: {error}"));
+            assert_eq!(
+                updated,
+                content.replace("^2.20.0", "^2.32.3"),
+                "{content:?}"
+            );
+        }
+
+        let private = "[[tool.poetry.source]]\nname = \"private\"\nurl = \"https://example.com/simple\"\npriority = \"explicit\"\n\n[tool.poetry.dependencies]\nrequests = { extras = [\n    \"socks\",\n], version = \"^2.20.0\", source = \"private\" }\n";
+        assert!(
+            PyprojectTomlParser
+                .update_version(private, "requests", "2.32.3")
+                .is_err()
+        );
     }
 
     /// 回帰テスト: ドットを含む名前は TOML でクォートが必須なので、
