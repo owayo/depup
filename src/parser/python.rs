@@ -9,7 +9,7 @@
 //! - レンジ: `>=1.0,<2.0`
 
 use crate::domain::{Language, VersionSpec, VersionSpecKind, range_lower_bound_version};
-use crate::parser::VersionParser;
+use crate::parser::{VersionParser, operator_prefix};
 use pep440_rs::Version as Pep440Version;
 use regex::Regex;
 use std::sync::LazyLock;
@@ -262,14 +262,16 @@ impl VersionParser for PythonVersionParser {
         if let Some(caps) = CARET_RE.captures(trimmed) {
             let version = normalize_for_compare(caps.get(1)?.as_str());
             return Some(
-                VersionSpec::new(VersionSpecKind::Caret, trimmed, version).with_prefix("^"),
+                VersionSpec::new(VersionSpecKind::Caret, trimmed, version)
+                    .with_prefix(operator_prefix(trimmed, "^")),
             );
         }
 
         if let Some(caps) = TILDE_RE.captures(trimmed) {
             let version = normalize_for_compare(caps.get(1)?.as_str());
             return Some(
-                VersionSpec::new(VersionSpecKind::Tilde, trimmed, version).with_prefix("~"),
+                VersionSpec::new(VersionSpecKind::Tilde, trimmed, version)
+                    .with_prefix(operator_prefix(trimmed, "~")),
             );
         }
 
@@ -297,7 +299,8 @@ impl VersionParser for PythonVersionParser {
 
             return Some(match op {
                 "===" | "==" if op == "===" || !raw_version.ends_with(".*") => {
-                    VersionSpec::new(VersionSpecKind::Exact, trimmed, normalized).with_prefix(op)
+                    VersionSpec::new(VersionSpecKind::Exact, trimmed, normalized)
+                        .with_prefix(operator_prefix(trimmed, op))
                 }
                 "~=" => {
                     // PEP 440 の compatible release (`~=1.2.3` = `>=1.2.3, <1.3.0`、
@@ -316,15 +319,13 @@ impl VersionParser for PythonVersionParser {
                     VersionSpec::new(VersionSpecKind::Range, trimmed, normalized)
                 }
                 ">=" => VersionSpec::new(VersionSpecKind::GreaterOrEqual, trimmed, normalized)
-                    .with_prefix(">="),
-                ">" => {
-                    VersionSpec::new(VersionSpecKind::Greater, trimmed, normalized).with_prefix(">")
-                }
+                    .with_prefix(operator_prefix(trimmed, ">=")),
+                ">" => VersionSpec::new(VersionSpecKind::Greater, trimmed, normalized)
+                    .with_prefix(operator_prefix(trimmed, ">")),
                 "<=" => VersionSpec::new(VersionSpecKind::LessOrEqual, trimmed, normalized)
-                    .with_prefix("<="),
-                "<" => {
-                    VersionSpec::new(VersionSpecKind::Less, trimmed, normalized).with_prefix("<")
-                }
+                    .with_prefix(operator_prefix(trimmed, "<=")),
+                "<" => VersionSpec::new(VersionSpecKind::Less, trimmed, normalized)
+                    .with_prefix(operator_prefix(trimmed, "<")),
                 _ => VersionSpec::new(VersionSpecKind::Range, trimmed, normalized),
             });
         }
@@ -378,6 +379,18 @@ impl VersionParser for PythonVersionParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 回帰テスト (#166): 演算子の後ろの空白を落とさない
+    #[test]
+    fn operators_keep_the_spaces_written_after_them() {
+        for (raw, newer, expected) in [
+            (">= 1.0", "2.0", ">= 2.0"),
+            ("== 1.0.0", "1.0.1", "== 1.0.1"),
+            ("^ 1.2", "2.0", "^ 2.0"),
+        ] {
+            assert_eq!(parse(raw).unwrap().format_updated(newer), expected, "{raw}");
+        }
+    }
 
     fn parse(version: &str) -> Option<VersionSpec> {
         PythonVersionParser.parse(version)

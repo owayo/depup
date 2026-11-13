@@ -9,7 +9,9 @@
 //! - レンジ: `>=1.0.0 <2.0.0`, `1.2 <2.0.0`, `1.0.0 - 2.0.0`, `^1 || ^2`
 
 use crate::domain::{Language, VersionSpec, VersionSpecKind, range_lower_bound_version};
-use crate::parser::{VersionParser, anchored_op_pattern, is_fully_floating_wildcard};
+use crate::parser::{
+    VersionParser, anchored_op_pattern, is_fully_floating_wildcard, operator_prefix,
+};
 use regex::Regex;
 use semver::Version;
 use std::sync::LazyLock;
@@ -343,16 +345,18 @@ fn parse_spec(version_str: &str) -> Option<VersionSpec> {
         if let Some(caps) = CARET_RE.captures(trimmed) {
             let version = normalize_valid_version(caps.get(1)?.as_str())?;
             return Some(
-                VersionSpec::new(VersionSpecKind::Caret, trimmed, version).with_prefix("^"),
+                VersionSpec::new(VersionSpecKind::Caret, trimmed, version)
+                    .with_prefix(operator_prefix(trimmed, "^")),
             );
         }
 
         // Tilde レンジ
         if let Some(caps) = TILDE_RE.captures(trimmed) {
             let version = normalize_valid_version(caps.get(1)?.as_str())?;
-            let prefix = if trimmed.starts_with("~>") { "~>" } else { "~" };
+            let operator = if trimmed.starts_with("~>") { "~>" } else { "~" };
             return Some(
-                VersionSpec::new(VersionSpecKind::Tilde, trimmed, version).with_prefix(prefix),
+                VersionSpec::new(VersionSpecKind::Tilde, trimmed, version)
+                    .with_prefix(operator_prefix(trimmed, operator)),
             );
         }
 
@@ -361,7 +365,7 @@ fn parse_spec(version_str: &str) -> Option<VersionSpec> {
             let version = normalize_valid_version(caps.get(1)?.as_str())?;
             return Some(
                 VersionSpec::new(VersionSpecKind::GreaterOrEqual, trimmed, version)
-                    .with_prefix(">="),
+                    .with_prefix(operator_prefix(trimmed, ">=")),
             );
         }
 
@@ -369,7 +373,8 @@ fn parse_spec(version_str: &str) -> Option<VersionSpec> {
         if let Some(caps) = GT_RE.captures(trimmed) {
             let version = normalize_valid_version(caps.get(1)?.as_str())?;
             return Some(
-                VersionSpec::new(VersionSpecKind::Greater, trimmed, version).with_prefix(">"),
+                VersionSpec::new(VersionSpecKind::Greater, trimmed, version)
+                    .with_prefix(operator_prefix(trimmed, ">")),
             );
         }
 
@@ -377,7 +382,8 @@ fn parse_spec(version_str: &str) -> Option<VersionSpec> {
         if let Some(caps) = LTE_RE.captures(trimmed) {
             let version = normalize_valid_version(caps.get(1)?.as_str())?;
             return Some(
-                VersionSpec::new(VersionSpecKind::LessOrEqual, trimmed, version).with_prefix("<="),
+                VersionSpec::new(VersionSpecKind::LessOrEqual, trimmed, version)
+                    .with_prefix(operator_prefix(trimmed, "<=")),
             );
         }
 
@@ -385,7 +391,8 @@ fn parse_spec(version_str: &str) -> Option<VersionSpec> {
         if let Some(caps) = LT_RE.captures(trimmed) {
             let version = normalize_valid_version(caps.get(1)?.as_str())?;
             return Some(
-                VersionSpec::new(VersionSpecKind::Less, trimmed, version).with_prefix("<"),
+                VersionSpec::new(VersionSpecKind::Less, trimmed, version)
+                    .with_prefix(operator_prefix(trimmed, "<")),
             );
         }
 
@@ -394,7 +401,8 @@ fn parse_spec(version_str: &str) -> Option<VersionSpec> {
             let version = normalize_valid_version(raw_version)?;
             if raw_version.matches('.').count() >= 2 {
                 return Some(
-                    VersionSpec::new(VersionSpecKind::Exact, trimmed, version).with_prefix("="),
+                    VersionSpec::new(VersionSpecKind::Exact, trimmed, version)
+                        .with_prefix(operator_prefix(trimmed, "=")),
                 );
             }
             return Some(VersionSpec::new(VersionSpecKind::Range, trimmed, version));
@@ -903,7 +911,26 @@ mod tests {
         let spec = parse("= 1.2.3").unwrap();
         assert_eq!(spec.kind, VersionSpecKind::Exact);
         assert_eq!(spec.version, "1.2.3");
-        assert_eq!(spec.prefix, Some("=".to_string()));
+        // 接頭辞は演算子の後ろの空白も含めて書かれたとおりに保つ (#166)
+        assert_eq!(spec.prefix, Some("= ".to_string()));
+        assert_eq!(spec.format_updated("1.2.4"), "= 1.2.4");
+    }
+
+    /// 回帰テスト (#166): 演算子の後ろの空白を落とさない。範囲の中の最新にいれば、
+    /// 書き換え後の表記が元の表記と一致する (空白だけの違いを更新として報告しない)
+    #[test]
+    fn operators_keep_the_spaces_written_after_them() {
+        for (raw, latest_in_range, expected_after_update, newer) in [
+            ("~ 2.1", "2.1.3", "~ 2.2", "2.2.0"),
+            ("~> 2.1", "2.1.3", "~> 2.2", "2.2.0"),
+            ("^ 1.2.0", "1.2.0", "^ 2.0.0", "2.0.0"),
+            (">= 1.0.0", "1.0.0", ">= 2.0.0", "2.0.0"),
+            ("= 4", "4.4.3", "= 5", "5.0.1"),
+        ] {
+            let spec = parse(raw).unwrap();
+            assert_eq!(spec.format_updated(latest_in_range), raw, "{raw}");
+            assert_eq!(spec.format_updated(newer), expected_after_update, "{raw}");
+        }
     }
 
     #[test]

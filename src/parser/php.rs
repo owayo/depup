@@ -9,7 +9,9 @@
 //! - ワイルドカード: `1.2.*`, `1.x`
 
 use crate::domain::{Language, VersionSpec, VersionSpecKind, range_lower_bound_version};
-use crate::parser::{VersionParser, anchored_op_pattern, is_fully_floating_wildcard};
+use crate::parser::{
+    VersionParser, anchored_op_pattern, is_fully_floating_wildcard, operator_prefix,
+};
 use regex::Regex;
 use std::sync::LazyLock;
 
@@ -172,7 +174,8 @@ impl PhpVersionParser {
         if let Some(caps) = CARET_RE.captures(trimmed) {
             let version = normalize_version(caps.get(1)?.as_str());
             return Some(
-                VersionSpec::new(VersionSpecKind::Caret, trimmed, version).with_prefix("^"),
+                VersionSpec::new(VersionSpecKind::Caret, trimmed, version)
+                    .with_prefix(operator_prefix(trimmed, "^")),
             );
         }
 
@@ -180,7 +183,8 @@ impl PhpVersionParser {
         if let Some(caps) = TILDE_RE.captures(trimmed) {
             let version = normalize_version(caps.get(1)?.as_str());
             return Some(
-                VersionSpec::new(VersionSpecKind::Tilde, trimmed, version).with_prefix("~"),
+                VersionSpec::new(VersionSpecKind::Tilde, trimmed, version)
+                    .with_prefix(operator_prefix(trimmed, "~")),
             );
         }
 
@@ -189,7 +193,7 @@ impl PhpVersionParser {
             let version = normalize_version(caps.get(1)?.as_str());
             return Some(
                 VersionSpec::new(VersionSpecKind::GreaterOrEqual, trimmed, version)
-                    .with_prefix(">="),
+                    .with_prefix(operator_prefix(trimmed, ">=")),
             );
         }
 
@@ -197,7 +201,8 @@ impl PhpVersionParser {
         if let Some(caps) = GT_RE.captures(trimmed) {
             let version = normalize_version(caps.get(1)?.as_str());
             return Some(
-                VersionSpec::new(VersionSpecKind::Greater, trimmed, version).with_prefix(">"),
+                VersionSpec::new(VersionSpecKind::Greater, trimmed, version)
+                    .with_prefix(operator_prefix(trimmed, ">")),
             );
         }
 
@@ -205,7 +210,8 @@ impl PhpVersionParser {
         if let Some(caps) = LTE_RE.captures(trimmed) {
             let version = normalize_version(caps.get(1)?.as_str());
             return Some(
-                VersionSpec::new(VersionSpecKind::LessOrEqual, trimmed, version).with_prefix("<="),
+                VersionSpec::new(VersionSpecKind::LessOrEqual, trimmed, version)
+                    .with_prefix(operator_prefix(trimmed, "<=")),
             );
         }
 
@@ -213,15 +219,17 @@ impl PhpVersionParser {
         if let Some(caps) = LT_RE.captures(trimmed) {
             let version = normalize_version(caps.get(1)?.as_str());
             return Some(
-                VersionSpec::new(VersionSpecKind::Less, trimmed, version).with_prefix("<"),
+                VersionSpec::new(VersionSpecKind::Less, trimmed, version)
+                    .with_prefix(operator_prefix(trimmed, "<")),
             );
         }
 
         if let Some(caps) = EQUAL_RE.captures(trimmed) {
-            let prefix = caps.get(1)?.as_str();
+            let operator = caps.get(1)?.as_str();
             let version = normalize_version(caps.get(2)?.as_str());
             return Some(
-                VersionSpec::new(VersionSpecKind::Exact, trimmed, version).with_prefix(prefix),
+                VersionSpec::new(VersionSpecKind::Exact, trimmed, version)
+                    .with_prefix(operator_prefix(trimmed, operator)),
             );
         }
 
@@ -311,6 +319,20 @@ mod tests {
 
     fn parse(version: &str) -> Option<VersionSpec> {
         PhpVersionParser.parse(version)
+    }
+
+    /// 回帰テスト (#166): 演算子の後ろの空白を落とさない (`v` の接頭辞は従来どおり外す)
+    #[test]
+    fn operators_keep_the_spaces_written_after_them() {
+        for (raw, newer, expected) in [
+            ("^ 1.2", "2.0.0", "^ 2.0.0"),
+            ("~ 1.2", "1.2.9", "~ 1.2"),
+            (">= 1.0", "2.0.0", ">= 2.0.0"),
+            ("== 1.0.0", "1.0.1", "== 1.0.1"),
+            ("^ v1.2", "2.0.0", "^ 2.0.0"),
+        ] {
+            assert_eq!(parse(raw).unwrap().format_updated(newer), expected, "{raw}");
+        }
     }
 
     /// Composer の `=1.2` は `1.2.0` の完全一致なので、範囲の包含下限でも完全版を書く
