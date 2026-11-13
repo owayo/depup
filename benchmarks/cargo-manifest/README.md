@@ -72,3 +72,25 @@ The `exploratory/` directory is excluded from the final comparison. Its a/b file
 - Synchronization started on a clean `main` at the baseline and required no updates or stash. `mise exec -- depup --install --include-pinned` reported no updates for 22 library dependencies and the Rust toolchain; `Cargo.toml`, `Cargo.lock`, and `mise.toml` are unchanged. Initial and implementation-stage GitHub queries returned no open issues, and no new reproducible product bug was found.
 - README and development documentation are updated in both languages, with the benchmark command and Git Bash/PowerShell check instructions. Two inspected file-replacement comments are translated to Japanese without code changes.
 - `/Users/owa/GitHub/mac-shell/shell/link_agent.md.sh` is absent on Windows and no equivalent was found in the local Windows script filenames, so it was not run. `CLAUDE.md` is recorded by Git as a symlink but checked out as a regular file; it was preserved without editing or replacement.
+
+## Re-measurement after matching TOML keys (#168)
+
+Measured on 2026-11-13 after the Cargo.toml writer was rebuilt to match declarations by their logical TOML key path (#168). Raw data: `{before,after}-{a,b}.csv` in [issue-168/](issue-168/); medians and ranges: [issue-168/comparison.csv](issue-168/comparison.csv).
+
+- Conditions as above (Windows x86_64, AMD Ryzen 7 5700X, rustc 1.99.1, `manifest_update_bench 1000 7 cargo`, 14 samples from two processes per implementation, ordered before-a → after-a → after-b → before-b, CPU not pinned).
+- "Before" is the working copy with the maintenance fixes #155–#166 applied (`3440e38`). Its git tag updates are slower than in the table above because #160 parsed the whole file as TOML to recognise `[patch]` entries that point at another repository.
+- "After" skips that TOML parse when the file does not contain the text `patch`, looks for the end of an inline table only on lines with more `{` than `}`, and turns keys into strings only on lines that name the package and in the body of a header that names it.
+
+| Case | Before µs | After µs | Time change | Allocation requests | Requested bytes |
+|---|---:|---:|---:|---:|---:|
+| Simple, 1 dependency | 1.745 | 1.861 | +6.65% | 19 → 27 | 651 → 1,494 |
+| Simple, 100 dependencies | 7.096 | 8.381 | +18.11% | 19 → 27 | 2,928 → 3,771 |
+| Simple, 1,000 dependencies | 53.290 | 64.986 | +21.95% | 19 → 27 | 23,628 → 24,471 |
+| Inline table, 100 dependencies | 8.450 | 9.116 | +7.89% | 21 → 27 | 6,517 → 7,171 |
+| Dotted key, 100 dependencies | 7.651 | 6.531 | -14.64% | 21 → 28 | 3,883 → 4,578 |
+| Multi-line table, 100 dependencies | 19.311 | 23.438 | +21.37% | 20 → 35 | 7,369 → 8,482 |
+| Git tag inline table, 100 dependencies | 167.142 | 11.554 | -93.09% | 1,158 → 20 | 507,980 → 9,901 |
+| Git tag dotted key, 100 dependencies | 114.670 | 11.578 | -89.90% | 959 → 27 | 338,063 → 8,645 |
+| Git tag multi-line table, 100 dependencies | 159.743 | 27.024 | -83.08% | 1,256 → 34 | 401,858 → 11,473 |
+
+Version updates are slower by the cost of reading quoted and dotted keys as TOML (+7–22%; the ranges overlap for simple 1 and 100 and for inline tables), and the allocation count stays constant regardless of the number of dependencies. The first rewrite (turning every line's key into strings and stacking inline-table nesting in a `Vec`) was 2–4 times slower at 100 dependencies with allocations proportional to their number, so the three points above were added. Git tag updates are faster because they no longer parse TOML, but remain slower than before #160 (5–12 µs in the table above). Every case stays at tens of microseconds per update, small next to registry queries (hundreds of milliseconds), so correctness takes priority.

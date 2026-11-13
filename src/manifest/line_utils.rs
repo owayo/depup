@@ -12,19 +12,6 @@ pub(crate) fn split_line_ending(raw_line: &str) -> (&str, &str) {
     }
 }
 
-/// 正規表現キャプチャから引用符種別と旧バージョン文字列 (グループ 2/3) を取り出す
-pub(crate) fn captured_quote_and_version<'a>(
-    caps: &regex::Captures<'a>,
-) -> (&'static str, &'a str) {
-    if let Some(m) = caps.get(2) {
-        ("\"", m.as_str())
-    } else if let Some(m) = caps.get(3) {
-        ("'", m.as_str())
-    } else {
-        ("\"", "")
-    }
-}
-
 /// クォート外の `#` 以降を落とす際のエスケープ規則
 pub(crate) enum HashCommentMode {
     /// バックスラッシュエスケープを解釈する (Ruby / Gemfile)
@@ -266,7 +253,10 @@ pub(crate) fn toml_inline_table_end(text: &str, open: usize) -> Option<usize> {
     if bytes.get(open) != Some(&b'{') {
         return None;
     }
-    let mut stack: Vec<u8> = Vec::new();
+    // 開いている括弧の種類を下位のビットから積む (1 が `{`、0 が `[`)。書き換えでは行ごとに
+    // 呼ぶので、ヒープを使わない。128 段を超える入れ子は読まない
+    let mut stack: u128 = 0;
+    let mut depth = 0u32;
     let mut index = open;
     while index < bytes.len() {
         match bytes[index] {
@@ -280,16 +270,23 @@ pub(crate) fn toml_inline_table_end(text: &str, open: usize) -> Option<usize> {
                     .map_or(bytes.len(), |offset| index + offset);
                 continue;
             }
-            bracket @ (b'{' | b'[') => stack.push(bracket),
-            b'}' => {
-                if stack.pop()? != b'{' {
+            bracket @ (b'{' | b'[') => {
+                if depth == u128::BITS {
                     return None;
                 }
-                if stack.is_empty() {
+                stack = (stack << 1) | u128::from(bracket == b'{');
+                depth += 1;
+            }
+            closing @ (b'}' | b']') => {
+                if depth == 0 || (stack & 1 == 1) != (closing == b'}') {
+                    return None;
+                }
+                stack >>= 1;
+                depth -= 1;
+                if depth == 0 {
                     return Some(index + 1);
                 }
             }
-            b']' if stack.pop()? != b'[' => return None,
             _ => {}
         }
         index += 1;
@@ -383,6 +380,116 @@ fn string_value_after_key(text: &str, after: usize, end: usize) -> Option<(usize
     }
     let value_end = single_line_string_end(text, value)?;
     (value_end <= end).then_some((value, value_end))
+}
+
+// --- TOML のキーの論理パス (pyproject・Cargo の書き換えで共有する。#168) ---
+
+/// TOML のキーセグメント 1 個 (bare キー / クォート付きキー) を読み、(値, 消費バイト数)
+/// を返す。クォート内のエスケープは展開しない (依存名でエスケープを使う例は無い)。
+fn read_toml_key_segment(rest: &str) -> Option<(&str, usize)> {
+    for quote in ['"', '\''] {
+        if rest.starts_with(quote) {
+            let len = skip_single_line_string(rest, quote == '"');
+            let literal = &rest[..len];
+            // 閉じクォートが無い断片はキーとして扱わない
+            let inner = literal
+                .strip_prefix(quote)
+                .and_then(|value| value.strip_suffix(quote))?;
+            return Some((inner, len));
+        }
+    }
+    let len = rest
+        .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'))
+        .unwrap_or(rest.len());
+    (len > 0).then(|| (&rest[..len], len))
+}
+
+/// 文字列の先頭から TOML のドット区切りキーを読み、セグメントごとに `on_segment` を呼んで、
+/// 消費バイト数を返す。消費バイト数には最後のセグメント直後の空白も含む。
+fn scan_toml_key_path<'a>(text: &'a str, mut on_segment: impl FnMut(&'a str)) -> Option<usize> {
+    let mut idx = 0;
+    loop {
+        idx += leading_whitespace_len(&text[idx..]);
+        let (segment, len) = read_toml_key_segment(text.get(idx..)?)?;
+        on_segment(segment);
+        idx += len + leading_whitespace_len(&text[idx + len..]);
+        match text[idx..].starts_with('.') {
+            true => idx += 1,
+            false => return Some(idx),
+        }
+    }
+}
+
+/// 文字列の先頭から TOML のドット区切りキーを読み、(セグメント列, 消費バイト数) を返す。
+/// 消費バイト数には最後のセグメント直後の空白も含む。
+pub(crate) fn read_toml_key_path(text: &str) -> Option<(Vec<String>, usize)> {
+    let mut segments = Vec::new();
+    let consumed = scan_toml_key_path(text, |segment| segments.push(segment.to_string()))?;
+    Some((segments, consumed))
+}
+
+/// 行頭が `key = ...` (ドット区切りキー可) なら、値の開始位置を返す。キーの文字列は作らない
+/// (Cargo の書き換えは、全部の行で値の形を見るが、キーを読むのは対象の行だけにする)。
+pub(crate) fn assignment_value_offset(line: &str) -> Option<usize> {
+    let indent = leading_whitespace_len(line);
+    if line[indent..].starts_with('#') {
+        return None;
+    }
+    let after_key = indent + scan_toml_key_path(&line[indent..], |_| {})?;
+    let value_start = after_key + line.get(after_key..)?.strip_prefix('=').map(|_| 1)?;
+    Some(value_start + leading_whitespace_len(&line[value_start..]))
+}
+
+pub(crate) fn leading_whitespace_len(text: &str) -> usize {
+    text.len() - text.trim_start().len()
+}
+
+/// ドット区切りキー全体 (セクションヘッダ等) をセグメント列へ分解する。
+/// 末尾に余分な文字が残る場合は解釈できないものとして `None` を返す。
+pub(crate) fn split_toml_key_path(key: &str) -> Option<Vec<String>> {
+    let (segments, consumed) = read_toml_key_path(key)?;
+    key[consumed..].trim().is_empty().then_some(segments)
+}
+
+/// `text[idx..]` の先頭から `key = ` を読み、(キーのセグメント列, 値の開始位置) を返す。
+/// 行頭の代入と inline table のエントリで共有する。
+pub(crate) fn read_key_assignment(text: &str, idx: usize) -> Option<(Vec<String>, usize)> {
+    let (segments, consumed) = read_toml_key_path(text.get(idx..)?)?;
+    let after_key = idx + consumed;
+    if !text.get(after_key..)?.starts_with('=') {
+        return None;
+    }
+    let value_start = after_key + 1;
+    Some((
+        segments,
+        value_start + leading_whitespace_len(text.get(value_start..)?),
+    ))
+}
+
+/// 行頭が `key = ...` (ドット区切りキー可) なら、キーのセグメント列と値の開始位置を返す。
+/// 配列要素の行 (`"requests>=2.0",`)・コメント行・継続行は `None`。
+pub(crate) fn parse_assignment_key_path(line: &str) -> Option<(Vec<String>, usize)> {
+    let indent = leading_whitespace_len(line);
+    if line[indent..].starts_with('#') {
+        return None;
+    }
+    read_key_assignment(line, indent)
+}
+
+/// 行の指定位置にあるクォート値の「中身」のバイト範囲を返す。
+/// 値がクォート文字列でない (inline table / 配列 / 真偽値等) 場合は `None`。
+pub(crate) fn quoted_value_span(line: &str, value_start: usize) -> Option<(usize, usize)> {
+    let rest = line.get(value_start..)?;
+    let quote = rest.chars().next().filter(|ch| matches!(ch, '"' | '\''))?;
+    let len = skip_single_line_string(rest, quote == '"');
+    // 閉じクォートが行内に無い値は書き換えない
+    if len <= quote.len_utf8() || !rest[..len].ends_with(quote) {
+        return None;
+    }
+    Some((
+        value_start + quote.len_utf8(),
+        value_start + len - quote.len_utf8(),
+    ))
 }
 
 #[cfg(test)]

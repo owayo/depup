@@ -25,8 +25,10 @@ use crate::error::ManifestError;
 use crate::manifest::{
     ManifestParser,
     line_utils::{
-        HashCommentMode, opens_unclosed_multiline_string, parse_toml_section_header,
-        scan_toml_line_outside_strings, skip_single_line_string, strip_hash_line_comment,
+        HashCommentMode, leading_whitespace_len, opens_unclosed_multiline_string,
+        parse_assignment_key_path, parse_toml_section_header, quoted_value_span,
+        read_key_assignment, scan_toml_line_outside_strings, skip_single_line_string,
+        split_toml_key_path, strip_hash_line_comment,
     },
 };
 use crate::parser::{VersionParser, get_parser};
@@ -407,79 +409,6 @@ fn line_bracket_depth_delta(line: &str) -> i32 {
     depth
 }
 
-/// TOML のキーセグメント 1 個 (bare キー / クォート付きキー) を読み、(値, 消費バイト数)
-/// を返す。クォート内のエスケープは展開しない (依存名でエスケープを使う例は無い)。
-fn read_toml_key_segment(rest: &str) -> Option<(String, usize)> {
-    for quote in ['"', '\''] {
-        if rest.starts_with(quote) {
-            let len = skip_single_line_string(rest, quote == '"');
-            let literal = &rest[..len];
-            // 閉じクォートが無い断片はキーとして扱わない
-            let inner = literal
-                .strip_prefix(quote)
-                .and_then(|value| value.strip_suffix(quote))?;
-            return Some((inner.to_string(), len));
-        }
-    }
-    let len = rest
-        .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'))
-        .unwrap_or(rest.len());
-    (len > 0).then(|| (rest[..len].to_string(), len))
-}
-
-/// 文字列の先頭から TOML のドット区切りキーを読み、(セグメント列, 消費バイト数) を返す。
-/// 消費バイト数には最後のセグメント直後の空白も含む。
-fn read_toml_key_path(text: &str) -> Option<(Vec<String>, usize)> {
-    let mut segments = Vec::new();
-    let mut idx = 0;
-    loop {
-        idx += leading_whitespace_len(&text[idx..]);
-        let (segment, len) = read_toml_key_segment(text.get(idx..)?)?;
-        segments.push(segment);
-        idx += len + leading_whitespace_len(&text[idx + len..]);
-        match text[idx..].starts_with('.') {
-            true => idx += 1,
-            false => return Some((segments, idx)),
-        }
-    }
-}
-
-fn leading_whitespace_len(text: &str) -> usize {
-    text.len() - text.trim_start().len()
-}
-
-/// ドット区切りキー全体 (セクションヘッダ等) をセグメント列へ分解する。
-/// 末尾に余分な文字が残る場合は解釈できないものとして `None` を返す。
-fn split_toml_key_path(key: &str) -> Option<Vec<String>> {
-    let (segments, consumed) = read_toml_key_path(key)?;
-    key[consumed..].trim().is_empty().then_some(segments)
-}
-
-/// `text[idx..]` の先頭から `key = ` を読み、(キーのセグメント列, 値の開始位置) を返す。
-/// 行頭の代入と inline table のエントリで共有する。
-fn read_key_assignment(text: &str, idx: usize) -> Option<(Vec<String>, usize)> {
-    let (segments, consumed) = read_toml_key_path(text.get(idx..)?)?;
-    let after_key = idx + consumed;
-    if !text.get(after_key..)?.starts_with('=') {
-        return None;
-    }
-    let value_start = after_key + 1;
-    Some((
-        segments,
-        value_start + leading_whitespace_len(text.get(value_start..)?),
-    ))
-}
-
-/// 行頭が `key = ...` (ドット区切りキー可) なら、キーのセグメント列と値の開始位置を返す。
-/// 配列要素の行 (`"requests>=2.0",`)・コメント行・継続行は `None`。
-fn parse_assignment_key_path(line: &str) -> Option<(Vec<String>, usize)> {
-    let indent = leading_whitespace_len(line);
-    if line[indent..].starts_with('#') {
-        return None;
-    }
-    read_key_assignment(line, indent)
-}
-
 /// inline table (`{ ... }`) の直下エントリを (キーのセグメント列, 値の開始位置) で列挙する。
 ///
 /// ネストした inline table / 配列 / 文字列リテラルの内側は読み飛ばす。文字列を読み飛ばすのが
@@ -536,22 +465,6 @@ fn inline_table_entries(line: &str, brace_start: usize) -> Vec<(Vec<String>, usi
     }
 
     entries
-}
-
-/// 行の指定位置にあるクォート値の「中身」のバイト範囲を返す。
-/// 値がクォート文字列でない (inline table / 配列 / 真偽値等) 場合は `None`。
-fn quoted_value_span(line: &str, value_start: usize) -> Option<(usize, usize)> {
-    let rest = line.get(value_start..)?;
-    let quote = rest.chars().next().filter(|ch| matches!(ch, '"' | '\''))?;
-    let len = skip_single_line_string(rest, quote == '"');
-    // 閉じクォートが行内に無い値は書き換えない
-    if len <= quote.len_utf8() || !rest[..len].ends_with(quote) {
-        return None;
-    }
-    Some((
-        value_start + quote.len_utf8(),
-        value_start + len - quote.len_utf8(),
-    ))
 }
 
 /// クォート値の中身を、更新後のバージョン制約へ差し替えた行を返す。
