@@ -3568,6 +3568,31 @@ mod tests {
         }
     }
 
+    /// 回帰テスト (#174): `django~=5.0rc1` は `constraint cannot be updated safely` で止めず、
+    /// 5.* の最新へ `~=5.2` と書き換える
+    #[test]
+    fn test_judge_python_compatible_release_with_prerelease_lower_bound_updates() {
+        use crate::parser::{PythonVersionParser, VersionParser};
+
+        let judge = UpdateJudge::new(UpdateFilter::new());
+        let spec = PythonVersionParser.parse("~=5.0rc1").unwrap();
+        let dep = Dependency::new("django", spec, false, Language::Python);
+        let versions = vec![
+            make_version_info("5.0rc1", 40),
+            make_version_info("5.0", 30),
+            make_version_info("5.2", 20),
+            make_version_info("6.0", 10),
+        ];
+        match judge.judge(&dep, &versions) {
+            UpdateResult::Update { new_version, .. } => assert_eq!(new_version, "5.2"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            dep.version_spec.try_format_updated("5.2").as_deref(),
+            Some("~=5.2")
+        );
+    }
+
     #[test]
     fn test_judge_strict_greater_skips_with_parse_error() {
         // 単独の `>` は最新候補へ更新すると `>最新候補` になり、解決不能になり得る
