@@ -647,15 +647,7 @@ impl UpdateJudge {
         dependency: &Dependency,
         available_versions: &'a [VersionInfo],
     ) -> Vec<&'a VersionInfo> {
-        let is_prerelease = |version: &str| match dependency.language {
-            Language::Node | Language::Rust | Language::Go | Language::Swift => {
-                version_info::is_semver_prerelease_version(version)
-            }
-            Language::Python => version_info::is_python_prerelease_version(version),
-            Language::Ruby => version_info::is_ruby_prerelease_version(version),
-            Language::Php => version_info::is_composer_prerelease_version(version),
-            _ => is_prerelease_version(version),
-        };
+        let is_prerelease = |version: &str| is_language_prerelease(dependency.language, version);
 
         if is_prerelease(dependency.version()) {
             available_versions.iter().collect()
@@ -803,14 +795,16 @@ fn apply_range_upper_bound<'a>(
     // 排他的な上限 `<V` は、V 自身がプレリリースでない限り V のプレリリースを含まない
     // (PEP 440・Composer・node-semver・Cargo の semver)。版の大小だけで比べると、上限と同じ版の
     // プレリリース (`<3` に対する 3.0.0rc1) が範囲内に見え、範囲外や充足できない制約を書く (#94)。
+    // プレリリースかどうかは候補の絞り込みと同じ言語ごとの規則で決める。共通の判定では、
+    // Composer の区切りのない `5.0.0beta1` や semver の `3.0.0-0` を見抜けない (#155)。
     let excludes_upper_prereleases = !inclusive
         && upper_bound_excludes_its_prereleases(dependency.language)
-        && !is_prerelease_version(&upper_bound);
+        && !is_language_prerelease(dependency.language, &upper_bound);
     candidates
         .into_iter()
         .filter(|v| {
             if excludes_upper_prereleases
-                && v.is_prerelease()
+                && is_language_prerelease(dependency.language, &v.version)
                 && same_release_core(&v.version, &upper_bound)
             {
                 return false;
@@ -822,6 +816,20 @@ fn apply_range_upper_bound<'a>(
             }
         })
         .collect()
+}
+
+/// エコシステムの規則でプレリリースかを判定する。安定版の利用者の候補の絞り込み
+/// (`UpdateJudge::stable_candidates`) と範囲の上限 (`apply_range_upper_bound`) が共有する。
+fn is_language_prerelease(language: Language, version: &str) -> bool {
+    match language {
+        Language::Node | Language::Rust | Language::Go | Language::Swift => {
+            version_info::is_semver_prerelease_version(version)
+        }
+        Language::Python => version_info::is_python_prerelease_version(version),
+        Language::Ruby => version_info::is_ruby_prerelease_version(version),
+        Language::Php => version_info::is_composer_prerelease_version(version),
+        _ => is_prerelease_version(version),
+    }
 }
 
 /// 排他的な上限 `<V` が V のプレリリースを含まない言語。RubyGems と Maven は、版の順序の
@@ -3263,6 +3271,56 @@ mod tests {
         match judge.judge(&dep, &versions) {
             UpdateResult::Update { new_version, .. } => assert_eq!(new_version, "3.0.0-rc.1"),
             other => panic!("{other:?}"),
+        }
+    }
+
+    /// Issue #155: 上限と同じ版のプレリリースかどうかは、言語ごとの規則で判定する。
+    /// 共通の判定は Composer の区切りのない `5.0.0beta1` や semver の `3.0.0-0` / `-pr.1` を
+    /// 見抜けず、`>=5.0.0beta1 <5.0` のような充足できない制約を書いていた。
+    #[test]
+    fn test_judge_exclusive_upper_bound_uses_the_ecosystem_prerelease_rules() {
+        let judge = UpdateJudge::new(UpdateFilter::new());
+        for (language, raw, current, versions, expected) in [
+            (
+                Language::Php,
+                ">=4.0.0-beta1 <5.0",
+                "4.0.0-beta1",
+                [
+                    "4.0.0-beta1",
+                    "4.0.0",
+                    "4.19.5",
+                    "5.0.0alpha3",
+                    "5.0.0beta1",
+                ],
+                "4.19.5",
+            ),
+            (
+                Language::Node,
+                ">=2.0.0-rc.1 <3.0.0",
+                "2.0.0-rc.1",
+                ["2.0.0-rc.1", "2.0.0", "2.1.0", "3.0.0-0", "3.0.0-pr.1"],
+                "2.1.0",
+            ),
+            (
+                Language::Rust,
+                ">=2.0.0-rc.1, <3.0.0",
+                "2.0.0-rc.1",
+                ["2.0.0-rc.1", "2.0.0", "2.1.0", "3.0.0-0", "3.0.0-pr.1"],
+                "2.1.0",
+            ),
+        ] {
+            let dep = make_range_dependency("example", raw, current, language);
+            let versions: Vec<_> = versions
+                .iter()
+                .zip([50, 40, 30, 20, 10])
+                .map(|(version, days_ago)| make_version_info(version, days_ago))
+                .collect();
+            match judge.judge(&dep, &versions) {
+                UpdateResult::Update { new_version, .. } => {
+                    assert_eq!(new_version, expected, "{language:?} {raw}")
+                }
+                other => panic!("{language:?} {raw}: {other:?}"),
+            }
         }
     }
 
