@@ -1407,16 +1407,16 @@ impl RollbackReport {
                     }
                 )?;
                 crate::output::write_wrapped(out, "  Cause: ", &unit.reason)?;
-                crate::output::write_wrapped(
-                    out,
-                    "  Scope: ",
-                    &unit
-                        .directories
-                        .iter()
-                        .map(|path| for_display(path).display().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                )?;
+                // 単位のディレクトリは、照合のために正規化した形 (Windows の `\\?\` 付き) と
+                // 絶対パスの形の両方を持つ。表示の形にそろえてから重複を除く (#177)
+                let mut scope: Vec<String> = Vec::new();
+                for directory in &unit.directories {
+                    let shown = for_display(directory).display().to_string();
+                    if !scope.contains(&shown) {
+                        scope.push(shown);
+                    }
+                }
+                crate::output::write_wrapped(out, "  Scope: ", &scope.join(", "))?;
             } else {
                 writeln!(
                     out,
@@ -1430,13 +1430,16 @@ impl RollbackReport {
                 )?;
             }
             for (path, outcome) in &unit.files {
+                // 単位の最も浅いディレクトリからの相対パスで出す。最も深いディレクトリからに
+                // すると、root と member の両方を持つ単位で、どちらの Cargo.toml も
+                // `Cargo.toml` になって区別できない (#177)
                 let display_path = if verbose {
                     path.as_path()
                 } else {
                     unit.directories
                         .iter()
                         .filter_map(|directory| path.strip_prefix(directory).ok())
-                        .min_by_key(|path| path.components().count())
+                        .max_by_key(|path| path.components().count())
                         .unwrap_or(path)
                 };
                 match outcome {
