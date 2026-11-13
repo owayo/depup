@@ -543,3 +543,6 @@ impl Repair {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;
