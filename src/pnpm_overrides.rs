@@ -94,12 +94,24 @@ impl PnpmOverrides {
         };
         let package: serde_json::Value = serde_json::from_slice(&package)
             .map_err(|_| "invalid package.json for pnpm overrides".to_string())?;
-        if let Some(legacy) = package.get("pnpm").and_then(|pnpm| pnpm.get("overrides")) {
+        // pnpm 10 までは、package.json の `pnpm.overrides` と `resolutions` (Yarn 互換。
+        // `pnpm.overrides` と同じ書式で、両方にあれば `pnpm.overrides` が優先) を実効の override に
+        // 合流させる。`pnpm config get overrides` はどちらも返さない。pnpm 11 以降は package.json の
+        // これらを読まない (12.16.1 で `resolutions` が効かないことを確かめた)。以前は `resolutions`
+        // を見ず、固定した直接依存も更新として報告していた (#158)
+        let legacy = package.get("pnpm").and_then(|pnpm| pnpm.get("overrides"));
+        let resolutions = package.get("resolutions");
+        if legacy.is_some() || resolutions.is_some() {
             let version = query(directory, program, &["--version"]).await?;
             let version = semver::Version::parse(version.trim())
                 .map_err(|_| "could not determine pnpm version for legacy overrides".to_string())?;
             if version.major < 11 {
-                overrides.add(legacy, "package.json pnpm.overrides")?;
+                if let Some(resolutions) = resolutions {
+                    overrides.add(resolutions, "package.json resolutions")?;
+                }
+                if let Some(legacy) = legacy {
+                    overrides.add(legacy, "package.json pnpm.overrides")?;
+                }
             }
         }
         Ok(overrides)
@@ -230,6 +242,35 @@ mod tests {
                 overrides.reason(&dependency("example")).is_some(),
                 major < 11
             );
+        }
+    }
+
+    /// Issue #158: pnpm 10 までは package.json の `resolutions` も override として効く
+    /// (pnpm 10.30.1 は lock に `overrides` を書き、12.16.1 は読まないことを確かめた)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pnpm_resolutions_control_direct_dependencies_until_version_11() {
+        for major in [10, 11, 12] {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(
+                directory.path().join("package.json"),
+                r#"{"dependencies":{"example":"^1.0.0"},"resolutions":{"example":"1.0.0"}}"#,
+            )
+            .unwrap();
+            let program = fake(
+                directory.path(),
+                &format!(
+                    "if [ \"$1\" = --version ]; then printf '{major}.0.0'; else printf null; fi"
+                ),
+            );
+            let overrides = PnpmOverrides::read_with(directory.path(), &program)
+                .await
+                .unwrap();
+            let reason = overrides.reason(&dependency("example"));
+            assert_eq!(reason.is_some(), major < 11, "{major}");
+            if let Some(reason) = reason {
+                assert!(reason.contains("package.json resolutions"), "{reason}");
+            }
         }
     }
 
