@@ -407,6 +407,77 @@ fn strip_gradle_comment_lines(content: &str) -> Vec<String> {
         .collect()
 }
 
+/// 依存以外のブロック (`constraints` / `resolutionStrategy` など) にある同じ座標の固定版
+/// (`force` と `constraints` の文字列記法・map 記法) を、更新先に合わせて書き換える。
+///
+/// 古いまま残すと、`force` は解決結果を固定し、`constraints` の版 (require) は `prefer` より
+/// 強いので、報告した更新が解決に効かない (#93)。rich version の `constraints` は書き換えない
+/// (`update_rich_version_block` と同じ)。直書きの宣言の更新 (`update_direct_version`) と、
+/// 変数を使う宣言の更新の両方で呼ぶ。以前は変数の経路が呼ばず、変数の定義だけを書き換えて
+/// force と constraints を古いまま残していた (#162)。`resolutionStrategy { force ... }` のような
+/// 1 行の形も拾うよう、行頭は求めない。
+fn sync_pinned_declarations(
+    content: &str,
+    package: &str,
+    new_version: &str,
+) -> Result<String, ManifestError> {
+    let Some((group, artifact)) = package.split_once(':') else {
+        return Ok(content.to_string());
+    };
+    let (escaped_group, escaped_artifact) = (regex::escape(group), regex::escape(artifact));
+    let version_parser = get_parser(Language::Java);
+    let format_updated = |current_version: &str| -> Option<String> {
+        version_parser
+            .parse(current_version)
+            .and_then(|spec| spec.try_format_updated(new_version))
+    };
+    let stripped_lines = strip_gradle_comment_lines(content);
+    let active_lines: Vec<&str> = stripped_lines.iter().map(String::as_str).collect();
+    let non_dependency_lines = non_dependency_block_mask(&active_lines);
+    let outside_dependencies =
+        |index: usize| non_dependency_lines.get(index).copied().unwrap_or(false);
+
+    // map 記法: group: 'x', name: 'y', version: 'z' (シングル/ダブルクォート両対応)
+    let map_re = declaration_regex(
+        &format!(
+            r#"(group\s*[:=]\s*['"]{escaped_group}['"]\s*,\s*name\s*[:=]\s*['"]{escaped_artifact}['"]\s*,\s*version\s*[:=]\s*)(['"])([^'"]+)['"]"#
+        ),
+        package,
+    )?;
+    // 文字列記法: 'group:artifact:version' (classifier / extension の後置きを保つ)
+    let string_re = declaration_regex(
+        &format!(
+            r#"(['"]){escaped_group}:{escaped_artifact}:([^:'"@]+)((?::[^'"]+)?(?:@[^'"]+)?)['"]"#
+        ),
+        package,
+    )?;
+    let (result, _) = replace_all_active_gradle_matches(
+        content,
+        &map_re,
+        outside_dependencies,
+        |caps: &regex::Captures| {
+            let current_version = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+            format_updated(current_version).map(|updated_version| {
+                format!("{}{}{updated_version}{}", &caps[1], &caps[2], &caps[2])
+            })
+        },
+    );
+    let (result, _) = replace_all_active_gradle_matches(
+        &result,
+        &string_re,
+        outside_dependencies,
+        |caps: &regex::Captures| {
+            let quote = &caps[1];
+            let current_version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+            let suffix = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+            format_updated(current_version).map(|updated_version| {
+                format!("{quote}{group}:{artifact}:{updated_version}{suffix}{quote}")
+            })
+        },
+    );
+    Ok(result)
+}
+
 /// 座標入りの宣言の正規表現を組み立てる (座標は呼び出し側で `regex::escape` 済み)。
 fn declaration_regex(pattern: &str, package: &str) -> Result<Regex, ManifestError> {
     Regex::new(pattern).map_err(|e| ManifestError::InvalidVersionSpec {
@@ -1101,11 +1172,13 @@ impl ManifestParser for GradleParser {
             }
         }
 
-        // 変数経由の場合は変数定義を更新
+        // 変数経由の場合は変数定義を更新し、同じ座標の force と constraints の固定版も合わせる (#162)
         if let Some(var_name) = variable_for_package
             && let Some(var_def) = variables.get(&var_name)
         {
-            return self.update_variable_definition(content, &var_name, var_def, new_version);
+            let updated =
+                self.update_variable_definition(content, &var_name, var_def, new_version)?;
+            return sync_pinned_declarations(&updated, package, new_version);
         }
 
         // それ以外は依存行の直接バージョンを更新
@@ -1192,50 +1265,14 @@ impl GradleParser {
         let non_dependency_lines = non_dependency_block_mask(&active_lines);
         let in_dependencies =
             |index: usize| !non_dependency_lines.get(index).copied().unwrap_or(false);
-        let outside_dependencies = |index: usize| !in_dependencies(index);
 
-        // map 記法を更新: group: 'x', name: 'y', version: 'z'
-        // 非後方参照パターンでシングル/ダブルクォート両対応
-        let map_pattern = format!(
-            r#"(group\s*[:=]\s*['"]{}['"]\s*,\s*name\s*[:=]\s*['"]{}['"]\s*,\s*version\s*[:=]\s*)(['"])([^'"]+)['"]"#,
-            escaped_group, escaped_artifact
-        );
-        let map_re = Regex::new(&map_pattern).map_err(|e| ManifestError::InvalidVersionSpec {
-            path: PathBuf::from("build.gradle"),
-            spec: package.to_string(),
-            message: format!("invalid regex pattern: {}", e),
-        })?;
-
-        // 文字列記法を更新: 'group:artifact:version'
-        // 非後方参照パターンでシングル/ダブルクォート両対応
-        let string_pattern = format!(
-            r#"(['"]){}:{}:([^:'"@]+)((?::[^'"]+)?(?:@[^'"]+)?)['"]"#,
-            escaped_group, escaped_artifact
-        );
-        let string_re =
-            Regex::new(&string_pattern).map_err(|e| ManifestError::InvalidVersionSpec {
-                path: PathBuf::from("build.gradle"),
-                spec: package.to_string(),
-                message: format!("invalid regex pattern: {}", e),
-            })?;
-
+        // map 記法: group: 'x', name: 'y', version: 'z' (1 = 版の前まで、2 = 引用符、3 = 版)
         let replace_map = |caps: &regex::Captures| {
             let prefix = &caps[1];
             let quote = &caps[2];
             let current_version = caps.get(3).map(|m| m.as_str()).unwrap_or("");
             format_updated(current_version)
                 .map(|updated_version| format!("{}{}{}{}", prefix, quote, updated_version, quote))
-        };
-        let replace_string = |caps: &regex::Captures| {
-            let quote = &caps[1];
-            let current_version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-            let suffix = caps.get(3).map(|m| m.as_str()).unwrap_or("");
-            format_updated(current_version).map(|updated_version| {
-                format!(
-                    "{}{}:{}:{}{}{}",
-                    quote, group, artifact, updated_version, suffix, quote
-                )
-            })
         };
 
         // 報告した宣言は、parse (`DEP_MAP` / `DEP_STRING`) と同じく行頭の configuration 名
@@ -1292,19 +1329,7 @@ impl GradleParser {
                 });
             }
         };
-        // 同じ座標の `force` や `constraints` の版も追随させる。古いまま残すと、`force` は
-        // 解決結果を固定し、`constraints` の版 (require) は `prefer` より強いので、報告した
-        // 更新が解決に効かない。rich version の `constraints` は書き換えない
-        // (`update_rich_version_block` と同じ)。
-        let (result, _) =
-            replace_all_active_gradle_matches(&result, &map_re, outside_dependencies, replace_map);
-        let (result, _) = replace_all_active_gradle_matches(
-            &result,
-            &string_re,
-            outside_dependencies,
-            replace_string,
-        );
-        Ok(result)
+        sync_pinned_declarations(&result, package, new_version)
     }
 
     /// rich version ブロック内の更新対象宣言を書き換える
@@ -1539,6 +1564,31 @@ mod tests {
             content.replace("slf4j-api:1.7.30", "slf4j-api:2.0.20"),
             "{updated}"
         );
+    }
+
+    /// Issue #162: 変数を使う宣言の更新でも、同じ座標の constraints と force の固定版を合わせる。
+    /// 以前は変数の定義だけを書き換えていた。変数を参照する固定版は書き換えない (変数で揃う)。
+    #[test]
+    fn variable_updates_also_move_constraints_and_force_pins() {
+        let content = concat!(
+            "def slf4jVersion = '1.7.30'\n",
+            "dependencies {\n",
+            "    implementation \"org.slf4j:slf4j-api:$slf4jVersion\"\n",
+            "    constraints {\n",
+            "        implementation 'org.slf4j:slf4j-api:1.7.30'\n",
+            "        implementation group: 'org.slf4j', name: 'slf4j-api', version: '1.7.30'\n",
+            "    }\n",
+            "}\n",
+            "configurations.all {\n",
+            "    resolutionStrategy { force 'org.slf4j:slf4j-api:1.7.30' }\n",
+            "    resolutionStrategy { force \"org.slf4j:slf4j-api:$slf4jVersion\" }\n",
+            "}\n",
+        );
+        let updated = GradleParser
+            .update_version(content, "org.slf4j:slf4j-api", "2.0.20")
+            .unwrap();
+        assert_eq!(updated, content.replace("1.7.30", "2.0.20"), "{updated}");
+        assert!(updated.contains("$slf4jVersion\" }"), "{updated}");
     }
 
     fn parse_catalog(content: &str) -> Result<Vec<Dependency>, ManifestError> {
