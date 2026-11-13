@@ -397,19 +397,8 @@ async fn run_with(
             reject(&mut tx, &mut errors, job, error);
             continue;
         }
-        let checked = async {
-            let snapshot = verifier.snapshot(job).await?;
-            tx.check_lock(&lock_path(job), snapshot.bytes.as_deref())?;
-            if job.language == Language::Node {
-                let failures = crate::node_lock::target_failures(&result.summary, &job.directory, &snapshot.node_direct_edges);
-                if !failures.is_empty() { return Err(failures.into_iter().map(|failure| failure.message).collect::<Vec<_>>().join("; ")); }
-            }
-            if snapshot.protected != before.protected { return Err("lock refresh changed an external dependency whose registry policy cannot be verified".into()); }
-            let notices = check_osv(verifier, job.language, &before.packages, &snapshot.packages, &progress).await?;
-            // ネットワーク処理の後、採用したバイト列を再確認する。
-            tx.check_lock(&lock_path(job), snapshot.bytes.as_deref())?;
-            Ok::<_,String>((snapshot, notices))
-        }.await;
+        let checked =
+            check_refreshed_lock(job, before, &result.summary, &tx, verifier, &progress).await;
         match checked {
             Ok((snapshot, notices)) => {
                 osv_notices.insert(key.clone(), notices);
@@ -523,6 +512,51 @@ fn verify_manifests(
             errors.insert(directory.clone(), error);
         }
     }
+}
+
+/// 再解決した lock を検証し、採用できればそのスナップショットと OSV の通知を返す。
+///
+/// 失敗したときの理由はこの順に決まる: lock の読み取り → 実行で書いた lock との照合 →
+/// pnpm の更新先への到達 → 方針を確かめられない外部の依存の変化 → OSV →
+/// ネットワーク処理の後の lock の再照合 (OSV が失敗したら再照合しない)。
+async fn check_refreshed_lock(
+    job: &InstallJob,
+    before: &Snapshot,
+    summary: &crate::domain::UpdateSummary,
+    tx: &InstallTransactions,
+    verifier: &impl Verification,
+    progress: &Progress,
+) -> Result<(Snapshot, super::security::Notices), String> {
+    let snapshot = verifier.snapshot(job).await?;
+    tx.check_lock(&lock_path(job), snapshot.bytes.as_deref())?;
+    if job.language == Language::Node {
+        let failures =
+            crate::node_lock::target_failures(summary, &job.directory, &snapshot.node_direct_edges);
+        if !failures.is_empty() {
+            return Err(failures
+                .into_iter()
+                .map(|failure| failure.message)
+                .collect::<Vec<_>>()
+                .join("; "));
+        }
+    }
+    if snapshot.protected != before.protected {
+        return Err(
+            "lock refresh changed an external dependency whose registry policy cannot be verified"
+                .into(),
+        );
+    }
+    let notices = check_osv(
+        verifier,
+        job.language,
+        &before.packages,
+        &snapshot.packages,
+        progress,
+    )
+    .await?;
+    // ネットワーク処理の後、採用したバイト列を再確認する。
+    tx.check_lock(&lock_path(job), snapshot.bytes.as_deref())?;
+    Ok((snapshot, notices))
 }
 
 async fn check_osv(
