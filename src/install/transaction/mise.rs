@@ -458,7 +458,7 @@ fn directories(
         Err(error) => {
             scan.errors.push(format!(
                 "Cannot enumerate {}: {error}",
-                directory.alias.display()
+                crate::user_path::display(&directory.alias)
             ));
             return vec![];
         }
@@ -470,7 +470,7 @@ fn directories(
             Err(error) => {
                 scan.errors.push(format!(
                     "Cannot read {}: {error}",
-                    directory.alias.display()
+                    crate::user_path::display(&directory.alias)
                 ));
                 continue;
             }
@@ -479,9 +479,10 @@ fn directories(
         match directory_guard(&path, boundary, known_links, &mut scan.links) {
             Ok(Some(guard)) => guards.push(guard),
             Ok(None) => {}
-            Err(error) => scan
-                .errors
-                .push(format!("Cannot inspect {}: {error}", path.display())),
+            Err(error) => scan.errors.push(format!(
+                "Cannot inspect {}: {error}",
+                crate::user_path::display(&path)
+            )),
         }
     }
     guards.sort_by(|left, right| left.alias.cmp(&right.alias));
@@ -509,20 +510,21 @@ fn visit(
                     Ok(kind) if kind.file_type().is_symlink() => {
                         scan.errors.push(format!(
                             "Mise metadata symlink requires manual recovery: {}",
-                            metadata.display()
+                            crate::user_path::display(&metadata)
                         ));
                     }
                     Ok(kind) if kind.is_file() => scan.paths.push(metadata),
                     Ok(_) => scan.errors.push(format!(
                         "Unsupported mise metadata file type: {}",
-                        metadata.display()
+                        crate::user_path::display(&metadata)
                     )),
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
                         scan.paths.push(metadata)
                     }
-                    Err(error) => scan
-                        .errors
-                        .push(format!("Cannot inspect {}: {error}", metadata.display())),
+                    Err(error) => scan.errors.push(format!(
+                        "Cannot inspect {}: {error}",
+                        crate::user_path::display(&metadata)
+                    )),
                 }
             }
         }

@@ -106,7 +106,7 @@ impl OutputFormatter for DiffFormatter {
             writeln!(
                 writer,
                 "# Lock refresh {} ({}): {}{}",
-                refresh.directory.display(),
+                crate::user_path::display(&refresh.directory),
                 refresh
                     .language
                     .map_or("no eligible scope", |language| language.display_name()),

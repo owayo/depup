@@ -320,7 +320,16 @@ impl OutputFormatter for JsonFormatter {
         };
 
         let output = JsonOutput {
-            lock_refreshes: result.summary.lock_refreshes.clone(),
+            // 再解決の単位のディレクトリは正規化されている。テキストと同じく `\\?\` を外す (#148)
+            lock_refreshes: result
+                .summary
+                .lock_refreshes
+                .iter()
+                .map(|refresh| crate::domain::LockRefreshResult {
+                    directory: crate::user_path::for_display(&refresh.directory).into_owned(),
+                    ..refresh.clone()
+                })
+                .collect(),
             dry_run: result.summary.dry_run,
             summary: JsonSummary {
                 updates,
@@ -680,6 +689,87 @@ mod tests {
             output.updates[0].source.as_deref(),
             Some("https://***@example.com/org/repo.git")
         );
+    }
+
+    /// Issue #148: `--refresh-lock` の結果のディレクトリと install・事前検査のエラーに入る
+    /// パスは正規化されていて、Windows では `\\?\` が付く。JSON・テキスト・diff のどれにも
+    /// 外して出す。
+    #[test]
+    fn canonical_lock_refresh_and_error_paths_are_shown_without_the_verbatim_prefix() {
+        use crate::orchestrator::OrchestratorError;
+        let temp = tempfile::tempdir().unwrap();
+        let directory = std::fs::canonicalize(temp.path()).unwrap();
+        let shown = crate::user_path::for_display(&directory)
+            .display()
+            .to_string();
+        let mut summary = UpdateSummary::new(false);
+        summary
+            .lock_refreshes
+            .push(crate::domain::LockRefreshResult {
+                directory: directory.clone(),
+                language: Some(Language::Rust),
+                status: "failed".into(),
+                changed: false,
+                error: Some("lock refresh failed".into()),
+            });
+        let errors = vec![
+            OrchestratorError::InstallResolutionError {
+                directory: directory.clone(),
+                message: "target was not locked".into(),
+            },
+            OrchestratorError::NodePreflightError {
+                directory: directory.clone(),
+                message: "the existing pnpm-lock.yaml is stale".into(),
+            },
+            OrchestratorError::CargoPreflightError {
+                manifest: directory.join("Cargo.toml"),
+                root: None,
+                message: "workspace root unknown".into(),
+            },
+        ];
+        for error in &errors {
+            let message = error.to_string();
+            assert!(message.contains(&shown), "{message}");
+            assert!(!message.contains(r"\\?\"), "{message}");
+        }
+        let result = OrchestratorResult {
+            summary,
+            write_results: Vec::new(),
+            errors,
+        };
+
+        let mut output = Vec::new();
+        JsonFormatter::new(Verbosity::Normal)
+            .format(&result, &mut output)
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(parsed["lock_refreshes"][0]["directory"], shown.as_str());
+        for error in parsed["errors"].as_array().unwrap() {
+            assert!(!error.as_str().unwrap().contains(r"\\?\"), "{error}");
+        }
+
+        for output in [
+            {
+                let mut text = Vec::new();
+                crate::output::TextFormatter::with_color(Verbosity::Normal, false, false)
+                    .format(&result, &mut text)
+                    .unwrap();
+                String::from_utf8(text).unwrap()
+            },
+            {
+                let mut diff = Vec::new();
+                crate::output::DiffFormatter::new(false)
+                    .format(&result, &mut diff)
+                    .unwrap();
+                String::from_utf8(diff).unwrap()
+            },
+        ] {
+            assert!(!output.contains(r"\\?\"), "{output}");
+            assert!(
+                output.contains(&format!("Lock refresh {shown} (")),
+                "{output}"
+            );
+        }
     }
 
     #[test]

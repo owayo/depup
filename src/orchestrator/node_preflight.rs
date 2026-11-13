@@ -206,7 +206,7 @@ pub(super) fn block(
             } else {
                 format!(
                     "shares a synchronized Tauri install with the stopped pnpm scope in {}",
-                    scope.directory.display()
+                    crate::user_path::display(&scope.directory)
                 )
             };
             errors.push(OrchestratorError::NodePreflightError {
@@ -264,7 +264,7 @@ pub(super) fn block(
                     message: format!(
                         "{} in {}; the manifest was not changed and its install was skipped",
                         reason,
-                        scope.directory.display()
+                        crate::user_path::display(&scope.directory)
                     ),
                 });
             }
@@ -566,7 +566,7 @@ fn repair_install_command(age: Duration) -> String {
 }
 
 fn report_lines(scope: &BlockedScope) -> Vec<String> {
-    let directory = scope.directory.display();
+    let directory = crate::user_path::display(&scope.directory);
     let mut lines = vec![format!(
         "  {directory} — {}; manifests were not changed and pnpm install was skipped",
         scope.failure.reason()

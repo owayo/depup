@@ -818,7 +818,7 @@ impl<'a> LockAgeAuditor<'a> {
         if pass_index == 0 && self.verbose {
             let message = format!(
                 "  {} — {} changed registry crate(s) in Cargo.lock; checking release dates",
-                project_dir.display(),
+                crate::user_path::display(project_dir),
                 targets.len()
             );
             match bar {

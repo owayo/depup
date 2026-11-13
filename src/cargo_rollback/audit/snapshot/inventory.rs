@@ -146,7 +146,12 @@ impl Walk {
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                         return Ok(false);
                     }
-                    Err(error) => return Err(format!("{}: {error}", directory.display())),
+                    Err(error) => {
+                        return Err(format!(
+                            "{}: {error}",
+                            crate::user_path::display(&directory)
+                        ));
+                    }
                 };
                 // symlink の輪や、別の経路で同じディレクトリに同じ位置で戻ったら辿らない。
                 if !key.is_dir() || !self.visited.insert((key, rest.len())) {
@@ -168,7 +173,7 @@ impl Walk {
         let manifest = directory.join("Cargo.toml");
         if manifest.is_file() {
             let canonical = fs::canonicalize(&manifest)
-                .map_err(|error| format!("{}: {error}", manifest.display()))?;
+                .map_err(|error| format!("{}: {error}", crate::user_path::display(&manifest)))?;
             self.manifests.insert((manifest, canonical));
         }
         Ok(())
@@ -183,7 +188,7 @@ impl Walk {
         let unreadable = |error: std::io::Error| {
             format!(
                 "workspace inventory could not read {}: {error}",
-                directory.display()
+                crate::user_path::display(directory)
             )
         };
         let mut entries = Vec::new();

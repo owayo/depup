@@ -86,7 +86,7 @@ impl AuditSnapshot {
                 if !before.matches(&guard.read().map_err(|error| error.to_string())?) {
                     return Err(format!(
                         "{} changed during the age audit",
-                        guard.alias.display()
+                        crate::user_path::display(&guard.alias)
                     ));
                 }
             }
@@ -133,7 +133,7 @@ impl AuditSnapshot {
                 let backup = match save_recovery_copy(&self.start) {
                     Ok(path) => format!(
                         "the install-time Cargo.lock was saved to {} — copy it back to restore",
-                        path.display()
+                        crate::user_path::display(&path)
                     ),
                     Err(reason) => {
                         format!("saving the install-time Cargo.lock also failed: {reason}")

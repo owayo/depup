@@ -178,7 +178,7 @@ pub(crate) async fn run_with(
                     "failed"
                 },
                 outcome.command,
-                command.directory.display()
+                crate::user_path::display(&command.directory)
             );
             if !outcome.success && !outcome.stderr.is_empty() {
                 eprintln!("    {}", outcome.stderr);
@@ -217,7 +217,9 @@ pub(crate) async fn run_with(
         if let Some((directory, "pnpm")) = manager {
             verification.spinner("Verifying pnpm update targets in the final lockfile");
             for message in checks.pnpm_targets(&directory, &mut result.summary).await {
-                verification.suspend(|| eprintln!("  {} — {message}", directory.display()));
+                verification.suspend(|| {
+                    eprintln!("  {} — {message}", crate::user_path::display(&directory))
+                });
                 result.errors.push(
                     crate::orchestrator::OrchestratorError::InstallResolutionError {
                         directory: directory.clone(),
@@ -330,7 +332,7 @@ async fn audit_rust_locks(
     for directory in &plan.missing_lock_dirs {
         eprintln!(
             "  {} — cannot audit --age: Cargo.lock not found",
-            directory.display()
+            crate::user_path::display(directory)
         );
         // このマニフェストを install した単位を選び、同じディレクトリの別の単位は選ばない。
         tx.fail_holder(
@@ -358,7 +360,7 @@ async fn audit_rust_locks(
             progress.suspend(|| {
                 eprintln!(
                     "  {} — cannot safely roll back --age violations: pre-install {problem}",
-                    lock.directory.display()
+                    crate::user_path::display(&lock.directory)
                 )
             });
             tx.fail_holder(
@@ -434,7 +436,7 @@ async fn audit_node_locks(
             Err(error) => {
                 eprintln!(
                     "  {} — cannot audit --age: {error}",
-                    job.directory.display()
+                    crate::user_path::display(&job.directory)
                 );
                 failed = true;
                 continue;
@@ -446,7 +448,7 @@ async fn audit_node_locks(
         else {
             eprintln!(
                 "  {} — cannot audit --age: Node package manager could not be determined",
-                job.directory.display()
+                crate::user_path::display(&job.directory)
             );
             failed = true;
             continue;
@@ -461,13 +463,13 @@ async fn audit_node_locks(
             for message in audit.failure_messages() {
                 eprintln!(
                     "{}",
-                    format!("  {} — {message}", directory.display()).yellow()
+                    format!("  {} — {message}", crate::user_path::display(&directory)).yellow()
                 );
             }
             if args.verbose && !audit.has_failures() {
                 eprintln!(
                     "  {} — {} public npm package version(s) verified against --age",
-                    directory.display(),
+                    crate::user_path::display(&directory),
                     audit.checked
                 );
             }

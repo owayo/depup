@@ -232,9 +232,10 @@ impl<'a> CargoMembership<'a> {
                     Ok(root) => {
                         answers.insert(root.clone());
                     }
-                    Err(error) => {
-                        reasons.push(format!("rechecked from {}: {error}", anchor.cwd.display()))
-                    }
+                    Err(error) => reasons.push(format!(
+                        "rechecked from {}: {error}",
+                        crate::user_path::display(&anchor.cwd)
+                    )),
                 }
             }
             let root = if answers.len() == 1 {
@@ -245,7 +246,7 @@ impl<'a> CargoMembership<'a> {
                         "successful Cargo anchors disagree: {}",
                         answers
                             .iter()
-                            .map(|path| path.display().to_string())
+                            .map(|path| crate::user_path::display(path).to_string())
                             .collect::<Vec<_>>()
                             .join(", ")
                     ));
@@ -406,9 +407,12 @@ pub(crate) mod tests {
         };
         assert!(reason.contains("simulated member toolchain failure"));
         assert!(reason.contains("anchors disagree"));
+        // 理由は利用者に見せるので、正規化したパスの `\\?\` は外して出す (#148)
         for path in [&a, &b] {
-            assert!(reason.contains(&path.parent().unwrap().display().to_string()));
+            let shown = crate::user_path::display(path.parent().unwrap()).to_string();
+            assert!(reason.contains(&shown), "{reason}");
         }
+        assert!(!reason.contains(r"\\?\"), "{reason}");
         resolver.assert_cached();
     }
 

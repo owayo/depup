@@ -824,7 +824,7 @@ async fn commit_resolution(
             };
             return Err(AttemptError::Broken(format!(
                 "{reason}; restoring the previous {} also failed ({restore}); {}",
-                lock_path.display(),
+                crate::user_path::display(&lock_path),
                 save_backup(scratch.original_lock())
             )));
         }
