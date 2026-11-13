@@ -68,9 +68,10 @@ impl DiffFormatter {
 
         // 各更新を diff hunk として書く
         for (dependency, new_version) in displayable {
+            // 書き込みと同じ表記 (Rust は build metadata を落とす) で整形する (#157)
             let new_constraint = dependency
                 .version_spec
-                .try_format_updated(new_version)
+                .try_format_updated(dependency.language.manifest_version(new_version))
                 .unwrap_or_else(|| dependency.version_spec.raw.clone());
             // 値には接頭辞も含める。npm alias では `version_spec.raw` が制約部分
             // (`^17.0.0`) しか持たないため、そのまま出すと「alias 宣言が外れて素の
@@ -235,6 +236,33 @@ mod tests {
             !text.contains("actual-crate"),
             "マニフェストに存在しないキーを出さない: {text}"
         );
+    }
+
+    /// Issue #157: Rust の更新先の build metadata は、書き込みと同じく diff にも出さない
+    #[test]
+    fn test_format_diff_drops_rust_build_metadata_like_the_writer() {
+        let mut summary = UpdateSummary::new(false);
+        let mut manifest = ManifestUpdateResult::new(PathBuf::from("Cargo.toml"), Language::Rust);
+        let spec = crate::parser::get_parser(Language::Rust)
+            .parse("1.1.8")
+            .unwrap();
+        let dep = Dependency::new("toml", spec, false, Language::Rust);
+        manifest.add_result(UpdateResult::update(dep, "1.2.1+spec-1.1.0"));
+        summary.add_manifest(manifest);
+        let result = OrchestratorResult {
+            summary,
+            write_results: Vec::new(),
+            errors: Vec::new(),
+        };
+
+        let mut output = Vec::new();
+        DiffFormatter::new(false)
+            .format(&result, &mut output)
+            .unwrap();
+        let text = String::from_utf8(output).unwrap();
+
+        assert!(text.contains(r#"+  "toml": "1.2.1""#), "{text}");
+        assert!(!text.contains("+spec"), "{text}");
     }
 
     /// 回帰テスト: npm alias では値の `npm:<real>@` 接頭辞も diff に出す。

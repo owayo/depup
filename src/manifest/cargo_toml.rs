@@ -383,8 +383,9 @@ impl ManifestParser for CargoTomlParser {
         package: &str,
         new_version: &str,
     ) -> Result<String, ManifestError> {
-        // Cargo 警告を避けるため semver の build metadata (`+...`) は落とす
-        let new_version = new_version.split('+').next().unwrap_or(new_version);
+        // Cargo 警告を避けるため semver の build metadata (`+...`) は落とす。
+        // 判定と `--diff` も同じ `Language::manifest_version` を使う (#157)
+        let new_version = Language::Rust.manifest_version(new_version);
 
         let parser = get_parser(Language::Rust);
         let mut updated = false;

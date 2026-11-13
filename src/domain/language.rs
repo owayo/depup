@@ -133,6 +133,20 @@ impl Language {
         }
     }
 
+    /// レジストリの版 `version` を、マニフェストの版の指定として書くときの表記。
+    ///
+    /// Cargo は版要求の build metadata (`+...`) を無視して警告を出すので、Rust では落とす
+    /// (crates.io の toml は `1.2.1+spec-1.1.0` で公開される)。判定 (`formatted == raw`)・
+    /// `--diff`・書き込みが同じ表記を使うための単一の情報源。以前は書き込みだけが落とし、
+    /// 判定は `~1` を `~1.2.1+spec-1.1.0` と整形して、書いても変わらない更新を毎回報告していた
+    /// (#157)。Go の `+incompatible` は版の一部なので落とさない。
+    pub fn manifest_version<'a>(&self, version: &'a str) -> &'a str {
+        match self {
+            Language::Rust => version.split('+').next().unwrap_or(version),
+            _ => version,
+        }
+    }
+
     /// `--age` を transitive (推移) 依存にも効かせられるパッケージマネージャを返す。
     ///
     /// 対応は**言語単位ではなく PM 単位**である点が重要。ここに載っていない PM が
@@ -174,6 +188,22 @@ impl fmt::Display for Language {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #157: マニフェストへ書く表記は、Rust だけ build metadata を落とす
+    #[test]
+    fn manifest_version_drops_build_metadata_only_for_rust() {
+        assert_eq!(Language::Rust.manifest_version("1.2.1+spec-1.1.0"), "1.2.1");
+        assert_eq!(Language::Rust.manifest_version("1.2.1"), "1.2.1");
+        // Go の `+incompatible` は版の一部
+        assert_eq!(
+            Language::Go.manifest_version("v2.0.0+incompatible"),
+            "v2.0.0+incompatible"
+        );
+        assert_eq!(
+            Language::Node.manifest_version("1.0.0+build"),
+            "1.0.0+build"
+        );
+    }
 
     #[test]
     fn test_manifest_filenames() {
