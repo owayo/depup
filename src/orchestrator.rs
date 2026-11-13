@@ -1416,8 +1416,11 @@ impl Orchestrator {
             .into_iter()
             .next();
 
-        // tauriパッケージが一つも見つからなければ、同期不要
-        if npm_packages.is_empty() && crate_info.is_none() {
+        // 同期する相手 (Tauri の npm パッケージか tauri crate) のどちらかが無ければ同期できない
+        // (`synchronize_with_current` は片側が無ければ何もしない)。レジストリへ問い合わせずに
+        // 戻る。以前は両方が無いときだけ戻り、片側だけでも npm と crates.io に問い合わせて、
+        // 失敗すると同期しないのにエラー (exit 2) にしていた (#175)
+        if npm_packages.is_empty() || crate_info.is_none() {
             return;
         }
 
@@ -2869,6 +2872,77 @@ mod tests {
         // エラーの行は依存ごとに 1 行
         assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
         assert_eq!(result.write_results[0].updates_failed(), 2);
+    }
+
+    /// 回帰テスト (#175): 同期する相手 (Tauri の npm パッケージか tauri crate) が無ければ、
+    /// 同期のためにレジストリへ問い合わせない (問い合わせに失敗してエラーにしない)
+    #[tokio::test]
+    async fn tauri_sync_does_not_fetch_when_one_side_is_missing() {
+        for rust_only in [true, false] {
+            let root = TempDir::new().unwrap();
+            fs::create_dir_all(root.path().join("src-tauri")).unwrap();
+            let dependencies = if rust_only {
+                "[dependencies]\ntauri = '2.0.0'\n"
+            } else {
+                "[dependencies]\n"
+            };
+            fs::write(
+                root.path().join("src-tauri/Cargo.toml"),
+                format!("[package]\nname = 'app'\nversion = '0.1.0'\n{dependencies}"),
+            )
+            .unwrap();
+            if !rust_only {
+                fs::write(
+                    root.path().join("package.json"),
+                    r#"{"dependencies":{"@tauri-apps/api":"^2.0.0"}}"#,
+                )
+                .unwrap();
+            }
+            let orchestrator = Orchestrator::new(make_args_with_path(
+                root.path(),
+                &["--no-age", "--no-osv", "--dry-run", "--quiet"],
+            ))
+            .unwrap();
+            let now = chrono::Utc::now();
+            let versions = vec![
+                VersionInfo::new("2.0.0", now - chrono::Duration::days(60)),
+                VersionInfo::new("2.1.0", now - chrono::Duration::days(30)),
+            ];
+            let (present, missing) = if rust_only {
+                (
+                    (Language::Rust, TAURI_CRATE.to_string()),
+                    (Language::Node, TAURI_NPM_PACKAGES[0].to_string()),
+                )
+            } else {
+                (
+                    (Language::Node, TAURI_NPM_PACKAGES[0].to_string()),
+                    (Language::Rust, TAURI_CRATE.to_string()),
+                )
+            };
+            orchestrator
+                .versions
+                .cache
+                .lock()
+                .await
+                .insert(present, versions);
+            let result = orchestrator
+                .run_directories(&[root.path().to_path_buf()])
+                .await;
+            assert!(
+                result.errors.is_empty(),
+                "rust_only={rust_only}: {:?}",
+                result.errors
+            );
+            assert!(
+                !orchestrator
+                    .versions
+                    .cache
+                    .lock()
+                    .await
+                    .contains_key(&missing),
+                "rust_only={rust_only}"
+            );
+        }
     }
 
     #[tokio::test]
