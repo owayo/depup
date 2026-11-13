@@ -23,8 +23,9 @@ mod node_preflight;
 mod osv_policy;
 pub(crate) mod osv_report;
 use crate::manifest::{
-    ManifestInfo, ManifestWriter, MiseSettings, RegistryLockEntries, WriteResult, detect_manifests,
-    find_cargo_lock_upward, has_mise_config, parser_for, read_git_entries,
+    ManifestInfo, ManifestWriter, MiseSettings, RegistryLockEntries, WriteResult,
+    detect_manifests_with_warnings, find_cargo_lock_upward, has_mise_config, parser_for,
+    read_git_entries,
 };
 use crate::osv::{OsvCheck, OsvChecker};
 use crate::progress::Progress;
@@ -226,6 +227,13 @@ fn unseen_notices(shown: &mut HashSet<String>, notices: Vec<String>) -> Vec<Stri
         .into_iter()
         .filter(|notice| shown.insert(notice.clone()))
         .collect()
+}
+
+/// マニフェストの検出で見つけた設定の問題を出す。スピナーを消した後に呼ぶ (#163)
+fn print_detection_warnings(warnings: &[String]) {
+    for warning in warnings {
+        eprintln!("Warning: {warning}");
+    }
 }
 
 impl Orchestrator {
@@ -567,10 +575,12 @@ impl Orchestrator {
 
         // ステップ1: マニフェストファイルを検出
         progress.spinner("Detecting manifest files...");
-        let manifests = detect_manifests(&self.args.path);
+        let detection = detect_manifests_with_warnings(&self.args.path);
         progress.finish_and_clear();
+        print_detection_warnings(&detection.warnings);
 
-        self.process_manifests(&manifests, &mut progress).await
+        self.process_manifests(&detection.manifests, &mut progress)
+            .await
     }
 
     /// 複数ディレクトリにまたがって更新ワークフローを実行する (モノレポモード)
@@ -586,17 +596,25 @@ impl Orchestrator {
         // 重複するため、正規化パスで重複排除する。
         progress.spinner("Detecting manifest files...");
         let mut all_manifests: Vec<ManifestInfo> = Vec::new();
+        let mut warnings: Vec<String> = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for dir in directories {
-            for manifest in detect_manifests(dir) {
+            let detection = detect_manifests_with_warnings(dir);
+            for manifest in detection.manifests {
                 let key =
                     std::fs::canonicalize(&manifest.path).unwrap_or_else(|_| manifest.path.clone());
                 if seen.insert(key) {
                     all_manifests.push(manifest);
                 }
             }
+            for warning in detection.warnings {
+                if !warnings.contains(&warning) {
+                    warnings.push(warning);
+                }
+            }
         }
         progress.finish_and_clear();
+        print_detection_warnings(&warnings);
 
         self.process_manifests(&all_manifests, &mut progress).await
     }

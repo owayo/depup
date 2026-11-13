@@ -10,6 +10,8 @@
 
 depup は `pnpm-workspace.yaml` を検出し、すべてのワークスペースパッケージを処理します。`packages` 配列はブロック形式（`- 'packages/*'`）とフロー形式（`packages: ['packages/*', 'apps/*']`）の両方に対応し、否定パターン（`!packages/legacy`）も扱えます。
 
+パターンは、depup が解釈できる構文（そのままのパス、要素の中の `*`、要素全体の `**`）について pnpm と同じ規則で照合します。たとえば `!**/test/**` は、どの階層の `test` パッケージも除外します。pnpm と同じく、`*` と `**` は `.` で始まる名前に一致せず（含めるには名前を明示します）、`node_modules` と `bower_components` の下のパッケージはメンバーにしません。含めるパターンを展開できるのは `dir`、`dir/*`、`dir/**`（第 1 階層だけ）、`dir/prefix*suffix` の形だけで、ほかの形は何も足しません。解釈できない除外のパターン（`?`、文字クラス、brace、extglob、エスケープを使うもの）や、読めない `packages` があると、警告を出してワークスペースのパッケージを 1 つも更新しません。除外したパッケージを書き換えないためです。ルートの `package.json` は処理します。
+
 pnpm の実効 override が直接依存を制御している場合、depup は設定を変更せず、理由を表示してその依存の更新をスキップします。固定版とレンジの両方が対象で、`--include-pinned` を付けても更新しません。版付きのセレクターは安全のため保護します。`parent>child` は、無関係な直接依存 `child` の更新を妨げません。スコープ付きの名前と npm alias にも対応します。設定は依存解決の単位ごとに `pnpm config get overrides --json` で一度取得するため、pnpm が必要です。コマンドの失敗や不正な出力で設定を確認できない場合は、その単位の処理を停止します。旧設定 `package.json` の `pnpm.overrides` と、Yarn 互換の `resolutions` (pnpm は override に合流させ、`pnpm.overrides` を優先します) は、実際に利用する pnpm が 11 未満の場合だけ有効とみなします。`pnpm config get overrides` はどちらも返しません。
 
 pnpm の `--install` 後は、更新した本番・開発・任意依存が、最終 lock の該当 workspace と宣言キーで更新先以上の版に解決されたか確認します。`--refresh-lock` と `--no-age` でも確認します。解決結果の欠落・曖昧さ・不正な版・読み取り失敗はエラーです。別の alias、workspace、推移依存の版では代用しません。peerDependencies だけの要件には、ローカルへのインストールを求めません。確認に失敗した更新は通常テキスト・quiet・diff・JSON の各出力で失敗として表示し、成功件数から除いて終了コード 2 を返します。通常の install では確認用にマニフェストと lock の変更を残し、refresh では既存の復旧処理を使います。パッケージマネージャ自体の実行失敗は、従来どおり終了コード 1 です。
