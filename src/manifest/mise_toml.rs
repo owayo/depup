@@ -1162,6 +1162,41 @@ minimum_release_age = "7d"
         );
     }
 
+    /// Issue #153: 引用符付きのキーに `]` を含むテーブルヘッダも、別のツールのセクションとして
+    /// 読む。以前はヘッダと見ずに `[tools.node]` が続くものとして読み、node の `prefix` の代わりに
+    /// ripgrep の `version` を書き換えていた。
+    #[test]
+    fn test_quoted_header_key_with_brackets_starts_another_tool() {
+        let content = concat!(
+            "[tools.node]\n",
+            "prefix = \"22\"\n",
+            "\n",
+            "[tools.\"ubi:BurntSushi/ripgrep[exe=rg]\"]\n",
+            "version = \"14.1.1\"\n",
+        );
+        let deps = parse(content);
+        let names: Vec<_> = deps
+            .iter()
+            .map(|dependency| dependency.name.as_str())
+            .collect();
+        assert_eq!(names, ["node", "ubi:BurntSushi/ripgrep[exe=rg]"]);
+
+        let updated = MiseTomlParser
+            .update_version(content, "node", "26.13.1")
+            .unwrap();
+        assert_eq!(
+            updated,
+            content.replace("prefix = \"22\"", "prefix = \"26\"")
+        );
+        let updated = MiseTomlParser
+            .update_version(content, "ubi:BurntSushi/ripgrep[exe=rg]", "14.2.0")
+            .unwrap();
+        assert_eq!(
+            updated,
+            content.replace("version = \"14.1.1\"", "version = \"14.2.0\"")
+        );
+    }
+
     #[test]
     fn test_language() {
         assert_eq!(MiseTomlParser.language(), Language::Mise);

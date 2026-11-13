@@ -75,13 +75,49 @@ pub(crate) fn parse_toml_section_header(line: &str) -> Option<&str> {
     let inner = trimmed
         .strip_prefix("[[")
         .or_else(|| trimmed.strip_prefix('['))?;
-    let close = inner.find(']')?;
+    let close = header_key_end(inner)?;
     let key = inner[..close].trim();
     let rest = inner[close..].trim_start_matches(']').trim_start();
     if key.is_empty() || !(rest.is_empty() || rest.starts_with('#')) {
         return None;
     }
     Some(key)
+}
+
+/// ヘッダの中身 (`[` の後) で、キーを閉じる `]` の位置を返す。
+///
+/// 引用符付きのキー (`[tools."ubi:BurntSushi/ripgrep[exe=rg]"]` / `['a]b']`) の中の `]` では
+/// 閉じない。以前は最初の `]` で切っていたのでヘッダと見ず、直前のセクションが続くものとして
+/// 読んで、mise.toml で別のツールの `version` を書き換えていた (#153)。
+fn header_key_end(inner: &str) -> Option<usize> {
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, ch) in inner.char_indices() {
+        match quote {
+            // 基本文字列はバックスラッシュでエスケープする
+            Some('"') => {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    quote = None;
+                }
+            }
+            // リテラル文字列にエスケープは無い
+            Some(_) => {
+                if ch == '\'' {
+                    quote = None;
+                }
+            }
+            None => match ch {
+                '"' | '\'' => quote = Some(ch),
+                ']' => return Some(index),
+                _ => {}
+            },
+        }
+    }
+    None
 }
 
 /// TOML の 1 行を走査し、文字列リテラルの外側にある文字だけを `visit` へ渡す。
@@ -541,5 +577,25 @@ mod tests {
         assert_eq!(parse_toml_section_header("[a]b]"), None);
         // 閉じ括弧なし
         assert_eq!(parse_toml_section_header("[deps"), None);
+        // 引用符の中の `]` の後に、閉じ括弧が無い
+        assert_eq!(parse_toml_section_header(r#"[tools."a]b""#), None);
+    }
+
+    /// Issue #153: 引用符付きのキーの中の `]` ではヘッダを閉じない
+    #[test]
+    fn test_parse_toml_section_header_keeps_brackets_inside_quoted_keys() {
+        assert_eq!(
+            parse_toml_section_header(r#"[tools."ubi:BurntSushi/ripgrep[exe=rg]"]"#),
+            Some(r#"tools."ubi:BurntSushi/ripgrep[exe=rg]""#)
+        );
+        assert_eq!(
+            parse_toml_section_header(r#"[[a.'b]c'.d]] # note"#),
+            Some("a.'b]c'.d")
+        );
+        // 基本文字列の中のエスケープした引用符では、文字列を閉じない
+        assert_eq!(
+            parse_toml_section_header(r#"[a."x\"]y"]"#),
+            Some(r#"a."x\"]y""#)
+        );
     }
 }
