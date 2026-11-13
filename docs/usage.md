@@ -658,7 +658,7 @@ By default, the text output counts skipped dependencies and shows details for up
 
 These are the labels in the text output. In `--json` output with `--verbose`, the same reasons appear as `already_latest`, `current_version_too_recent`, `pinned`, `change_level_limited: <LEVEL>`, `excluded`, `not_in_only_list`, `no_suitable_version`, `parse_error: ...`, and `fetch_failed: ...`. An otherwise allowed newer release with an unknown publication date is reported as `release_date_unknown: <VERSION>`. This also applies when dated candidates are all older and outside the `--max-change` limit. A Swift dependency whose date lookups ran out is reported as `release_date_unchecked: <VERSION>` (text: `release date lookup limit reached; <VERSION> and older not checked`).
 
-Dates in the verbose skip list belong to the current version itself, never to an older candidate. An unknown current date, an ambiguous version alias, or a floating wildcard/prefix has no displayed date. For example:
+Dates in the verbose skip list belong to the current version itself, never to an older candidate. An unknown current date, an ambiguous version alias, or a floating wildcard/prefix has no displayed date. When the manifest omits build metadata that the registry version carries (crates.io publishes `toml` as `1.2.0+spec-1.1.0` while Cargo.toml says `1.2.0`), the single registry version with the same precedence counts as the current version. For example:
 
 ```text
   1 newer than --age:

@@ -661,7 +661,7 @@ Python プロジェクトで `--install` が `uv sync` を呼び出すとき、d
 
 表の理由はテキスト出力の表記です。`--verbose` を付けた `--json` の出力では、同じ理由が `already_latest`、`current_version_too_recent`、`pinned`、`change_level_limited: <LEVEL>`、`excluded`、`not_in_only_list`、`no_suitable_version`、`parse_error: ...`、`fetch_failed: ...` と表記されます。条件に合う新しい候補の公開日が不明な場合は `release_date_unknown: <VERSION>` です。日付付きの古い候補だけが残り、それらが `--max-change` の許容範囲から外れる場合にも、日付不明の新しい候補をこの理由で報告します。Swift の依存で公開日の取得が上限に達した場合は `release_date_unchecked: <VERSION>` (テキスト出力では `release date lookup limit reached; <VERSION> and older not checked`) です。
 
-verbose のスキップ一覧に付く日付は、現在版自身の公開日です。古い候補の日付は使いません。現在版の日付が不明、別表記の対応が曖昧、または wildcard・prefix の浮動指定の場合は、日付を表示しません。
+verbose のスキップ一覧に付く日付は、現在版自身の公開日です。古い候補の日付は使いません。現在版の日付が不明、別表記の対応が曖昧、または wildcard・prefix の浮動指定の場合は、日付を表示しません。レジストリの版にだけ build metadata が付いている場合 (crates.io の `toml` は `1.2.0+spec-1.1.0` で公開され、Cargo.toml には `1.2.0` と書く) は、build metadata を除いた優先順位が同じ唯一の版を現在版とみなします。
 
 ```text
   1 newer than --age:
