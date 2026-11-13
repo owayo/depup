@@ -406,6 +406,91 @@ fn has_unquoted_end_keyword(code: &str) -> bool {
     false
 }
 
+/// 式の位置 (代入の右辺・括弧や引数の始まり) にある `if` / `unless` / `while` / `until` /
+/// `case` / `begin` があるかを判定する (`rake_version = if ENV["X"]` / `x = case y`)。
+///
+/// これらは `end` で閉じるブロックを開く。行頭の形は `BLOCK_KEYWORD_RE` が見るが、代入の右辺に
+/// 書くと行頭が変数名になるので見落とし、対応する `end` が外側の `source … do` を閉じていた
+/// (#152)。直前が式 (識別子・文字列・閉じ括弧など) のときは行末修飾子
+/// (`gem 'x' if cond` / `x = y if cond`) なので含めない。直前の記号は文字列の外で数える。
+fn opens_expression_block(code: &str) -> bool {
+    const KEYWORDS: [&[u8]; 6] = [b"if", b"unless", b"while", b"until", b"case", b"begin"];
+    let bytes = code.as_bytes();
+    let is_identifier_byte =
+        |value: u8| value.is_ascii_alphanumeric() || value == b'_' || !value.is_ascii();
+    // 文字列の外で直前に見た空白以外の 2 バイト (古い順)
+    let mut previous: [Option<u8>; 2] = [None, None];
+    let mut quote = None;
+    let mut escaped = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(open) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == open {
+                quote = None;
+                previous = [previous[1], Some(byte)];
+            }
+            index += 1;
+            continue;
+        }
+        if matches!(byte, b'\'' | b'"') {
+            quote = Some(byte);
+            index += 1;
+            continue;
+        }
+        // `%w[...]` / `%i(...)` の中の語はキーワードではない
+        if byte == b'%'
+            && matches!(bytes.get(index + 1), Some(b'w' | b'W' | b'i' | b'I'))
+            && let Some(close) = match bytes.get(index + 2) {
+                Some(b'[') => Some(b']'),
+                Some(b'(') => Some(b')'),
+                Some(b'{') => Some(b'}'),
+                Some(b'<') => Some(b'>'),
+                _ => None,
+            }
+        {
+            index = bytes[index + 3..]
+                .iter()
+                .position(|value| *value == close)
+                .map_or(bytes.len(), |offset| index + 3 + offset + 1);
+            previous = [previous[1], Some(close)];
+            continue;
+        }
+        if is_identifier_byte(byte) && (index == 0 || !is_identifier_byte(bytes[index - 1])) {
+            let end = bytes[index..]
+                .iter()
+                .position(|value| !is_identifier_byte(*value))
+                .map_or(bytes.len(), |offset| index + offset);
+            let word = &bytes[index..end];
+            // `if:` はハッシュのキー (`foo(if: true)`)。`::` は定数の参照
+            let hash_key = bytes.get(end) == Some(&b':') && bytes.get(end + 1) != Some(&b':');
+            if KEYWORDS.contains(&word) && !hash_key {
+                let expression_start = match previous {
+                    // 代入 (`=` / `||=` / `+=`)。比較 (`==` / `!=` / `<=` / `>=`) は除く
+                    [before, Some(b'=')] => !matches!(before, Some(b'=' | b'!' | b'<' | b'>')),
+                    [_, Some(b'(' | b',' | b'[')] => true,
+                    _ => false,
+                };
+                if expression_start {
+                    return true;
+                }
+            }
+            previous = [previous[1], word.last().copied()];
+            index = end;
+            continue;
+        }
+        if !byte.is_ascii_whitespace() {
+            previous = [previous[1], Some(byte)];
+        }
+        index += 1;
+    }
+    false
+}
+
 /// ブロックの開始・終了行ならスタックを更新して `true` を返す。
 ///
 /// parse と `update_version` が同じ規則を共有するための唯一の情報源。片方にしか
@@ -435,6 +520,12 @@ fn track_block_structure(code: &str, block_stack: &mut Vec<GemfileBlock>) -> boo
         if !has_unquoted_end_keyword(code) {
             block_stack.push(GemfileBlock::Other);
         }
+        return true;
+    }
+    // 代入の右辺などの `if` / `case` も同じく `end` を消費する (#152)。
+    // 同じ行で閉じるもの (`x = if a then 1 else 2 end`) は積まず、行の解釈も続ける。
+    if opens_expression_block(code) && !has_unquoted_end_keyword(code) {
+        block_stack.push(GemfileBlock::Other);
         return true;
     }
 
@@ -2086,6 +2177,84 @@ else
 end
 "#
         );
+    }
+
+    /// Issue #152: 代入の右辺の `if` / `case` の `end` は、外側の `source … do` を閉じない。
+    /// 以前は代入の行を積まずに `end` だけを pop していたので、私設 source の gem に
+    /// rubygems.org の版を書き込んでいた。
+    #[test]
+    fn test_assignment_keyword_blocks_keep_the_outer_source_block_open() {
+        let content = r#"source "https://rubygems.org"
+source "https://gems.example.com" do
+  rake_version = if ENV["RAKE_NEXT"]
+    "~> 13.0"
+  else
+    "~> 12.0"
+  end
+  rails_version ||= case ENV["RAILS"]
+  when "edge" then "~> 8.0"
+  else "~> 7.0"
+  end
+  gem "rake", "~> 12.0"
+end
+gem "rack", "~> 3.0"
+"#;
+        let deps = parse(content).unwrap();
+        let names: Vec<_> = deps
+            .iter()
+            .map(|dependency| dependency.name.as_str())
+            .collect();
+        assert_eq!(names, ["rack"]);
+        assert!(
+            GemfileParser
+                .update_version(content, "rake", "13.4.2")
+                .is_err()
+        );
+        let updated = GemfileParser
+            .update_version(content, "rack", "3.2.0")
+            .unwrap();
+        assert!(updated.contains(r#"gem "rake", "~> 12.0""#), "{updated}");
+        assert!(updated.contains(r#"gem "rack", "~> 3.2""#), "{updated}");
+    }
+
+    /// 行末修飾子・同じ行で閉じる式・ハッシュのキー・`%w[...]` の中の語は、ブロックを積まない
+    #[test]
+    fn test_expression_keywords_that_do_not_open_a_block() {
+        for code in [
+            r#"gem "wdm", ">= 0.1.0" if Gem.win_platform?"#,
+            "ruby_version = RUBY_VERSION if defined?(RUBY_VERSION)",
+            "return if ENV['SKIP']",
+            "same = a == if_value",
+            "options = { if: true, unless: false }",
+            "names = %w[if case begin]",
+            "range.begin",
+        ] {
+            assert!(!opens_expression_block(code), "{code}");
+        }
+        for code in [
+            r#"rake_version = if ENV["RAKE_NEXT"]"#,
+            "rails ||= case ENV['RAILS']",
+            "value = begin",
+            "pick(if ready",
+            "list = [unless done",
+        ] {
+            assert!(opens_expression_block(code), "{code}");
+        }
+
+        let content = r#"group :development do
+  value = if ENV["A"] then "1" else "2" end
+  gem "pry"
+end
+gem "rails", "~> 7.0"
+"#;
+        let deps = parse(content).unwrap();
+        let pry = deps.iter().find(|dependency| dependency.name == "pry");
+        assert!(pry.is_some_and(|pry| pry.is_dev), "{deps:?}");
+        let rails = deps
+            .iter()
+            .find(|dependency| dependency.name == "rails")
+            .unwrap();
+        assert!(!rails.is_dev);
     }
 
     /// バージョンなし gem の挿入経路 (`version_parts` が空の分岐) でも
