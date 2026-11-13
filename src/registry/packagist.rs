@@ -15,6 +15,12 @@ use std::collections::HashMap;
 /// Packagist レジストリのベース URL
 const PACKAGIST_API_URL: &str = "https://repo.packagist.org/p2";
 
+/// p2 の応答の `minified` が示す圧縮形式 (Composer の `MetadataMinifier`)
+const MINIFIED_COMPOSER_2: &str = "composer/2.0";
+
+/// 圧縮形式で、直前の版にあったキーが消えたことを表す値
+const UNSET_MARKER: &str = "__unset";
+
 /// Packagist レジストリアダプタ
 pub struct PackagistAdapter {
     client: HttpClient,
@@ -25,6 +31,9 @@ pub struct PackagistAdapter {
 struct PackagistResponse {
     /// パッケージ名からバージョンリストへのマップ
     packages: HashMap<String, Vec<PackagistVersionInfo>>,
+    /// 版の一覧の圧縮形式 (`composer/2.0`)。無ければ各要素が完全な情報を持つ
+    #[serde(default)]
+    minified: Option<String>,
 }
 
 /// Packagist API レスポンスのバージョン情報
@@ -33,9 +42,11 @@ struct PackagistResponse {
 /// 利用するフィールドだけを宣言する。
 #[derive(Debug, Deserialize)]
 struct PackagistVersionInfo {
-    /// バージョン文字列 (例: "v1.0.0" または "1.0.0")
+    /// バージョン文字列 (例: "v1.0.0" または "1.0.0")。版ごとに必ず違うので、
+    /// 圧縮形式でもどの要素にもある
     version: String,
-    /// ISO 8601 形式のリリースタイムスタンプ
+    /// ISO 8601 形式のリリースタイムスタンプ。圧縮形式では直前の版と同じなら省かれ、
+    /// 直前の版にあって消えるなら `"__unset"` になる
     time: Option<String>,
 }
 
@@ -98,6 +109,49 @@ impl PackagistAdapter {
     fn resolve_released_at(time: Option<&str>) -> Option<DateTime<Utc>> {
         time.and_then(|t| t.parse::<DateTime<Utc>>().ok())
     }
+
+    /// 版の一覧の各要素の公開日時の文字列を、要素と同じ順で返す。
+    ///
+    /// p2 の応答は `"minified": "composer/2.0"` の圧縮形式で、各要素は直前の要素から
+    /// 変わったキーだけを持つ (同じ値のキーは省き、消えたキーは `"__unset"`)。
+    /// Composer の `MetadataMinifier::expand` と同じく直前の値を引き継いで読まないと、
+    /// 同じコミットに打ったタグのように `time` が直前の版と同じ版の公開日が無いことになる (#164)。
+    fn release_times(list: &[PackagistVersionInfo], minified: bool) -> Vec<Option<&str>> {
+        let mut inherited: Option<&str> = None;
+        list.iter()
+            .map(|info| {
+                let time = info.time.as_deref();
+                if !minified {
+                    return time;
+                }
+                match time {
+                    Some(UNSET_MARKER) => inherited = None,
+                    Some(time) => inherited = Some(time),
+                    None => {}
+                }
+                inherited
+            })
+            .collect()
+    }
+
+    /// 版の一覧を、dev 版を除いた VersionInfo の昇順の一覧にする。
+    ///
+    /// 圧縮形式の展開は dev 版も含めた並びのまま行う (dev 版を先に除くと、
+    /// その後の版が引き継ぐ値がずれる)。
+    fn versions_from_list(list: &[PackagistVersionInfo], minified: bool) -> Vec<VersionInfo> {
+        let mut versions: Vec<VersionInfo> = list
+            .iter()
+            .zip(Self::release_times(list, minified))
+            .filter(|(info, _)| !Self::is_dev_version(&info.version))
+            .map(|(info, time)| {
+                // time が欠けても版自体は残し、age 判定に日付不明を伝える。
+                let released_at = Self::resolve_released_at(time);
+                VersionInfo::with_released_at(Self::normalize_version(&info.version), released_at)
+            })
+            .collect();
+        versions.sort();
+        versions
+    }
 }
 
 #[async_trait]
@@ -119,8 +173,6 @@ impl RegistryAdapter for PackagistAdapter {
             .get_json(&url, package, self.registry_name())
             .await?;
 
-        let mut versions = Vec::new();
-
         // レスポンス内からパッケージを検索
         // キーは完全なパッケージ名 (vendor/package)。
         // Packagist はリクエスト URL の綴りに関わらず小文字へ正規化したキーで返すため、
@@ -135,25 +187,10 @@ impl RegistryAdapter for PackagistAdapter {
                 .map(|(_, list)| list)
         });
 
-        if let Some(version_list) = version_list {
-            for version_info in version_list {
-                // dev バージョンをスキップ
-                if Self::is_dev_version(&version_info.version) {
-                    continue;
-                }
-
-                // リリースタイムスタンプをパース
-                // time が欠けても版自体は残し、age 判定に日付不明を伝える。
-                let released_at = Self::resolve_released_at(version_info.time.as_deref());
-                let normalized = Self::normalize_version(&version_info.version);
-                versions.push(VersionInfo::with_released_at(&normalized, released_at));
-            }
-        }
-
-        // バージョンでソート
-        versions.sort();
-
-        Ok(versions)
+        let minified = response.minified.as_deref() == Some(MINIFIED_COMPOSER_2);
+        Ok(version_list
+            .map(|list| Self::versions_from_list(list, minified))
+            .unwrap_or_default())
     }
 }
 
@@ -310,6 +347,68 @@ mod tests {
             PackagistAdapter::resolve_released_at(Some("not-a-timestamp")),
             None
         );
+    }
+
+    /// 回帰テスト (#164): p2 の圧縮形式では、`time` を省いた版は直前の版の公開日時を
+    /// 引き継ぎ、`"__unset"` の版は公開日時が無い。dev 版を除いても引き継ぎはずれない。
+    #[test]
+    fn minified_versions_inherit_the_release_time_of_the_previous_entry() {
+        let json = r#"{
+            "minified": "composer/2.0",
+            "packages": {
+                "symfony/deprecation-contracts": [
+                    {"version": "v3.8.0", "version_normalized": "3.8.0.0", "time": "2026-06-05T06:23:12+00:00"},
+                    {"version": "v3.7.1", "version_normalized": "3.7.1.0"},
+                    {"version": "3.7.x-dev", "version_normalized": "3.7.9999999.9999999-dev", "time": "2026-04-13T15:52:40+00:00"},
+                    {"version": "v3.7.0", "version_normalized": "3.7.0.0"},
+                    {"version": "v3.6.0", "version_normalized": "3.6.0.0", "time": "__unset"},
+                    {"version": "v3.5.0", "version_normalized": "3.5.0.0"}
+                ]
+            }
+        }"#;
+        let response: PackagistResponse = serde_json::from_str(json).unwrap();
+        let minified = response.minified.as_deref() == Some(MINIFIED_COMPOSER_2);
+        assert!(minified);
+        let versions = PackagistAdapter::versions_from_list(
+            &response.packages["symfony/deprecation-contracts"],
+            minified,
+        );
+
+        let at = |time: &str| Some(time.parse::<DateTime<Utc>>().unwrap());
+        let released: Vec<(String, Option<DateTime<Utc>>)> = versions
+            .iter()
+            .map(|v| (v.version.clone(), v.released_at))
+            .collect();
+        assert_eq!(
+            released,
+            vec![
+                ("3.5.0".to_string(), None),
+                ("3.6.0".to_string(), None),
+                ("3.7.0".to_string(), at("2026-04-13T15:52:40+00:00")),
+                ("3.7.1".to_string(), at("2026-06-05T06:23:12+00:00")),
+                ("3.8.0".to_string(), at("2026-06-05T06:23:12+00:00")),
+            ]
+        );
+    }
+
+    /// 圧縮形式でない応答では、各要素をそのまま読む (`time` の無い版は日時不明)。
+    #[test]
+    fn unminified_versions_do_not_inherit_release_times() {
+        let json = r#"{
+            "packages": {
+                "vendor/pkg": [
+                    {"version": "2.0.0", "time": "2024-01-01T00:00:00+00:00"},
+                    {"version": "1.0.0"}
+                ]
+            }
+        }"#;
+        let response: PackagistResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.minified, None);
+        let versions =
+            PackagistAdapter::versions_from_list(&response.packages["vendor/pkg"], false);
+        assert_eq!(versions[0].version, "1.0.0");
+        assert_eq!(versions[0].released_at, None);
+        assert!(versions[1].released_at.is_some());
     }
 
     #[test]
