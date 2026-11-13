@@ -765,6 +765,29 @@ fn normalize_composer_version(value: &str) -> String {
     if has_dev { format!("{body}.dev") } else { body }
 }
 
+/// Maven (ComparableVersion) の規則でプレリリースかどうかを判定する。
+///
+/// 共通判定に加えて、`a` / `b` の直後に数字だけが続くトークン (`2.4.0-b180830.0359` /
+/// `1.0-a1`) を alpha / beta とみなす。ComparableVersion は `a` / `b` / `m` の直後に数字が
+/// 続く綴りを alpha / beta / milestone と読む (`m<数字>` は共通判定が見ている)。
+/// 共通判定は数字の直後の `a1` / `b1` (PEP 440) しか見ないので、区切りの後の `-b1` を
+/// 安定版と判定し、`jaxb-api 2.3.1` を `2.4.0-b180830.0359` へ更新していた (#156)。
+/// npm や mise が使う共通判定には入れない (`-b1` を beta と読む規則は Maven のもの)。
+pub(crate) fn is_maven_prerelease_version(version: &str) -> bool {
+    if is_prerelease_version(version) {
+        return true;
+    }
+    let lower = version.to_lowercase();
+    let scan = lower.split('+').next().unwrap_or("");
+    scan.split(['-', '.', '_']).any(|token| {
+        ["a", "b"].iter().any(|prefix| {
+            token
+                .strip_prefix(prefix)
+                .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+        })
+    })
+}
+
 /// Composer (composer/semver) の規則でプレリリースかどうかを判定する。
 ///
 /// 共通判定に加えて短縮綴り (`1.0.0-a1` = alpha / `1.0.0-b1` = beta) と、区切りなしの
@@ -2275,6 +2298,34 @@ mod tests {
     /// 回帰テスト: ビルドメタデータ (`+` 以降) は prerelease 判定の走査対象外。
     /// 以前は `1.0.0+sha.a1b2c3` (メタデータ内の digit+英字+digit) や
     /// `1.0.0+pre.1` を prerelease と誤判定していた。
+    #[test]
+    fn maven_alpha_and_beta_shorthands_are_prereleases() {
+        // Issue #156: ComparableVersion は `a` / `b` の直後の数字を alpha / beta と読む
+        for version in [
+            "2.4.0-b180830.0359",
+            "1.0-a1",
+            "3.0.0.b2",
+            "1.0-B3",
+            "4.0.0-M1",
+        ] {
+            assert!(is_maven_prerelease_version(version), "{version}");
+        }
+        for version in [
+            "2.3.1",
+            "31.1-jre",
+            "1.0.0.Final",
+            "2.0.0-b",
+            "1.0-android",
+            "1.0-alpine",
+            "5.3.23.RELEASE",
+            "2.0.0+b1",
+        ] {
+            assert!(!is_maven_prerelease_version(version), "{version}");
+        }
+        // 共通の判定 (npm・mise) は区切りの後の `-b1` を見ない
+        assert!(!is_prerelease_version("2.4.0-b180830.0359"));
+    }
+
     #[test]
     fn test_is_prerelease_ignores_build_metadata() {
         assert!(!is_prerelease_version("1.0.0+sha.a1b2c3"));
