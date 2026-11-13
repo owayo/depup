@@ -160,7 +160,8 @@ fn snapshot(
     path: &Path,
 ) -> Result<(Lock, Vec<Entry>), String> {
     let record = files.get(path).ok_or("Mise lock has no guarded snapshot")?;
-    parse(record.expected.bytes.as_deref()).map_err(|error| format!("{}: {error}", path.display()))
+    parse(record.expected.bytes.as_deref())
+        .map_err(|error| format!("{}: {error}", crate::user_path::display(path)))
 }
 
 fn identity_fields(entry: &Entry) -> toml::Value {

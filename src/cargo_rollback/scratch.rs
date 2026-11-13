@@ -219,7 +219,7 @@ impl ScratchWorkspace {
     ) -> Result<Self, String> {
         let started = std::time::Instant::now();
         let canonical_root = canonical_path(root)
-            .map_err(|e| format!("failed to resolve {}: {e}", root.display()))?;
+            .map_err(|e| format!("failed to resolve {}: {e}", crate::user_path::display(root)))?;
         let original_lock_path = canonical_root.join(LOCK_FILE);
         let original_lock = std::fs::read_to_string(&original_lock_path)
             .map_err(|e| format!("failed to read {}: {e}", original_lock_path.display()))?;

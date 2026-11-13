@@ -100,7 +100,7 @@ pub fn lock_age_report_lines(
     verbose: bool,
 ) -> Vec<ReportLine> {
     let mut lines = Vec::new();
-    let dir = dir.display();
+    let dir = crate::user_path::display(dir);
 
     // 元の Cargo.lock を戻せなかった等、差し戻せなかったことより深刻な問題は必ず出す
     for problem in &audit.problems {
@@ -302,7 +302,7 @@ pub fn lock_mismatch_lines(
     }
     let mut lines = vec![format!(
         "  {} — {} update(s) locked at a different version than shown:",
-        manifest_path.display(),
+        crate::user_path::display(manifest_path),
         mismatches.len()
     )];
     for mismatch in mismatches {
@@ -728,5 +728,45 @@ mod tests {
             ]
         );
         assert!(lock_mismatch_lines(Path::new("./Cargo.toml"), &[]).is_empty());
+    }
+
+    /// Issue #148: install の単位のディレクトリは正規化されていて、Windows では `\\?\` が付く。
+    /// 報告の見出しでは外して出す。
+    #[test]
+    fn report_headings_show_canonical_directories_without_the_verbatim_prefix() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = std::fs::canonicalize(temp.path()).unwrap();
+        let shown = crate::user_path::for_display(&directory)
+            .display()
+            .to_string();
+        let audit = LockAgeAuditResult {
+            adjustments: vec![adjustment(
+                "cc",
+                "1.11.1",
+                Some("1.11.0"),
+                LockAgeStatus::Downgraded,
+            )],
+            problems: vec!["restoring the previous Cargo.lock also failed".to_string()],
+            ..Default::default()
+        };
+        let lines = lock_age_report_lines(&directory, &audit, false);
+        assert_eq!(
+            texts(&lines),
+            vec![
+                format!("  {shown} — restoring the previous Cargo.lock also failed"),
+                format!("  {shown} — 1 crate(s) rolled back to satisfy --age:"),
+                "    cc 1.11.1 → 1.11.0".to_string(),
+            ]
+        );
+
+        let mismatches = [LockedVersionMismatch {
+            name: "cc".to_string(),
+            from: "1.10.0".to_string(),
+            to: "1.11.0".to_string(),
+            locked: "1.11.1".to_string(),
+        }];
+        let lines = lock_mismatch_lines(&directory.join("Cargo.toml"), &mismatches);
+        assert!(!lines[0].contains(r"\\?\"), "{}", lines[0]);
+        assert!(lines[0].starts_with(&format!("  {shown}")), "{}", lines[0]);
     }
 }

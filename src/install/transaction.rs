@@ -494,7 +494,10 @@ impl InstallTransactions {
                 true
             }
             Err(error) => {
-                task.command = Err(format!("Cannot snapshot {}: {error}", path.display()));
+                task.command = Err(format!(
+                    "Cannot snapshot {}: {error}",
+                    for_display(path).display()
+                ));
                 // ほかの管理対象の保存が失敗しても、書き込み記録から復元できる場合がある。
                 if let Ok(key) = resolved_path(path)
                     && self.files.contains_key(&key)
@@ -1045,7 +1048,10 @@ impl InstallTransactions {
                     record.expected = state;
                     if let Err(error) = line_endings::preserve(record) {
                         self.units[unit].failure.get_or_insert_with(|| {
-                            format!("Cannot preserve line endings in {}: {error}", key.display())
+                            format!(
+                                "Cannot preserve line endings in {}: {error}",
+                                for_display(key).display()
+                            )
                         });
                     }
                 }

@@ -171,7 +171,7 @@ impl std::fmt::Display for OrchestratorError {
                 write!(
                     f,
                     "pnpm resolution verification failed in {}: {}",
-                    directory.display(),
+                    crate::user_path::display(directory),
                     message
                 )
             }
@@ -179,7 +179,7 @@ impl std::fmt::Display for OrchestratorError {
                 write!(
                     f,
                     "pnpm preflight failed in {}: {}",
-                    directory.display(),
+                    crate::user_path::display(directory),
                     message
                 )
             }
@@ -189,7 +189,7 @@ impl std::fmt::Display for OrchestratorError {
                 write!(
                     f,
                     "Cargo preflight stopped {}: {}",
-                    manifest.display(),
+                    crate::user_path::display(manifest),
                     message
                 )
             }

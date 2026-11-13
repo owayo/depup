@@ -121,7 +121,7 @@ fn finish_scope(
             // 監査だけの lock や、別の原因ですでに失敗した単位の診断も残す。
             let recorded = tx.fail_holder(&path, reason.clone());
             if verbose || !recorded {
-                eprintln!("  {} — {reason}", path.display());
+                eprintln!("  {} — {reason}", crate::user_path::display(&path));
             }
         }
     }

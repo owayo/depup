@@ -43,9 +43,38 @@ pub(crate) fn for_display(path: &Path) -> Cow<'_, Path> {
     }
 }
 
+/// 利用者に見せるパスを `format!` や `eprintln!` へ渡す形にする
+/// (`for_display(path).display()` と同じ表記)。install の単位のディレクトリや lock のパスは
+/// `std::fs::canonicalize` を通っているので、メッセージに入れるときはこれを使う (#148)。
+pub(crate) fn display(path: &Path) -> impl std::fmt::Display + '_ {
+    Shown(for_display(path))
+}
+
+struct Shown<'a>(Cow<'a, Path>);
+
+impl std::fmt::Display for Shown<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.display().fmt(f)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #148: メッセージへ入れる表記も `for_display` と同じく `\\?\` を付けない。
+    #[test]
+    fn display_matches_for_display_without_the_verbatim_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(dir.path()).unwrap();
+        let shown = format!("{}", display(&canonical));
+        assert!(!shown.starts_with(r"\\?\"), "{shown}");
+        assert_eq!(shown, for_display(&canonical).display().to_string());
+        assert_eq!(
+            format!("{}", display(dir.path())),
+            dir.path().display().to_string()
+        );
+    }
 
     #[cfg(windows)]
     #[test]

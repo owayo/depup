@@ -67,7 +67,7 @@ impl RollbackOsvChecks {
                         "Cargo.lock".into(),
                         format!(
                             "{}: rollback destinations not checked: {error}",
-                            path.display()
+                            crate::user_path::display(path)
                         ),
                     ));
                     continue;
@@ -114,7 +114,7 @@ impl RollbackOsvChecks {
                     name.clone(),
                     format!(
                         "{}: {name}@{version}, retained after --age rollback, {detail}",
-                        path.display()
+                        crate::user_path::display(path)
                     ),
                 ));
             }
@@ -126,7 +126,7 @@ impl RollbackOsvChecks {
                     "Cargo.lock".into(),
                     format!(
                         "{} changed during OSV checks; final rollback destinations not verified",
-                        path.display()
+                        crate::user_path::display(path)
                     ),
                 ));
             }
