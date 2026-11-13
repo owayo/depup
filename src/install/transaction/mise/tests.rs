@@ -44,3 +44,54 @@ fn a_parent_project_config_under_the_home_still_stops_the_install() {
     let error = check_parent_scope(&project, &project, &[], Some(&home), None).unwrap_err();
     assert!(error.contains("outside the recovery boundary"), "{error}");
 }
+
+/// 設定ファイル名の接尾辞は、優先度の低い順 (`""` → `.<env>` → `.local` → `.<env>.local`) に並ぶ。
+/// 復元の範囲と lock の文脈を作る順はこの順に従う
+#[test]
+fn config_suffixes_follow_mise_priority_order() {
+    let environments = vec!["dev".to_string(), "ci".to_string()];
+    assert_eq!(
+        config_suffixes(&environments).collect::<Vec<_>>(),
+        vec!["", ".dev", ".ci", ".local", ".dev.local", ".ci.local"]
+    );
+    assert_eq!(config_suffixes(&[]).collect::<Vec<_>>(), vec!["", ".local"]);
+}
+
+/// `MISE_ENV` の値は重複も書いたまま残し、明示的に選んだ環境別の設定の環境は、まだ無いものだけを足す
+#[test]
+fn active_environments_keep_mise_env_and_add_selected_environment_configs() {
+    let manifests = [
+        PathBuf::from("/p/mise.staging.toml"),
+        PathBuf::from("/p/.mise.dev.local.toml"),
+        PathBuf::from("/p/mise.local.toml"),
+        PathBuf::from("/p/mise.toml"),
+    ];
+    assert_eq!(
+        active_environments(" dev , dev,,ci ", &manifests),
+        vec!["dev", "dev", "ci", "staging"]
+    );
+}
+
+/// 別の場所の設定は、それを含むプロジェクトの設定として読む。`.config/mise/config.toml` は
+/// `mise/config.toml` にも要素の末尾で一致するので、長い名前を先に照合する
+#[test]
+fn alternate_configs_belong_to_the_project_that_contains_them() {
+    let project = Path::new("/work/app");
+    for (config, parent) in [
+        (".config/mise/config.toml", ".config/mise"),
+        ("mise/config.toml", "mise"),
+        (".mise/config.toml", ".mise"),
+        (".config/mise.toml", ".config"),
+    ] {
+        let config = project.join(config);
+        let parent = project.join(parent);
+        assert_eq!(
+            project_directory(&config, &parent),
+            project,
+            "{}",
+            config.display()
+        );
+    }
+    let config = project.join("mise.toml");
+    assert_eq!(project_directory(&config, project), project);
+}
