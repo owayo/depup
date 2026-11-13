@@ -46,7 +46,7 @@ Found version mismatched Tauri packages:
 tauri: 2.9.0 → 2.10.1
 ```
 
-Both packages are automatically adjusted to the same major.minor version (e.g., 2.10.x).
+Both packages are automatically adjusted to the same major.minor version (e.g., 2.10.x). If one side cannot reach the newer major.minor (for example, the `tauri` crate release is still newer than the age cutoff), the other side's update is held at its current version and reported as `held at <MAJOR.MINOR> for Tauri sync`. Other Tauri npm packages such as `@tauri-apps/cli` that are already in the synchronized major.minor are left as they are; depup never moves them below their current version.
 
 ## Ecosystem Details
 

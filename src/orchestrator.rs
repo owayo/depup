@@ -1559,31 +1559,37 @@ impl Orchestrator {
     ) {
         let npm_adapter = self.get_adapter(Language::Node);
         let npm_pkg_name = TAURI_NPM_PACKAGES[0];
-        for (manifest_idx, result_idx, original, _current) in npm_packages {
+        for (manifest_idx, result_idx, original, current) in npm_packages {
             let pkg_name = original.package_name();
             let pkg_target = if pkg_name == npm_pkg_name {
                 Some(target.to_string())
             } else {
-                match self.fetch_versions(&*npm_adapter, pkg_name).await {
-                    Ok(vs) => {
-                        let vs = filter_versions_by_cutoff(
-                            vs,
-                            cutoff,
-                            Language::Node,
-                            pkg_name,
-                            &self
-                                .resolved_age_policy_for(
-                                    summary.manifests[*manifest_idx]
-                                        .path
-                                        .parent()
-                                        .unwrap_or(&self.args.path),
-                                )
-                                .exemptions,
-                        );
-                        pick_sync_version(&vs, target)
+                match other_package_sync(original, current, target) {
+                    OtherPackageSync::Untouched => continue,
+                    OtherPackageSync::Stay => Some(current.clone()),
+                    OtherPackageSync::Pick => {
+                        match self.fetch_versions(&*npm_adapter, pkg_name).await {
+                            Ok(vs) => {
+                                let vs = filter_versions_by_cutoff(
+                                    vs,
+                                    cutoff,
+                                    Language::Node,
+                                    pkg_name,
+                                    &self
+                                        .resolved_age_policy_for(
+                                            summary.manifests[*manifest_idx]
+                                                .path
+                                                .parent()
+                                                .unwrap_or(&self.args.path),
+                                        )
+                                        .exemptions,
+                                );
+                                pick_sync_version(&vs, target)
+                            }
+                            // フェッチできない場合はこのパッケージの同期を見送る
+                            Err(_) => None,
+                        }
                     }
-                    // フェッチできない場合はこのパッケージの同期を見送る
-                    Err(_) => None,
                 }
             };
             let Some(pkg_target) = pkg_target else {
@@ -2218,6 +2224,18 @@ fn apply_sync_adjustment(
     // これがないと npm 側が crates.io より先行しているとき `2.9.6 → 2.9.6` が毎回
     // 「更新」として報告され、writer は何も書かないのに `--install` だけが走る。
     if original.dependency().version() == target {
+        // judge が新しい major.minor への更新を出していても、反対側がその系列に届かなければ
+        // 今の版に据え置く。以前はここで何もせずに戻り、揃わない更新を書いていた (#154)
+        if original.is_update() {
+            let series = crate::tauri_sync::extract_major_minor(&target).map_or_else(
+                || target.clone(),
+                |(major, minor)| format!("{major}.{minor}"),
+            );
+            let manifest = &mut summary.manifests[manifest_idx];
+            manifest.results[result_idx] =
+                UpdateResult::skip(original.dependency().clone(), SkipReason::TauriSync(series));
+            manifest.modified = manifest.results.iter().any(UpdateResult::is_update);
+        }
         return;
     }
 
@@ -2226,6 +2244,33 @@ fn apply_sync_adjustment(
     summary.manifests[manifest_idx].results[result_idx] = adjusted;
     if matches!(original, UpdateResult::Skip { .. }) {
         summary.manifests[manifest_idx].modified = true;
+    }
+}
+
+/// 先頭以外の Tauri npm パッケージ (`@tauri-apps/cli` など) を同期先へどう合わせるか。
+#[derive(Debug, PartialEq, Eq)]
+enum OtherPackageSync {
+    /// 実効の版 (更新があれば更新先) が、もう同期先と同じ major.minor にいる
+    Untouched,
+    /// 今の版が同期先の major.minor にいて、judge の更新だけが系列を外れている。今の版に留める
+    Stay,
+    /// 同期先の major.minor の版を、そのパッケージの版の一覧から選ぶ
+    Pick,
+}
+
+/// 同期先 (`target`。先頭のパッケージの版の一覧から選んだ版) に合わせて、ほかのパッケージを
+/// どう扱うかを決める。同期先の版をそのまま当てると、同じ major.minor に揃っている
+/// パッケージを今の版より下げていた (`@tauri-apps/cli` 2.11.5 → 2.11.1。#154)。
+fn other_package_sync(original: &UpdateResult, current: &str, target: &str) -> OtherPackageSync {
+    use crate::tauri_sync::extract_major_minor;
+    let series = extract_major_minor(target);
+    let in_series = |version: &str| series.is_some() && extract_major_minor(version) == series;
+    if in_series(effective_version(original, current)) {
+        OtherPackageSync::Untouched
+    } else if in_series(current) {
+        OtherPackageSync::Stay
+    } else {
+        OtherPackageSync::Pick
     }
 }
 
@@ -2498,6 +2543,72 @@ mod git_helper_tests {
         );
         // 系列ごと存在しなければ None (同期を見送る)
         assert_eq!(pick_sync_version(&versions, "3.0.0"), None);
+    }
+
+    fn npm_dep(name: &str, version: &str) -> Dependency {
+        Dependency::new(
+            name,
+            VersionSpec::new(
+                crate::domain::VersionSpecKind::Caret,
+                format!("^{version}"),
+                version,
+            )
+            .with_prefix("^"),
+            false,
+            Language::Node,
+        )
+    }
+
+    /// Issue #154: 同期先が今の版と同じなら、judge が出した新しい major.minor への更新を取り消し、
+    /// 据え置いた系列をスキップの理由に残す。元がスキップなら何もしない。
+    #[test]
+    fn sync_adjustment_holds_an_update_whose_target_is_the_current_version() {
+        let api = npm_dep("@tauri-apps/api", "2.11.1");
+        let mut manifest = ManifestUpdateResult::new("package.json", Language::Node);
+        manifest.add_result(UpdateResult::update(api.clone(), "2.12.0"));
+        let mut summary = UpdateSummary::new(true);
+        summary.add_manifest(manifest);
+        let original = summary.manifests[0].results[0].clone();
+
+        apply_sync_adjustment(&mut summary, 0, 0, &original, "2.11.1".into(), None);
+
+        assert_eq!(
+            summary.manifests[0].results[0],
+            UpdateResult::skip(api.clone(), SkipReason::TauriSync("2.11".into()))
+        );
+        assert!(!summary.manifests[0].modified);
+
+        // 元がスキップなら、同じ版への同期は何も変えない
+        let skipped = UpdateResult::skip_already_latest(api);
+        summary.manifests[0].results[0] = skipped.clone();
+        apply_sync_adjustment(&mut summary, 0, 0, &skipped, "2.11.1".into(), None);
+        assert_eq!(summary.manifests[0].results[0], skipped);
+    }
+
+    /// Issue #154: 先頭以外の npm パッケージは、もう同期先の major.minor にいれば触らず、
+    /// judge の更新だけが系列を外れていれば今の版に留める。今の版より下げない。
+    #[test]
+    fn other_tauri_packages_are_never_moved_below_their_series() {
+        let cli = npm_dep("@tauri-apps/cli", "2.11.5");
+        let latest = UpdateResult::skip_already_latest(cli.clone());
+        assert_eq!(
+            other_package_sync(&latest, "2.11.5", "2.11.1"),
+            OtherPackageSync::Untouched
+        );
+        let ahead = UpdateResult::update(cli.clone(), "2.12.0");
+        assert_eq!(
+            other_package_sync(&ahead, "2.11.5", "2.11.1"),
+            OtherPackageSync::Stay
+        );
+        let older = npm_dep("@tauri-apps/cli", "2.10.3");
+        assert_eq!(
+            other_package_sync(
+                &UpdateResult::skip_already_latest(older),
+                "2.10.3",
+                "2.11.1"
+            ),
+            OtherPackageSync::Pick
+        );
     }
 
     #[test]

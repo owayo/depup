@@ -203,6 +203,7 @@ impl TextFormatter {
             }
             SkipReason::ParseError(msg) => format!("parse error: {}", msg),
             SkipReason::ChangeLevelLimited(level) => format!("max-change={}", level),
+            SkipReason::TauriSync(series) => format!("held at {series} for Tauri sync"),
         }
     }
 

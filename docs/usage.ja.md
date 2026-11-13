@@ -656,10 +656,11 @@ Python プロジェクトで `--install` が `uv sync` を呼び出すとき、d
 | `max-change=<LEVEL>` | 新しいバージョンはあるが、すべて `--max-change` の上限を超えている | [更新幅の制限](#更新幅の制限--max-change) |
 | `excluded` / `not in --only` | `--exclude` で除外した、または `--only` に含まれていない | [オプション](cli-reference.ja.md#オプション) |
 | `no suitable version` | フィルターを通るバージョンが 1 つもない（例: 現在版と、それより新しいリリースがどちらも age の基準より新しい） | [更新候補の絞り込み](#更新候補の絞り込み) |
+| `held at <MAJOR.MINOR> for Tauri sync` | 新しい major.minor の版を選んだが、Tauri の組の反対側 (npm のパッケージか `tauri` crate) がその系列に届かないので、両側を揃えるために今の版に据え置いた | [Tauri バージョン同期](ecosystems.ja.md#tauri-バージョン同期) |
 | `parse error: ...` | 制約は読み取れたが、安全に書き換えられない（例: `parse error: constraint cannot be updated safely`）。ラベルに反してマニフェスト自体は正しく解析できており、終了コードも変わらない | [自動更新しない制約](#自動更新しない制約) |
 | `fetch failed: ...` | バージョンの取得に失敗した（レジストリのエラーや `git ls-remote` の失敗など）。終了コードが変わるかどうかは原因による | [終了コード](cli-reference.ja.md#終了コード) |
 
-表の理由はテキスト出力の表記です。`--verbose` を付けた `--json` の出力では、同じ理由が `already_latest`、`current_version_too_recent`、`pinned`、`change_level_limited: <LEVEL>`、`excluded`、`not_in_only_list`、`no_suitable_version`、`parse_error: ...`、`fetch_failed: ...` と表記されます。条件に合う新しい候補の公開日が不明な場合は `release_date_unknown: <VERSION>` です。日付付きの古い候補だけが残り、それらが `--max-change` の許容範囲から外れる場合にも、日付不明の新しい候補をこの理由で報告します。Swift の依存で公開日の取得が上限に達した場合は `release_date_unchecked: <VERSION>` (テキスト出力では `release date lookup limit reached; <VERSION> and older not checked`) です。
+表の理由はテキスト出力の表記です。`--verbose` を付けた `--json` の出力では、同じ理由が `already_latest`、`current_version_too_recent`、`pinned`、`change_level_limited: <LEVEL>`、`excluded`、`not_in_only_list`、`no_suitable_version`、`tauri_sync: <MAJOR.MINOR>`、`parse_error: ...`、`fetch_failed: ...` と表記されます。条件に合う新しい候補の公開日が不明な場合は `release_date_unknown: <VERSION>` です。日付付きの古い候補だけが残り、それらが `--max-change` の許容範囲から外れる場合にも、日付不明の新しい候補をこの理由で報告します。Swift の依存で公開日の取得が上限に達した場合は `release_date_unchecked: <VERSION>` (テキスト出力では `release date lookup limit reached; <VERSION> and older not checked`) です。
 
 verbose のスキップ一覧に付く日付は、現在版自身の公開日です。古い候補の日付は使いません。現在版の日付が不明、別表記の対応が曖昧、または wildcard・prefix の浮動指定の場合は、日付を表示しません。レジストリの版にだけ build metadata が付いている場合 (crates.io の `toml` は `1.2.0+spec-1.1.0` で公開され、Cargo.toml には `1.2.0` と書く) は、build metadata を除いた優先順位が同じ唯一の版を現在版とみなします。
 
