@@ -970,6 +970,25 @@ mod tests {
         assert_eq!(spec.version, "1.0");
     }
 
+    /// 回帰テスト (#174): 下限にプレリリースの付いた互換リリース句 (`~=5.0rc1`) は、先頭の
+    /// リリースのセグメント数にそろえて書き換える (`~=5.2`)
+    #[test]
+    fn compatible_release_with_a_prerelease_lower_bound_keeps_its_release_width() {
+        for (raw, new, expected) in [
+            ("~=5.0rc1", "5.2", "~=5.2"),
+            ("~=5.0rc1", "5.2.1", "~=5.2"),
+            ("~= 1.4.0b2", "1.4.3", "~= 1.4.3"),
+            ("~=2.1.post1", "2.3", "~=2.3"),
+        ] {
+            let spec = parse(raw).unwrap();
+            assert_eq!(
+                spec.try_format_updated(new).as_deref(),
+                Some(expected),
+                "{raw}"
+            );
+        }
+    }
+
     #[test]
     fn test_parse_compatible_release_updates_correctly() {
         // ~=1.2.3 の更新フォーマット

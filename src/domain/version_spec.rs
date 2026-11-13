@@ -219,6 +219,21 @@ fn format_partial_version_like(raw: &str, new_version: &str) -> Option<String> {
     ))
 }
 
+/// PEP 440 の互換リリース句の版 (`5.0rc1` / `1.4.post2`) の、先頭のリリースのセグメント
+/// (`5.0` / `1.4`)。リリースの後ろに何も無い版 (`5.0`)、2 セグメントに満たない版、epoch
+/// (`1!5.0`) やローカル版 (`+local`) を含む版は `None` (呼び出し側で元の版をそのまま扱う)。
+fn compatible_release_segments(version: &str) -> Option<&str> {
+    if version.contains(['!', '+']) {
+        return None;
+    }
+    let end = version
+        .find(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+        .unwrap_or(version.len());
+    let release = version[..end].trim_end_matches('.');
+    (end < version.len() && release.split('.').count() >= 2 && !release.is_empty())
+        .then_some(release)
+}
+
 /// プレフィックス選択 (mise の `node = "26"` / `"26.7"`) を、元のセグメント数を
 /// 保ったまま新しいバージョンへ書き換える。
 ///
@@ -612,7 +627,11 @@ fn format_range_like(raw: &str, new_version: &str, partial_equal_is_range: bool)
         let spacing_len = rest.len() - rest.trim_start().len();
         let spacing = &rest[..spacing_len];
         let body = rest.trim();
-        return format_partial_version_like(body, new_version)
+        // 下限にプレリリースなどの付いた `~=5.0rc1` は、先頭のリリースのセグメント数 (2) が
+        // 許容幅を決める (PEP 440 で `>=5.0rc1, ==5.*`)。同じ数にそろえた `~=5.2` は幅を変えずに
+        // 下限だけを進める。以前は書き換えられないものとして扱い、更新できなかった (#174)
+        let release = compatible_release_segments(body).unwrap_or(body);
+        return format_partial_version_like(release, new_version)
             .map(|formatted| format!("~={spacing}{formatted}"));
     }
 
