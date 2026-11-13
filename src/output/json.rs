@@ -272,7 +272,9 @@ impl JsonFormatter {
                 {
                     Some(JsonSkip {
                         name: dependency.name.clone(),
-                        version: dependency.version_spec.version.clone(),
+                        // `updates[].from` とテキストの出力と同じく元の表記 (Go の `v1.6.0`) を出す。
+                        // 以前は比較用の版を出していたので `v` が落ち、同じ依存の書式が割れていた (#179)
+                        version: dependency.version_spec.display_version(),
                         reason: Self::skip_reason_to_string(reason),
                         released_at: released_at.map(|d| d.to_rfc3339()),
                         osv: match reason {
@@ -471,6 +473,25 @@ mod tests {
             JsonFormatter::skip_reason_to_string(&SkipReason::Excluded),
             "excluded"
         );
+    }
+
+    /// 回帰テスト (#179): スキップの `version` も、`updates[].from` と同じく元の表記
+    /// (Go の `v` 接頭辞) を出す
+    #[test]
+    fn skipped_versions_keep_their_written_prefix_like_updates() {
+        let spec = crate::parser::get_parser(Language::Go)
+            .parse("v1.6.0")
+            .unwrap();
+        let dependency = Dependency::new("github.com/google/uuid", spec, false, Language::Go);
+        let mut manifest = ManifestUpdateResult::new(PathBuf::from("go.mod"), Language::Go);
+        manifest.add_result(UpdateResult::skip_already_latest(dependency.clone()));
+        manifest.add_result(UpdateResult::update(dependency, "v1.7.0".to_string()));
+        let output = serde_json::to_value(
+            JsonFormatter::new(Verbosity::Verbose).manifest_to_json(&manifest),
+        )
+        .unwrap();
+        assert_eq!(output["skips"][0]["version"], "v1.6.0");
+        assert_eq!(output["updates"][0]["from"], "v1.6.0");
     }
 
     #[test]
