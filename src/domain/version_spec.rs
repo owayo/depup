@@ -182,8 +182,10 @@ fn format_wildcard_like(raw: &str, new_version: &str) -> Option<String> {
 
 fn format_partial_version_like(raw: &str, new_version: &str) -> Option<String> {
     let trimmed = raw.trim();
+    // `= 4` のような演算子の後ろの空白も、書かれたとおりに保つ (#166)
     let (op_prefix, body) = if let Some(rest) = trimmed.strip_prefix('=') {
-        ("=", rest.trim_start())
+        let body = rest.trim_start();
+        (&trimmed[..trimmed.len() - body.len()], body)
     } else {
         ("", trimmed)
     };

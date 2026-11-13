@@ -43,6 +43,19 @@ pub(crate) fn is_fully_floating_wildcard(raw: &str) -> bool {
 /// 演算子付きアンカー正規表現パターンを生成する。
 /// 各言語パーサの GTE/GT/LTE/LT (および同形の caret/tilde) ラッパが共用し、
 /// CORE 定数だけ差し替えても「1本だけパターンがずれる」不整合を防ぐ。
+/// 先頭の演算子と、その後ろの空白を書かれたとおりに返す (`"~ 1.0"` と `"~"` → `"~ "`)。
+///
+/// 接頭辞を空白の無い固定の文字列にすると、`~ 1.0` が範囲の中の最新にいても `~1.0` と
+/// 書き換え、空白だけの違いを更新として報告する (書き換え後の表記が元の表記と一致しないので、
+/// 何も変わらない更新の判定が働かない。Ruby の #107 と同じ、#166)。`trimmed` は `operator` で
+/// 始まっていること。
+pub(crate) fn operator_prefix<'a>(trimmed: &'a str, operator: &str) -> &'a str {
+    debug_assert!(trimmed.starts_with(operator), "{trimmed:?} / {operator:?}");
+    let rest = &trimmed[operator.len()..];
+    let spacing = rest.len() - rest.trim_start().len();
+    &trimmed[..operator.len() + spacing]
+}
+
 pub(crate) fn anchored_op_pattern(op: &str, core: &str) -> String {
     format!(r"^{op}\s*({core})$")
 }
