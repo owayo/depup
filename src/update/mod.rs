@@ -2227,6 +2227,33 @@ mod tests {
         }
     }
 
+    /// 回帰テスト (#165): Cargo の `=1.0` は 1.0.x を許す範囲なので、--include-pinned でも
+    /// 最新の 1.0.x の完全一致 (`=1.0.104`) へ書き換えない
+    #[test]
+    fn test_judge_cargo_partial_equal_is_not_rewritten_to_an_exact_pin() {
+        use crate::parser::{RustVersionParser, VersionParser};
+
+        let judge = UpdateJudge::new(UpdateFilter::new().with_include_pinned(true));
+        let spec = RustVersionParser.parse("=1.0").unwrap();
+        let dep = Dependency::new("anyhow", spec, false, Language::Rust);
+        let versions = vec![
+            make_version_info("1.0.0", 30),
+            make_version_info("1.0.104", 20),
+        ];
+
+        let result = judge.judge(&dep, &versions);
+        assert!(
+            matches!(
+                result,
+                UpdateResult::Skip {
+                    reason: SkipReason::AlreadyLatest,
+                    ..
+                }
+            ),
+            "{result:?}"
+        );
+    }
+
     #[test]
     fn test_judge_include_pinned() {
         let filter = UpdateFilter::new().with_include_pinned(true);

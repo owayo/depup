@@ -120,6 +120,8 @@ Git dependencies are checked with `git ls-remote` instead of a registry:
 
 Tag updates are limited to the same dependency tables as version updates and to `[patch.<registry>]` / `[patch.<registry>.<package>]`, and they preserve single or double quotes in both inline and multiline tables. Git dependencies are not subject to the age filter or the OSV check, and a failed `git ls-remote` skips the dependency without changing the exit code. `git ls-remote` never asks for credentials or a host key confirmation on the terminal: unless `GIT_SSH`, `GIT_SSH_COMMAND`, or `core.sshCommand` sets how ssh runs, depup uses `ssh -o BatchMode=yes`, so a remote that needs such a prompt fails right away.
 
+A Cargo `=` requirement with fewer than three numeric parts, such as `=1.2` or `=1`, is a partial comparator as in npm: the semver crate reads `=1.2` as any 1.2.x (`>=1.2.0, <1.3.0`). depup treats it as a range rather than a pinned exact version and keeps the visible segment shape when updating (`=1.2` → `=1.4`), also when it is the lower bound of a range such as `=1.2, <1.5`. `=1.2.3` stays pinned.
+
 Cargo comparison ranges may contain more than two comma-separated requirements, for example `>=1.0, <2.0, >=1.0.100`. Mixed multi-requirement constraints that combine caret/tilde/wildcard with comparators, such as `^1.2.2, <1.5`, are validated with `semver::VersionReq` and detected as ranges. Mixed constraints without an upper bound, such as `>=1.2.3, ^1.3`, cannot be rewritten safely and are skipped.
 
 ### Go

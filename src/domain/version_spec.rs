@@ -67,6 +67,11 @@ pub struct VersionSpec {
     /// 更新候補から除外するバージョン。例: Gradle rich version の `reject`
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rejected_versions: Vec<String>,
+    /// 数値の要素が 3 つ未満の `=` の比較子 (`=1.2` / `=1`) が範囲を表すか。npm と Cargo は
+    /// x-range (`=1.2` は `>=1.2.0, <1.3.0`) で、Composer と RubyGems は完全一致
+    /// (`=1.2` は `1.2.0`)。範囲の包含下限がこの比較子なら、書き換えで要素の数を保つ (#165)
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub partial_equal_is_range: bool,
 }
 
 fn extract_numeric_parts(new_version: &str) -> Option<Vec<String>> {
@@ -327,6 +332,21 @@ fn format_tilde_like(raw: &str, current_version: &str, new_version: &str) -> Opt
 
 /// バージョントークンの数値セグメントが 1 つ以上あり、その全てが 0 か判定する
 /// (`v` / `V` 接頭辞は許容。プレリリース等の非数値が混ざれば false)。
+/// 数値の要素が 3 つ未満の版 (`1.2` / `v1`) かを返す。プレリリースやビルドメタデータを
+/// 含む版、ワイルドカードは対象外。
+pub(crate) fn is_partial_release(token: &str) -> bool {
+    let core = token.trim();
+    let core = core
+        .strip_prefix('v')
+        .or_else(|| core.strip_prefix('V'))
+        .unwrap_or(core);
+    let segments: Vec<&str> = core.split('.').collect();
+    segments.len() < 3
+        && segments
+            .iter()
+            .all(|segment| !segment.is_empty() && segment.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 fn all_numeric_segments_are_zero(token: &str) -> bool {
     let core = token.trim();
     let core = core
@@ -549,13 +569,16 @@ fn contains_not_equal_operator(raw: &str) -> bool {
         .any(|window| window == b"!=" || window == b"<>")
 }
 
-fn format_range_like(raw: &str, new_version: &str) -> Option<String> {
+/// `partial_equal_is_range` は [`VersionSpec::partial_equal_is_range`] (部分版の `=` が
+/// x-range か)。
+fn format_range_like(raw: &str, new_version: &str, partial_equal_is_range: bool) -> Option<String> {
     // PEP 508 の末尾のカンマ (`~=1.2,` / `>=1.0,<2.0,`) は要件を足さない区切りなので、外して
     // 書き換え、後ろに付け直す。外さないと、カンマ区切りの複数の要件として扱い、上限のない
     // 組として書き換えを断るか (`~=1.2,`)、`~=` の書き換えの経路に入らない (#105)
     if let Some(body) = raw.trim_end().strip_suffix(',') {
         let tail = &raw[body.len()..];
-        return format_range_like(body, new_version).map(|formatted| format!("{formatted}{tail}"));
+        return format_range_like(body, new_version, partial_equal_is_range)
+            .map(|formatted| format!("{formatted}{tail}"));
     }
     let trimmed = raw.trim();
     let leading_ws_len = raw.len() - raw.trim_start().len();
@@ -655,9 +678,13 @@ fn format_range_like(raw: &str, new_version: &str) -> Option<String> {
         // `^` は上限が左端の非ゼロセグメントで決まる (`^1` も `^1.9.3` も <2.0.0) ため
         // 通常は対象外だが、書かれたセグメントが全てゼロのとき (`^0` = <1.0.0 /
         // `^0.0` = <0.1.0) だけはセグメント数で上限が変わるので保護する。
+        // npm と Cargo の部分版の `=` (`=1.2, <1.5`) も x-range なので要素の数を保つ。完全版を
+        // 埋めると `=1.4.9` の完全一致へ狭まる。Composer と RubyGems の `=1.2` は `1.2.0` の
+        // 完全一致なので、完全版を書く (#165)
         if operator == "~="
             || operator == "~"
             || (operator == "^" && all_numeric_segments_are_zero(&raw[start..end]))
+            || (operator == "=" && partial_equal_is_range && is_partial_release(&raw[start..end]))
         {
             return replace_version_token_preserving_shape(raw, start, end, new_version);
         }
@@ -679,6 +706,7 @@ impl VersionSpec {
             prefix: None,
             suffix: None,
             rejected_versions: Vec::new(),
+            partial_equal_is_range: false,
         }
     }
 
@@ -701,6 +729,12 @@ impl VersionSpec {
         S: Into<String>,
     {
         self.rejected_versions = versions.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// 部分版の `=` を x-range として読むエコシステム (npm / Cargo) の指定にする
+    pub fn with_partial_equal_range(mut self) -> Self {
+        self.partial_equal_is_range = true;
         self
     }
 
@@ -738,7 +772,9 @@ impl VersionSpec {
                     .unwrap_or(&self.raw);
                 format_wildcard_like(raw, new_version).map(|body| self.wrap_with_affixes(&body))
             }
-            VersionSpecKind::Range => format_range_like(&self.raw, new_version),
+            VersionSpecKind::Range => {
+                format_range_like(&self.raw, new_version, self.partial_equal_is_range)
+            }
             VersionSpecKind::Greater | VersionSpecKind::LessOrEqual | VersionSpecKind::Less => None,
             // Prefix は元のセグメント数が「どこまで固定するか」を表すため、更新後も
             // セグメント数を保つ (`26` → `27`、`26.7` → `26.8`)。完全版を書き戻すと
@@ -1315,6 +1351,7 @@ mod tests {
             prefix: None,
             suffix: None,
             rejected_versions: Vec::new(),
+            partial_equal_is_range: false,
         };
         assert_eq!(spec.try_format_updated("1.2.3").as_deref(), Some("1.2.3"));
     }

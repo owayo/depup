@@ -1,14 +1,16 @@
 //! Rust (Cargo) のバージョン指定パーサ。
 //!
 //! 対応する形式:
-//! - 固定: `=1.2.3`
+//! - 固定: `=1.2.3` (要素が 3 つ未満の `=1.2` / `=1` は部分版の比較子で、範囲として扱う)
 //! - キャレット: `1.2.3`, `^1.2.3`
 //! - チルダ: `~1.2.3`
 //! - 比較演算子: `>=1.2.3`, `>1.2.3`, `<=1.2.3`, `<1.2.3`
 //! - ワイルドカード: `1.*`, `1.x`, `1.X`
 //! - レンジ: `>=1.0, <2.0`
 
-use crate::domain::{Language, VersionSpec, VersionSpecKind, range_lower_bound_version};
+use crate::domain::{
+    Language, VersionSpec, VersionSpecKind, is_partial_release, range_lower_bound_version,
+};
 use crate::parser::{VersionParser, anchored_op_pattern};
 use regex::Regex;
 use std::sync::LazyLock;
@@ -66,15 +68,38 @@ static FIRST_VERSION_TOKEN_RE: LazyLock<Regex> =
 
 impl VersionParser for RustVersionParser {
     fn parse(&self, version_str: &str) -> Option<VersionSpec> {
+        // semver crate の部分版の `=` (`=1.2`) は x-range なので、範囲の書き換えで要素の数を
+        // 保たせる (#165)
+        parse_spec(version_str).map(|spec| {
+            if spec.kind == VersionSpecKind::Range {
+                spec.with_partial_equal_range()
+            } else {
+                spec
+            }
+        })
+    }
+
+    fn language(&self) -> Language {
+        Language::Rust
+    }
+}
+
+fn parse_spec(version_str: &str) -> Option<VersionSpec> {
+    {
         let trimmed = version_str.trim();
 
         if trimmed.is_empty() {
             return None;
         }
 
-        // 固定バージョン
+        // 固定バージョン。数値の要素が 3 つ未満の `=` (`=1.0` / `=1`) は、semver crate では
+        // 部分版の比較子 (`=1.0` は `>=1.0.0, <1.1.0`、`=1` は `>=1.0.0, <2.0.0`) なので、
+        // npm の `=1.2` と同じく範囲として扱い、更新でも要素の数を保つ (#165)
         if let Some(caps) = EXACT_PINNED_RE.captures(trimmed) {
             let version = caps.get(1)?.as_str();
+            if is_partial_release(version) {
+                return Some(VersionSpec::new(VersionSpecKind::Range, trimmed, version));
+            }
             return Some(
                 VersionSpec::new(VersionSpecKind::Exact, trimmed, version).with_prefix("="),
             );
@@ -198,10 +223,6 @@ impl VersionParser for RustVersionParser {
 
         None
     }
-
-    fn language(&self) -> Language {
-        Language::Rust
-    }
 }
 
 #[cfg(test)]
@@ -210,6 +231,35 @@ mod tests {
 
     fn parse(version: &str) -> Option<VersionSpec> {
         RustVersionParser.parse(version)
+    }
+
+    /// 回帰テスト (#165): 数値の要素が 3 つ未満の `=` は semver crate の部分版の比較子
+    /// (`=1.0` は `>=1.0.0, <1.1.0`) なので、完全一致の固定ではなく範囲として扱い、
+    /// 更新でも要素の数を保つ
+    #[test]
+    fn partial_equal_requirements_are_ranges_that_keep_their_width() {
+        let minor = parse("=1.0").unwrap();
+        assert_eq!(minor.kind, VersionSpecKind::Range);
+        assert!(!minor.is_pinned());
+        assert_eq!(minor.version, "1.0");
+        assert_eq!(minor.format_updated("1.0.104"), "=1.0");
+        assert_eq!(minor.format_updated("1.2.3"), "=1.2");
+
+        let major = parse("=1").unwrap();
+        assert_eq!(major.kind, VersionSpecKind::Range);
+        assert_eq!(major.format_updated("2.3.4"), "=2");
+
+        // 範囲の包含下限の部分版の `=` も要素の数を保つ (完全版を書くと完全一致へ狭まる)
+        let bounded = parse("=1.2, <1.5").unwrap();
+        assert_eq!(bounded.kind, VersionSpecKind::Range);
+        assert_eq!(bounded.format_updated("1.4.9"), "=1.4, <1.5");
+
+        // 完全な版の `=` はこれまでどおり固定
+        for exact in ["=1.2.3", "=1.2.3-rc.1", "=1.2.3+build"] {
+            let spec = parse(exact).unwrap();
+            assert_eq!(spec.kind, VersionSpecKind::Exact, "{exact}");
+            assert!(spec.is_pinned(), "{exact}");
+        }
     }
 
     #[test]
