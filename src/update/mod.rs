@@ -1124,8 +1124,12 @@ fn select_latest_candidate(
         );
     }
 
-    // 更新先の文字列表現を安全に組み立てられない制約は更新対象にしない
-    let Some(formatted) = dependency.version_spec.try_format_updated(&latest.version) else {
+    // 更新先の文字列表現を安全に組み立てられない制約は更新対象にしない。
+    // 書き込みと同じ表記 (Rust は build metadata を落とす) で整形する (#157)
+    let Some(formatted) = dependency
+        .version_spec
+        .try_format_updated(dependency.language.manifest_version(&latest.version))
+    else {
         return UpdateResult::skip(
             dependency.clone(),
             SkipReason::ParseError("constraint cannot be updated safely".to_string()),
@@ -3273,6 +3277,41 @@ mod tests {
             UpdateResult::Update { new_version, .. } => assert_eq!(new_version, "3.0.0-rc.1"),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// Issue #157: Rust の更新先に build metadata が付いていても (`1.2.1+spec-1.1.0`)、書き込みと
+    /// 同じく落とした表記で整形する。以前は `~1` を `~1.2.1+spec-1.1.0` と整形して、書いても
+    /// 変わらない (`~1` のまま) 更新を毎回報告していた。
+    #[test]
+    fn test_judge_formats_rust_updates_without_build_metadata() {
+        let judge = UpdateJudge::new(UpdateFilter::new());
+        let versions = vec![
+            make_version_info("1.1.8+spec-1.1.0", 60),
+            make_version_info("1.2.1+spec-1.1.0", 30),
+        ];
+        let parse = |raw: &str| {
+            Dependency::new(
+                "toml",
+                crate::parser::get_parser(Language::Rust)
+                    .parse(raw)
+                    .unwrap(),
+                false,
+                Language::Rust,
+            )
+        };
+        // `~1` は 1.x の範囲で、1.2.1 も範囲内なので書き換えない
+        assert!(matches!(
+            judge.judge(&parse("~1"), &versions),
+            UpdateResult::Skip {
+                reason: SkipReason::AlreadyLatest,
+                ..
+            }
+        ));
+        // 通常の更新は従来どおり。更新先の版はレジストリの表記 (build metadata 付き) のまま
+        assert!(matches!(
+            judge.judge(&parse("1.1.8"), &versions),
+            UpdateResult::Update { new_version, .. } if new_version == "1.2.1+spec-1.1.0"
+        ));
     }
 
     /// Issue #156: Java の安定版の利用者を、Maven の beta の省略形 (`-b<数字>`) へ更新しない
