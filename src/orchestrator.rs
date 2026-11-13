@@ -774,10 +774,6 @@ impl Orchestrator {
             let osv_baselines = self.osv_baselines(info, &dependencies).await;
             let dir = info.path.parent().unwrap_or(&self.args.path);
             let (mut filter, notices) = self.build_filter_for(dir);
-            for notice in unseen_notices(&mut shown_notices, notices) {
-                // 進捗バーの表示中は、バーと混ざらないように出す
-                progress.suspend(|| eprintln!("{notice}"));
-            }
             let policy = match self.resolved_age_policy_for_language(dir, info.language) {
                 Ok(policy) => policy,
                 Err(message) => {
@@ -788,6 +784,12 @@ impl Orchestrator {
                     continue;
                 }
             };
+            // 設定を確かめてから通知する。止めたマニフェストについて、採らなかった設定を
+            // 使うような通知を出さない (#167)
+            for notice in unseen_notices(&mut shown_notices, notices) {
+                // 進捗バーの表示中は、バーと混ざらないように出す
+                progress.suspend(|| eprintln!("{notice}"));
+            }
             filter.min_age = policy.min_age;
             filter.age_exempt = policy.exemptions.clone();
             let overrides = if info.language == Language::Node
@@ -1045,16 +1047,22 @@ impl Orchestrator {
         language: Language,
     ) -> Result<AgePolicy, String> {
         let mut policy = self.resolved_age_policy_for(dir);
-        if language == Language::Node {
-            let root = age::project_scope_root(&self.args.path);
-            let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-            for scope in dir.ancestors().take_while(|scope| scope.starts_with(&root)) {
-                if let Some((age, _)) =
-                    crate::manifest::PnpmSettings::checked_minimum_release_age_with_source(scope)?
-                {
-                    policy.min_age = policy.min_age.max(Some(age));
-                    policy.exemptions = crate::update::AgeExemptions::default();
-                }
+        let root = age::project_scope_root(&self.args.path);
+        let scope_dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        for scope in scope_dir
+            .ancestors()
+            .take_while(|scope| scope.starts_with(&root))
+        {
+            // pnpm の minimumReleaseAge はどの言語の age にも効く (`resolve` の project_ages)。
+            // 解釈できない値は、Node と同じくどの言語でもエラーにする。以前は Node 以外で黙って
+            // 捨て、通知も出さずに弱い設定で更新先を選んでいた (#167)
+            let checked =
+                crate::manifest::PnpmSettings::checked_minimum_release_age_with_source(scope)?;
+            if language == Language::Node
+                && let Some((age, _)) = checked
+            {
+                policy.min_age = policy.min_age.max(Some(age));
+                policy.exemptions = crate::update::AgeExemptions::default();
             }
         }
         // mise の利用者設定は --no-age で上書きする。プロジェクトの明示制約は残す。
@@ -4187,6 +4195,27 @@ mod tests {
             filter.min_age.unwrap(),
             std::time::Duration::from_secs(10 * 24 * 60 * 60)
         );
+    }
+
+    /// 回帰テスト (#167): `.npmrc` の minimum-release-age を解釈できないとき、Node 以外の
+    /// 言語でも黙って捨てずにエラーにする (Node と同じ扱い)
+    #[test]
+    fn an_invalid_npmrc_age_is_an_error_for_every_language() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join(".npmrc"), "minimum-release-age=one week\n").unwrap();
+
+        let args = make_args_with_path(dir.path(), &[]);
+        let orchestrator = Orchestrator::new(args).unwrap();
+        for language in [Language::Node, Language::Python, Language::Rust] {
+            let result = orchestrator.resolved_age_policy_for_language(dir.path(), language);
+            assert!(
+                result
+                    .as_ref()
+                    .is_err_and(|message| message.contains(".npmrc")),
+                "{language:?}: {:?}",
+                result.map(|policy| policy.min_age)
+            );
+        }
     }
 
     #[test]

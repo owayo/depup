@@ -672,8 +672,11 @@ async fn root_detected_tauri_members_join_the_blocked_node_and_cargo_scope() {
     }
 }
 
+/// 解釈できない (読めない) プロジェクトの minimumReleaseAge は、そのプロジェクトのどの言語の
+/// マニフェストも更新先を選ぶ前に止める。Tauri の Rust 側も書き換えず、独立したプロジェクトは
+/// 更新・監査・install の計画へ進む (#167。以前は Node だけを止め、Rust は preflight で止めていた)
 #[tokio::test]
-async fn failed_node_policy_keeps_tauri_rust_unwritten_and_independent_projects_running() {
+async fn invalid_project_age_stops_every_manifest_of_its_project_and_others_keep_running() {
     for unreadable in [false, true] {
         let temp = tempfile::tempdir().unwrap();
         let app = temp.path().join("app");
@@ -698,14 +701,22 @@ async fn failed_node_policy_keeps_tauri_rust_unwritten_and_independent_projects_
             std::fs::read(app.join("src-tauri/Cargo.toml")).unwrap(),
             rust_before
         );
-        assert_eq!(result.summary.total_failed(), 2);
+        // 更新先を選ぶ前に止めるので、書き込めなかった更新 (failed) にはならない
+        assert_eq!(result.summary.total_failed(), 0);
         assert_eq!(result.summary.total_updates(), 4);
         let calls = auditor.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, std::fs::canonicalize(&other).unwrap());
-        assert!(result.errors.iter().any(|error| matches!(error,
-            crate::orchestrator::OrchestratorError::NodePreflightError { directory, message }
-            if directory == &std::fs::canonicalize(&app).unwrap() && message.contains("policy could not be read or interpreted"))));
+        for manifest in [app.join("package.json"), app.join("src-tauri/Cargo.toml")] {
+            assert!(
+                result.errors.iter().any(|error| matches!(error,
+                    crate::orchestrator::OrchestratorError::ManifestParseError { path, message }
+                    if std::path::Path::new(path) == manifest && message.contains(".npmrc"))),
+                "{}: {:?}",
+                manifest.display(),
+                result.errors
+            );
+        }
         let plan = InstallPlan::new_scoped(
             &orchestrator,
             &result,
@@ -721,12 +732,17 @@ async fn failed_node_policy_keeps_tauri_rust_unwritten_and_independent_projects_
     }
 }
 
+/// 解釈できないプロジェクトの minimumReleaseAge は、Node を除いた実行 (`--rust`) でも、
+/// dry-run や install なしでも、Rust の更新先を選ばずに止める。lock の監査も呼ばない (#167)
 #[tokio::test]
-async fn failed_node_policy_does_not_preflight_excluded_languages_dryrun_or_noinstall() {
-    for options in [
-        vec!["--rust", "--install"],
-        vec!["--install", "--dry-run"],
-        vec![],
+async fn invalid_project_age_stops_rust_too_without_auditing_locks() {
+    for (options, stopped) in [
+        (vec!["--rust", "--install"], vec!["src-tauri/Cargo.toml"]),
+        (
+            vec!["--install", "--dry-run"],
+            vec!["package.json", "src-tauri/Cargo.toml"],
+        ),
+        (vec![], vec!["package.json", "src-tauri/Cargo.toml"]),
     ] {
         let temp = tempfile::tempdir().unwrap();
         write_tauri(temp.path(), "app");
@@ -734,9 +750,44 @@ async fn failed_node_policy_does_not_preflight_excluded_languages_dryrun_or_noin
         let orchestrator = tauri_orchestrator(temp.path(), &options).await;
         let auditor = FakeAuditor::default();
         let result = run(&orchestrator, &[temp.path()], &auditor).await;
-        assert_eq!(result.summary.total_failed(), 0);
-        assert!(result.summary.total_updates() >= 2);
-        assert!(auditor.calls.lock().unwrap().is_empty());
+        assert_eq!(result.summary.total_failed(), 0, "{options:?}");
+        assert_eq!(result.summary.total_updates(), 0, "{options:?}");
+        assert!(auditor.calls.lock().unwrap().is_empty(), "{options:?}");
+        for manifest in stopped {
+            let manifest = temp.path().join(manifest);
+            assert!(
+                result.errors.iter().any(|error| matches!(error,
+                    crate::orchestrator::OrchestratorError::ManifestParseError { path, message }
+                    if std::path::Path::new(path) == manifest && message.contains(".npmrc"))),
+                "{options:?} {}: {:?}",
+                manifest.display(),
+                result.errors
+            );
+        }
+    }
+}
+
+/// Node を除いた実行 (`--rust`)・dry-run・install なしでは、監査すれば違反になる lock が
+/// あっても事前に監査せず、更新の判定を進める
+#[tokio::test]
+async fn preflight_is_skipped_for_excluded_languages_dryrun_or_noinstall() {
+    for options in [
+        vec!["--rust", "--install"],
+        vec!["--install", "--dry-run"],
+        vec![],
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        write_tauri(temp.path(), "app");
+        let orchestrator = tauri_orchestrator(temp.path(), &options).await;
+        let auditor = FakeAuditor::default();
+        auditor.results.lock().unwrap().insert(
+            std::fs::canonicalize(temp.path()).unwrap(),
+            violation(&orchestrator),
+        );
+        let result = run(&orchestrator, &[temp.path()], &auditor).await;
+        assert_eq!(result.summary.total_failed(), 0, "{options:?}");
+        assert!(result.summary.total_updates() >= 2, "{options:?}");
+        assert!(auditor.calls.lock().unwrap().is_empty(), "{options:?}");
         assert!(result.errors.iter().all(|error| !matches!(
             error,
             crate::orchestrator::OrchestratorError::NodePreflightError { .. }
