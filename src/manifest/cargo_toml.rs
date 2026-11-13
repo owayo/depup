@@ -8,6 +8,7 @@
 //! - inline table 形式: `{ version = "1.0" }`
 //! - workspace 依存関係
 
+use crate::domain::git_urls_match;
 use crate::domain::{Dependency, GitReference, GitSource, Language, VersionSpec, VersionSpecKind};
 use crate::error::ManifestError;
 use crate::manifest::{
@@ -19,6 +20,7 @@ use crate::manifest::{
 };
 use crate::parser::{VersionParser, get_parser};
 use regex::Regex;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 use toml::Value;
@@ -67,6 +69,62 @@ fn is_cargo_package_git_tag_table(section: &str, package: &str) -> bool {
                 .strip_prefix("patch.")
                 .is_some_and(|registry| !registry.is_empty())
     })
+}
+
+/// `[patch.<registry>]` の親セクションの registry (引用符を外したもの)。
+fn patch_registry(parent_section: &str) -> Option<&str> {
+    let registry = parent_section.strip_prefix("patch.")?.trim();
+    Some(registry.trim_matches('"').trim_matches('\''))
+}
+
+/// `[patch.<registry>]` で `package` を、依存セクションに書いた `package` の `git` のどれとも違う
+/// リポジトリ (fork など) へ差し替えている registry の一覧。
+///
+/// 新しい tag は依存の URL (upstream) の `git ls-remote` で決めたものなので、別のリポジトリを指す
+/// patch の tag は書き換えない。以前は URL を照合せずに書き換え、fork に無い tag を書いて patch を
+/// 壊していた (#160)。TOML として読めなければ空 (どの patch も別のリポジトリとはみなさない)。
+fn foreign_git_patch_registries(content: &str, package: &str) -> HashSet<String> {
+    let Ok(toml) = toml::from_str::<Value>(content) else {
+        return HashSet::new();
+    };
+    fn git_of<'a>(dependencies: Option<&'a Value>, package: &str) -> Option<&'a str> {
+        dependencies?.get(package)?.get("git")?.as_str()
+    }
+    const SECTIONS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+    let mut upstream: Vec<&str> = SECTIONS
+        .iter()
+        .filter_map(|section| git_of(toml.get(*section), package))
+        .collect();
+    if let Some(targets) = toml.get("target").and_then(Value::as_table) {
+        for config in targets.values() {
+            upstream.extend(
+                SECTIONS
+                    .iter()
+                    .filter_map(|section| git_of(config.get(*section), package)),
+            );
+        }
+    }
+    upstream.extend(git_of(
+        toml.get("workspace")
+            .and_then(|workspace| workspace.get("dependencies")),
+        package,
+    ));
+    // 同じファイルに依存の宣言が無ければ取得元を照合できないので、従来どおり書き換える
+    if upstream.is_empty() {
+        return HashSet::new();
+    }
+    toml.get("patch")
+        .and_then(Value::as_table)
+        .into_iter()
+        .flatten()
+        .filter_map(|(registry, patches)| {
+            let url = patches.get(package)?.get("git")?.as_str()?;
+            (!upstream
+                .iter()
+                .any(|upstream| git_urls_match(url, upstream)))
+            .then(|| registry.clone())
+        })
+        .collect()
 }
 
 /// インラインテーブル 形式の git tag を更新してよい親セクションかどうかを返す。
@@ -522,6 +580,11 @@ impl ManifestParser for CargoTomlParser {
 
         // インラインテーブル・dotted key・複数行テーブルをセクション追跡しながら更新する。
         // 依存セクション外の同名キーを誤って書き換えず、TOML の単一引用符も保持する。
+        // 別のリポジトリ (fork など) を指す `[patch]` の宣言は書き換えない (#160)。
+        let foreign = foreign_git_patch_registries(content, package);
+        let foreign_patch = |parent: &str| {
+            patch_registry(parent).is_some_and(|registry| foreign.contains(registry))
+        };
         let mut section = "";
         let mut rebuilt = String::with_capacity(content.len());
         let mut line_start = 0usize;
@@ -542,6 +605,7 @@ impl ManifestParser for CargoTomlParser {
 
             // 複数行の inline table の `tag` も、閉じる行までをまとめて扱う (#98)。
             if is_cargo_git_tag_inline_section(section)
+                && !foreign_patch(section)
                 && let Some(table) = multiline_inline_table(content, segment_start, line, package)
             {
                 written_until = line_end_after(content, table.1);
@@ -559,6 +623,7 @@ impl ManifestParser for CargoTomlParser {
 
             // inline table と dotted key は同じ親セクションで有効になる。
             if is_cargo_git_tag_inline_section(section)
+                && !foreign_patch(section)
                 && let Some((key, remainder)) = cargo_package_line(line, package)
                 && let Some((regex, caps)) = INLINE_TAG_RE
                     .captures(remainder)
@@ -578,6 +643,7 @@ impl ManifestParser for CargoTomlParser {
             }
 
             if is_cargo_package_git_tag_table(section, package)
+                && !cargo_package_table_parent(section, package).is_some_and(foreign_patch)
                 && let Some(caps) = TAG_LINE_RE.captures(line)
             {
                 let quote = if caps.get(3).is_some() { "'" } else { "\"" };
@@ -1889,6 +1955,38 @@ tag = "v1.2.3"
         assert!(result.contains(r#"tag = "v1.3.0""#));
         assert!(result.contains(r#"# tag = "v0.9.0" 以前のタグ"#));
         assert!(!result.contains(r#"tag = "v1.2.3""#));
+    }
+
+    /// Issue #160: 別のリポジトリ (fork) を指す `[patch]` の tag は、upstream の新しい tag で
+    /// 書き換えない。同じリポジトリを指す patch は従来どおり揃える。
+    #[test]
+    fn test_update_git_tag_keeps_patches_that_point_to_another_repository() {
+        let content = r#"[dependencies]
+foo = { git = "https://example.com/upstream.git", tag = "v1.0.0" }
+
+[patch."https://example.com/upstream.git"]
+foo = { git = "https://example.com/fork.git", tag = "v1.0.0-fix" }
+
+[patch.crates-io.foo]
+git = "https://example.com/fork"
+tag = "v1.0.0-fix"
+
+[patch.'https://example.com/other.git']
+foo = { git = "https://example.com/upstream", tag = "v1.0.0" }
+"#;
+        let result = CargoTomlParser
+            .update_git_tag(content, "foo", "v1.1.0")
+            .unwrap();
+        assert_eq!(
+            result,
+            content
+                .replacen(r#"tag = "v1.0.0" }"#, r#"tag = "v1.1.0" }"#, 1)
+                .replace(
+                    r#"foo = { git = "https://example.com/upstream", tag = "v1.0.0" }"#,
+                    r#"foo = { git = "https://example.com/upstream", tag = "v1.1.0" }"#
+                )
+        );
+        assert_eq!(result.matches("v1.0.0-fix").count(), 2, "{result}");
     }
 
     #[test]

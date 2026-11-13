@@ -20,6 +20,7 @@ mod version_spec;
 pub use age::{MAX_AGE_SECS, checked_age, checked_age_from_minutes, cutoff_from, cutoff_now};
 pub use change_level::ChangeLevel;
 pub use dependency::Dependency;
+pub(crate) use git_source::git_urls_match;
 pub use git_source::{GitReference, GitSource};
 pub use language::Language;
 pub use summary::{LanguageCounts, LockRefreshResult, ManifestUpdateResult, UpdateSummary};

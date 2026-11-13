@@ -2117,14 +2117,7 @@ fn enrich_with_cargo_lock(
     }
 }
 
-/// git URL 同士を末尾の `/` と `.git` の差を無視して比較する
-fn git_urls_match(a: &str, b: &str) -> bool {
-    fn normalize(url: &str) -> &str {
-        let url = url.trim_end_matches('/');
-        url.strip_suffix(".git").unwrap_or(url)
-    }
-    normalize(a) == normalize(b)
-}
+use crate::domain::git_urls_match;
 
 /// Tauri バージョン同期が judge の結果を上書きしてはならないかどうか。
 ///

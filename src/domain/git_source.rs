@@ -53,6 +53,17 @@ impl fmt::Display for GitReference {
     }
 }
 
+/// git URL 同士を、末尾の `/` と `.git` の差を無視して比べる。
+/// Cargo.lock の取得元との照合 (orchestrator) と、Cargo.toml の `[patch]` の取得元の照合
+/// (manifest::cargo_toml) が共有する。
+pub(crate) fn git_urls_match(a: &str, b: &str) -> bool {
+    fn normalize(url: &str) -> &str {
+        let url = url.trim_end_matches('/');
+        url.strip_suffix(".git").unwrap_or(url)
+    }
+    normalize(a) == normalize(b)
+}
+
 /// マニフェストで宣言された git 依存
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitSource {
