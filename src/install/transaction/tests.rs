@@ -2024,7 +2024,7 @@ fn wrapper_second_pass_failure_restores_binary_scripts_properties_and_skips_java
         &mut result,
         &directory.join("build.gradle"),
         Language::Java,
-        "dependencies { implementation 'org.example:library:1.0.0' }\n",
+        "dependencies {\n    implementation 'org.example:library:1.0.0'\n}\n",
         "org.example:library",
     );
     fs::write(
