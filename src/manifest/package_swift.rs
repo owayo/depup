@@ -288,120 +288,95 @@ fn mask_comments(content: &str) -> String {
     masked
 }
 
+/// parse が依存として読む `.package(...)` の宣言 1 つ
+struct SwiftDeclaration {
+    /// 宣言の開始位置 (`.package(` の位置)
+    start: usize,
+    /// 書き換える版 (範囲なら下限) の文字列の範囲 (引用符の内側)
+    version: std::ops::Range<usize>,
+    dependency: Dependency,
+}
+
+/// コメントを伏せた本文から、版の指定を解析できた `.package(...)` の宣言を、書かれた順に返す。
+///
+/// parse と書き換えはこの一覧を共有する。同じ URL の宣言が複数あると、parse は解析できた
+/// 宣言の先頭を採るので、書き換えも同じ宣言を選ぶ。以前の書き換えは最初に現れた URL に固定して
+/// いたので、`#if` で分けた最初の宣言が `branch:` の形だと対象がずれ、報告した更新を書き換え
+/// られなかった (#170)。
+fn swift_declarations(clean: &str) -> Vec<SwiftDeclaration> {
+    let mut found = Vec::new();
+
+    // より具体的なパターンを先に、汎用の FROM_RE を最後に試す (同じ位置では先のものが残る)
+    let single: [(&Regex, VersionSpecKind); 5] = [
+        (&UP_TO_NEXT_MAJOR_RE, VersionSpecKind::Caret),
+        (&UP_TO_NEXT_MINOR_RE, VersionSpecKind::Tilde),
+        (&EXACT_KEYWORD_RE, VersionSpecKind::Exact),
+        (&EXACT_METHOD_RE, VersionSpecKind::Exact),
+        (&FROM_RE, VersionSpecKind::Caret),
+    ];
+    for (regex, kind) in single {
+        for caps in regex.captures_iter(clean) {
+            let (Some(whole), Some(url), Some(version)) = (caps.get(0), caps.get(1), caps.get(2))
+            else {
+                continue;
+            };
+            if let Some(dependency) = swift_dependency(
+                url.as_str(),
+                kind,
+                version.as_str().to_string(),
+                version.as_str(),
+                &[],
+            ) {
+                found.push(SwiftDeclaration {
+                    start: whole.start(),
+                    version: version.range(),
+                    dependency,
+                });
+            }
+        }
+    }
+
+    let ranges: [(&Regex, &str); 2] = [(&RANGE_HALF_OPEN_RE, "..<"), (&RANGE_CLOSED_RE, "...")];
+    for (regex, operator) in ranges {
+        for caps in regex.captures_iter(clean) {
+            let (Some(whole), Some(url), Some(lower), Some(upper)) =
+                (caps.get(0), caps.get(1), caps.get(2), caps.get(3))
+            else {
+                continue;
+            };
+            let raw = format!("{}{operator}{}", lower.as_str(), upper.as_str());
+            if let Some(dependency) = swift_dependency(
+                url.as_str(),
+                VersionSpecKind::Range,
+                raw,
+                lower.as_str(),
+                &[upper.as_str()],
+            ) {
+                found.push(SwiftDeclaration {
+                    start: whole.start(),
+                    version: lower.range(),
+                    dependency,
+                });
+            }
+        }
+    }
+
+    // 元の順序を保つため位置でソートする (安定ソート)
+    found.sort_by_key(|declaration| declaration.start);
+    found
+}
+
 impl ManifestParser for PackageSwiftParser {
     fn parse(&self, content: &str) -> Result<Vec<Dependency>, ManifestError> {
         // コメントをマスクし、URL やバージョン文字列の位置を保ったまま全体を走査する
         let clean = mask_comments(content);
-        let mut found: Vec<(usize, Dependency)> = Vec::new();
 
-        // より具体的なパターンを先に、汎用の FROM_RE を最後に試す
-        for caps in UP_TO_NEXT_MAJOR_RE.captures_iter(&clean) {
-            let pos = caps.get(0).unwrap().start();
-            let url = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-            let version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-            if let Some(dep) = swift_dependency(
-                url,
-                VersionSpecKind::Caret,
-                version.to_string(),
-                version,
-                &[],
-            ) {
-                found.push((pos, dep));
-            }
-        }
-
-        for caps in UP_TO_NEXT_MINOR_RE.captures_iter(&clean) {
-            let pos = caps.get(0).unwrap().start();
-            let url = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-            let version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-            if let Some(dep) = swift_dependency(
-                url,
-                VersionSpecKind::Tilde,
-                version.to_string(),
-                version,
-                &[],
-            ) {
-                found.push((pos, dep));
-            }
-        }
-
-        for caps in EXACT_KEYWORD_RE.captures_iter(&clean) {
-            let pos = caps.get(0).unwrap().start();
-            let url = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-            let version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-            if let Some(dep) = swift_dependency(
-                url,
-                VersionSpecKind::Exact,
-                version.to_string(),
-                version,
-                &[],
-            ) {
-                found.push((pos, dep));
-            }
-        }
-
-        for caps in EXACT_METHOD_RE.captures_iter(&clean) {
-            let pos = caps.get(0).unwrap().start();
-            let url = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-            let version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-            if let Some(dep) = swift_dependency(
-                url,
-                VersionSpecKind::Exact,
-                version.to_string(),
-                version,
-                &[],
-            ) {
-                found.push((pos, dep));
-            }
-        }
-
-        for caps in RANGE_HALF_OPEN_RE.captures_iter(&clean) {
-            let pos = caps.get(0).unwrap().start();
-            let url = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-            let lower = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-            let upper = caps.get(3).map(|m| m.as_str()).unwrap_or("");
-            let raw = format!("{}..<{}", lower, upper);
-            if let Some(dep) = swift_dependency(url, VersionSpecKind::Range, raw, lower, &[upper]) {
-                found.push((pos, dep));
-            }
-        }
-
-        for caps in RANGE_CLOSED_RE.captures_iter(&clean) {
-            let pos = caps.get(0).unwrap().start();
-            let url = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-            let lower = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-            let upper = caps.get(3).map(|m| m.as_str()).unwrap_or("");
-            let raw = format!("{}...{}", lower, upper);
-            if let Some(dep) = swift_dependency(url, VersionSpecKind::Range, raw, lower, &[upper]) {
-                found.push((pos, dep));
-            }
-        }
-
-        // FROM_RE を最後に (最も汎用的なパターン)
-        for caps in FROM_RE.captures_iter(&clean) {
-            let pos = caps.get(0).unwrap().start();
-            let url = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-            let version = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-            if let Some(dep) = swift_dependency(
-                url,
-                VersionSpecKind::Caret,
-                version.to_string(),
-                version,
-                &[],
-            ) {
-                found.push((pos, dep));
-            }
-        }
-
-        // 元の順序を保つため位置でソートする
-        found.sort_by_key(|(pos, _)| *pos);
-
-        // パッケージ名で重複を除去する
+        // パッケージ名で重複を除去する (先に書かれた宣言を採る)
         let mut seen = std::collections::HashSet::new();
-        let dependencies = found
+        let dependencies = swift_declarations(&clean)
             .into_iter()
-            .filter(|(_, dep)| seen.insert(dep.name.clone()))
-            .map(|(_, dep)| dep)
+            .filter(|declaration| seen.insert(declaration.dependency.name.clone()))
+            .map(|declaration| declaration.dependency)
             .collect();
 
         Ok(dependencies)
@@ -431,116 +406,23 @@ impl ManifestParser for PackageSwiftParser {
             });
         }
 
-        let escaped_package = regex::escape(package);
-        // URL は Swift 文字列リテラル内にあるため、リポジトリ名の直後には必ず閉じ引用符
-        // (`"`) かパス区切り等の境界文字が続く。境界文字を要求することで、
-        // `grpc/grpc-swift` の更新が先に宣言された `grpc/grpc-swift-nio` の URL へ
-        // 前方一致して別依存を書き換えるのを防ぐ (前方一致は境界で弾かれるため、
-        // 最初のマッチが境界一致した正しい宣言になる)。
-        // ホスト名は大小文字を区別しないため `(?i:...)` で囲む。`extract_github_owner_repo`
-        // が `https://GitHub.com/...` を受理する一方でここが大小区別のままだと、parse は
-        // 依存として surface するのに書き換え先が見つからず report/apply が矛盾する。
-        // owner/repo 側まで大小無視にすると別リポジトリへ誤爆するため、ホスト部だけを囲む。
-        // `extract_github_owner_repo` は GitHub の SSH over 443
-        // (`ssh://git@ssh.github.com:443/owner/repo.git`) も正規形として受理するため、
-        // ホスト部に `ssh.` 接頭辞とポート番号を許容しないと parse だけ通って
-        // 書き換え先が見つからず report/apply が矛盾する
-        let url_pattern = format!(
-            r#"((?i:(?:ssh\.)?github\.com)(?::\d+)?[/:]{}(?:\.git)?)["'/?#\s)]"#,
-            escaped_package
-        );
+        // parse が採る宣言 (同じ名前の宣言のうち、版の指定を解析できた最初のもの) の版
+        // (範囲なら下限) の文字列だけを差し替える (#170)
         let masked = mask_comments(content);
-
-        let url_re = Regex::new(&url_pattern).map_err(|e| ManifestError::InvalidVersionSpec {
-            path: PathBuf::from("Package.swift"),
-            spec: package.to_string(),
-            message: format!("invalid regex pattern: {}", e),
-        })?;
-
-        // SPM は semver 2.0.0 準拠のためプレリリース識別子とビルドメタデータも許容する
-        let version_re = Regex::new(
-            r#""((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)""#,
-        )
-            .map_err(|e| ManifestError::InvalidVersionSpec {
-                path: PathBuf::from("Package.swift"),
-                spec: package.to_string(),
-                message: format!("invalid regex pattern: {}", e),
-            })?;
-
-        // 全体から URL を検索する (複数行宣言に対応)。
-        // 境界文字込みでマッチさせ、以降の位置計算には URL 本体 (グループ1) の範囲を使う
-        let url_match = url_re
-            .captures(&masked)
-            .and_then(|caps| caps.get(1))
+        let declaration = swift_declarations(&masked)
+            .into_iter()
+            .find(|declaration| declaration.dependency.name == package)
             .ok_or_else(|| ManifestError::InvalidVersionSpec {
                 path: PathBuf::from("Package.swift"),
                 spec: package.to_string(),
                 message: "package not found or version could not be updated".to_string(),
             })?;
 
-        // 囲む .package() 宣言を見つける
-        let prefix = &masked[..url_match.start()];
-        let pkg_start =
-            prefix
-                .rfind(".package(")
-                .ok_or_else(|| ManifestError::InvalidVersionSpec {
-                    path: PathBuf::from("Package.swift"),
-                    spec: package.to_string(),
-                    message: "package not found or version could not be updated".to_string(),
-                })?;
-
-        // .package( から URL 末尾までの括弧深度を数える
-        let mut depth: i32 = 0;
-        for c in masked[pkg_start..url_match.end()].chars() {
-            match c {
-                '(' => depth += 1,
-                ')' => depth -= 1,
-                _ => {}
-            }
-        }
-
-        if depth <= 0 {
-            return Err(ManifestError::InvalidVersionSpec {
-                path: PathBuf::from("Package.swift"),
-                spec: package.to_string(),
-                message: "package not found or version could not be updated".to_string(),
-            });
-        }
-
-        // 対応する閉じ括弧を見つける
-        let mut end_pos = content.len();
-        for (i, c) in masked[url_match.end()..].char_indices() {
-            match c {
-                '(' => depth += 1,
-                ')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end_pos = url_match.end() + i + 1;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        // URL 末尾からパッケージ宣言末尾までの実バージョン文字列だけを差し替える
-        let masked_section = &masked[url_match.end()..end_pos];
-        let Some(version_match) = version_re.find(masked_section) else {
-            return Err(ManifestError::InvalidVersionSpec {
-                path: PathBuf::from("Package.swift"),
-                spec: package.to_string(),
-                message: "package not found or version could not be updated".to_string(),
-            });
-        };
-
-        let replace_start = url_match.end() + version_match.start();
-        let replace_end = url_match.end() + version_match.end();
-
         Ok(format!(
-            "{}\"{}\"{}",
-            &content[..replace_start],
+            "{}{}{}",
+            &content[..declaration.version.start],
             new_version,
-            &content[replace_end..]
+            &content[declaration.version.end..]
         ))
     }
 }
@@ -552,6 +434,43 @@ mod tests {
 
     fn parse(content: &str) -> Result<Vec<Dependency>, ManifestError> {
         PackageSwiftParser.parse(content)
+    }
+
+    /// 回帰テスト (#170): 同じ URL の宣言が複数あると、parse が採る宣言 (版の指定を解析できた
+    /// 最初の宣言) を書き換える。最初の宣言が `branch:` の形でも対象がずれない
+    #[test]
+    fn the_declaration_parse_adopts_is_updated_when_a_url_repeats() {
+        let content = r#"let package = Package(
+    dependencies: [
+#if os(Linux)
+        .package(url: "https://github.com/apple/swift-argument-parser", branch: "main"),
+#else
+        .package(url: "https://github.com/apple/swift-argument-parser", from: "1.2.0"),
+#endif
+        .package(url: "https://github.com/apple/swift-log", from: "1.5.0"),
+        .package(url: "https://github.com/apple/swift-log", exact: "1.4.0"),
+    ]
+)
+"#;
+        let deps = parse(content).unwrap();
+        assert_eq!(deps.len(), 2);
+        assert_eq!(deps[0].version_spec.version, "1.2.0");
+        assert_eq!(deps[1].version_spec.version, "1.5.0");
+
+        let updated = PackageSwiftParser
+            .update_version(content, "apple/swift-argument-parser", "1.8.2")
+            .unwrap();
+        assert_eq!(
+            updated,
+            content.replace(r#"from: "1.2.0""#, r#"from: "1.8.2""#)
+        );
+        let updated = PackageSwiftParser
+            .update_version(content, "apple/swift-log", "1.6.4")
+            .unwrap();
+        assert_eq!(
+            updated,
+            content.replace(r#"from: "1.5.0""#, r#"from: "1.6.4""#)
+        );
     }
 
     #[test]
