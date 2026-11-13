@@ -660,8 +660,19 @@ fn collect_gradle_includes(content: &str) -> Vec<String> {
     let mut paths = Vec::new();
     let mut cursor = 0;
 
-    while let Some(offset) = stripped[cursor..].find(INCLUDE) {
-        let start = cursor + offset;
+    while cursor < bytes.len() {
+        // 文字列リテラルの中の `include` は呼び出しではない。以前は文字列の中の語にも一致し、
+        // その後の閉じ引用符を引数の始まりとして読み進めて、後ろの本物の include を飲み込んで
+        // いた (`val note = "modules to include"` の後の `include(":app")` を取りこぼす、#173)
+        if matches!(bytes[cursor], b'\'' | b'"') {
+            cursor = gradle_string_end(bytes, cursor);
+            continue;
+        }
+        if !bytes[cursor..].starts_with(INCLUDE.as_bytes()) {
+            cursor += 1;
+            continue;
+        }
+        let start = cursor;
         let end = start + INCLUDE.len();
         cursor = end;
 
@@ -707,6 +718,21 @@ fn collect_gradle_includes(content: &str) -> Vec<String> {
     }
 
     paths
+}
+
+/// `start` の引用符で始まる文字列リテラルの終わり (閉じ引用符の次) の位置。閉じていなければ
+/// 末尾。`strip_gradle_comments` と同じく、バックスラッシュの次の文字は閉じ引用符にしない。
+fn gradle_string_end(bytes: &[u8], start: usize) -> usize {
+    let quote = bytes[start];
+    let mut pos = start + 1;
+    while pos < bytes.len() {
+        match bytes[pos] {
+            b'\\' => pos += 2,
+            byte if byte == quote => return pos + 1,
+            _ => pos += 1,
+        }
+    }
+    bytes.len()
 }
 
 /// Gradle のプロジェクトパス (`:app:core`) を相対ディレクトリ (`app/core`) へ変換する。
@@ -892,6 +918,32 @@ mod tests {
             .filter(|m| m.language == Language::Mise)
             .collect();
         assert_eq!(mise_manifests.len(), 1);
+    }
+
+    /// 回帰テスト (#173): 文字列リテラルの中の `include` は呼び出しとして読まず、後ろの
+    /// include を取りこぼさない
+    #[test]
+    fn gradle_includes_inside_strings_do_not_hide_later_includes() {
+        for (content, expected) in [
+            (
+                "val note = \"modules to include\"\ninclude(\":app\")\n",
+                vec!["app"],
+            ),
+            (
+                "rootProject.name = 'gradle-include'\ninclude 'app'\n",
+                vec!["app"],
+            ),
+            (
+                "println(\"include ':ghost'\")\ninclude ':lib'\n",
+                vec!["lib"],
+            ),
+            (
+                "val q = \"a \\\" include\"\ninclude(\":lib\")\n",
+                vec!["lib"],
+            ),
+        ] {
+            assert_eq!(collect_gradle_includes(content), expected, "{content:?}");
+        }
     }
 
     #[test]
