@@ -2,7 +2,10 @@
 
 use crate::domain::{Dependency, Language, VersionSpec, VersionSpecKind};
 use crate::error::ManifestError;
-use crate::manifest::line_utils::{parse_toml_section_header, split_line_ending};
+use crate::manifest::line_utils::{
+    parse_assignment_key_path, parse_toml_section_header, quoted_value_span, split_line_ending,
+    toml_inline_table_end, toml_inline_table_string_value,
+};
 use crate::parser::get_parser;
 use regex::Regex;
 use std::path::PathBuf;
@@ -123,6 +126,40 @@ fn replace_catalog_coordinate_version(
         &line[..whole.start()],
         replacement,
         &line[whole.end()..]
+    ))
+}
+
+/// 行頭のキーが TOML のキーとして `keys` (dotted key の要素の並び) のとき、値の開始位置を返す。
+/// 引用符付きのキーや点の前後の空白も、parse (toml クレート) と同じく読む
+fn assignment_value_start(line: &str, keys: &[&str]) -> Option<usize> {
+    let (path, value_start) = parse_assignment_key_path(line)?;
+    (path.len() == keys.len() && path.iter().zip(keys).all(|(key, expected)| key == expected))
+        .then_some(value_start)
+}
+
+/// `key = "..."` の文字列の中身を `new_value` に置き換えた行
+fn replace_assignment_string_value(
+    line: &str,
+    value_start: usize,
+    new_value: &str,
+) -> Option<String> {
+    let (start, end) = quoted_value_span(line, value_start)?;
+    Some(format!("{}{new_value}{}", &line[..start], &line[end..]))
+}
+
+/// `key = { ... }` の inline table の直下の `member` の文字列を `new_value` に置き換えた行
+fn replace_inline_member_value(
+    line: &str,
+    value_start: usize,
+    member: &str,
+    new_value: &str,
+) -> Option<String> {
+    let end = toml_inline_table_end(line, value_start)?;
+    let (start, value_end) = toml_inline_table_string_value(line, value_start, end, member)?;
+    Some(format!(
+        "{}{new_value}{}",
+        &line[..start + 1],
+        &line[value_end - 1..]
     ))
 }
 
@@ -392,6 +429,11 @@ fn replace_version_alias_line(
     in_target_block: &mut bool,
 ) -> Option<String> {
     if let Some(member) = update_member {
+        // dotted key の rich version (`alias.prefer = "..."`)。parse は `[versions]` の
+        // `alias.<member>` を rich version として読むので、書き換えも同じキーを探す (#171)
+        if let Some(value_start) = assignment_value_start(line, &[alias, member]) {
+            return replace_assignment_string_value(line, value_start, formatted_version);
+        }
         if line_starts_toml_assignment(line, alias) {
             *in_target_block = line.contains('{') && !line.contains('}');
             return replace_toml_string_member(line, member, formatted_version);
@@ -516,6 +558,12 @@ fn replace_library_dotted_line(
     formatted_version: &str,
 ) -> Option<String> {
     if let Some(member) = entry.version.update_member {
+        // `alias.version = { strictly = "...", prefer = "..." }` の inline table の rich version (#171)
+        if let Some(value_start) = assignment_value_start(line, &[entry.alias.as_str(), "version"])
+            && line[value_start..].starts_with('{')
+        {
+            return replace_inline_member_value(line, value_start, member, formatted_version);
+        }
         let member_key = format!("{}.version.{}", entry.alias, member);
         if line_starts_toml_assignment(line, &member_key) {
             return replace_toml_assignment_string(line, &member_key, formatted_version);
@@ -640,6 +688,39 @@ pub(super) fn update_version(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 回帰テスト (#171): dotted key で書いた rich version (`[versions]` の `alias.prefer` と
+    /// `[libraries]` の `alias.version = { ... }`) も、parse が読み、`prefer` を書き換える
+    #[test]
+    fn dotted_rich_versions_are_updated_like_parse_reads_them() {
+        let content = r#"[versions]
+slf4j.strictly = "[1.7, 1.8["
+slf4j.prefer = "1.7.25"
+
+[libraries]
+slf4j-api = { module = "org.slf4j:slf4j-api", version.ref = "slf4j" }
+commons-lang3.module = "org.apache.commons:commons-lang3"
+commons-lang3.version = { strictly = "[3.8, 4.0[", prefer = "3.8.1" }
+"#;
+        let parsed = deps(content);
+        assert_eq!(parsed.len(), 2, "{parsed:?}");
+
+        let updated = update_version(content, "org.slf4j:slf4j-api", "1.7.36")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            updated,
+            content.replace(r#"slf4j.prefer = "1.7.25""#, r#"slf4j.prefer = "1.7.36""#)
+        );
+
+        let updated = update_version(content, "org.apache.commons:commons-lang3", "3.9")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            updated,
+            content.replace(r#"prefer = "3.8.1" }"#, r#"prefer = "3.9" }"#)
+        );
+    }
 
     /// テスト用のカタログを組み立てる (`looks_like_version_catalog` を通すため
     /// 必ずセクションヘッダを含める)
