@@ -14,6 +14,64 @@ fn result() -> OrchestratorResult {
     }
 }
 
+/// 回帰テスト (#177): root と member の両方を持つ単位の復元の報告で、ファイルを単位の中で
+/// 区別できる表記 (最も浅いディレクトリからの相対パス) で出し、Scope の同じディレクトリを
+/// 1 回だけ出す
+#[test]
+fn recovery_report_distinguishes_member_files_and_lists_each_scope_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = identity(temp.path());
+    let member = root.join("a");
+    let shown_root = for_display(&root).into_owned();
+    let shown_member = shown_root.join("a");
+    let report = RollbackReport {
+        units: vec![FailedUnit {
+            directories: BTreeSet::from([
+                root.clone(),
+                shown_root.clone(),
+                member.clone(),
+                shown_member.clone(),
+            ]),
+            summaries: BTreeSet::from([0]),
+            reason: "cargo update failed".into(),
+            files: BTreeMap::from([
+                (root.join("Cargo.toml"), FileOutcome::Restored),
+                (member.join("Cargo.toml"), FileOutcome::Restored),
+            ]),
+            held: BTreeSet::from([root.join("Cargo.toml"), member.join("Cargo.toml")]),
+            policy_failure: false,
+            skipped: false,
+        }],
+        node_managers: BTreeMap::new(),
+    };
+    let mut output = vec![];
+    report.print(&mut output, false).unwrap();
+    let output = String::from_utf8(output).unwrap();
+    assert_eq!(output.matches("restored Cargo.toml").count(), 1, "{output}");
+    assert!(
+        output.contains(&format!(
+            "restored {}",
+            Path::new("a").join("Cargo.toml").display()
+        )),
+        "{output}"
+    );
+    // Scope は折り返して出すので、続く行を 1 つにまとめてから区切る
+    let scope_start = output.find("  Scope: ").unwrap() + "  Scope: ".len();
+    let scope_end = output[scope_start..].find("\n  restored").unwrap() + scope_start;
+    let scope: Vec<&str> = output[scope_start..scope_end]
+        .split(',')
+        .map(str::trim)
+        .collect();
+    assert_eq!(
+        scope,
+        vec![
+            shown_root.display().to_string(),
+            shown_member.display().to_string()
+        ],
+        "{output}"
+    );
+}
+
 #[test]
 fn normal_recovery_report_keeps_the_cause_once_and_does_not_claim_unrestored_files_are_restored() {
     use crate::output::{OutputFormatter, TextFormatter, Verbosity};
