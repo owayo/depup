@@ -1,0 +1,5 @@
+scenario,runs,before_median_seconds,before_min_seconds,before_max_seconds,after_median_seconds,after_min_seconds,after_max_seconds,time_reduction_percent
+sixty,10,6.737,6.230,11.562,2.575,2.227,5.209,61.78
+workspace,10,6.996,6.619,7.832,3.143,2.551,4.551,55.07
+npm,10,5.719,5.339,6.349,3.558,3.283,7.034,37.78
+depup-own,10,0.799,0.694,3.680,0.960,0.562,1.795,-20.21

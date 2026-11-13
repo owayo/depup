@@ -56,8 +56,13 @@ const DEFAULT_CONCURRENCY: usize = 10;
 const CRATES_IO_CONCURRENCY: usize = 8;
 
 /// バージョンチェックの並列度上限 (マニフェスト内の依存関係に対して)。
-/// 依存数が少ない場合はそれに合わせて並列度を下げる (`dep_count.clamp(1, 4)`)。
-const MAX_VERSION_CHECK_CONCURRENCY: usize = 4;
+/// 依存数が少ない場合はそれに合わせて並列度を下げる (`dep_count.clamp(1, 16)`)。
+///
+/// 版の一覧の取得はレジストリ別のセマフォ (`DEFAULT_CONCURRENCY` / `CRATES_IO_CONCURRENCY`) が
+/// 別に抑えるので、この上限が主に決めるのは、更新候補ごとの OSV の問い合わせが重なる数。
+/// 4 では 60 件のマニフェストの確認が OSV の往復を 15 段待っていた
+/// (`benchmarks/version-check-concurrency/`)。
+const MAX_VERSION_CHECK_CONCURRENCY: usize = 16;
 
 /// マニフェスト内の依存数から並列度を計算する。
 /// 最小 1、最大 `MAX_VERSION_CHECK_CONCURRENCY`。
@@ -3960,15 +3965,15 @@ mod tests {
 
     #[test]
     fn test_version_check_concurrency_scaling() {
-        // 依存数に応じて並列度が 1〜4 の範囲で伸縮する
+        // 依存数に応じて並列度が 1〜16 の範囲で伸縮する
         assert_eq!(version_check_concurrency(0), 1); // 0 件でも最小 1
         assert_eq!(version_check_concurrency(1), 1);
-        assert_eq!(version_check_concurrency(2), 2);
-        assert_eq!(version_check_concurrency(3), 3);
         assert_eq!(version_check_concurrency(4), 4);
-        assert_eq!(version_check_concurrency(10), 4); // 上限に張り付く
-        assert_eq!(version_check_concurrency(100), 4);
-        assert_eq!(version_check_concurrency(usize::MAX), 4);
+        assert_eq!(version_check_concurrency(10), 10);
+        assert_eq!(version_check_concurrency(16), 16);
+        assert_eq!(version_check_concurrency(17), 16); // 上限に張り付く
+        assert_eq!(version_check_concurrency(100), 16);
+        assert_eq!(version_check_concurrency(usize::MAX), 16);
     }
 
     #[test]

@@ -145,6 +145,7 @@ make ci                # CI と同じ検査 (fmt-check + lint + test、書き換
 - JSON マニフェスト更新の性能は `mise exec -- cargo run --release --locked --example manifest_update_bench -- 1000 7` で測る。入力・依存・ツールチェーン・release 設定をそろえ、ビルドやテストを並行実行しない。確保バイト数は再確保を含む要求量で、ピークメモリではない。生データと比較条件は `benchmarks/json-manifest/` に保存する。
 - Cargo の更新性能は同じコマンドの末尾に `cargo` を付けて測り、生データと比較条件を `benchmarks/cargo-manifest/` に保存する。単純指定・inline table・dotted key・複数行テーブルと git tag の更新を含む。Cargo の書き換えは正規表現を使わず、`cargo_sites` が見出しと行頭のキーを TOML のキーとして読んだ論理パスで宣言の場所を集め、値の範囲だけを置き換える (#168)。キーを文字列にするのはパッケージ名を書いた行とパッケージのテーブルの本文の行だけで、ほかの行は値の形 (複数行の inline table か) だけを見る。ソース除外と書き換えで同じ宣言の一覧を使う。
 - crates.io の版の取得を含む CLI 全体の時間は `bash benchmarks/crates-io-fetch/measure.sh <実装名> <depup の実行ファイル> <回数>` で測る。ネットワークに左右されるので、変更前後の release ビルドを before → after → after → before の順に交互に測り、生データと比較条件を `benchmarks/crates-io-fetch/` に保存する。
+- 依存の確認の並列度 (`MAX_VERSION_CHECK_CONCURRENCY`) を含む CLI 全体の時間は `bash benchmarks/version-check-concurrency/measure.sh <実装名> <depup の実行ファイル> <回数>` で測る (既定の age と OSV を有効にした `--dry-run`。crates.io 60 件・その 4 メンバーの workspace・npm 30 件・対照の depup 自身)。ネットワークに左右されるので、変更前後を before → after → after → before の順に交互に測り、作業用のディレクトリは `BENCH_WORK_ROOT` の下に残す
 - npm と PyPI の取得 (HTTP の圧縮の効果) は、同じ手順で `bash benchmarks/http-compression/measure.sh <実装名> <depup の実行ファイル> <回数>` を使い、`benchmarks/http-compression/` に保存する。
 - **Unit tests**: 各モジュール内に `#[cfg(test)]` で配置
 - **Integration tests**: `tests/integration_tests.rs` - マニフェスト検出、パース、パイプラインテスト
@@ -242,7 +243,7 @@ make ci                # CI と同じ検査 (fmt-check + lint + test、書き換
 - npm/Composer/Cargo は semver の prerelease (`-...`) と build metadata (`+...`) を同時に含むバージョン（例: `^1.2.3-rc.1+build123`）も正しくパースする。ビルドメタデータはバージョン比較時には無視される (semver 仕様)
 - Rust (Cargo) の git 依存 (`{ git = "...", branch/tag/rev = "..." }` / 省略形) を検出し、`git ls-remote` でリモート HEAD / タグを取得して更新判定する。branch / 省略形 (デフォルトブランチ) は最新コミットへ更新 (Cargo.toml は書き換えず、Cargo.lock を `--install` の `cargo update` で再解決)、tag は最新 semver タグへ更新 (Cargo.toml の tag 文字列を書き換え)、rev は常にスキップ (pinned 扱い)
 - Cargo.lock の git source 末尾 `#<hash>` から現在コミットハッシュを抽出し、`git ls-remote` の結果と比較して差分があれば更新として扱う
-- バージョンチェックはマニフェストごとに並列処理される (`futures::stream::buffered`)。並列度は依存数に応じて `clamp(dep_count, 1, 4)` で適応 (最大 4)。内部では各レジストリ別のセマフォ (crates.io は 8、他は 10) が効く。crates.io の API を使う場合の 1 リクエスト/秒は、アダプタ内の `CratesIoRateLimit` が実行全体で守る。結果は入力順で返るため表示順は安定する
+- バージョンチェックはマニフェストごとに並列処理される (`futures::stream::buffered`)。並列度は依存数に応じて `clamp(dep_count, 1, 16)` で適応 (最大 16。版の一覧の取得はレジストリ別のセマフォが別に抑えるので、この上限が主に決めるのは更新候補ごとの OSV の問い合わせの重なり。4 では 60 件のマニフェストの確認が OSV の往復を 15 段待っていた。測定は `benchmarks/version-check-concurrency/`)。内部では各レジストリ別のセマフォ (crates.io は 8、他は 10) が効く。crates.io の API を使う場合の 1 リクエスト/秒は、アダプタ内の `CratesIoRateLimit` が実行全体で守る。結果は入力順で返るため表示順は安定する
 - `--only` が指定されている場合は `--exclude` より優先される。Cargo リネーム依存では実パッケージ名・マニフェスト名のどちらで指定しても同じ優先順位で判定する
 - `.depup` にルートとサブディレクトリが両方含まれる場合、`--install` と Rust の `--age --install` 後処理は、更新されたマニフェストに最も近い（最も深い）対象ディレクトリで実行する
 - age が有効な場合 (CLI `--age` / プロジェクト `minimumReleaseAge` / グローバル設定 / 組み込みデフォルト 1w のいずれか) の transitive 依存への適用方法は PM ごとに異なる。install フェーズも judge と同じ解決済み age を使うため、CLI `--age` を明示しなくてもプロジェクト設定やデフォルト 1w が transitive へ反映される:
