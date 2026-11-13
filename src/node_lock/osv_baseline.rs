@@ -110,9 +110,9 @@ async fn read_direct(manifest: &Path) -> Result<BTreeMap<String, (String, String
         .to_str()
         .ok_or("invalid importer path")?
         .replace('\\', "/");
-    let manifest: Value =
-        serde_json::from_slice(&std::fs::read(manifest).map_err(|error| error.to_string())?)
-            .map_err(|error| error.to_string())?;
+    let manifest = std::fs::read(manifest).map_err(|error| error.to_string())?;
+    let manifest: Value = serde_json::from_slice(crate::manifest::strip_utf8_bom_bytes(&manifest))
+        .map_err(|error| error.to_string())?;
     let mut result = BTreeMap::new();
     for section in ["dependencies", "devDependencies", "optionalDependencies"] {
         for (key, _) in manifest

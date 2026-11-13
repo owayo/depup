@@ -34,9 +34,9 @@ fn evaluate_targets(
             .path
             .parent()
             .and_then(|path| path.canonicalize().ok());
-        let declaration = std::fs::read(&manifest.path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+        let declaration = std::fs::read(&manifest.path).ok().and_then(|bytes| {
+            serde_json::from_slice::<Value>(crate::manifest::strip_utf8_bom_bytes(&bytes)).ok()
+        });
         for (index, update) in manifest.results.iter().enumerate() {
             let UpdateResult::Update {
                 dependency,

@@ -92,8 +92,9 @@ impl PnpmOverrides {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(overrides),
             Err(_) => return Err("could not read package.json for pnpm overrides".into()),
         };
-        let package: serde_json::Value = serde_json::from_slice(&package)
-            .map_err(|_| "invalid package.json for pnpm overrides".to_string())?;
+        let package: serde_json::Value =
+            serde_json::from_slice(crate::manifest::strip_utf8_bom_bytes(&package))
+                .map_err(|_| "invalid package.json for pnpm overrides".to_string())?;
         // pnpm 10 までは、package.json の `pnpm.overrides` と `resolutions` (Yarn 互換。
         // `pnpm.overrides` と同じ書式で、両方にあれば `pnpm.overrides` が優先) を実効の override に
         // 合流させる。`pnpm config get overrides` はどちらも返さない。pnpm 11 以降は package.json の

@@ -128,6 +128,13 @@ pub(crate) fn split_utf8_bom(content: &str) -> (&'static str, &str) {
     }
 }
 
+/// バイト列の先頭の UTF-8 の BOM を除く。package.json をバイト列のまま `serde_json` へ渡す
+/// 箇所 (pnpm の override・install 後の監査・OSV の基準) で使う。`serde_json` は BOM を
+/// 読み飛ばさないので、BOM 付きの package.json で Node の処理が止まっていた (#159)。
+pub(crate) fn strip_utf8_bom_bytes(bytes: &[u8]) -> &[u8] {
+    bytes.strip_prefix(UTF8_BOM.as_bytes()).unwrap_or(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
