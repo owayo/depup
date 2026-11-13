@@ -184,6 +184,7 @@ impl JsonFormatter {
             }
             SkipReason::ParseError(msg) => format!("parse_error: {}", msg),
             SkipReason::ChangeLevelLimited(level) => format!("change_level_limited: {}", level),
+            SkipReason::TauriSync(series) => format!("tauri_sync: {series}"),
         }
     }
 

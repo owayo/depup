@@ -76,6 +76,9 @@ pub enum SkipReason {
     /// 採用候補が `--max-change` の許容範囲を超えるためスキップ
     /// (内側の値は `max-change` に指定されたレベル)
     ChangeLevelLimited(ChangeLevel),
+    /// Tauri の npm パッケージと tauri crate の major.minor を揃えるため、judge の更新を
+    /// 取り消して今の版に据え置いた (内側の値は据え置いた major.minor。#154)
+    TauriSync(String),
 }
 
 impl fmt::Display for SkipReason {
@@ -109,6 +112,9 @@ impl fmt::Display for SkipReason {
             SkipReason::LanguageFiltered => write!(f, "language filtered"),
             SkipReason::ChangeLevelLimited(level) => {
                 write!(f, "limited by --max-change={}", level)
+            }
+            SkipReason::TauriSync(series) => {
+                write!(f, "held at {series} to match the other Tauri packages")
             }
         }
     }
