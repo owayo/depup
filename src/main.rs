@@ -231,7 +231,7 @@ mod install_tests {
     async fn failed_install_restores_the_written_manifest() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("build.gradle");
-        let before = "dependencies { implementation 'org.example:library:1.0.0' }\n";
+        let before = "dependencies {\n    implementation 'org.example:library:1.0.0'\n}\n";
         std::fs::write(&path, before).unwrap();
         let script = temp.path().join("gradlew");
         write_script(&script, "#!/bin/sh\nexit 1\n", 0o755);

@@ -407,6 +407,15 @@ fn strip_gradle_comment_lines(content: &str) -> Vec<String> {
         .collect()
 }
 
+/// 座標入りの宣言の正規表現を組み立てる (座標は呼び出し側で `regex::escape` 済み)。
+fn declaration_regex(pattern: &str, package: &str) -> Result<Regex, ManifestError> {
+    Regex::new(pattern).map_err(|e| ManifestError::InvalidVersionSpec {
+        path: PathBuf::from("build.gradle"),
+        spec: package.to_string(),
+        message: format!("invalid regex pattern: {}", e),
+    })
+}
+
 /// コメントの外にある `re` の一致を、`select` が真になる行 (0 始まりの番号) だけ書き換える。
 fn replace_all_active_gradle_matches<F>(
     content: &str,
@@ -1229,17 +1238,45 @@ impl GradleParser {
             })
         };
 
-        // 報告した宣言は map 記法 → 文字列記法 → rich version の順に探す。
-        let (map_result, map_updated) =
-            replace_all_active_gradle_matches(content, &map_re, in_dependencies, replace_map);
+        // 報告した宣言は、parse (`DEP_MAP` / `DEP_STRING`) と同じく行頭の configuration 名
+        // (とラッパ) から始まるものだけを map 記法 → 文字列記法 → rich version の順に探す。
+        // 以前は行頭を求めない正規表現で探したので、parse が読まない複数行の map 記法の値の行に
+        // 当たってそれを書き換え、文字列記法を試さずに終わって報告した宣言を残していた (#161)。
+        let map_declaration_re = declaration_regex(
+            &format!(
+                r#"^(\s*\w+\s*[\(\s]+{DEP_WRAPPER}group\s*[:=]\s*['"]{escaped_group}['"]\s*,\s*name\s*[:=]\s*['"]{escaped_artifact}['"]\s*,\s*version\s*[:=]\s*)(['"])([^'"]+)['"]"#
+            ),
+            package,
+        )?;
+        let string_declaration_re = declaration_regex(
+            &format!(
+                r#"^(\s*\w+\s*[\(\s]*{DEP_WRAPPER})(['"]){escaped_group}:{escaped_artifact}:([^:'"@]+)((?::[^'"]+)?(?:@[^'"]+)?)['"]"#
+            ),
+            package,
+        )?;
+        let replace_string_declaration = |caps: &regex::Captures| {
+            let lead = &caps[1];
+            let quote = &caps[2];
+            let current_version = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+            let suffix = caps.get(4).map(|m| m.as_str()).unwrap_or("");
+            format_updated(current_version).map(|updated_version| {
+                format!("{lead}{quote}{group}:{artifact}:{updated_version}{suffix}{quote}")
+            })
+        };
+        let (map_result, map_updated) = replace_all_active_gradle_matches(
+            content,
+            &map_declaration_re,
+            in_dependencies,
+            replace_map,
+        );
         let result = if map_updated {
             map_result
         } else {
             let (string_result, string_updated) = replace_all_active_gradle_matches(
                 content,
-                &string_re,
+                &string_declaration_re,
                 in_dependencies,
-                replace_string,
+                replace_string_declaration,
             );
             if string_updated {
                 string_result
@@ -1476,6 +1513,30 @@ mod tests {
         assert!(updated.contains("prefer '2.0.20'"), "{updated}");
         assert!(
             updated.contains("force 'org.slf4j:slf4j-api:2.0.20'"),
+            "{updated}"
+        );
+    }
+
+    /// Issue #161: parse が読まない複数行の map 記法の宣言を書き換えず、報告した宣言を書き換える
+    #[test]
+    fn the_reported_declaration_is_updated_instead_of_an_unparsed_multiline_map() {
+        let content = concat!(
+            "dependencies {\n",
+            "    implementation(\"org.slf4j:slf4j-api:1.7.30\")\n",
+            "    testImplementation(\n",
+            "        group = \"org.slf4j\", name = \"slf4j-api\", version = \"1.7.25\"\n",
+            "    )\n",
+            "}\n",
+        );
+        let dependencies = parse(content).unwrap();
+        assert_eq!(dependencies.len(), 1, "{dependencies:?}");
+        assert_eq!(dependencies[0].version_spec.version, "1.7.30");
+        let updated = GradleParser
+            .update_version(content, "org.slf4j:slf4j-api", "2.0.20")
+            .unwrap();
+        assert_eq!(
+            updated,
+            content.replace("slf4j-api:1.7.30", "slf4j-api:2.0.20"),
             "{updated}"
         );
     }
