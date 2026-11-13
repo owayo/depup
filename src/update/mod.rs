@@ -828,7 +828,8 @@ fn is_language_prerelease(language: Language, version: &str) -> bool {
         Language::Python => version_info::is_python_prerelease_version(version),
         Language::Ruby => version_info::is_ruby_prerelease_version(version),
         Language::Php => version_info::is_composer_prerelease_version(version),
-        _ => is_prerelease_version(version),
+        Language::Java => version_info::is_maven_prerelease_version(version),
+        Language::Mise => is_prerelease_version(version),
     }
 }
 
@@ -3272,6 +3273,41 @@ mod tests {
             UpdateResult::Update { new_version, .. } => assert_eq!(new_version, "3.0.0-rc.1"),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// Issue #156: Java の安定版の利用者を、Maven の beta の省略形 (`-b<数字>`) へ更新しない
+    #[test]
+    fn test_judge_java_keeps_stable_users_off_maven_beta_shorthands() {
+        let judge = UpdateJudge::new(UpdateFilter::new().with_include_pinned(true));
+        let dep = make_dependency("javax.xml.bind:jaxb-api", "2.3.1", Language::Java, false);
+        let versions = vec![
+            make_version_info("2.3.0", 60),
+            make_version_info("2.3.1", 50),
+            make_version_info("2.4.0-b180725.0427", 40),
+            make_version_info("2.4.0-b180830.0359", 30),
+        ];
+        assert!(
+            matches!(
+                judge.judge(&dep, &versions),
+                UpdateResult::Skip {
+                    reason: SkipReason::AlreadyLatest,
+                    ..
+                }
+            ),
+            "{:?}",
+            judge.judge(&dep, &versions)
+        );
+        // beta の利用者には、新しい beta を候補に残す
+        let beta = make_dependency(
+            "javax.xml.bind:jaxb-api",
+            "2.4.0-b180725.0427",
+            Language::Java,
+            false,
+        );
+        assert!(matches!(
+            judge.judge(&beta, &versions),
+            UpdateResult::Update { new_version, .. } if new_version == "2.4.0-b180830.0359"
+        ));
     }
 
     /// Issue #155: 上限と同じ版のプレリリースかどうかは、言語ごとの規則で判定する。
