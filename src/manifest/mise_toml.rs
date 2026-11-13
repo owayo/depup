@@ -29,8 +29,6 @@ use super::line_utils::{
 use crate::domain::{Dependency, Language};
 use crate::error::ManifestError;
 use crate::parser::{MiseVersionParser, VersionParser, format_mise_version};
-use regex::Regex;
-use std::sync::LazyLock;
 
 /// ツール定義を置く TOML セクション名
 const TOOLS_SECTION: &str = "tools";
@@ -45,16 +43,6 @@ const VERSION_KEY: &str = "version";
 /// 扱い、`path` / `ref` は文字列形式の `path:` / `ref:` と同じく更新対象外にする
 /// (同義の 2 記法で挙動が割れないようにする)。
 const PREFIX_KEY: &str = "prefix";
-
-/// inline table 内の `version = "..."` を捉える (行内の最初の 1 件だけ置換する)
-static INLINE_VERSION_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(\bversion\s*=\s*)(["'])([^"']*)(["'])"#).expect("valid inline version regex")
-});
-
-/// inline table 内の `prefix = "..."` を捉える (`version` が無いときの代替)
-static INLINE_PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(\bprefix\s*=\s*)(["'])([^"']*)(["'])"#).expect("valid inline prefix regex")
-});
 
 /// mise 設定ファイルのパーサ
 pub struct MiseTomlParser;
@@ -478,83 +466,24 @@ fn locate_multiline_inline_table(
     )
 }
 
-/// 文字列リテラル (`"..."` / `'...'`) の範囲を列挙する。
-///
-/// 返す範囲は `(開始クォート位置, 終了クォート位置)`。閉じられていない場合は
-/// 行末までを範囲とする。basic string (`"`) はバックスラッシュエスケープを
-/// 解釈し、literal string (`'`) は解釈しない (TOML 仕様どおり)。
-fn string_literal_ranges(text: &str) -> Vec<(usize, usize)> {
-    let bytes = text.as_bytes();
-    let mut ranges = Vec::new();
-    let mut i = 0;
-
-    while i < bytes.len() {
-        let quote = bytes[i];
-        if quote != b'"' && quote != b'\'' {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        i += 1;
-        while i < bytes.len() {
-            if quote == b'"' && bytes[i] == b'\\' {
-                i += 2;
-                continue;
-            }
-            if bytes[i] == quote {
-                break;
-            }
-            i += 1;
-        }
-        if i < bytes.len() {
-            ranges.push((start, i));
-            i += 1;
-        } else {
-            ranges.push((start, text.len()));
-            break;
-        }
-    }
-    ranges
-}
-
-/// inline table のバージョンフィールドだけを置換する (他のオプションは保持)。
+/// 1 行の inline table のバージョンフィールドだけを置換する (他のオプションは保持)。
 ///
 /// `version` を優先し、無ければ `prefix` を対象にする (mise の `tool_options` は
-/// oneOf なので両方が同時に書かれることはない)。
+/// oneOf なので両方が同時に書かれることはない)。複数行の inline table と同じく、
+/// TOML として直下のキーを探す (`toml_inline_table_string_value`)。以前は正規表現で探して
+/// いたので、`{ "version" = "22.0.0" }` の引用符付きのキーに一致せず、前の文字列が
+/// `version=` で終わると (`postinstall = "echo version="`) 本物の `version` を見落とし、
+/// 報告した更新を書き換えられなかった (#172)。
 fn replace_inline_table_version(value_part: &str, new_version: &str) -> Option<String> {
-    [&*INLINE_VERSION_RE, &*INLINE_PREFIX_RE]
-        .into_iter()
-        .find_map(|re| replace_inline_table_field(value_part, re, new_version))
-}
-
-/// inline table の指定フィールド (`version` / `prefix`) を置換する。
-///
-/// 正規表現の一致位置が別フィールドの文字列リテラルの内側にある場合は飛ばす。
-/// 例えば `java = { postinstall = 'echo version = "x"', version = "temurin-21" }`
-/// では `postinstall` の中身が先に一致するため、素朴に最初の一致を置換すると
-/// ツールのバージョンではなくコマンド文字列を書き換えてしまう。
-fn replace_inline_table_field(
-    value_part: &str,
-    field_re: &Regex,
-    new_version: &str,
-) -> Option<String> {
-    let literals = string_literal_ranges(value_part);
-    let is_inside_literal = |pos: usize| literals.iter().any(|(s, e)| pos > *s && pos < *e);
-
-    let caps = field_re
-        .captures_iter(value_part)
-        .find(|caps| !is_inside_literal(caps.get(0).expect("group 0 always exists").start()))?;
-
-    let whole = caps.get(0).expect("group 0 always exists");
-    let formatted = format_mise_version(&caps[3], new_version);
+    let open = value_part.len() - value_part.trim_start().len();
+    let end = toml_inline_table_end(value_part, open)?;
+    let (start, value_end) = toml_inline_table_string_value(value_part, open, end, VERSION_KEY)
+        .or_else(|| toml_inline_table_string_value(value_part, open, end, PREFIX_KEY))?;
+    let formatted = format_mise_version(&value_part[start + 1..value_end - 1], new_version);
     Some(format!(
-        "{}{}{}{}{}{}",
-        &value_part[..whole.start()],
-        &caps[1],
-        &caps[2],
-        formatted,
-        &caps[4],
-        &value_part[whole.end()..]
+        "{}{formatted}{}",
+        &value_part[..start + 1],
+        &value_part[value_end - 1..]
     ))
 }
 
@@ -588,6 +517,31 @@ mod tests {
     }
     fn parse(content: &str) -> Vec<Dependency> {
         MiseTomlParser.parse(content).unwrap()
+    }
+
+    /// 回帰テスト (#172): 1 行の inline table でも、引用符付きの `version` のキーと、前の文字列が
+    /// `version=` で終わるときの本物の `version` を、TOML として探して書き換える
+    #[test]
+    fn single_line_inline_tables_find_the_version_key_like_toml() {
+        let content = "[tools]\nnode = { \"version\" = \"22.0.0\" }\ngo = { postinstall = \"echo version=\", version = \"1.22.0\" }\npython = { prefix = '3.12' }\n";
+        let deps = parse(content);
+        assert_eq!(deps.len(), 3, "{deps:?}");
+        for (tool, old, new) in [
+            ("node", "\"22.0.0\"", "22.5.0"),
+            ("go", "\"1.22.0\"", "1.23.0"),
+            ("python", "'3.12'", "3.13.1"),
+        ] {
+            let updated = MiseTomlParser
+                .update_version(content, tool, new)
+                .unwrap_or_else(|error| panic!("{tool}: {error}"));
+            let quote = &old[..1];
+            let expected_value = if tool == "python" { "3.13" } else { new };
+            assert_eq!(
+                updated,
+                content.replace(old, &format!("{quote}{expected_value}{quote}")),
+                "{tool}"
+            );
+        }
     }
 
     #[test]
