@@ -6,8 +6,11 @@ pub(super) fn expand(root: &Path, pattern: &str) -> Result<Vec<PathBuf>, String>
     let root = identity(root);
     let mut paths = vec![root.clone()];
     for part in Path::new(pattern).components() {
-        let Component::Normal(part) = part else {
-            return Err("Unsafe workspace path in install recovery scope".into());
+        let part = match part {
+            // 先頭の `./` は root を指す (先頭より後の `.` は `components` が落とす)
+            Component::CurDir => continue,
+            Component::Normal(part) => part,
+            _ => return Err("Unsafe workspace path in install recovery scope".into()),
         };
         let part = part.to_str().ok_or("Workspace path is not UTF-8")?;
         if part.contains(['?', '[', ']', '{', '}'])
@@ -148,3 +151,6 @@ pub(super) fn uv_root(directory: &Path, boundary: &Path) -> Result<UvScope, Stri
     }
     Ok(UvScope::standalone(directory))
 }
+
+#[cfg(test)]
+mod tests;
