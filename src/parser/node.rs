@@ -294,6 +294,24 @@ fn build_wildcard_spec(trimmed: &str, body: &str) -> Option<VersionSpec> {
 
 impl VersionParser for NodeVersionParser {
     fn parse(&self, version_str: &str) -> Option<VersionSpec> {
+        // node-semver の部分版の `=` (`=1.2`) は x-range なので、比較子の組の書き換えでも
+        // 要素の数を保たせる (#165)
+        parse_spec(version_str).map(|spec| {
+            if spec.kind == VersionSpecKind::Range {
+                spec.with_partial_equal_range()
+            } else {
+                spec
+            }
+        })
+    }
+
+    fn language(&self) -> Language {
+        Language::Node
+    }
+}
+
+fn parse_spec(version_str: &str) -> Option<VersionSpec> {
+    {
         let trimmed = version_str.trim();
 
         if trimmed.is_empty() {
@@ -433,10 +451,6 @@ impl VersionParser for NodeVersionParser {
         // npm dist-tag (`latest` / `beta` 等) やその他解釈できない文字列は更新対象にしない
         None
     }
-
-    fn language(&self) -> Language {
-        Language::Node
-    }
 }
 
 #[cfg(test)]
@@ -445,6 +459,18 @@ mod tests {
 
     fn parse(version: &str) -> Option<VersionSpec> {
         NodeVersionParser.parse(version)
+    }
+
+    /// 回帰テスト (#165): 比較子の組の包含下限の部分版の `=` も x-range なので、書き換えで
+    /// 要素の数を保つ。完全な版の `=` は完全版のまま
+    #[test]
+    fn partial_equal_lower_bound_in_a_comparator_set_keeps_its_width() {
+        let spec = parse("=1.2 <1.5").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.format_updated("1.4.9"), "=1.4 <1.5");
+
+        let full = parse("=1.2.0 <1.5").unwrap();
+        assert_eq!(full.format_updated("1.4.9"), "=1.4.9 <1.5");
     }
 
     #[test]

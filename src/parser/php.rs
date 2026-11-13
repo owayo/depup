@@ -313,6 +313,15 @@ mod tests {
         PhpVersionParser.parse(version)
     }
 
+    /// Composer の `=1.2` は `1.2.0` の完全一致なので、範囲の包含下限でも完全版を書く
+    /// (要素の数を保つのは x-range として読む npm と Cargo だけ、#165)
+    #[test]
+    fn partial_equal_lower_bound_is_written_in_full() {
+        let spec = parse("=1.2 <1.5").unwrap();
+        assert_eq!(spec.kind, VersionSpecKind::Range);
+        assert_eq!(spec.format_updated("1.4.9"), "=1.4.9 <1.5");
+    }
+
     // Caret のテスト
     #[test]
     fn test_parse_caret() {
