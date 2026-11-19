@@ -341,11 +341,13 @@ mod exit_code_tests {
             fs::write(dir.path().join(filename), content).unwrap();
             // lock のない無変更プロジェクトは install を起動せず正常終了する。
             let no_lock = Command::new(get_binary_path())
-                .args(["--install", "--age", "2w", "--no-osv", "--quiet"])
+                .args(["--install", "--age", "2w", "--no-osv", "--quiet", "--json"])
                 .arg(dir.path())
                 .output()
                 .unwrap();
             assert!(no_lock.status.success(), "{filename}: {no_lock:?}");
+            let json: serde_json::Value = serde_json::from_slice(&no_lock.stdout).unwrap();
+            assert!(json.get("lock_age_failures").is_none());
             fs::write(dir.path().join(lock), "invalid lock").unwrap();
             let output = Command::new(get_binary_path())
                 .args(["--install", "--age", "2w", "--no-osv", "--quiet"])
@@ -353,7 +355,29 @@ mod exit_code_tests {
                 .output()
                 .unwrap();
             assert_eq!(output.status.code(), Some(2), "{filename}: {output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("Lock age audit failed"));
             assert!(String::from_utf8_lossy(&output.stderr).contains(lock));
+            let output = Command::new(get_binary_path())
+                .args(["--install", "--age", "2w", "--no-osv", "--quiet", "--json"])
+                .arg(dir.path())
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(2), "{filename}: {output:?}");
+            let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(json["summary"]["failed"], 0);
+            let failures = json["lock_age_failures"].as_array().unwrap();
+            assert_eq!(failures.len(), 1);
+            assert_eq!(
+                failures[0]["language"],
+                if lock == "Cargo.lock" { "rust" } else { "node" }
+            );
+            let directory = failures[0]["directory"].as_str().unwrap();
+            assert!(!directory.starts_with(r"\\?\"));
+            assert_eq!(
+                fs::canonicalize(directory).unwrap(),
+                fs::canonicalize(dir.path()).unwrap()
+            );
+            assert!(failures[0]["problems"][0].as_str().unwrap().contains(lock));
             assert_eq!(
                 fs::read_to_string(dir.path().join(filename)).unwrap(),
                 content
