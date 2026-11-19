@@ -376,6 +376,8 @@ pnpm first runs `update --no-save --lockfile-only --ignore-scripts`, using optio
 
 Cargo runs `cargo update`, then applies its existing age rollback and final verification. Both ecosystems check newly introduced public registry versions against OSV after age verification. An OSV error, failed age verification, a changed external git/private-registry/remote-tarball identity, or inconsistent direct Tauri npm/Cargo versions causes the affected shared install unit to be restored.
 
+When creating the first `Cargo.lock`, depup accepts Git dependencies whose declared `rev` is a full 40-character commit hash and matches the commit Cargo locks. Branches, tags, abbreviated hashes, and named refs still cause the new lock to be removed. Versions from crates.io still undergo the configured age and OSV checks.
+
 For Cargo age verification, restoration depends on violating or unverified versions still in the final lock that this run introduced, or problems that prevented the audit from completing. Young versions already in the pre-run lock, including a rollback to a young pre-run version, produce warnings and exit code 2 while retaining other updates. The refresh is still reported as `completed`; `changed` is `false` if the rollbacks leave the lock unchanged from before the run. Unrelated projects continue.
 
 Local workspace/path packages are not public-registry audit targets. This incremental OSV check does not certify unchanged versions already in the lock. `--no-age` and `--no-osv` retain their existing configuration precedence.

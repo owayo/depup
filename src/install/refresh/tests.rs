@@ -242,6 +242,9 @@ impl Verification for FakeVerification {
         Ok(None)
     }
     async fn snapshot(&self, job: &InstallJob) -> Result<Snapshot, String> {
+        if job.language == Language::Rust {
+            return cargo_snapshot(&lock_path(job));
+        }
         let content = std::fs::read_to_string(lock_path(job)).map_err(|error| error.to_string())?;
         let packages = crate::manifest::parse_registry_entries(&content)
             .into_iter()
@@ -775,6 +778,143 @@ fn tauri_workspace_inheritance_uses_only_the_apps_root_edge() {
     assert!(
         locked_tauri_version(&manifest, &content.replace("name='app'", "name='missing'")).is_err()
     );
+}
+
+#[test]
+fn git_source_pin_requires_the_declared_revision_to_match_the_locked_commit() {
+    let commit = "0123456789abcdef0123456789abcdef01234567";
+    let other = "fedcba9876543210fedcba9876543210fedcba98";
+    let url = "git+https://example.com/repo";
+    assert!(is_commit_pinned_git_source(&format!(
+        "{url}?rev={commit}#{commit}"
+    )));
+    for unpinned in [
+        format!("{url}?rev={commit}#{other}"),
+        format!("{url}?rev={commit}"),
+        format!("{url}?rev={commit}&branch=main#{commit}"),
+        format!("{url}?rev=refs/heads/main#{commit}"),
+        format!("{url}?tag=v1#{commit}"),
+        format!("{url}#{commit}"),
+        format!("registry+https://example.com/index?rev={commit}#{commit}"),
+    ] {
+        assert!(!is_commit_pinned_git_source(&unpinned), "{unpinned}");
+    }
+}
+
+#[tokio::test]
+async fn only_an_initial_lock_can_add_a_git_dependency_at_its_full_revision() {
+    use crate::test_support::local_registry::{LocalRegistry, TestProject};
+    use std::process::Command;
+
+    let repository = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repository.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    git(&["init", "--initial-branch=main"]);
+    std::fs::write(
+        repository.path().join("Cargo.toml"),
+        "[package]\nname='git-dep'\nversion='0.1.0'\n[lib]\npath='lib.rs'\n",
+    )
+    .unwrap();
+    std::fs::write(repository.path().join("lib.rs"), "").unwrap();
+    git(&["add", "Cargo.toml", "lib.rs"]);
+    git(&[
+        "-c",
+        "user.name=Example",
+        "-c",
+        "user.email=you@example.com",
+        "commit",
+        "-m",
+        "test dependency",
+    ]);
+    let revision = git(&["rev-parse", "HEAD"]);
+    let url = reqwest::Url::from_directory_path(repository.path()).unwrap();
+    let registry = LocalRegistry::new();
+    let original_lock = "version = 4\n";
+    for (key, value, existing, accepted) in [
+        ("rev", revision.as_str(), false, true),
+        ("branch", "main", false, false),
+        ("rev", &revision[..7], false, false),
+        ("rev", revision.as_str(), true, false),
+    ] {
+        let manifest = format!(
+            "[package]\nname='app'\nversion='0.1.0'\nedition='2024'\n[dependencies]\ngit-dep = {{ git = '{url}', {key} = '{value}' }}\n"
+        );
+        let project = TestProject::new(&registry, &manifest);
+        let path = project.path().join("Cargo.lock");
+        if existing {
+            std::fs::write(&path, original_lock).unwrap();
+        }
+        let args = args(project.path());
+        let orchestrator = Orchestrator::new(args.clone()).unwrap();
+        let mut result = OrchestratorResult {
+            summary: UpdateSummary::new(false),
+            write_results: Vec::new(),
+            errors: Vec::new(),
+        };
+        result.summary.add_manifest(ManifestUpdateResult::new(
+            project.path().join("Cargo.toml"),
+            Language::Rust,
+        ));
+        let plan = InstallPlan::new(&orchestrator, &result, &None, project.path());
+        let outcome = run_with(
+            &args,
+            &orchestrator,
+            &plan,
+            &mut result,
+            &SystemVerification(&orchestrator),
+            |command| {
+                let output = Command::new(TestProject::cargo_program())
+                    .arg("update")
+                    .current_dir(&command.directory)
+                    .envs(project.cargo_envs())
+                    // The registry and the Git repository are both local. Cargo needs online mode
+                    // to fetch an uncached file:// Git source.
+                    .env("CARGO_NET_OFFLINE", "false")
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{key}={value}: {output:?}");
+                InstallResult::success(
+                    Language::Rust,
+                    "cargo update".into(),
+                    String::new(),
+                    String::new(),
+                )
+            },
+        )
+        .await;
+        let refresh = &result.summary.lock_refreshes[0];
+        assert!(!outcome.install_failed, "{refresh:?}");
+        assert_eq!(
+            outcome.audit_failed, !accepted,
+            "{key}={value}, {existing}: {refresh:?}"
+        );
+        assert_eq!(refresh.changed, accepted, "{refresh:?}");
+        assert_eq!(project.read("Cargo.toml"), manifest);
+        if accepted {
+            let locked = crate::manifest::read_git_entries(&path);
+            assert_eq!(locked["git-dep"][0].commit, revision);
+        } else {
+            assert!(
+                refresh
+                    .error
+                    .as_ref()
+                    .unwrap()
+                    .contains("changed an external dependency")
+            );
+            if existing {
+                assert_eq!(project.read("Cargo.lock"), original_lock);
+            } else {
+                assert!(!path.exists());
+            }
+        }
+    }
 }
 
 #[tokio::test]
