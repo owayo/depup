@@ -124,6 +124,7 @@ struct Snapshot {
     bytes: Option<Vec<u8>>,
     packages: BTreeSet<(String, String)>,
     protected: BTreeSet<String>,
+    cargo_external: BTreeSet<(String, String, String)>,
     node_direct: BTreeMap<PathBuf, BTreeMap<String, String>>,
     node_direct_edges: crate::node_lock::DirectEdges,
 }
@@ -194,34 +195,10 @@ impl Verification for SystemVerification<'_> {
                 protected: node.protected,
                 node_direct: node.direct,
                 node_direct_edges: node.direct_edges,
+                ..Default::default()
             });
         }
-        let (content, entries) = read_audit_lock(&lock_path(job))?;
-        let protected = parse_lock_packages(&content)
-            .into_iter()
-            .filter(|package| {
-                package
-                    .source
-                    .as_deref()
-                    .is_some_and(|source| !is_crates_io_source(source))
-            })
-            .map(|package| {
-                serde_json::json!([package.name, package.version, package.source]).to_string()
-            })
-            .collect();
-        Ok(Snapshot {
-            bytes: Some(content.into_bytes()),
-            packages: entries
-                .into_iter()
-                .flat_map(|(name, versions)| {
-                    versions
-                        .into_iter()
-                        .map(move |version| (name.clone(), version))
-                })
-                .collect(),
-            protected,
-            ..Default::default()
-        })
+        cargo_snapshot(&lock_path(job))
     }
     async fn cargo_age(
         &self,
@@ -262,6 +239,53 @@ impl Verification for SystemVerification<'_> {
             )
             .await
     }
+}
+
+fn cargo_snapshot(path: &Path) -> Result<Snapshot, String> {
+    let (content, entries) = read_audit_lock(path)?;
+    let cargo_external = parse_lock_packages(&content)
+        .into_iter()
+        .filter_map(|package| {
+            let source = package
+                .source
+                .filter(|source| !is_crates_io_source(source))?;
+            Some((package.name, package.version, source))
+        })
+        .collect();
+    Ok(Snapshot {
+        bytes: Some(content.into_bytes()),
+        packages: entries
+            .into_iter()
+            .flat_map(|(name, versions)| {
+                versions
+                    .into_iter()
+                    .map(move |version| (name.clone(), version))
+            })
+            .collect(),
+        cargo_external,
+        ..Default::default()
+    })
+}
+
+/// Cargo writes the requested Git reference in the query and the resolved commit in the fragment.
+fn is_commit_pinned_git_source(source: &str) -> bool {
+    let Some(url) = source
+        .strip_prefix("git+")
+        .and_then(|source| reqwest::Url::parse(source).ok())
+    else {
+        return false;
+    };
+    let mut query = url.query_pairs();
+    let Some((key, rev)) = query.next() else {
+        return false;
+    };
+    key == "rev"
+        && query.next().is_none()
+        && rev.len() == 40
+        && rev.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && url
+            .fragment()
+            .is_some_and(|commit| commit.eq_ignore_ascii_case(&rev))
 }
 
 /// 復元用スナップショットを検証完了まで保持したまま、明示指定の処理を実行する。
@@ -550,7 +574,15 @@ async fn check_refreshed_lock(
                 .join("; "));
         }
     }
-    if snapshot.protected != before.protected {
+    let is_pinned_initial_cargo_lock = job.language == Language::Rust
+        && before.bytes.is_none()
+        && snapshot
+            .cargo_external
+            .iter()
+            .all(|(_, _, source)| is_commit_pinned_git_source(source));
+    if snapshot.protected != before.protected
+        || (snapshot.cargo_external != before.cargo_external && !is_pinned_initial_cargo_lock)
+    {
         return Err(
             "lock refresh changed an external dependency whose registry policy cannot be verified"
                 .into(),
