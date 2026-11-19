@@ -23,9 +23,9 @@ mod node_preflight;
 mod osv_policy;
 pub(crate) mod osv_report;
 use crate::manifest::{
-    ManifestInfo, ManifestWriter, MiseSettings, RegistryLockEntries, WriteResult,
-    detect_manifests_with_warnings, find_cargo_lock_upward, has_mise_config, parser_for,
-    read_git_entries,
+    GradleFile, ManifestInfo, ManifestWriter, MiseSettings, RegistryLockEntries, WriteResult,
+    detect_manifests_with_warnings, find_cargo_lock_upward, has_gradle_wrapper_checksum,
+    has_mise_config, parser_for, read_git_entries,
 };
 use crate::osv::{OsvCheck, OsvChecker};
 use crate::progress::Progress;
@@ -79,6 +79,7 @@ pub use crate::registry::versions::VersionCache;
 struct ParsedManifest<'a> {
     info: &'a ManifestInfo,
     dependencies: Vec<Dependency>,
+    skip_reason: Option<SkipReason>,
 }
 
 /// 更新ワークフローを調整するオーケストレータ
@@ -710,7 +711,15 @@ impl Orchestrator {
             if info.language == Language::Rust {
                 enrich_with_cargo_lock(&info.path, &self.rust_lock_boundary(), &mut dependencies);
             }
-            parsed.push(ParsedManifest { info, dependencies });
+            let skip_reason = (info.language == Language::Java
+                && GradleFile::of(&info.path) == GradleFile::Wrapper
+                && has_gradle_wrapper_checksum(body))
+            .then_some(SkipReason::GradleWrapperChecksum);
+            parsed.push(ParsedManifest {
+                info,
+                dependencies,
+                skip_reason,
+            });
         }
         progress.finish_and_clear();
         parsed
@@ -732,7 +741,12 @@ impl Orchestrator {
         let mut pnpm_settings = BTreeMap::new();
         // 出した通知。同じ通知をマニフェストごとに繰り返さない (#108)
         let mut shown_notices = HashSet::new();
-        for ParsedManifest { info, dependencies } in parsed {
+        for ParsedManifest {
+            info,
+            dependencies,
+            skip_reason,
+        } in parsed
+        {
             let osv_baselines = self.osv_baselines(info, &dependencies).await;
             let dir = info.path.parent().unwrap_or(&self.args.path);
             let (mut filter, notices) = self.build_filter_for(dir);
@@ -826,12 +840,14 @@ impl Orchestrator {
                     let bar = progress_bar.clone();
                     let override_reason = overrides.and_then(|settings| settings.reason(&dep));
                     let package_filter = package_filter.package_filter_skip_reason(&dep);
+                    let manifest_reason = skip_reason.clone();
                     let source_reason = sources.skip_reason(&dep.name);
                     async move {
                         if let Some(ref b) = bar {
                             b.set_message(format!("Checking {}", dep.name));
                         }
                         let result = if let Some(reason) = package_filter
+                            .or(manifest_reason)
                             .or(source_reason)
                             .or_else(|| override_reason.map(SkipReason::PnpmOverride))
                         {

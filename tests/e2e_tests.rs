@@ -80,6 +80,38 @@ require (
 mod dry_run_tests {
     use super::*;
 
+    #[test]
+    fn gradle_wrapper_checksum_is_reported_as_a_skip() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let wrapper = temp_dir
+            .path()
+            .join("gradle/wrapper/gradle-wrapper.properties");
+        fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
+        let properties = "distributionUrl=https\\://services.gradle.org/distributions/gradle-9.7-bin.zip\n\
+                          distributionSha256Sum=abc\n";
+        fs::write(&wrapper, properties).unwrap();
+
+        let binary = get_binary_path();
+        for extra in [
+            vec!["--dry-run"],
+            vec!["--dry-run", "--include-pinned"],
+            vec!["--install", "--include-pinned"],
+        ] {
+            let output = Command::new(&binary)
+                .args(extra)
+                .args(["--no-osv", "--verbose"])
+                .arg(temp_dir.path())
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stdout}\n{stderr}");
+            assert!(stdout.contains("gradle:wrapper"), "{stdout}");
+            assert!(stdout.contains("distributionSha256Sum"), "{stdout}");
+            assert_eq!(fs::read_to_string(&wrapper).unwrap(), properties);
+        }
+    }
+
     /// dry-run モードがファイルを変更しないことを確認する
     #[test]
     fn test_dry_run_leaves_files_unchanged() {
