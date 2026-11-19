@@ -114,6 +114,8 @@ With `--refresh-lock`, `lock_refreshes` reports each lock scope's `directory`, `
 
 With `--json --install`, output is deferred until install recovery and age audits finish, then one JSON value is flushed even if install fails. Updates canceled by a failed project, including recovery conflicts and lock-only Git updates, move from `updates` to `failed` with a reason. Successful independent projects remain in `updates`. Recovery details and copy locations go to stderr.
 
+Failed post-install age audits appear in `lock_age_failures`, including failures involving only versions locked before the run. Each entry has a `directory`, a `language` (`rust` or `node`), affected `packages` with `name`, `version` and `reason`, lock-level `problems`, and an `unchecked` count for packages the Cargo audit ran out of time to check. The field is omitted when there are no failed audits. `summary.failed` continues to count failed direct updates. Text output shows `Lock age audit failed` for each affected scope, including in quiet mode.
+
 ```bash
 depup --json
 ```

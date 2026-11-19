@@ -3,13 +3,15 @@
 //! `--age` を満たさない場合、または lockfile を検証できなかった場合は、install 単位を
 //! 実行前の状態へ戻す。実行前から lock にあった版の違反は報告するが、
 //! 復元の理由にはしない。
-use super::age::{named, print_rust_audit, rust_restore_reason};
+use super::age::{
+    age_problem, named, node_age_failure, print_rust_audit, rust_age_failure, rust_restore_reason,
+};
 use super::transaction::InstallTransactions;
 use super::*;
 use crate::cargo_rollback::audit::{AuditReceipt, LockAgeAuditResult};
 use crate::cargo_rollback::report::lock_mismatch_lines;
 use crate::cli::CliArgs;
-use crate::domain::UpdateSummary;
+use crate::domain::{LockAgeFailure, UpdateSummary};
 use crate::node_lock::{NodeBaseline, NodeLockAuditResult, UnverifiedKind};
 use crate::orchestrator::osv_report::RollbackOsvChecks;
 use crate::package_manager::{InstallResult, PreparedInstall, SystemPackageManager};
@@ -191,9 +193,18 @@ pub(crate) async fn run_with(
     // 同じディレクトリの別の言語の単位 (Bundler・Go・uv など) の失敗では外さない (#89)。
     tx.pending_report().exclude_rust_audits(&mut audit_plan);
     let mut rollback_osv = RollbackOsvChecks::default();
-    let mut audit_failed =
-        audit_rust_locks(args, &audit_plan, &mut tx, checks, &mut rollback_osv).await;
-    audit_failed |= audit_node_locks(args, plan, &baselines, &mut tx, checks).await;
+    let failures = &mut result.summary.lock_age_failures;
+    audit_rust_locks(
+        args,
+        &audit_plan,
+        &mut tx,
+        checks,
+        &mut rollback_osv,
+        failures,
+    )
+    .await;
+    audit_node_locks(args, plan, &baselines, &mut tx, checks, failures).await;
+    let mut audit_failed = !failures.is_empty();
     let security = audit_osv(args, plan, &audit_plan, &osv_baselines, &mut tx, checks).await;
     audit_failed |= security.failed;
     let recovery = tx.rollback();
@@ -328,21 +339,26 @@ async fn audit_rust_locks(
     tx: &mut InstallTransactions,
     checks: &impl Checks,
     rollback_osv: &mut RollbackOsvChecks,
-) -> bool {
+    failures: &mut Vec<LockAgeFailure>,
+) {
     for directory in &plan.missing_lock_dirs {
         eprintln!(
             "  {} — cannot audit --age: Cargo.lock not found",
             crate::user_path::display(directory)
         );
+        failures.push(age_problem(
+            directory,
+            Language::Rust,
+            "Cargo.lock not found".into(),
+        ));
         // このマニフェストを install した単位を選び、同じディレクトリの別の単位は選ばない。
         tx.fail_holder(
             &directory.join("Cargo.toml"),
             "Cargo.lock was not found after the install, so --age could not be checked".into(),
         );
     }
-    let mut has_unresolved = !plan.missing_lock_dirs.is_empty();
     if plan.locks.is_empty() {
-        return has_unresolved;
+        return;
     }
     if args.verbose {
         eprintln!();
@@ -356,13 +372,17 @@ async fn audit_rust_locks(
             continue;
         }
         if let Some(problem) = &lock.baseline_problem {
-            has_unresolved = true;
             progress.suspend(|| {
                 eprintln!(
                     "  {} — cannot safely roll back --age violations: pre-install {problem}",
                     crate::user_path::display(&lock.directory)
                 )
             });
+            failures.push(age_problem(
+                &lock.directory,
+                Language::Rust,
+                format!("pre-install {problem}"),
+            ));
             tx.fail_holder(
                 &lock.directory.join("Cargo.lock"),
                 format!(
@@ -373,26 +393,24 @@ async fn audit_rust_locks(
         }
         let (audit, receipt) = checks.rust_lock(lock, bar.as_ref()).await;
         rollback_osv.record(&lock.directory, &audit);
-        has_unresolved |= audit.has_unresolved();
         print_rust_audit(&lock.directory, &audit, args.verbose, &progress);
         let mut reason = rust_restore_reason(&audit, &lock.baseline);
         let path = lock.directory.join("Cargo.lock");
         // 監査が保証したバイト列だけを採用する。どの単位にも含まれない lockfile は監査だけの対象。
-        if let Some(receipt) = receipt
-            && tx.manages(&path)
-            && let Err(error) = tx.accept_audit_lock(&path, &receipt.before, &receipt.after)
-        {
-            has_unresolved = true;
-            reason.get_or_insert(format!(
-                "Cargo.lock changed outside the --age audit ({error})"
-            ));
+        let ownership_problem = receipt.filter(|_| tx.manages(&path)).and_then(|receipt| {
+            tx.accept_audit_lock(&path, &receipt.before, &receipt.after)
+                .err()
+                .map(|error| format!("Cargo.lock changed outside the --age audit ({error})"))
+        });
+        if let Some(problem) = &ownership_problem {
+            reason.get_or_insert_with(|| problem.clone());
         }
+        failures.extend(rust_age_failure(&lock.directory, &audit, ownership_problem));
         if let Some(reason) = reason {
             tx.fail_holder(&path, reason);
         }
     }
     progress.finish_and_clear();
-    has_unresolved
 }
 
 /// Node の lockfile を読み取り専用で監査し、復元する単位を失敗にする。
@@ -402,9 +420,9 @@ async fn audit_node_locks(
     baselines: &BTreeMap<PathBuf, NodeBaseline>,
     tx: &mut InstallTransactions,
     checks: &impl Checks,
-) -> bool {
+    failures: &mut Vec<LockAgeFailure>,
+) {
     let pm_runner = SystemPackageManager::new();
-    let mut failed = false;
     let mut progress = Progress::new(!args.quiet);
     for job in &plan.node_audits {
         // install 自体や Tauri の Cargo.lock ですでに失敗した単位も、どのみち復元される。
@@ -438,7 +456,7 @@ async fn audit_node_locks(
                     "  {} — cannot audit --age: {error}",
                     crate::user_path::display(&job.directory)
                 );
-                failed = true;
+                failures.push(age_problem(&job.directory, Language::Node, error.clone()));
                 continue;
             }
         };
@@ -450,7 +468,11 @@ async fn audit_node_locks(
                 "  {} — cannot audit --age: Node package manager could not be determined",
                 crate::user_path::display(&job.directory)
             );
-            failed = true;
+            failures.push(age_problem(
+                &job.directory,
+                Language::Node,
+                "Node package manager could not be determined".into(),
+            ));
             continue;
         };
         progress.start(0, "Auditing Node lockfile against --age");
@@ -458,7 +480,9 @@ async fn audit_node_locks(
         let audit = checks
             .node_lock(&directory, manager, policy, bar.as_ref())
             .await;
-        failed |= audit.has_failures();
+        if audit.has_failures() {
+            failures.push(node_age_failure(&directory, &audit));
+        }
         progress.suspend(|| {
             for message in audit.failure_messages() {
                 eprintln!(
@@ -482,7 +506,6 @@ async fn audit_node_locks(
             tx.fail_holder(&lockfile, reason);
         }
     }
-    failed
 }
 
 /// Node の単位を実行前へ戻す理由。公開 npm レジストリ以外の取得元は監査対象外であり、

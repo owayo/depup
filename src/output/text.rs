@@ -942,6 +942,14 @@ impl OutputFormatter for TextFormatter {
                     .map_or(String::new(), |error| format!(" — {error}"))
             )?;
         }
+        for failure in &result.summary.lock_age_failures {
+            writeln!(
+                writer,
+                "Lock age audit failed for {} ({}). See stderr for details.",
+                crate::user_path::display(&failure.directory),
+                failure.language.display_name(),
+            )?;
+        }
         // quiet モードではサマリのみ表示
         if self.verbosity == Verbosity::Quiet {
             return self.format_summary(&result.summary, writer);

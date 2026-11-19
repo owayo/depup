@@ -122,6 +122,25 @@ pub struct UpdateSummary {
     /// lock の再解決の結果は、直接依存の更新件数と分けて集計する。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lock_refreshes: Vec<LockRefreshResult>,
+    /// install 後の lockfile 監査で、age を満たさなかった単位。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lock_age_failures: Vec<LockAgeFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockAgeFailure {
+    pub directory: PathBuf,
+    pub language: Language,
+    pub packages: Vec<LockAgePackageFailure>,
+    pub problems: Vec<String>,
+    pub unchecked: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockAgePackageFailure {
+    pub name: String,
+    pub version: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -140,6 +159,7 @@ impl UpdateSummary {
             manifests: Vec::new(),
             dry_run,
             lock_refreshes: Vec::new(),
+            lock_age_failures: Vec::new(),
         }
     }
 

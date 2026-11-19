@@ -1,5 +1,5 @@
 //! 明示指定による lock の再解決。最終 lock のすべての検証が通るまで、解決結果は仮のものとする。
-use super::age::{print_rust_audit, rust_restore_reason};
+use super::age::{node_age_failure, print_rust_audit, rust_age_failure, rust_restore_reason};
 use super::transaction::InstallTransactions;
 use super::*;
 use crate::cargo_rollback::audit::{AuditReceipt, LockAgeAuditResult};
@@ -7,6 +7,7 @@ use crate::cli::CliArgs;
 use crate::domain::LockRefreshResult;
 use crate::file_snapshot::{FileGuard, FileState};
 use crate::manifest::{is_crates_io_source, parse_lock_packages};
+use crate::node_lock::NodeLockAuditResult;
 use crate::orchestrator::osv_report::RollbackOsvChecks;
 use crate::package_manager::{InstallResult, PreparedInstall, SystemPackageManager};
 use crate::progress::Progress;
@@ -157,7 +158,7 @@ trait Verification: Sync {
         preferred: &PreferredVersions,
         progress: &Progress,
     ) -> (LockAgeAuditResult, Option<AuditReceipt>);
-    async fn node_age(&self, job: &InstallJob, progress: &Progress) -> Result<(), String>;
+    async fn node_age(&self, job: &InstallJob, progress: &Progress) -> NodeLockAuditResult;
     async fn osv(&self, language: Language, name: &str, version: &str) -> Result<(), String>;
 }
 
@@ -239,19 +240,14 @@ impl Verification for SystemVerification<'_> {
             )
             .await
     }
-    async fn node_age(&self, job: &InstallJob, progress: &Progress) -> Result<(), String> {
-        let audit = crate::node_lock::audit_node_lock(
+    async fn node_age(&self, job: &InstallJob, progress: &Progress) -> NodeLockAuditResult {
+        crate::node_lock::audit_node_lock(
             &job.directory,
             "pnpm",
             job.policy.as_ref().expect("prepared policy"),
             progress.bar().as_ref(),
         )
-        .await;
-        if audit.has_failures() {
-            Err(audit.failure_messages().join("; "))
-        } else {
-            Ok(())
-        }
+        .await
     }
     async fn osv(&self, language: Language, name: &str, version: &str) -> Result<(), String> {
         self.0
@@ -379,7 +375,11 @@ async fn run_with(
                 tx.accept_audit_lock(&lock_path(job), &receipt.before, &receipt.after)
             });
             // 既存版の違反も終了コードに反映するが、復元は今回入った版で判定する。
-            audit_failed |= audit.has_unresolved();
+            result.summary.lock_age_failures.extend(rust_age_failure(
+                &job.directory,
+                &audit,
+                ownership.as_ref().err().cloned(),
+            ));
             if job
                 .policy
                 .as_ref()
@@ -391,7 +391,16 @@ async fn run_with(
             }
             ownership.and_then(|_| rust_restore_reason(&audit, &baseline).map_or(Ok(()), Err))
         } else {
-            verifier.node_age(job, &progress).await
+            let audit = verifier.node_age(job, &progress).await;
+            if audit.has_failures() {
+                result
+                    .summary
+                    .lock_age_failures
+                    .push(node_age_failure(&job.directory, &audit));
+                Err(audit.failure_messages().join("; "))
+            } else {
+                Ok(())
+            }
         };
         if let Err(error) = age {
             reject(&mut tx, &mut errors, job, error);
@@ -475,6 +484,7 @@ async fn run_with(
     InstallOutcome {
         install_failed: report.has_install_failures(),
         audit_failed: audit_failed
+            || !result.summary.lock_age_failures.is_empty()
             || !errors.is_empty()
             || result
                 .summary

@@ -310,11 +310,14 @@ impl Verification for FakeVerification {
             None,
         )
     }
-    async fn node_age(&self, _: &InstallJob, _: &Progress) -> Result<(), String> {
-        if self.age_error {
-            Err("young lock version".into())
-        } else {
-            Ok(())
+    async fn node_age(&self, _: &InstallJob, _: &Progress) -> NodeLockAuditResult {
+        NodeLockAuditResult {
+            errors: self
+                .age_error
+                .then(|| "young lock version".into())
+                .into_iter()
+                .collect(),
+            ..Default::default()
         }
     }
     async fn osv(&self, _: Language, name: &str, version: &str) -> Result<(), String> {
@@ -864,7 +867,7 @@ async fn real_cargo_refresh(case: &str, existing_young: bool, restored_young: bo
             self.audits.lock().unwrap().push(result.clone());
             (result, receipt)
         }
-        async fn node_age(&self, _: &InstallJob, _: &Progress) -> Result<(), String> {
+        async fn node_age(&self, _: &InstallJob, _: &Progress) -> NodeLockAuditResult {
             panic!("Cargo-only fixture")
         }
         async fn osv(&self, _: Language, name: &str, version: &str) -> Result<(), String> {
@@ -922,6 +925,10 @@ async fn real_cargo_refresh(case: &str, existing_young: bool, restored_young: bo
     assert_eq!(refresh.status, "completed", "{case}: {refresh:?}");
     assert_eq!(refresh.changed, !restored_young, "{case}");
     assert!(refresh.error.is_none(), "{case}");
+    assert_eq!(
+        result.summary.lock_age_failures.len(),
+        usize::from(outcome.audit_failed)
+    );
     let audit = verifier.audits.lock().unwrap();
     let lines =
         crate::cargo_rollback::report::lock_age_report_lines(project.path(), &audit[0], false);

@@ -114,6 +114,8 @@ depup --cd ./projects/myapp -n
 
 `--json --install` は、install の復元と age 監査が終わってから JSON を 1 回だけ出力して flush します。install が失敗しても JSON を出します。失敗したプロジェクトの取り消した更新は、復元の競合や lock だけを変える Git 更新も含め、理由付きで `updates` から `failed` に移ります。独立したプロジェクトの成功は `updates` に残ります。復元の詳細とコピーの保存先は標準エラー出力に出します。
 
+install 後の age 監査の失敗は、実行前から lock にある版だけが違反した場合も `lock_age_failures` に出します。各要素には `directory`、`language`（`rust` または `node`）、対象の `packages`（`name`、`version`、`reason`）、lock 全体の問題を示す `problems`、Cargo の監査で時間内に確認できなかった件数 `unchecked` が入ります。監査の失敗がなければこのフィールドは出ません。`summary.failed` は引き続き直接依存の更新失敗を数えます。テキスト出力では `--quiet` でも、対象ごとに `Lock age audit failed` を表示します。
+
 ```bash
 depup --json
 ```

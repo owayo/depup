@@ -30,6 +30,8 @@ impl JsonFormatter {
 struct JsonOutput {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     lock_refreshes: Vec<crate::domain::LockRefreshResult>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    lock_age_failures: Vec<crate::domain::LockAgeFailure>,
     /// dry-run だったかどうか
     dry_run: bool,
     /// サマリ統計
@@ -331,6 +333,15 @@ impl OutputFormatter for JsonFormatter {
                 .map(|refresh| crate::domain::LockRefreshResult {
                     directory: crate::user_path::for_display(&refresh.directory).into_owned(),
                     ..refresh.clone()
+                })
+                .collect(),
+            lock_age_failures: result
+                .summary
+                .lock_age_failures
+                .iter()
+                .map(|failure| crate::domain::LockAgeFailure {
+                    directory: crate::user_path::for_display(&failure.directory).into_owned(),
+                    ..failure.clone()
                 })
                 .collect(),
             dry_run: result.summary.dry_run,

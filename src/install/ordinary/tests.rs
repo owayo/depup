@@ -490,6 +490,17 @@ async fn a_young_version_locked_before_the_run_does_not_restore_the_unit() {
     assert_eq!(run.project.locked_versions("leaf"), ["1.2.0"]);
     assert_eq!(run.project.locked_versions("top"), ["1.1.0"]);
     assert!(!run.canceled());
+    let mut output = Vec::new();
+    let formatter = crate::output::JsonFormatter::new(crate::output::Verbosity::Normal);
+    crate::output::OutputFormatter::format(&formatter, &run.result, &mut output).unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(json["summary"]["failed"], 0);
+    assert_eq!(
+        json["lock_age_failures"][0]["packages"],
+        serde_json::json!([
+            {"name": "leaf", "version": "1.2.0", "reason": "newer than --age"}
+        ])
+    );
 }
 
 /// 監査の外で変わった lockfile は採用せず、上書きもしない。マニフェストだけを戻すと
