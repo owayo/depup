@@ -77,7 +77,7 @@ pub struct InstallTransactions {
     task_units: Vec<usize>,
     files: BTreeMap<PathBuf, FileRecord>,
     node_managers: BTreeMap<PathBuf, (PathBuf, &'static str)>,
-    recovery_boundary: PathBuf,
+    mise_recovery_boundary: PathBuf,
 }
 
 #[derive(Debug)]
@@ -130,14 +130,37 @@ pub struct RollbackReport {
 
 impl InstallTransactions {
     pub fn begin(plan: &InstallPlan, result: &OrchestratorResult, boundary: &Path) -> Self {
+        Self::begin_in(plan, result, boundary, None)
+    }
+
+    pub(crate) fn begin_for_run(
+        plan: &InstallPlan,
+        result: &OrchestratorResult,
+        boundary: &Path,
+    ) -> Self {
+        Self::begin_in(
+            plan,
+            result,
+            boundary,
+            std::env::current_dir().ok().as_deref(),
+        )
+    }
+
+    fn begin_in(
+        plan: &InstallPlan,
+        result: &OrchestratorResult,
+        boundary: &Path,
+        invocation: Option<&Path>,
+    ) -> Self {
         let pm = SystemPackageManager::new();
+        let mise_recovery_boundary = mise::invocation_boundary(identity(boundary), invocation);
         let mut tx = Self {
             tasks: vec![],
             units: vec![],
             task_units: vec![],
             files: BTreeMap::new(),
             node_managers: BTreeMap::new(),
-            recovery_boundary: identity(boundary),
+            mise_recovery_boundary,
         };
         for job in &plan.node_audits {
             if let Some(manager) = pm.resolve_package_manager(job.language, &job.directory) {
@@ -301,7 +324,7 @@ impl InstallTransactions {
             self.attach_uv_scope(&mut task, &effective_dir, result, boundary, roots);
         }
         if manager == "mise" {
-            self.attach_mise_scope(&mut task, &effective_dir, &job.manifests, result, boundary);
+            self.attach_mise_scope(&mut task, &effective_dir, &job.manifests, result);
         }
         if job.language == Language::Java {
             let root = gradle_root(&effective_dir, boundary);
@@ -343,8 +366,9 @@ impl InstallTransactions {
         if let Ok(Some(command)) = &mut task.command {
             task.uv_lock = uv_lock::Normalization::prepare(scope.root.join("uv.lock"), command);
         }
+        let recovery_boundary = identity(boundary);
         for name in ["pyproject.toml", "uv.lock"] {
-            self.add_scoped_path(task, &scope.root.join(name));
+            self.add_scoped_path(task, &scope.root.join(name), &recovery_boundary);
         }
         // uv は、各メンバーで選ばれたコマンドが pip である場合や準備に失敗した場合も含め、
         // 確定したすべてのメンバーの要件を解決する。
@@ -384,9 +408,9 @@ impl InstallTransactions {
         effective_dir: &Path,
         manifests: &[PathBuf],
         result: &OrchestratorResult,
-        boundary: &Path,
     ) {
-        let scope = match mise::managed_paths(effective_dir, manifests, boundary) {
+        let boundary = self.mise_recovery_boundary.clone();
+        let scope = match mise::managed_paths(effective_dir, manifests, &boundary) {
             Ok(scope) => scope,
             Err(error) => {
                 task.command = Err(error);
@@ -394,7 +418,7 @@ impl InstallTransactions {
             }
         };
         for config in &scope.configs {
-            self.add_guarded_path(task, config, false, Some(&identity(boundary)));
+            self.add_guarded_path(task, config, false, Some(&boundary));
         }
         // このマニフェスト自身のジョブの準備に失敗しても、別のジョブによって、
         // 共有コマンドが読む設定を確定できる場合がある。
@@ -403,21 +427,16 @@ impl InstallTransactions {
                 && scope.configs.contains(&identity(&manifest.path))
             {
                 task.summaries.insert(index);
-                self.add_guarded_path(
-                    task,
-                    &manifest.path,
-                    false,
-                    Some(&self.recovery_boundary.clone()),
-                );
+                self.add_guarded_path(task, &manifest.path, false, Some(&boundary));
             }
         }
         for path in scope.paths {
-            if !self.add_scoped_path(task, &path) {
+            if !self.add_scoped_path(task, &path, &boundary) {
                 continue;
             }
             let tree = mise::sidecar(&path);
             match FileGuard::capture(&tree).and_then(|guard| {
-                let paths = mise::tree_files(&guard, &self.recovery_boundary, None)?;
+                let paths = mise::tree_files(&guard, &boundary, None)?;
                 Ok((guard, paths))
             }) {
                 Ok((guard, paths)) => {
@@ -428,7 +447,7 @@ impl InstallTransactions {
                         ));
                     }
                     for path in paths.paths {
-                        self.add_scoped_path(task, &path);
+                        self.add_scoped_path(task, &path, &boundary);
                     }
                     task.tree_links.extend(paths.links);
                     task.trees.push(guard);
@@ -509,10 +528,9 @@ impl InstallTransactions {
         }
     }
 
-    fn add_scoped_path(&mut self, task: &mut Task, path: &Path) -> bool {
+    fn add_scoped_path(&mut self, task: &mut Task, path: &Path, boundary: &Path) -> bool {
         task.claimed
             .insert(std::path::absolute(path).unwrap_or_else(|_| path.into()));
-        let boundary = self.recovery_boundary.clone();
         let logical = path
             .parent()
             .zip(path.file_name())
@@ -525,13 +543,13 @@ impl InstallTransactions {
                 return false;
             }
         };
-        if !logical.starts_with(&boundary) {
+        if !logical.starts_with(boundary) {
             task.command = Err("Managed scope is outside the permitted recovery boundary".into());
             return false;
         }
         // lock の場所の特定や保存に失敗しても、確定した関係は保持する。
         task.scope_paths.insert(logical);
-        self.add_guarded_path(task, path, true, Some(&boundary))
+        self.add_guarded_path(task, path, true, Some(boundary))
     }
 
     fn group(&mut self, result: &OrchestratorResult) {
@@ -956,7 +974,7 @@ impl InstallTransactions {
         for tree in self.tasks[task].trees.clone() {
             let paths = match mise::tree_files(
                 &tree,
-                &self.recovery_boundary,
+                &self.mise_recovery_boundary,
                 Some(&self.tasks[task].tree_links),
             ) {
                 Ok(paths) => paths,
@@ -981,7 +999,7 @@ impl InstallTransactions {
                     continue;
                 }
                 match FileGuard::capture(&path).and_then(|guard| {
-                    if !guard.target.starts_with(&self.recovery_boundary) {
+                    if !guard.target.starts_with(&self.mise_recovery_boundary) {
                         return Err(io::Error::other(
                             "Mise metadata resolves outside the permitted recovery boundary",
                         ));
