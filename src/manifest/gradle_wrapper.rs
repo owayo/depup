@@ -19,6 +19,12 @@ pub(crate) const GRADLE_WRAPPER_FILES: [&str; 4] = [
     "gradlew.bat",
 ];
 
+pub(crate) fn has_gradle_wrapper_checksum(content: &str) -> bool {
+    content
+        .lines()
+        .any(|line| line.trim_start().starts_with("distributionSha256Sum"))
+}
+
 fn is_distribution_url_line(line: &str) -> bool {
     let trimmed = line.trim_start();
     if trimmed.starts_with(['#', '!']) {
@@ -78,17 +84,6 @@ pub(super) fn parse(content: &str) -> Result<Option<Vec<Dependency>>, ManifestEr
     if versions.len() != 1 {
         return Ok(Some(Vec::new()));
     }
-    if content
-        .lines()
-        .any(|line| line.trim_start().starts_with("distributionSha256Sum"))
-    {
-        return Err(ManifestError::InvalidVersionSpec {
-            path: PathBuf::from("gradle-wrapper.properties"),
-            spec: GRADLE_WRAPPER_PACKAGE.to_string(),
-            message: "distributionSha256Sum must be updated together with distributionUrl"
-                .to_string(),
-        });
-    }
     let version = versions[0].2;
     let Some(spec) = get_parser(Language::Java).parse(version) else {
         return Ok(Some(Vec::new()));
@@ -107,6 +102,14 @@ pub(super) fn update_version(
 ) -> Result<Option<String>, ManifestError> {
     if package != GRADLE_WRAPPER_PACKAGE || parse(content)?.is_none() {
         return Ok(None);
+    }
+    if has_gradle_wrapper_checksum(content) {
+        return Err(ManifestError::InvalidVersionSpec {
+            path: PathBuf::from("gradle-wrapper.properties"),
+            spec: package.to_string(),
+            message: "distributionSha256Sum must be updated together with distributionUrl"
+                .to_string(),
+        });
     }
     if get_parser(Language::Java).parse(new_version).is_none()
         || !new_version
@@ -171,7 +174,8 @@ mod tests {
                 .is_empty()
         );
         let content = "distributionUrl=https\\://services.gradle.org/distributions/gradle-9.7-bin.zip\ndistributionSha256Sum=abc\n";
-        assert!(parse(content).is_err());
+        let dependencies = parse(content).unwrap().unwrap();
+        assert_eq!(dependencies[0].version_spec.version, "9.7");
         assert!(update_version(content, GRADLE_WRAPPER_PACKAGE, "9.8").is_err());
         let duplicate = "distributionUrl=https\\://services.gradle.org/distributions/gradle-9.7-bin.zip\ndistributionUrl=https\\://example.com/gradle-9.6-bin.zip\n";
         assert!(parse(duplicate).is_err());

@@ -52,6 +52,8 @@ pub enum SkipReason {
     NotInOnlyList,
     /// 実効的な pnpm override がこの宣言を制御している。override 自体は変更しない。
     PnpmOverride(String),
+    /// Wrapper の配布 URL に対応するチェックサムが設定されている。
+    GradleWrapperChecksum,
     /// プロジェクトの設定が、公開レジストリ以外 (私設レジストリ・ミラー・Packagist 以外の
     /// リポジトリ) を取得元にしている。公開レジストリの版で判定・更新しない (#91)。
     /// 内側の値はどの設定か (`.npmrc: @example:registry` など)
@@ -90,6 +92,7 @@ impl fmt::Display for SkipReason {
             SkipReason::Excluded => write!(f, "excluded by --exclude"),
             SkipReason::NotInOnlyList => write!(f, "not in --only list"),
             SkipReason::PnpmOverride(message) => write!(f, "{message}"),
+            SkipReason::GradleWrapperChecksum => write!(f, "distributionSha256Sum is set"),
             SkipReason::NonPublicSource(origin) => write!(f, "non-public source ({origin})"),
             SkipReason::SourceUnverified(reason) => {
                 write!(f, "source could not be verified ({reason})")

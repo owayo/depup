@@ -172,6 +172,7 @@ impl JsonFormatter {
             SkipReason::Excluded => "excluded".to_string(),
             SkipReason::NotInOnlyList => "not_in_only_list".to_string(),
             SkipReason::PnpmOverride(message) => format!("pnpm_override: {message}"),
+            SkipReason::GradleWrapperChecksum => "gradle_wrapper_checksum".to_string(),
             SkipReason::NonPublicSource(origin) => format!("non_public_source: {origin}"),
             SkipReason::SourceUnverified(reason) => format!("source_unverified: {reason}"),
             SkipReason::FetchFailed(msg) => format!("fetch_failed: {}", msg),
