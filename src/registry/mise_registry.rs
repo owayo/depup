@@ -226,7 +226,17 @@ impl RegistryAdapter for MiseAdapter {
             .cutoff
             .map(|cutoff| cutoff.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
             .unwrap_or_else(|| "0".into());
-        let mut command = Command::new(&self.program);
+        // Windows では存在確認と install と同様に、PATH 上の .cmd / .bat を実体パスで渡す。
+        #[cfg(windows)]
+        let program = crate::package_manager::resolve_program(
+            &self.program,
+            self.directory
+                .as_deref()
+                .unwrap_or(std::path::Path::new(".")),
+        );
+        #[cfg(not(windows))]
+        let program = &self.program;
+        let mut command = Command::new(program);
         if let Some(dir) = &self.directory {
             command.current_dir(dir);
         }
