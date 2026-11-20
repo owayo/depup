@@ -11,7 +11,8 @@
 use crate::domain::{Dependency, Language, VersionSpec, VersionSpecKind};
 use crate::error::ManifestError;
 use crate::manifest::{
-    ManifestParser, gradle_version_catalog, gradle_wrapper, line_utils::split_line_ending,
+    ManifestParser, gradle_plugins, gradle_version_catalog, gradle_wrapper,
+    line_utils::split_line_ending,
 };
 use crate::parser::get_parser;
 use regex::Regex;
@@ -1124,6 +1125,7 @@ impl ManifestParser for GradleParser {
             }
         }
 
+        dependencies.extend(gradle_plugins::parse(content, parser.as_ref()));
         Ok(dependencies)
     }
 
@@ -1138,6 +1140,11 @@ impl ManifestParser for GradleParser {
         new_version: &str,
     ) -> Result<String, ManifestError> {
         let parser = get_parser(Language::Java);
+        if let Some(updated) =
+            gradle_plugins::update_version(content, package, new_version, parser.as_ref())?
+        {
+            return Ok(updated);
+        }
         let variables = self.extract_variables(content);
         // コメントアウトされた宣言に変数バインドを誘導されないよう、除去済みの行で判定する
         let stripped_lines = strip_gradle_comment_lines(content);
@@ -2951,7 +2958,21 @@ dependencies {
 }
 "#;
         let deps = parse(content).unwrap();
-        assert_eq!(deps.len(), 5);
+        assert_eq!(deps.len(), 6);
+        let plugin = deps
+            .iter()
+            .find(|dep| {
+                dep.name == "org.springframework.boot:org.springframework.boot.gradle.plugin"
+            })
+            .unwrap();
+        assert_eq!(plugin.version_spec.version, "3.0.0");
+        assert!(plugin.is_pinned());
+        assert_eq!(
+            GradleParser
+                .update_version(content, &plugin.name, "3.1.0")
+                .unwrap(),
+            content.replace("version '3.0.0'", "version '3.1.0'")
+        );
 
         // 主要な依存関係を確認
         let spring_boot = deps
@@ -2970,6 +2991,45 @@ dependencies {
 
         let test_deps: Vec<_> = deps.iter().filter(|d| d.is_dev).collect();
         assert_eq!(test_deps.len(), 2);
+    }
+
+    #[test]
+    fn gradle_plugin_versions_only_rewrite_the_active_literal() {
+        let content = r#"
+/* ignore a nested Kotlin comment /* inner */
+    plugins { id("com.android.application") version "8.0.0" }
+*/
+buildscript {
+    val note = """
+        plugins { id("com.example.literal") version "1.0.0" }
+    """
+}
+plugins /* 日本語 */ {
+    // id("com.example.commented") version "1.0.0"
+    /* id("com.example.commented") version "1.0.0" */
+    id("java")
+    alias(libs.plugins.somePlugin)
+    id("com.example.computed") version "$pluginVersion"
+    id("com.android.application") version "9.1.1" apply false // preserve the comment
+    id("com.example.other").version("1.0.0")
+}
+subprojects {
+    plugins { id("com.example.nested") version "1.0.0" }
+}
+"#
+        .replace('\n', "\r\n");
+        let deps = parse(&content).unwrap();
+        assert_eq!(deps.len(), 2);
+        let agp = "com.android.application:com.android.application.gradle.plugin";
+        assert_eq!(deps[0].name, agp);
+        assert_eq!(
+            deps[1].name,
+            "com.example.other:com.example.other.gradle.plugin"
+        );
+        assert_eq!(
+            GradleParser.update_version(&content, agp, "9.2.0").unwrap(),
+            content.replace("\"9.1.1\"", "\"9.2.0\"")
+        );
     }
 
     // --- 追加エッジケーステスト ---

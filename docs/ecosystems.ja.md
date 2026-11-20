@@ -184,6 +184,8 @@ Gradle の宣言ラッパー `platform(...)` / `enforcedPlatform(...)` / `testFi
 
 `gradle/wrapper/gradle-wrapper.properties` の配布 URL は、Gradle の公式版一覧を使って更新します。RC とマイルストーンは、ほかのプレリリースと同じく、Wrapper がすでにプレリリースを指しているときだけ選びます。そのため RC を指す Wrapper は、正式リリースが出ればそこへ更新します。スナップショット・ナイトリー・壊れた版は使いません。`-bin` / `-all` と改行形式を保持します。Wrapper を更新して `--install` を実行する場合、依存の処理より前に `./gradlew wrapper --gradle-version <version>` を 2 回実行し、スクリプトと JAR を揃えます（Windows では `gradlew.bat`）。独自の配布 URL は更新対象から外します。公式 URL を使う Wrapper に `distributionSha256Sum` が設定されている場合は、チェックサムを理由にスキップと表示します。`--include-pinned` を付けた場合も同じで、終了コードには影響しません。Wrapper として読むのは `gradle/wrapper/gradle-wrapper.properties` だけです。build スクリプトの `wrapper` タスクなどにある `distributionUrl` の設定は Wrapper として扱わず、そのスクリプトの依存も通常どおり検出します。Android Gradle Plugin を更新する場合は、[公式の対応表](https://developer.android.com/build/releases/about-agp)で選んだ Gradle Wrapper が必要最小版を満たすことを確認してください。
 
+Gradle のビルドスクリプトでは、トップレベルの `plugins { ... }` にある `id("com.android.application") version "9.1.1"` や Groovy の `id 'org.springframework.boot' version '3.0.0'` を更新します。version catalog のプラグインと同じリポジトリで plugin marker を取得し、`apply false` の有無にかかわらず版の文字列だけを書き換えます。
+
 Gradle の文字列記法では、`:resources@zip` や `@aar` のような classifier / extension の接尾辞を保持します。`//` の行コメントや `/* ... */` のブロックコメントの中だけにある依存宣言は無視します。Gradle version catalog では、バージョンが宣言されている TOML の文字列形式またはテーブル形式を保ったまま更新します。
 
 `-SNAPSHOT` / `.SNAPSHOT` で終わるバージョンを直接指定した依存（`1.2.3-SNAPSHOT`、`1.2.3-SNAPSHOT!!`、`[1.2.3-SNAPSHOT]`）は対象外です。SNAPSHOT は、依存を解決するたびに最新のタイムスタンプ付きビルドを取り直す「動く参照」です。固定のリリース版へ書き換えると、ビルドに使われる中身が気づかないうちに変わります。`.Final` / `.RELEASE` / `-jre` / `-SP1` のような安定版の qualifier が付いたバージョンは、通常どおり更新します。
