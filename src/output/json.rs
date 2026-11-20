@@ -6,7 +6,9 @@
 
 #[cfg(test)]
 use crate::domain::Language;
-use crate::domain::{GitReference, ManifestUpdateResult, SkipReason, UpdateResult, UpdateSummary};
+use crate::domain::{
+    GitReference, ManifestUpdateResult, SkipReason, SubmoduleResult, UpdateResult, UpdateSummary,
+};
 use crate::orchestrator::OrchestratorResult;
 use crate::output::{OutputFormatter, Verbosity};
 use serde::Serialize;
@@ -27,11 +29,13 @@ impl JsonFormatter {
 
 /// 全結果の JSON 表現
 #[derive(Serialize)]
-struct JsonOutput {
+struct JsonOutput<'a> {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     lock_refreshes: Vec<crate::domain::LockRefreshResult>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     lock_age_failures: Vec<crate::domain::LockAgeFailure>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    submodules: Option<&'a [SubmoduleResult]>,
     /// dry-run だったかどうか
     dry_run: bool,
     /// サマリ統計
@@ -326,6 +330,7 @@ impl OutputFormatter for JsonFormatter {
         };
 
         let output = JsonOutput {
+            submodules: result.summary.submodules.as_deref(),
             // 再解決の単位のディレクトリは正規化されている。テキストと同じく `\\?\` を外す (#148)
             lock_refreshes: result
                 .summary

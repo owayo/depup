@@ -30,6 +30,7 @@ mod pnpm_overrides;
 pub mod progress;
 pub mod registry;
 mod registry_sources;
+mod submodules;
 pub mod tauri_sync;
 #[cfg(test)]
 pub(crate) mod test_support;

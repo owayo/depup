@@ -4,7 +4,9 @@
 //! - unified diff 形式の表示
 //! - 更新前後バージョンの比較
 
-use crate::domain::{GitReference, ManifestUpdateResult, UpdateResult, UpdateSummary};
+use crate::domain::{
+    GitReference, ManifestUpdateResult, SubmoduleOutcome, UpdateResult, UpdateSummary,
+};
 use crate::orchestrator::OrchestratorResult;
 use crate::output::OutputFormatter;
 use std::io::Write;
@@ -126,6 +128,32 @@ impl OutputFormatter for DiffFormatter {
             }
         }
 
+        for module in result.summary.submodules.iter().flatten() {
+            let path = &module.path;
+            match &module.outcome {
+                SubmoduleOutcome::Updated { from, to, .. } => {
+                    writeln!(writer, "{prefix}--- a/{path}")?;
+                    writeln!(writer, "{prefix}+++ b/{path}")?;
+                    writeln!(writer, "@@ -1 +1 @@")?;
+                    writeln!(writer, "-Subproject commit {from}")?;
+                    writeln!(writer, "+Subproject commit {to}\n")?;
+                }
+                SubmoduleOutcome::Skipped { reason } => {
+                    writeln!(writer, "{prefix}# {path}: skipped: {reason}")?
+                }
+                SubmoduleOutcome::Failed { error } => {
+                    writeln!(writer, "{prefix}# {path}: failed: {error}")?
+                }
+            }
+        }
+
+        if result.summary.submodules.is_some() {
+            for error in &result.errors {
+                writeln!(writer, "{prefix}# {error}")?;
+            }
+            return self.format_summary(&result.summary, writer);
+        }
+
         // 最後にサマリを書く。件数はテキスト・JSON の出力と同じく、書き込めなかった更新を
         // 含めずに別に数える (hunk の無い更新、たとえば Cargo.lock だけが変わる git 依存も数える)
         let updates = result.summary.total_updates();
@@ -148,6 +176,14 @@ impl OutputFormatter for DiffFormatter {
         let prefix = self.dry_run_prefix();
         let updates = summary.total_updates();
         let skips = summary.total_skips();
+
+        if summary.submodules.is_some() {
+            let failed = summary.total_failed();
+            return writeln!(
+                writer,
+                "{prefix}# Git submodules: {updates} updated, {failed} failed, {skips} skipped"
+            );
+        }
 
         writeln!(
             writer,

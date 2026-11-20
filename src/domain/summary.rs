@@ -125,6 +125,31 @@ pub struct UpdateSummary {
     /// install 後の lockfile 監査で、age を満たさなかった単位。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lock_age_failures: Vec<LockAgeFailure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submodules: Option<Vec<SubmoduleResult>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmoduleResult {
+    pub path: String,
+    #[serde(flatten)]
+    pub outcome: SubmoduleOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SubmoduleOutcome {
+    Updated {
+        from: String,
+        to: String,
+        reference: String,
+    },
+    Skipped {
+        reason: String,
+    },
+    Failed {
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,6 +185,7 @@ impl UpdateSummary {
             dry_run,
             lock_refreshes: Vec::new(),
             lock_age_failures: Vec::new(),
+            submodules: None,
         }
     }
 
@@ -180,27 +206,60 @@ impl UpdateSummary {
 
     /// 更新された依存関係の合計数を返す (書き込めなかった更新は数えない)
     pub fn total_updates(&self) -> usize {
-        self.manifests.iter().map(|m| m.update_count()).sum()
+        self.manifests
+            .iter()
+            .map(|m| m.update_count())
+            .sum::<usize>()
+            + self
+                .submodules
+                .iter()
+                .flatten()
+                .filter(|m| matches!(m.outcome, SubmoduleOutcome::Updated { .. }))
+                .count()
     }
 
     /// 書き込めなかった更新の合計数を返す
     pub fn total_failed(&self) -> usize {
-        self.manifests.iter().map(|m| m.failed_count()).sum()
+        self.manifests
+            .iter()
+            .map(|m| m.failed_count())
+            .sum::<usize>()
+            + self
+                .submodules
+                .iter()
+                .flatten()
+                .filter(|m| matches!(m.outcome, SubmoduleOutcome::Failed { .. }))
+                .count()
     }
 
     /// スキップされた依存関係の合計数を返す
     pub fn total_skips(&self) -> usize {
-        self.manifests.iter().map(|m| m.skip_count()).sum()
+        self.manifests.iter().map(|m| m.skip_count()).sum::<usize>()
+            + self
+                .submodules
+                .iter()
+                .flatten()
+                .filter(|m| matches!(m.outcome, SubmoduleOutcome::Skipped { .. }))
+                .count()
     }
 
     /// 処理された依存関係の合計数を返す
     pub fn total_dependencies(&self) -> usize {
-        self.manifests.iter().map(|m| m.results.len()).sum()
+        self.manifests
+            .iter()
+            .map(|m| m.results.len())
+            .sum::<usize>()
+            + self.submodules.as_ref().map_or(0, Vec::len)
     }
 
     /// ファイルが変更されたかどうかを返す
     pub fn has_changes(&self) -> bool {
         self.files_modified() > 0
+            || self
+                .submodules
+                .iter()
+                .flatten()
+                .any(|m| matches!(m.outcome, SubmoduleOutcome::Updated { .. }))
     }
 
     /// 特定言語のマニフェストを返す

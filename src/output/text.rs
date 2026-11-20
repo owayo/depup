@@ -961,6 +961,32 @@ impl OutputFormatter for TextFormatter {
             self.format_manifest_grouped(manifest, writer)?;
         }
 
+        for module in result.summary.submodules.iter().flatten() {
+            use crate::domain::SubmoduleOutcome;
+            let prefix = self.dry_run_prefix();
+            let path = &module.path;
+            match &module.outcome {
+                SubmoduleOutcome::Updated {
+                    from,
+                    to,
+                    reference,
+                } => {
+                    let short_from: String = from.chars().take(8).collect();
+                    let short_to: String = to.chars().take(8).collect();
+                    writeln!(
+                        writer,
+                        "{prefix}{path} (Git submodule, {reference}) {short_from} -> {short_to}"
+                    )?;
+                }
+                SubmoduleOutcome::Skipped { reason } => {
+                    writeln!(writer, "{prefix}{path} (Git submodule) skipped: {reason}")?
+                }
+                SubmoduleOutcome::Failed { error } => {
+                    writeln!(writer, "{prefix}{path} (Git submodule) failed: {error}")?
+                }
+            }
+        }
+
         let errors: Vec<_> = result
             .errors
             .iter()
@@ -1048,6 +1074,13 @@ impl OutputFormatter for TextFormatter {
             .count();
         let failed = summary.total_failed() - canceled;
         let skips = summary.total_skips();
+
+        if summary.submodules.is_some() {
+            return writeln!(
+                writer,
+                "{prefix}Git submodules: {updates} updated, {failed} failed, {skips} skipped"
+            );
+        }
 
         if self.verbosity == Verbosity::Quiet {
             // 最小限の出力

@@ -27,6 +27,7 @@ depup [OPTIONS] [PATH]
 | `--java` | | Java の依存関係のみ更新 |
 | `--swift` | | Swift の依存関係のみ更新 |
 | `--mise` | | mise（mise.toml / .tool-versions）のツールバージョンのみ更新 |
+| `--submodules` | | [Git サブモジュール](ecosystems.ja.md#git-サブモジュール)のみ更新。`--only` と `--exclude` にはリポジトリルートからの相対パスを指定。言語フィルター・`--install` とは併用不可 |
 | `--exclude <PKG>` | | 指定したパッケージを除外（複数指定可） |
 | `--only <PKG>` | | 指定したパッケージのみ更新（複数指定可） |
 | `--include-pinned` | | 固定指定も更新対象に含める |
@@ -44,6 +45,8 @@ depup [OPTIONS] [PATH]
 | `--help` | `-h` | ヘルプを表示 |
 
 `--only` と `--exclude` の両方を指定した場合は、`--only` が優先されます。`--only` で明示したパッケージは、同じ名前を `--exclude` に指定していても更新対象に残ります。
+
+サブモジュールモードの `--json` は `submodules` に結果を出力します。各項目には `path` と `status` が入ります。更新には完全なコミット ID の `from` と `to`、および Git の `reference` が付きます。スキップには `reason`、失敗には `error` が入り、失敗があれば終了コードは `2` です。事前確認であるかどうかは `dry_run` で判別できます。
 
 ## 使用例
 

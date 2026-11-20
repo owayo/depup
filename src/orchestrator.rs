@@ -534,6 +534,10 @@ impl Orchestrator {
 
     /// プログレス表示オプション付きで更新ワークフローを実行する
     pub async fn run_with_progress(&self, show_progress: bool) -> OrchestratorResult {
+        if self.args.submodules {
+            return crate::submodules::run(&self.args).await;
+        }
+
         let mut progress = Progress::new(show_progress);
 
         // ステップ1: マニフェストファイルを検出

@@ -120,6 +120,10 @@ pub struct CliArgs {
     #[arg(long)]
     pub mise: bool,
 
+    /// Git サブモジュールだけを追跡ブランチの先端へ更新する
+    #[arg(long, conflicts_with_all = ["node", "python", "rust_lang", "go", "ruby", "php", "java", "swift", "mise", "install"])]
+    pub submodules: bool,
+
     // パッケージフィルタ
     /// 指定したパッケージを更新対象から除外する（複数回指定可）
     #[arg(long, action = ArgAction::Append)]

@@ -27,6 +27,7 @@ depup [OPTIONS] [PATH]
 | `--java` | | Update only Java dependencies |
 | `--swift` | | Update only Swift dependencies |
 | `--mise` | | Update only mise tool versions (mise.toml / .tool-versions) |
+| `--submodules` | | Update only [Git submodules](ecosystems.md#git-submodules). Use repository-relative paths with `--only` and `--exclude`. Incompatible with language flags and `--install`. |
 | `--exclude <PKG>` | | Exclude specific packages (repeatable) |
 | `--only <PKG>` | | Update only specific packages (repeatable) |
 | `--include-pinned` | | Include pinned versions in update |
@@ -44,6 +45,8 @@ depup [OPTIONS] [PATH]
 | `--help` | `-h` | Show help |
 
 When `--only` is present, it takes precedence over `--exclude`. This lets an explicit allow-list entry remain updatable even if the same package also appears in a broader exclude list.
+
+In submodule mode, `--json` reports results in `submodules`. Each entry has a `path` and a `status`. Updates include full `from` and `to` commit IDs and the Git `reference`. Skips include a `reason`, and failures include an `error` and produce exit code `2`. The `dry_run` field indicates whether reported updates were previews.
 
 ## Examples
 

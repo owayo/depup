@@ -41,6 +41,7 @@ Add `--install` to let each project's package manager refresh its lock file afte
 
 - **Multi-Language Support**: Node.js, Python, Rust, Go, Ruby, PHP, Java, and Swift dependencies, plus mise tool versions in `mise.toml` / `.tool-versions`, through the same workflow
 - **Manifest Updates**: Directly updates version specifications in manifest files (`package.json`, `Cargo.toml`, and so on)
+- **Git Submodules**: Preview or advance submodule pointers with [`--submodules`](docs/ecosystems.md#git-submodules)
 - **Smart Version Handling**: Preserves version range formats (`^`, `~`, `>=`) and upper bounds, including prerelease and patch qualifiers; also preserves spaces in Cargo operator wildcards such as `= 1.*`
 - **Pinned Version Detection**: Skips intentionally pinned versions by default
 - **Age Filter**: Only updates to versions that have been public for at least N days or weeks (1 week by default)

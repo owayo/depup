@@ -50,6 +50,21 @@ tauri: 2.9.0 → 2.10.1
 
 Both packages are automatically adjusted to the same major.minor version (e.g., 2.10.x). If one side cannot reach the newer major.minor (for example, the `tauri` crate release is still newer than the age cutoff), the other side's update is held at its current version and reported as `held at <MAJOR.MINOR> for Tauri sync`. Other Tauri npm packages such as `@tauri-apps/cli` that are already in the synchronized major.minor are left as they are; depup never moves them below their current version.
 
+## Git Submodules
+
+Use `--submodules` to update initialized submodules recorded in `.gitmodules`. Give depup the repository root or a directory that contains the submodules you want to update. To select one submodule, pass its repository-relative path to `--only`.
+
+```bash
+depup --submodules --dry-run --diff third_party
+depup --submodules --only third_party/example
+```
+
+depup uses the remote's `HEAD` by default and honors `submodule.<name>.branch` in `.gitmodules`, with the parent repository's local Git configuration taking precedence. A branch value of `.` follows the parent repository's current branch. See [Git's submodule documentation](https://git-scm.com/docs/git-submodule).
+
+depup skips uninitialized or dirty submodules, staged or locally changed pointers, and updates it cannot verify as fast-forwards. Dry-run queries the remote without fetching objects. If the target commit is missing locally, depup checks ancestry when applying the update. `--age`, `--osv`, and `--max-change` apply to package versions and have no effect on submodule commits.
+
+depup checks out the new commit with a detached `HEAD`. Review the unstaged pointer changes with `git diff --submodule=log`, then stage and commit the desired paths in the parent repository. To initialize a missing checkout, run `git submodule update --init -- <path>` in the parent repository first.
+
 ## Ecosystem Details
 
 This chapter is a reference. Look up your ecosystem when you need to know exactly which declarations depup reads and how it rewrites them; the shared rules are in [Version Specifiers and Rewriting](usage.md#version-specifiers-and-rewriting).

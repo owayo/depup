@@ -25,7 +25,7 @@ pub use git_source::{GitReference, GitSource};
 pub use language::Language;
 pub use summary::{
     LanguageCounts, LockAgeFailure, LockAgePackageFailure, LockRefreshResult, ManifestUpdateResult,
-    UpdateSummary,
+    SubmoduleOutcome, SubmoduleResult, UpdateSummary,
 };
 pub use update_result::{
     AgeWaitingVersion, OsvBlocked, SkipReason, UpdateCancellation, UpdateResult,

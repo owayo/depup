@@ -87,7 +87,11 @@ async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
     }
 
     // .depup モノレポ設定を確認
-    let monorepo_config = DepupConfig::from_dir(&args.path);
+    let monorepo_config = if args.submodules {
+        None
+    } else {
+        DepupConfig::from_dir(&args.path)
+    };
 
     // オーケストレーターを作成 (global_config を渡して age 解決に利用)
     let orchestrator = Orchestrator::new(args.clone())?.with_global_config(global_config);
@@ -157,7 +161,7 @@ async fn run(args: CliArgs) -> anyhow::Result<ExitCode> {
     // 設計どおりの正常動作の通知なので、エラー扱い (exit code 2) にしない。
     let has_errors = result.errors.iter().any(|e| !e.is_warning());
 
-    if has_errors || age_audit_failed {
+    if has_errors || age_audit_failed || (args.submodules && result.summary.total_failed() > 0) {
         // 部分的な成功 - 一部エラーが発生
         Ok(ExitCode::from(2))
     } else {
