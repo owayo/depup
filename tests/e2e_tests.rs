@@ -10,6 +10,9 @@ use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;
 
+#[cfg(windows)]
+mod support;
+
 /// Cargo が統合テスト用にコンパイルしたバイナリのパスを取得する
 fn get_binary_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_depup"))
@@ -79,6 +82,60 @@ require (
 
 mod dry_run_tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_mise_shims_are_used_for_version_lookup() {
+        for extension in ["cmd", "bat"] {
+            let temp = tempfile::tempdir().unwrap();
+            let bin = temp.path().join("tool shims");
+            let project = temp.path().join("project");
+            fs::create_dir(&bin).unwrap();
+            fs::create_dir(&project).unwrap();
+            support::write_script(
+                &bin.join(format!("mise.{extension}")),
+                concat!(
+                    "@echo off\r\n",
+                    "if not \"%1\"==\"ls-remote\" exit /b 1\r\n",
+                    "echo [{\"version\":\"20.1.0\"},{\"version\":\"20.2.0\"}]\r\n",
+                ),
+                0o700,
+            );
+            let global = temp.path().join("global.toml");
+            fs::write(&global, "").unwrap();
+            let manifest = project.join("mise.toml");
+            let original = "[tools]\nnode = \"20.1.0\"\n";
+            fs::write(&manifest, original).unwrap();
+
+            let system = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32");
+            let path = std::env::join_paths([&bin, &system]).unwrap();
+            let output = Command::new(get_binary_path())
+                .current_dir(&project)
+                .env("PATH", path)
+                .env("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+                .env("XDG_CONFIG_HOME", temp.path())
+                .env("MISE_GLOBAL_CONFIG_FILE", global)
+                .env_remove("MISE_CONFIG_FILE")
+                .env_remove("MISE_CONFIG_DIR")
+                .args([
+                    "--dry-run",
+                    "--mise",
+                    "--include-pinned",
+                    "--no-age",
+                    "--no-osv",
+                    "--json",
+                    ".",
+                ])
+                .output()
+                .unwrap();
+
+            assert!(output.status.success(), "{extension}: {output:?}");
+            let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(json["summary"]["updates"], 1);
+            assert_eq!(json["manifests"][0]["updates"][0]["to"], "20.2.0");
+            assert_eq!(fs::read_to_string(&manifest).unwrap(), original);
+        }
+    }
 
     #[test]
     fn gradle_wrapper_checksum_is_reported_as_a_skip() {

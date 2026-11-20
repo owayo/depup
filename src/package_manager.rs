@@ -54,7 +54,7 @@ pub struct PreparedInstall {
 /// `which::which` はプロセスの CWD 基準で絶対化するため、モノレポで
 /// `depup --install` をルートから実行するとサブプロジェクトの wrapper ではなく
 /// ルートの `gradlew` (別の Gradle ディストリビューション) を起動していた。
-fn resolve_program(program: &str, working_dir: &Path) -> PathBuf {
+pub(crate) fn resolve_program(program: &str, working_dir: &Path) -> PathBuf {
     which::which_in(program, std::env::var_os("PATH"), working_dir)
         .unwrap_or_else(|_| PathBuf::from(program))
 }

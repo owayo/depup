@@ -211,7 +211,7 @@ Only dependencies on GitHub URLs with a version requirement are processed. Non-G
 
 ### mise
 
-Tool versions declared in [mise](https://mise.jdx.dev) config files go through the same workflow as every other language (detect → parse → judge → write). Version lists come from `mise ls-remote <tool> --json`, so every backend mise supports (core / aqua / ubi / asdf / `npm:` / `cargo:` / `go:` / `pipx:` …) works out of the box.
+Tool versions declared in [mise](https://mise.jdx.dev) config files go through the same workflow as every other language (detect → parse → judge → write). Version lists come from `mise ls-remote <tool> --json`, so every backend mise supports (core / aqua / ubi / asdf / `npm:` / `cargo:` / `go:` / `pipx:` …) works out of the box. On Windows, version lookup also works with `.cmd` and `.bat` shims on `PATH`.
 
 depup does not answer mise's confirmation prompts for you (it does not pass `MISE_YES`). When mise needs to ask whether to trust a config file or install a plugin, `mise ls-remote` fails and the tool is reported as a fetch failure. Run `mise trust` or install the plugin yourself first. Fetching version lists, including with `--dry-run`, should not change mise's trust records or install plugins without confirmation.
 
