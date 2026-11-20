@@ -356,7 +356,7 @@ fn parse_version_catalog_plugin(
     };
     Some(VersionCatalogEntry {
         alias: alias.to_string(),
-        name: package_name(id, &format!("{id}.gradle.plugin")),
+        name: super::gradle_plugins::plugin_marker(id),
         section: "plugins",
         version,
         version_ref,
