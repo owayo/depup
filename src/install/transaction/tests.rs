@@ -2973,7 +2973,7 @@ fn member_execution_boundary_does_not_prove_uv_or_mise_recovery_is_local() {
             std::slice::from_ref(&manifest),
         )]);
         // メンバー内で起動した main が取得する Cargo の境界を使う。
-        let mut tx = InstallTransactions::begin(&plan, &result, &member);
+        let mut tx = InstallTransactions::begin_in(&plan, &result, &member, Some(&member));
         let mut calls = 0;
         tx.execute(|command| {
             calls += 1;
@@ -2994,6 +2994,55 @@ fn member_execution_boundary_does_not_prove_uv_or_mise_recovery_is_local() {
         assert_eq!(fs::read(&manifest).unwrap(), before);
         assert_eq!(result.summary.total_failed(), 1);
     }
+}
+
+#[test]
+fn nested_mise_install_from_parent_recovers_parent_and_member_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let member = root.join("sub");
+    fs::create_dir(&member).unwrap();
+    let manifest = member.join("mise.toml");
+    let original = "[tools]\nnode = \"1.0.0\"\n";
+    fs::write(root.join("mise.toml"), original).unwrap();
+    let lock = root.join("mise.lock");
+    fs::write(&lock, "# original parent lock\n").unwrap();
+
+    let mut result = result();
+    update(&mut result, &manifest, Language::Mise, original, "node");
+    let plan = plan(vec![job(
+        &member,
+        Language::Mise,
+        std::slice::from_ref(&manifest),
+    )]);
+    let mut tx = InstallTransactions::begin_in(&plan, &result, &member, Some(root));
+
+    let member_lock = member.join("mise.lock");
+    let sidecar = root.join(".mise/locks/npm-tool/2.0.0/package.json");
+    let mut calls = 0;
+    tx.execute(|command| {
+        calls += 1;
+        assert_eq!(identity(&command.directory), identity(&member));
+        fs::write(&lock, "# changed parent lock\n").unwrap();
+        fs::write(&member_lock, "# new member lock\n").unwrap();
+        fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+        fs::write(&sidecar, "{}").unwrap();
+        failure(command)
+    });
+
+    assert_eq!(calls, 1);
+    assert!(tx.rollback().has_failures());
+    assert_eq!(
+        fs::read_to_string(root.join("mise.toml")).unwrap(),
+        original
+    );
+    assert_eq!(fs::read_to_string(&manifest).unwrap(), original);
+    assert_eq!(
+        fs::read_to_string(&lock).unwrap(),
+        "# original parent lock\n"
+    );
+    assert!(!member_lock.exists());
+    assert!(!sidecar.exists());
 }
 
 #[test]

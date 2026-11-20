@@ -23,6 +23,27 @@ struct MonorepoScope {
     config_roots: Vec<String>,
 }
 
+/// 親の mise プロジェクトから子を指定したとき、親の lock とメタデータも復元できるようにする。
+/// 実体で祖先に当たる起動ディレクトリだけを候補にし、グローバル設定だけのディレクトリは除く。
+pub(super) fn invocation_boundary(boundary: PathBuf, invocation: Option<&Path>) -> PathBuf {
+    let Some(root) = invocation
+        .and_then(|dir| dir.canonicalize().ok())
+        .filter(|dir| *dir != boundary && boundary.starts_with(dir))
+    else {
+        return boundary;
+    };
+    let home = dirs::home_dir().map(|home| identity(&home));
+    let global = crate::manifest::native_age::global_config_path(Language::Mise);
+    let environments = active_environments(&std::env::var("MISE_ENV").unwrap_or_default(), &[]);
+    let has_project_config =
+        config_names(&environments)
+            .map(|name| root.join(name))
+            .any(|config| {
+                config.is_file() && !is_global_config(&config, home.as_deref(), global.as_deref())
+            });
+    if has_project_config { root } else { boundary }
+}
+
 pub(super) fn managed_paths(
     directory: &Path,
     manifests: &[PathBuf],
@@ -118,6 +139,12 @@ fn config_suffixes(environments: &[String]) -> impl Iterator<Item = String> + '_
                 .iter()
                 .map(|environment| format!(".{environment}.local")),
         )
+}
+
+fn config_names(environments: &[String]) -> impl Iterator<Item = String> + '_ {
+    config_suffixes(environments)
+        .flat_map(|suffix| [format!("mise{suffix}.toml"), format!(".mise{suffix}.toml")])
+        .chain(ALTERNATE_CONFIGS.into_iter().map(str::to_string))
 }
 
 /// 祖先 `ancestor` の設定を読み、見つけたものを `configs` に足す。`mise[.<suffix>].toml` の層を
@@ -336,7 +363,7 @@ fn project_directory<'a>(config: &'a Path, parent: &'a Path) -> &'a Path {
     .unwrap_or(parent)
 }
 
-/// mise は、Cargo から得た許可境界より上の親プロジェクト設定を読むことがある。`home` の
+/// mise は、復元の許可境界より上の親プロジェクト設定を読むことがある。`home` の
 /// `.config/mise` の設定と、mise のグローバルな設定 `global` は、親のプロジェクトとみなさない。
 fn check_parent_scope(
     directory: &Path,
@@ -349,12 +376,8 @@ fn check_parent_scope(
         .ancestors()
         .filter(|ancestor| !ancestor.starts_with(boundary))
     {
-        let mut names: Vec<_> = config_suffixes(environments)
-            .flat_map(|suffix| [format!("mise{suffix}.toml"), format!(".mise{suffix}.toml")])
-            .collect();
-        names.extend(ALTERNATE_CONFIGS.into_iter().map(str::to_string));
-        for name in names {
-            let config = ancestor.join(&name);
+        for name in config_names(environments) {
+            let config = ancestor.join(name);
             let content = match fs::read_to_string(&config) {
                 Ok(content) => content,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
@@ -374,10 +397,7 @@ fn check_parent_scope(
                     .transpose()?
                     == Some(true);
             // 標準のホーム設定はグローバルなので、その install 生成物は対象外にする。
-            let is_global = (home == Some(ancestor) && name.starts_with(".config/mise"))
-                || global.is_some_and(|global| {
-                    crate::manifest::native_age::same_config_path(&config, global)
-                });
+            let is_global = is_global_config(&config, home, global);
             let stem = config
                 .file_stem()
                 .and_then(|stem| stem.to_str())
@@ -396,11 +416,21 @@ fn check_parent_scope(
                     }
                 };
             if parent_monorepo || (!is_global && (value.get("tools").is_some() || existing_lock)) {
-                return Err("Parent mise project scope is outside the recovery boundary; run from the project root".into());
+                return Err("Parent mise project scope is outside the recovery boundary. Run depup from the parent mise project root and pass the member path explicitly.".into());
             }
         }
     }
     Ok(())
+}
+
+fn is_global_config(config: &Path, home: Option<&Path>, global: Option<&Path>) -> bool {
+    home.and_then(|home| config.strip_prefix(home).ok())
+        .is_some_and(|relative| {
+            relative == Path::new(".config/mise.toml")
+                || relative == Path::new(".config/mise/config.toml")
+        })
+        || global
+            .is_some_and(|global| crate::manifest::native_age::same_config_path(config, global))
 }
 
 pub(super) fn sidecar(lock: &Path) -> PathBuf {

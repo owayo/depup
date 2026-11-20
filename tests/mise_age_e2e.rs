@@ -91,6 +91,33 @@ esac
 }
 
 #[test]
+fn mise_install_targets_a_member_from_the_parent_project() {
+    let project = MiseProject::new();
+    let member = project.project.join("sub");
+    fs::create_dir(&member).unwrap();
+    let original = "[tools]\npython = '3.14.7'\n";
+    fs::write(member.join("mise.toml"), original).unwrap();
+
+    let report =
+        project.run(
+            project
+                .command()
+                .args(["--no-age", "--include-pinned", "--install", "sub"]),
+        );
+    assert_eq!(report["summary"]["updates"], 1);
+    assert!(member.join("installed-age").is_file());
+    assert!(!project.project.join("installed-age").exists());
+    assert_eq!(
+        fs::read_to_string(member.join("mise.toml")).unwrap(),
+        original.replace("3.14.7", "3.15.0")
+    );
+    assert_eq!(
+        fs::read_to_string(project.project.join("mise.toml")).unwrap(),
+        original
+    );
+}
+
+#[test]
 fn mise_no_age_accepts_unknown_dates_without_native_constraints() {
     let project = MiseProject::new();
     let report = project.run(project.command().args(["--no-age", "--dry-run"]));
