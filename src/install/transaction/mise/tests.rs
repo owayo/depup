@@ -77,21 +77,19 @@ fn active_environments_keep_mise_env_and_add_selected_environment_configs() {
 #[test]
 fn alternate_configs_belong_to_the_project_that_contains_them() {
     let project = Path::new("/work/app");
-    for (config, parent) in [
-        (".config/mise/config.toml", ".config/mise"),
-        ("mise/config.toml", "mise"),
-        (".mise/config.toml", ".mise"),
-        (".config/mise.toml", ".config"),
+    for config in [
+        ".config/mise/config.toml",
+        "mise/config.toml",
+        ".mise/config.toml",
+        ".config/mise.toml",
+        "mise.toml",
     ] {
         let config = project.join(config);
-        let parent = project.join(parent);
         assert_eq!(
-            project_directory(&config, &parent),
+            crate::manifest::mise_project_directory(&config),
             project,
             "{}",
             config.display()
         );
     }
-    let config = project.join("mise.toml");
-    assert_eq!(project_directory(&config, project), project);
 }

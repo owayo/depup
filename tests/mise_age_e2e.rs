@@ -118,6 +118,27 @@ fn mise_install_targets_a_member_from_the_parent_project() {
 }
 
 #[test]
+fn mise_python_install_respects_the_project_requirement() {
+    let project = MiseProject::new();
+    let manifest = project.project.join("mise.toml");
+    let pyproject = project.project.join("pyproject.toml");
+    let requirement = "[project]\nrequires-python = '>=3.14,<3.15'\n";
+    fs::write(&pyproject, requirement).unwrap();
+    fs::write(&manifest, "[tools]\npython = '3.14.6'\n").unwrap();
+
+    let report = project.run(project.command().args(["--no-age", "--install"]));
+    assert_eq!(report["manifests"][0]["updates"][0]["to"], "3.14.7");
+    assert!(project.project.join("installed-age").is_file());
+    let expected = "[tools]\npython = '3.14.7'\n";
+    assert_eq!(fs::read_to_string(&manifest).unwrap(), expected);
+    assert_eq!(fs::read_to_string(&pyproject).unwrap(), requirement);
+
+    let report = project.run(project.command().args(["--no-age", "--install"]));
+    assert_eq!(report["summary"]["updates"], 0);
+    assert_eq!(fs::read_to_string(&manifest).unwrap(), expected);
+}
+
+#[test]
 fn mise_no_age_accepts_unknown_dates_without_native_constraints() {
     let project = MiseProject::new();
     let report = project.run(project.command().args(["--no-age", "--dry-run"]));

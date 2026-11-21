@@ -376,6 +376,7 @@ impl Orchestrator {
     async fn process_one_dependency(
         &self,
         dep: Dependency,
+        manifest: &Path,
         adapter: &(dyn RegistryAdapter + Send + Sync),
         judge: &UpdateJudge,
         bar: Option<&ProgressBar>,
@@ -391,6 +392,16 @@ impl Orchestrator {
         if dep.is_git() {
             return OnePassResult::new(self.judge_git_dependency(&dep).await);
         }
+
+        let requires_python = match crate::manifest::read_mise_requires_python(manifest, &dep) {
+            Ok(requirement) => requirement,
+            Err(message) => {
+                return OnePassResult::new(UpdateResult::skip(
+                    dep,
+                    SkipReason::ParseError(message),
+                ));
+            }
+        };
 
         // registry 経由のフェッチ
         match self.fetch_versions(adapter, &dep.name).await {
@@ -433,7 +444,11 @@ impl Orchestrator {
                         };
                         judge_with_osv(self, adapter, judge, &dep, versions, &mut context).await
                     }
-                    _ => Ok(judge.judge(&dep, &versions)),
+                    _ => Ok(judge.judge_with_requires_python(
+                        &dep,
+                        &versions,
+                        requires_python.as_ref(),
+                    )),
                 };
                 let result = match result {
                     Ok(result) => result,
@@ -859,6 +874,7 @@ impl Orchestrator {
                         } else {
                             self.process_one_dependency(
                                 dep,
+                                &info.path,
                                 &*adapter,
                                 judge,
                                 bar.as_ref(),
@@ -3533,7 +3549,14 @@ mod tests {
             // 版と公開日のキャッシュは実行全体で共有されるので、組ごとに名前を変える
             let dep = swift_dependency(&format!("owner/library{index}"));
             let result = orchestrator
-                .process_one_dependency(dep, &adapter, &judge, None, None)
+                .process_one_dependency(
+                    dep,
+                    &dir.path().join("Package.swift"),
+                    &adapter,
+                    &judge,
+                    None,
+                    None,
+                )
                 .await
                 .outcome;
             let outcome = match &result {
@@ -3598,6 +3621,7 @@ mod tests {
         let result = orchestrator
             .process_one_dependency(
                 swift_dependency("owner/cached"),
+                &dir.path().join("Package.swift"),
                 &adapter,
                 &judge,
                 None,
@@ -3625,6 +3649,7 @@ mod tests {
         let result = orchestrator
             .process_one_dependency(
                 swift_dependency("owner/failing"),
+                &dir.path().join("Package.swift"),
                 &adapter,
                 &judge,
                 None,

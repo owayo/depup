@@ -459,6 +459,15 @@ impl UpdateJudge {
         dependency: &Dependency,
         available_versions: &[VersionInfo],
     ) -> UpdateResult {
+        self.judge_with_requires_python(dependency, available_versions, None)
+    }
+
+    pub(crate) fn judge_with_requires_python(
+        &self,
+        dependency: &Dependency,
+        available_versions: &[VersionInfo],
+        requires_python: Option<&pep440_rs::VersionSpecifiers>,
+    ) -> UpdateResult {
         if let Some(reason) = self.should_skip(dependency) {
             return UpdateResult::skip(dependency.clone(), reason);
         }
@@ -499,10 +508,10 @@ impl UpdateJudge {
             Language::Java => true,
             _ => false,
         };
-        let stable = self.stable_candidates(dependency, available_versions);
-        let flavored = apply_java_flavor_filter(dependency, stable);
-        let ranged = apply_range_upper_bound(dependency, flavored);
-        let before_age = apply_rejected_versions(dependency, ranged);
+        let mut before_age = self.candidates_before_age(dependency, available_versions);
+        if let Some(requirement) = requires_python {
+            retain_compatible_python_versions(dependency, requirement, &mut before_age);
+        }
         let age_enabled = self
             .filter
             .min_age
@@ -994,6 +1003,44 @@ fn apply_java_flavor_filter<'a>(
         .into_iter()
         .filter(|v| java_flavor_marker(&v.version) == Some(flavor))
         .collect()
+}
+
+fn retain_compatible_python_versions(
+    dependency: &Dependency,
+    requirement: &pep440_rs::VersionSpecifiers,
+    candidates: &mut Vec<&VersionInfo>,
+) {
+    let compatible = |info: &VersionInfo| {
+        info.version
+            .parse()
+            .is_ok_and(|version| requirement.contains(&version))
+    };
+    if dependency.version_spec.kind == VersionSpecKind::Prefix {
+        // 部分指定は同じ系列の最新版に解決される。3.14.10 を選んでも、書き込む
+        // 「3.14」が範囲外の 3.14.11 を選ぶなら、その系列には進めない。
+        let mut latest = std::collections::HashMap::<String, &VersionInfo>::new();
+        for &candidate in candidates.iter() {
+            if let Some(selector) = dependency
+                .version_spec
+                .try_format_updated(&candidate.version)
+            {
+                let entry = latest.entry(selector).or_insert(candidate);
+                if compare_dependency_versions(dependency, &candidate.version, &entry.version)
+                    .is_gt()
+                {
+                    *entry = candidate;
+                }
+            }
+        }
+        latest.retain(|_, info| !compatible(info));
+        candidates.retain(|info| {
+            dependency
+                .version_spec
+                .try_format_updated(&info.version)
+                .is_some_and(|selector| !latest.contains_key(&selector))
+        });
+    }
+    candidates.retain(|info| compatible(info));
 }
 
 fn mise_flavor_candidates(dependency: &Dependency, versions: &[VersionInfo]) -> Vec<VersionInfo> {
@@ -4386,6 +4433,23 @@ mod tests {
             .parse(raw)
             .expect("parsable mise version");
         Dependency::new(name, spec, false, Language::Mise)
+    }
+
+    #[test]
+    fn mise_python_prefix_must_resolve_to_a_compatible_version() {
+        let judge = UpdateJudge::new(UpdateFilter::new());
+        let python = make_mise_dependency("python", "prefix:3.12");
+        let versions = ["3.14.11", "3.13.9", "3.14.10", "3.15.0"].map(VersionInfo::undated);
+        for (requirement, expected) in [
+            (">=3.13,<3.15,!=3.14.11", "3.13.9"),
+            ("~=3.14.0,!=3.14.10", "3.14.11"),
+        ] {
+            let requirement = requirement.parse().unwrap();
+            let result = judge.judge_with_requires_python(&python, &versions, Some(&requirement));
+            assert!(
+                matches!(result, UpdateResult::Update { new_version, .. } if new_version == expected)
+            );
+        }
     }
 
     #[test]
