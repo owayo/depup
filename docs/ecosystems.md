@@ -252,6 +252,8 @@ depup does not answer mise's confirmation prompts for you (it does not pass `MIS
 
 Most of the 3000+ entries `mise ls-remote java` returns carry a vendor prefix (`temurin-`, `graalvm-community-`, `zulu-`, …). depup only considers candidates with the same prefix as the current value, so a project on `temurin-21` is never rewritten to `zulu-27`.
 
+When the project's `pyproject.toml` declares `[project].requires-python`, depup checks mise's Python candidates against that PEP 440 constraint, including with `--mise` or `--install`. For example, `>=3.14,<3.15` allows an update from `3.14.10` to `3.14.11` and excludes `3.15.2`. If no newer compatible release is available, depup keeps the current setting. For a partial selector such as `3.14`, the latest release that selector would resolve to must also satisfy the constraint.
+
 Only the `[tools]` section is rewritten; identically named keys under `[settings]`, `[env]`, `[tasks]`, or `[alias]` are untouched. Quote style (`"` / `'`), trailing comments, CRLF line endings, and the column alignment of `.tool-versions` are all preserved.
 
 Tool declarations inside multiline task strings are ignored. Triple-quote markers inside ordinary strings or comments do not hide subsequent `[tools]` declarations.

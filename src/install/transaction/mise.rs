@@ -319,7 +319,9 @@ fn build_mise_scope(
         locks.push(super::mise_lock::LockContext {
             source: identity(&colocated),
             destination: identity(&destination),
-            directory: identity(shared_root.unwrap_or_else(|| project_directory(config, parent))),
+            directory: identity(
+                shared_root.unwrap_or_else(|| crate::manifest::mise_project_directory(config)),
+            ),
             config: identity(config),
             local: suffix == ".local" || suffix.ends_with(".local"),
             environment: suffix
@@ -339,28 +341,6 @@ fn build_mise_scope(
             .collect(),
         locks,
     })
-}
-
-/// 別の場所の設定 (`.config/mise/config.toml` など) は、それを含むプロジェクトの設定として読む。
-/// `Path::ends_with` は要素の末尾で照合するので、長い名前から試す
-/// (`.config/mise/config.toml` は `mise/config.toml` にも一致する)。
-fn project_directory<'a>(config: &'a Path, parent: &'a Path) -> &'a Path {
-    [
-        ".config/mise/config.toml",
-        "mise/config.toml",
-        ".mise/config.toml",
-        ".config/mise.toml",
-    ]
-    .into_iter()
-    .find_map(|suffix| {
-        config.ends_with(suffix).then(|| {
-            config
-                .ancestors()
-                .nth(Path::new(suffix).components().count())
-                .unwrap()
-        })
-    })
-    .unwrap_or(parent)
 }
 
 /// mise は、復元の許可境界より上の親プロジェクト設定を読むことがある。`home` の

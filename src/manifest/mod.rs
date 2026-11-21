@@ -53,6 +53,7 @@ pub(crate) use gradle_wrapper::{
     GRADLE_WRAPPER_FILES, GRADLE_WRAPPER_PROPERTIES, has_gradle_wrapper_checksum,
 };
 pub use mise::MiseParser;
+pub(crate) use mise::{mise_project_directory, read_mise_requires_python};
 pub use mise_settings::{MISE_CONFIG_FILENAMES, MiseSettings, has_mise_config, mise_config_paths};
 pub use package_json::PackageJsonParser;
 pub use package_swift::PackageSwiftParser;
