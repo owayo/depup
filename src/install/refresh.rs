@@ -346,6 +346,10 @@ async fn run_with(
     }
     let mut audit_failed = false;
     let mut rollback_osv = RollbackOsvChecks::default();
+    tx.execute_linked_mise(&mut |command| {
+        progress.spinner("Installing the selected Node package manager");
+        runner(command)
+    });
     let manifests = tx.declaration_snapshots();
     for job in &jobs {
         if tx.pending_report().holds(&lock_path(job)) {

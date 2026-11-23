@@ -6,13 +6,21 @@
 //! - 更新時の書式保持
 //! - 失敗時も継続できるエラーハンドリング
 
-use crate::domain::{Dependency, GitReference, Language, ManifestUpdateResult, UpdateResult};
+use crate::domain::{
+    ChangeLevel, Dependency, GitReference, Language, ManifestUpdateResult, UpdateResult,
+};
 use crate::error::ManifestError;
-use crate::file_snapshot::{FileGuard, write_checked};
-use crate::manifest::ManifestParser;
-use std::collections::{HashMap, HashSet};
+use crate::file_snapshot::{FileGuard, FileState, save_recovery_copy, write_checked};
+use crate::manifest::{ManifestInfo, ManifestParser};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+
+mod package_manager;
+use package_manager::SyncContext;
+pub(crate) use package_manager::{
+    PackageManagerSync, capture_package_manager_pins, is_mise_package_manager,
+};
 
 /// マニフェストの書き込み成功時、install 開始前の正確なファイル状態。
 #[derive(Debug, Clone)]
@@ -45,6 +53,8 @@ pub struct WriteResult {
     /// 更新中に発生したエラー
     pub errors: Vec<String>,
     pub journal: Option<ManifestJournal>,
+    pub(crate) package_manager_sync: Option<PackageManagerSync>,
+    pub(crate) package_manager_warning: Option<(std::path::PathBuf, String)>,
 }
 
 /// 書き込めなかった更新 1 件
@@ -66,6 +76,8 @@ impl WriteResult {
             file_modified: false,
             errors: Vec::new(),
             journal: None,
+            package_manager_sync: None,
+            package_manager_warning: None,
         }
     }
 
@@ -152,6 +164,15 @@ impl ManifestWriter {
         &self,
         manifest_result: &ManifestUpdateResult,
         parser: &dyn ManifestParser,
+    ) -> Result<WriteResult, ManifestError> {
+        self.apply_updates_inner(manifest_result, parser, None)
+    }
+
+    fn apply_updates_inner(
+        &self,
+        manifest_result: &ManifestUpdateResult,
+        parser: &dyn ManifestParser,
+        sync: Option<&SyncContext<'_>>,
     ) -> Result<WriteResult, ManifestError> {
         let path = &manifest_result.path;
         let mut result = WriteResult::new(path);
@@ -240,6 +261,7 @@ impl ManifestWriter {
         // 曖昧として拒否した依存キー。版や取得元の食い違う宣言が別々の更新になっても、
         // 同じ依存のエラーは 1 行だけ出す
         let mut refused_ambiguous: HashSet<&str> = HashSet::new();
+        let mut applied = Vec::new();
 
         for (index, update) in manifest_result.results.iter().enumerate() {
             if let UpdateResult::Update {
@@ -303,6 +325,9 @@ impl ManifestWriter {
                         if updated_content != current_content {
                             current_content = updated_content;
                             result.updates_applied += 1;
+                            if sync.is_some() {
+                                applied.push(index);
+                            }
                         }
                     }
                     Err(e) => {
@@ -314,6 +339,25 @@ impl ManifestWriter {
             }
         }
 
+        let mut companion = sync.and_then(|sync| {
+            let project = sync.project_for(path)?;
+            match sync.prepare(project, manifest_result, &applied, &parsed_dependencies) {
+                Ok(companion) => companion,
+                Err(reason) => {
+                    result.package_manager_warning = Some((project.join("package.json"), reason));
+                    None
+                }
+            }
+        });
+        if let (Some(companion), Some(sync)) = (&companion, sync)
+            && sync.blocked.contains(&companion.report.path)
+        {
+            result.record_manifest_failure(
+                manifest_result,
+                "The synchronized Node scope did not pass preflight".into(),
+            );
+            return Ok(result);
+        }
         // dry-run でなく、実際に変更がある場合のみ書き戻す
         if result.updates_applied > 0 && !self.dry_run {
             let written = format!("{bom}{current_content}");
@@ -333,6 +377,39 @@ impl ManifestWriter {
                 );
                 return Ok(result);
             }
+            // mise を先に書く。同時に走る depup は mise の書き込みが競合した時点で止まるため、
+            // 別の実行が適用した packageManager を後から戻さない。
+            if let Some(companion) = &mut companion
+                && let Err(error) = companion.commit()
+            {
+                let package = crate::user_path::display(&companion.report.path);
+                result.record_manifest_failure(
+                    manifest_result,
+                    format!("Cannot write {package}: {error}"),
+                );
+                let expected = FileState {
+                    bytes: Some(written.into_bytes()),
+                    permissions: before.permissions.clone(),
+                };
+                if let Err(error) = write_checked(
+                    &guard,
+                    &expected,
+                    content.as_bytes(),
+                    before.permissions.as_ref(),
+                ) {
+                    let recovery = match save_recovery_copy(&before) {
+                        Ok(copy) => {
+                            format!("original saved to {}", crate::user_path::display(&copy))
+                        }
+                        Err(error) => error,
+                    };
+                    let path = crate::user_path::display(path);
+                    result
+                        .errors
+                        .push(format!("Could not restore {path}: {error} ({recovery})"));
+                }
+                return Ok(result);
+            }
             result.file_modified = true;
             result.journal = Some(ManifestJournal {
                 target: guard.target.clone(),
@@ -342,6 +419,7 @@ impl ManifestWriter {
                 guard,
             });
         }
+        result.package_manager_sync = companion.map(|companion| companion.report);
 
         Ok(result)
     }
@@ -352,13 +430,39 @@ impl ManifestWriter {
         manifests: &[ManifestUpdateResult],
         get_parser: impl Fn(&Path, Language) -> Box<dyn ManifestParser>,
     ) -> Vec<WriteResult> {
+        self.apply_scoped_updates(
+            manifests,
+            get_parser,
+            &BTreeSet::new(),
+            &[],
+            &BTreeMap::new(),
+            None,
+        )
+    }
+
+    pub(crate) fn apply_scoped_updates(
+        &self,
+        manifests: &[ManifestUpdateResult],
+        get_parser: impl Fn(&Path, Language) -> Box<dyn ManifestParser>,
+        blocked: &BTreeSet<std::path::PathBuf>,
+        detected: &[ManifestInfo],
+        initial_pins: &BTreeMap<std::path::PathBuf, String>,
+        max_change: Option<ChangeLevel>,
+    ) -> Vec<WriteResult> {
+        let sync = SyncContext {
+            blocked,
+            detected,
+            initial_pins,
+            max_change,
+        };
         manifests
             .iter()
             // 更新対象があるマニフェストだけ処理する
-            .filter(|manifest| manifest.has_judged_updates())
+            .filter(|manifest| !blocked.contains(&manifest.path) && manifest.has_judged_updates())
             .map(|manifest| {
                 let parser = get_parser(&manifest.path, manifest.language);
-                self.apply_updates(manifest, parser.as_ref())
+                let sync = (manifest.language == Language::Mise).then_some(&sync);
+                self.apply_updates_inner(manifest, parser.as_ref(), sync)
                     .unwrap_or_else(|e| {
                         // 読み込み・解析に失敗したので、どの更新も試せていない
                         let mut result = WriteResult::new(&manifest.path);

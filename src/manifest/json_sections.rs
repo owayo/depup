@@ -124,15 +124,49 @@ pub(crate) fn top_level_object_section_ranges(
     content: &str,
     section_names: &[&str],
 ) -> Vec<(usize, usize)> {
+    let Some(range) = root_object_range(content) else {
+        return Vec::new();
+    };
+    direct_child_object_section_ranges(content, &[range], Some(section_names))
+}
+
+fn root_object_range(content: &str) -> Option<(usize, usize)> {
     let bytes = content.as_bytes();
     let start = skip_json_ws(bytes, 0);
     if bytes.get(start) != Some(&b'{') {
-        return Vec::new();
+        return None;
     }
-    let Some(end) = find_matching_json_object_end(bytes, start) else {
-        return Vec::new();
+    Some((start + 1, find_matching_json_object_end(bytes, start)?))
+}
+
+type StringProperty<'a> = (std::ops::Range<usize>, Cow<'a, str>);
+
+/// For validated JSON, locate a unique top-level string literal by its decoded key.
+/// Duplicate keys have no unique edit site, even if one value is not a string.
+pub(crate) fn unique_top_level_string_property<'a>(
+    content: &'a str,
+    property: &str,
+) -> Result<Option<StringProperty<'a>>, ()> {
+    let Some((start, end)) = root_object_range(content) else {
+        return Ok(None);
     };
-    direct_child_object_section_ranges(content, &[(start + 1, end)], Some(section_names))
+    let mut matches = direct_child_properties(content, start, end)
+        .filter(|(key, _)| decode_json_string(key).as_deref() == Some(property));
+    let Some((_, start)) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Err(());
+    }
+    let bytes = content.as_bytes();
+    if bytes[start] != b'"' {
+        return Ok(None);
+    }
+    Ok(find_json_string_end(bytes, start).and_then(|end| {
+        let range = start..end + 1;
+        let value = decode_json_string(&content[range.clone()])?;
+        Some((range, value))
+    }))
 }
 
 pub(crate) fn replace_string_property_in_top_level_sections(

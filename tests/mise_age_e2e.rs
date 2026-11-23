@@ -51,6 +51,12 @@ esac
     }
 
     fn command(&self) -> Command {
+        let mut command = self.command_for("python");
+        command.args(["--max-change", "major", "--json"]);
+        command
+    }
+
+    fn command_for(&self, tool: &str) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_depup"));
         command
             .env_clear()
@@ -69,17 +75,27 @@ esac
                 self.config.join("mise/config.toml"),
             )
             .current_dir(&self.project)
-            .args([
-                "--mise",
-                "--only",
-                "python",
-                "--no-osv",
-                "--max-change",
-                "major",
-                "--verbose",
-                "--json",
-            ]);
+            .args(["--mise", "--only", tool, "--no-osv", "--verbose"]);
         command
+    }
+
+    fn stub_package_manager_versions(&self) {
+        support::write_script(
+            &self.bin.join("mise"),
+            r#"#!/bin/sh
+case "$1" in
+    ls-remote)
+        if [ -n "${EDIT_PACKAGE_MANAGER:-}" ]; then
+            printf '%s' "$EDIT_PACKAGE_MANAGER" > package.json
+        fi
+        printf '%s\n' '[{"version":"12.15.0"},{"version":"12.18.0"}]'
+        ;;
+    install) cp package.json during-install.json && [ "${FAIL_INSTALL:-}" != 1 ] ;;
+    *) exit 1 ;;
+esac
+"#,
+            0o700,
+        );
     }
 
     fn run(&self, command: &mut Command) -> serde_json::Value {
@@ -136,6 +152,181 @@ fn mise_python_install_respects_the_project_requirement() {
     let report = project.run(project.command().args(["--no-age", "--install"]));
     assert_eq!(report["summary"]["updates"], 0);
     assert_eq!(fs::read_to_string(&manifest).unwrap(), expected);
+}
+
+#[test]
+fn mise_package_manager_is_synchronized_before_install() {
+    let project = MiseProject::new();
+    let manifest = project.project.join("mise.toml");
+    let package = project.project.join("package.json");
+    let original = "\u{feff}{\r\n\t\"packageManager\": \"pnpm@12.15.0\",\r\n\t\"nested\": {\"packageManager\": \"pnpm@12.15.0\"}\r\n}";
+    let expected = original.replacen("pnpm@12.15.0", "pnpm@12.18.0", 1);
+    fs::write(&manifest, "[tools]\npnpm = '12.15.0'\n").unwrap();
+    fs::write(&package, original).unwrap();
+    project.stub_package_manager_versions();
+
+    let preview = project
+        .command_for("pnpm")
+        .args(["--no-age", "--dry-run", "--diff"])
+        .output()
+        .unwrap();
+    assert!(preview.status.success(), "{preview:?}");
+    let diff = String::from_utf8(preview.stdout).unwrap();
+    assert!(
+        diff.contains("+  \"packageManager\": \"pnpm@12.18.0\""),
+        "{diff}"
+    );
+    assert_eq!(fs::read_to_string(&package).unwrap(), original);
+
+    let failed = project
+        .command_for("pnpm")
+        .args(["--no-age", "--install", "--json"])
+        .env("FAIL_INSTALL", "1")
+        .output()
+        .unwrap();
+    assert_eq!(failed.status.code(), Some(1), "{failed:?}");
+    let report: serde_json::Value = serde_json::from_slice(&failed.stdout).unwrap();
+    assert!(report.get("package_manager_syncs").is_none(), "{report}");
+    assert_eq!(
+        fs::read_to_string(project.project.join("during-install.json")).unwrap(),
+        expected
+    );
+    assert_eq!(fs::read_to_string(&package).unwrap(), original);
+    assert_eq!(
+        fs::read_to_string(&manifest).unwrap(),
+        "[tools]\npnpm = '12.15.0'\n"
+    );
+
+    let report = project.run(
+        project
+            .command_for("pnpm")
+            .args(["--no-age", "--install", "--json"]),
+    );
+    assert_eq!(report["summary"]["updates"], 1);
+    assert_eq!(report["package_manager_syncs"][0]["from"], "pnpm@12.15.0");
+    assert_eq!(report["package_manager_syncs"][0]["to"], "pnpm@12.18.0");
+    assert_eq!(
+        fs::read_to_string(&manifest).unwrap(),
+        "[tools]\npnpm = '12.18.0'\n"
+    );
+    assert_eq!(fs::read_to_string(&package).unwrap(), expected);
+    assert_eq!(
+        fs::read_to_string(project.project.join("during-install.json")).unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn mise_package_manager_keeps_checksummed_and_unrelated_fields() {
+    let project = MiseProject::new();
+    project.stub_package_manager_versions();
+    let manifest = project.project.join("mise.toml");
+    let package = project.project.join("package.json");
+    for (pin, warning) in [("pnpm@12.15.0+sha512.abcdef", true), ("yarn@4.5.0", false)] {
+        let original = format!("{{\"packageManager\":\"{pin}\"}}");
+        fs::write(&manifest, "[tools]\npnpm = '12.15.0'\n").unwrap();
+        fs::write(&package, &original).unwrap();
+        let report = project.run(project.command_for("pnpm").args(["--no-age", "--json"]));
+        assert_eq!(report["summary"]["updates"], 1);
+        assert!(report.get("package_manager_syncs").is_none(), "{report}");
+        assert_eq!(
+            report["errors"].to_string().contains("checksum"),
+            warning,
+            "{report}"
+        );
+        assert_eq!(fs::read_to_string(&package).unwrap(), original);
+    }
+}
+
+#[test]
+fn mise_package_manager_uses_the_project_where_the_config_was_detected() {
+    let project = MiseProject::new();
+    project.stub_package_manager_versions();
+    let member = project.project.join(".config");
+    fs::create_dir(&member).unwrap();
+    let config = member.join("mise.toml");
+    let config_before = "[tools]\npnpm = '12.15.0'\n";
+    let package_before = r#"{"packageManager":"pnpm@12.15.0"}"#;
+    fs::write(&config, config_before).unwrap();
+    fs::write(member.join("package.json"), package_before).unwrap();
+    fs::write(project.project.join("package.json"), package_before).unwrap();
+
+    project.run(
+        project
+            .command_for("pnpm")
+            .args(["--no-age", "--json", ".config"]),
+    );
+    assert_eq!(
+        fs::read_to_string(member.join("package.json")).unwrap(),
+        package_before.replace("12.15.0", "12.18.0")
+    );
+    assert_eq!(
+        fs::read_to_string(project.project.join("package.json")).unwrap(),
+        package_before
+    );
+
+    fs::write(&config, config_before).unwrap();
+    project.run(project.command_for("pnpm").args(["--no-age", "--json"]));
+    assert_eq!(
+        fs::read_to_string(project.project.join("package.json")).unwrap(),
+        package_before.replace("12.15.0", "12.18.0")
+    );
+}
+
+#[test]
+fn mise_package_manager_respects_an_overlay_and_edits_during_version_lookup() {
+    let project = MiseProject::new();
+    project.stub_package_manager_versions();
+    let manifest = project.project.join("mise.toml");
+    let package = project.project.join("package.json");
+    let overlay = project.project.join("mise.local.toml");
+    let config = "[tools]\npnpm = '12.15.0'\n";
+    let original = r#"{"packageManager":"pnpm@12.15.0"}"#;
+    fs::write(&manifest, config).unwrap();
+    fs::write(&package, original).unwrap();
+    fs::write(&overlay, "[tools]\npnpm = 'latest'\n").unwrap();
+    let report = project.run(project.command_for("pnpm").args(["--no-age", "--json"]));
+    assert!(
+        report["errors"]
+            .to_string()
+            .contains("multiple mise declarations"),
+        "{report}"
+    );
+    assert_eq!(fs::read_to_string(&package).unwrap(), original);
+
+    fs::remove_file(&overlay).unwrap();
+    fs::write(&manifest, config).unwrap();
+    let edited = "{\"packageManager\":\"pnpm@12.16.0\"}\n";
+    let report = project.run(
+        project
+            .command_for("pnpm")
+            .args(["--no-age", "--json"])
+            .env("EDIT_PACKAGE_MANAGER", edited),
+    );
+    assert!(
+        report["errors"]
+            .to_string()
+            .contains("packageManager changed"),
+        "{report}"
+    );
+    assert_eq!(fs::read_to_string(&package).unwrap(), edited);
+
+    fs::write(&manifest, config).unwrap();
+    let older = r#"{"packageManager":"pnpm@11.0.0"}"#;
+    fs::write(&package, older).unwrap();
+    let report = project.run(project.command_for("pnpm").args([
+        "--no-age",
+        "--json",
+        "--max-change",
+        "minor",
+    ]));
+    assert!(
+        report["errors"]
+            .to_string()
+            .contains("would exceed --max-change=minor"),
+        "{report}"
+    );
+    assert_eq!(fs::read_to_string(&package).unwrap(), older);
 }
 
 #[test]

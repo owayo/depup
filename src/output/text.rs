@@ -960,6 +960,15 @@ impl OutputFormatter for TextFormatter {
         for manifest in &result.summary.manifests {
             self.format_manifest_grouped(manifest, writer)?;
         }
+        for sync in result.package_manager_syncs() {
+            let prefix = self.dry_run_prefix();
+            let path = crate::user_path::display(&sync.path);
+            writeln!(
+                writer,
+                "{prefix}{path} (packageManager) {} → {}",
+                sync.from, sync.to
+            )?;
+        }
 
         for module in result.summary.submodules.iter().flatten() {
             use crate::domain::SubmoduleOutcome;
@@ -1008,6 +1017,7 @@ impl OutputFormatter for TextFormatter {
                     error,
                     crate::orchestrator::OrchestratorError::OsvWarning { .. }
                         | crate::orchestrator::OrchestratorError::OsvTradeoff { .. }
+                        | crate::orchestrator::OrchestratorError::PackageManagerSyncWarning { .. }
                 )
             })
             .collect();
