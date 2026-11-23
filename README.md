@@ -5,7 +5,7 @@
 <h1 align="center">depup</h1>
 
 <p align="center">
-  Multi-language dependency updater CLI for Node.js, Python, Rust, Go, Ruby, PHP, Java, Swift and mise, with a release age filter and OSV vulnerability checks
+  Multi-language dependency updater CLI with release cooldowns and OSV checks to reduce software supply chain risk
 </p>
 
 <!-- standard:badges:start -->
@@ -31,27 +31,25 @@
 
 ---
 
-depup finds the manifests in a project (`package.json`, `pyproject.toml`, `Cargo.toml`, `go.mod`, `Gemfile`, `composer.json`, Gradle build files, `Package.swift`, and mise config files), looks up newer versions in each registry, and rewrites the version specifiers in place, for every language in one run.
+depup helps keep compromised releases out of routine dependency updates. The default one-week cooldown gives maintainers and registries time to flag a malicious release. depup checks update candidates against published vulnerability and malware reports on OSV.dev.
 
-It is conservative by default: a new version becomes a candidate only after it has been public for a week, versions without known vulnerabilities on OSV.dev are preferred, pinned versions stay as they are, and ranges keep their operators and upper bounds.
+One run finds and updates manifests for Node.js, Python, Rust, Go, Ruby, PHP, Java, Swift, and mise. By default, depup keeps intentional pins. It preserves range operators and upper bounds when rewriting constraints.
 
-Add `--install` to let each project's package manager refresh its lock file after the update.
+Add `--install` to run each project's package manager and audit the resolved versions in `Cargo.lock` and supported npm and pnpm lockfiles.
 
 ## Features
 
-- **Multi-Language Support**: Node.js, Python, Rust, Go, Ruby, PHP, Java, and Swift dependencies, plus mise tool versions in `mise.toml` / `.tool-versions`, through the same workflow
-- **Manifest Updates**: Directly updates version specifications in manifest files (`package.json`, `Cargo.toml`, and so on)
-- **Git Submodules**: Preview or advance submodule pointers with [`--submodules`](docs/ecosystems.md#git-submodules)
-- **Smart Version Handling**: Preserves version range formats (`^`, `~`, `>=`) and upper bounds, including prerelease and patch qualifiers; also preserves spaces in Cargo operator wildcards such as `= 1.*`
-- **Pinned Version Detection**: Skips intentionally pinned versions by default
-- **Age Filter**: Only updates to versions that have been public for at least N days or weeks (1 week by default)
-- **Project Age Policies**: Inherits pnpm, Bun, and mise policies per directory and preserves stricter uv and mise native cutoffs
-- **Vulnerability Check**: Looks up candidates on OSV.dev, preferring versions without known vulnerabilities. Updates that fix existing vulnerabilities may still be allowed under severity and count limits (enabled by default)
-- **Package Manager Install**: `--install` runs each project's package manager after the update and passes the age filter on to pnpm, uv, and mise
-- **Lockfile Age Audit**: Checks the direct and transitive versions in `Cargo.lock` and npm/pnpm lockfiles after install; if a version the run added still fails, that project's manifests and lockfiles return to their state before the run (exit code `2`)
-- **Bun Catalogs**: Updates Bun `catalog` / `catalogs` definitions in `package.json`
-- **Monorepo Support**: `.depup`, Cargo/pnpm/Go workspaces, Gradle multi-project builds, nested package installs, and Tauri projects
-- **Multiple Output Formats**: Colored text with the release date of each new version, JSON, and diff
+| Feature | What depup does |
+|---|---|
+| Release cooldown | Uses a one-week wait by default. Inherits project age settings and honors stricter native uv and mise cutoffs. |
+| OSV advisories | Checks candidates for reported vulnerabilities and malware. Severity and count limits govern when an update may leave a known vulnerability. |
+| Registry sources | Checks supported Node.js and Composer project settings to avoid replacing private dependencies with same-named public packages. |
+| Lockfile audits | `--install` passes the age policy to pnpm, uv, and mise and checks direct and transitive versions in `Cargo.lock` and supported npm and pnpm lockfiles. If a newly added version still violates the age policy, depup restores the affected files and returns exit code `2`. |
+| Multi-language updates | Rewrites declarations for eight languages and mise tools in one run, including Bun catalogs in `package.json`. |
+| Git submodules | Previews or advances submodule pointers with [`--submodules`](docs/ecosystems.md#git-submodules). |
+| Version constraints | Keeps intentional pins by default. Preserves range operators and upper bounds, including prerelease and patch qualifiers, and Cargo wildcard notation such as `= 1.*`. |
+| Monorepos | Supports `.depup`, Cargo, pnpm and Go workspaces, Gradle multi-project builds, nested installs, and Tauri projects. |
+| Output formats | Shows release dates in colored text and supports JSON and diffs. |
 
 ### Supported Languages
 
@@ -185,6 +183,16 @@ Output for a Python project and for a Tauri project:
     </td>
   </tr>
 </table>
+
+### Supply Chain Security
+
+Preview updates with a requested two-week cooldown and reject candidates that OSV reports as vulnerable.
+
+```bash
+depup --dry-run --age 2w --osv --no-osv-risk-tradeoff
+```
+
+Review any OSV lookup warnings before applying updates. The [supply chain security guide](docs/usage.md#supply-chain-security) covers registry sources, transitive dependencies, and lockfile verification.
 
 ### How depup Decides Updates
 

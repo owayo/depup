@@ -4,7 +4,7 @@ version = "26.11.106"
 edition = "2024"
 rust-version = "1.99"
 authors = ["owayo"]
-description = "Multi-language dependency updater CLI tool"
+description = "Multi-language dependency updater CLI with release cooldowns and OSV checks to reduce software supply chain risk"
 license = "MIT"
 repository = "https://github.com/owayo/depup"
 

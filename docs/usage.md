@@ -2,6 +2,20 @@
 
 This guide explains how depup chooses the new version of each dependency and how it writes it back. [How depup Decides Updates](#how-depup-decides-updates) gives the overview; the later chapters are references to look up when a result is not what you expected. The options are listed in the [Command-Line Reference](cli-reference.md), and the rules specific to each ecosystem are in [Ecosystems and Monorepos](ecosystems.md).
 
+## Supply Chain Security
+
+A release cooldown gives maintainers and registries time to flag or remove a compromised version. depup waits one week by default and checks update candidates against OSV.dev, which includes reports from the OpenSSF Malicious Packages project. [OSV data sources](https://google.github.io/osv.dev/data/)
+
+```bash
+depup --dry-run --age 2w --osv --no-osv-risk-tradeoff
+```
+
+This previews manifest updates with a requested two-week cooldown. The effective policy can also depend on project settings and publisher exemptions. `--osv` enables the lookup even if your global configuration disabled it. `--no-osv-risk-tradeoff` rejects candidates with known vulnerabilities. An unsuccessful candidate lookup is shown as a warning and may leave an unverified version in the results. [Vulnerability check](#vulnerability-check-osvdev)
+
+- **Registry sources**. depup checks supported project settings so a version from a public registry does not replace a same-named private dependency. [Node.js](ecosystems.md#nodejs) · [PHP](ecosystems.md#php)
+- **Actual resolved versions**. With `--install`, depup audits direct and transitive versions in `Cargo.lock` and supported npm and pnpm lockfiles. The audit runs after the package manager, when install scripts may already have run. Supported uv releases can check reported malware before installing packages. [Lockfile audits](#transitive-dependencies-and-the-age-filter) · [uv malware check](#uv-malware-check-preview)
+- **Cargo's update scope**. Ordinary `--install` asks Cargo to update the selected dependencies and resolves the changes they need. Use `--install --refresh-lock` when you want a full re-resolution. [Package manager commands](#commands-per-package-manager)
+
 ## How depup Decides Updates
 
 Unless a dependency is pinned, depup looks up its published versions, picks the newest one that passes the checks below, and rewrites the manifest in place. By default:
