@@ -950,43 +950,12 @@ impl MembershipFixture {
         for only in [false, true] {
             let plan =
                 InstallPlan::new_scoped(orchestrator, result, &directories, self.temp.path(), only);
-            let rust_dirs: Vec<PathBuf> = if only
-                || result
-                    .errors
-                    .iter()
-                    .any(|error| matches!(error, OrchestratorError::NodePreflightError { .. }))
+            assert_eq!(plan.jobs.len(), nodes.len() + roots.len());
+            for (language, expected) in nodes
+                .iter()
+                .map(|path| (Language::Node, *path))
+                .chain(roots.iter().map(|path| (Language::Rust, *path)))
             {
-                roots
-                    .iter()
-                    .map(|path| std::fs::canonicalize(path).unwrap())
-                    .collect()
-            } else {
-                result
-                    .summary
-                    .manifests
-                    .iter()
-                    .filter(|manifest| {
-                        manifest.language == Language::Rust && manifest.has_updates()
-                    })
-                    .map(|manifest| {
-                        let parent = manifest.path.parent().unwrap();
-                        let project = if manifest.path.ends_with("src-tauri/Cargo.toml") {
-                            parent.parent().unwrap()
-                        } else {
-                            parent
-                        };
-                        std::fs::canonicalize(project).unwrap()
-                    })
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect()
-            };
-            assert_eq!(plan.jobs.len(), nodes.len() + rust_dirs.len());
-            for (language, expected) in nodes.iter().map(|path| (Language::Node, *path)).chain(
-                rust_dirs
-                    .iter()
-                    .map(|path| (Language::Rust, path.as_path())),
-            ) {
                 let expected = std::fs::canonicalize(expected).unwrap();
                 assert!(
                     plan.jobs.iter().any(|job| job.language == language
@@ -1762,19 +1731,12 @@ async fn normal_install_does_not_redirect_independent_cargo_updates_to_stopped_t
         let args = pm
             .scoped_install_args(manager, job.policy.as_ref().unwrap(), scope)
             .unwrap();
-        assert_eq!(
-            args,
-            if only {
-                vec!["cargo", "update", "--workspace"]
-            } else {
-                vec!["cargo", "update"]
-            }
-        );
+        assert_eq!(args, ["cargo", "update", "--workspace"]);
     }
 }
 
 #[tokio::test]
-async fn normal_full_install_keeps_tauri_redirect_when_preflight_does_not_stop_a_scope() {
+async fn normal_install_keeps_independent_cargo_and_tauri_roots_separate() {
     let temp = tempfile::tempdir().unwrap();
     write_tauri(temp.path(), "app");
     write_rust(temp.path(), "independent", false);
@@ -1786,26 +1748,29 @@ async fn normal_full_install_keeps_tauri_redirect_when_preflight_does_not_stop_a
     let result = run(&orchestrator, &[temp.path()], &FakeAuditor::default()).await;
     assert!(stopped_node_reason(&result, temp.path()).is_none());
     let plan = InstallPlan::new_scoped(&orchestrator, &result, &None, temp.path(), false);
-    let job = plan
+    let jobs = plan
         .jobs
         .iter()
-        .find(|job| job.language == Language::Rust)
-        .unwrap();
-    assert_eq!(job.scope, Ok(crate::package_manager::InstallScope::Full));
+        .filter(|job| job.language == Language::Rust)
+        .collect::<Vec<_>>();
+    assert_eq!(jobs.len(), 2);
     let pm = SystemPackageManager::new();
-    let (directory, _) = pm
-        .resolve_scoped_package_manager(job.language, &job.directory, job.scope.as_ref().unwrap())
-        .unwrap();
-    assert_eq!(directory, temp.path().join("src-tauri"));
-    assert_eq!(
-        pm.scoped_install_args(
-            "cargo",
-            job.policy.as_ref().unwrap(),
-            job.scope.as_ref().unwrap()
-        )
-        .unwrap(),
-        ["cargo", "update"]
-    );
+    for (job, root) in jobs
+        .into_iter()
+        .zip([temp.path().to_path_buf(), temp.path().join("src-tauri")])
+    {
+        let scope = job.scope.as_ref().unwrap();
+        let (directory, manager) = pm
+            .resolve_scoped_package_manager(job.language, &job.directory, scope)
+            .unwrap();
+        assert_eq!(directory, std::fs::canonicalize(&root).unwrap());
+        assert_eq!(job.manifests, [root.join("Cargo.toml")]);
+        assert_eq!(
+            pm.scoped_install_args(manager, job.policy.as_ref().unwrap(), scope)
+                .unwrap(),
+            ["cargo", "update", "--workspace"]
+        );
+    }
 }
 
 fn rust_lock(directory: &Path, name: &str) {
@@ -1877,7 +1842,7 @@ async fn stopped_cargo_locks_and_missing_locks_are_not_reintroduced_by_post_inst
 }
 
 #[tokio::test]
-async fn independent_full_cargo_install_associates_only_its_actual_new_lock_and_keeps_php_full() {
+async fn independent_cargo_install_associates_only_its_actual_new_lock_and_keeps_php_full() {
     for monorepo in [false, true] {
         let temp = tempfile::tempdir().unwrap();
         write_tauri(temp.path(), "app");
@@ -1914,7 +1879,7 @@ async fn independent_full_cargo_install_associates_only_its_actual_new_lock_and_
                 .find(|job| job.language == Language::Rust)
                 .unwrap()
                 .scope,
-            Ok(crate::package_manager::InstallScope::CargoFull)
+            Ok(crate::package_manager::InstallScope::CargoWorkspace)
         );
         assert_eq!(
             plan.jobs
@@ -1945,7 +1910,7 @@ async fn independent_full_cargo_install_associates_only_its_actual_new_lock_and_
 }
 
 #[tokio::test]
-async fn failed_full_cargo_root_preparation_is_an_error_and_never_restores_full_redirect() {
+async fn failed_cargo_root_preparation_does_not_redirect_to_stopped_tauri() {
     let temp = tempfile::tempdir().unwrap();
     write_tauri(temp.path(), "app");
     write_rust(temp.path(), "independent", false);

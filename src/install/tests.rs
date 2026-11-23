@@ -111,11 +111,18 @@ fn shared_install_includes_a_member_with_no_updates_and_does_not_mix_siblings() 
 #[test]
 fn a_missing_lock_is_an_unverified_age_audit() {
     let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("Cargo.toml"),
+        "[package]\nname = 'example'\nversion = '0.1.0'\n[lib]\npath = 'lib.rs'\n",
+    )
+    .unwrap();
+    std::fs::write(temp.path().join("lib.rs"), "").unwrap();
     let mut args = CliArgs::parse_from(["depup", "--age", "2w", "--quiet"]);
     args.path = temp.path().to_path_buf();
     let orchestrator = Orchestrator::new(args).unwrap();
     let result = result_with_update(temp.path().join("Cargo.toml"), Language::Rust);
     let plan = InstallPlan::new(&orchestrator, &result, &None, temp.path());
+    assert_eq!(plan.jobs[0].scope, Ok(InstallScope::CargoWorkspace));
     let audit = plan.rust_audit_plan(&orchestrator, &result);
     assert!(audit.locks.is_empty());
     assert_eq!(audit.missing_lock_dirs, vec![temp.path().to_path_buf()]);

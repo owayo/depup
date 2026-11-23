@@ -462,7 +462,7 @@ pnpm の更新先の不一致 (override や解決の結果、直接依存が別�
 | | `requirements.lock` / `requirements-dev.lock` | `rye sync` |
 | | `Pipfile.lock` | `pipenv install` |
 | | `pyproject.toml` / `requirements.txt` | `pip install -e .` |
-| Rust | `Cargo.toml`、または Tauri プロジェクトの `src-tauri/Cargo.toml`（このときは `src-tauri/` で実行） | `cargo update` |
+| Rust | `Cargo.toml`（`src-tauri/Cargo.toml` を含む） | Cargo workspace のルートで対象を絞って `cargo update` |
 | Go | `go.mod` | `go mod tidy` |
 | Ruby | `Gemfile` | `bundle install` |
 | PHP | `composer.json` | `composer update` |
@@ -481,11 +481,13 @@ PHP プロジェクトを `--install` で処理するとき、depup は `compose
 
 Poetry のプロジェクトでは、`poetry install` の前に lock を更新します。Poetry 1.8 以降の `poetry install` は、`pyproject.toml` の依存が `poetry.lock` と合わないと失敗するためです。depup は install と同じ実行ファイルと環境で `poetry --version` を実行し、Poetry 2 以降なら `poetry lock`、1.x なら `poetry lock --no-update` を実行します。どちらも lock 済みの版をできるだけ保ちます。版を確かめられないときや lock の更新に失敗したときは、`poetry install` を実行せず、install の失敗としてファイルを元に戻します。
 
-`--only` と `--install` を併用すると、Cargo と Composer は書き込みに成功した更新だけを指定して実行します。Cargo は `--exclude` でも同じ限定更新を使い、除外した git 依存のコミットを lock に保ちながら、無関係の更新を進めます。Cargo には更新前の lock の版と取得元を含む `--package <パッケージID>` を渡します。リネーム依存でも実クレート名を使い、git branch の更新にも同じ指定を使います。git tag を変更した依存や、更新前の lock にない依存は、旧取得元の指定を外したまま Cargo が解決します。パッケージの指定が 1 件も必要なければ `cargo update --workspace` を使います。どちらも無関係のロック済みパッケージを維持します。選んだ更新に必要な依存は変わる場合があります。既存の lock がなければ、最初の lock を解決します。lock が読めない場合や対象を一意に決められない場合は、install の失敗として表示します。
+通常の `--install` は、Cargo workspace のルートごとに lockfile を更新します。適用した更新に対応する lock エントリがあれば、更新前の版と取得元を含む `--package <パッケージID>` を Cargo に渡します。リネーム依存には実クレート名を使い、Git ブランチの更新もパッケージ ID で指定します。Git タグが変わった依存や、更新前の lock にない依存は、Cargo が新しい要件に従って解決します。対象のパッケージ ID がなければ `cargo update --workspace` を使います。
 
-Composer は `composer update --with-all-dependencies --minimal-changes -- <パッケージ>...` を実行します。選んだパッケージの依存は、ほかの直接依存も含めて必要な場合だけ更新し、互換性が保たれるものは現在の lock の版を維持します。この限定 install には Composer 2.7 以上が必要です。古い版では未対応オプションによる install 失敗を表示し、全体更新へは切り替えません。
+Cargo が更新するのは、指定された依存と、その解決に必要な推移依存です。無関係な依存は既存のロック版を維持します。既存の lock がなければ初回の解決になり、読み取れない場合や対象を一意に決められない場合は install の失敗として表示します。全体を解き直す場合は `--install --refresh-lock` を使います。
 
-composer.lock がない場合は、全体更新で最初の lock を生成します。Cargo は `--only` も `--exclude` もなければ全体更新します。Composer は `--only` がなければ全体更新し、古い版も引き続き使えます。他のパッケージマネージャーは表のコマンドを使います。
+`--only` と `--install` を併用すると、Composer は `composer update --with-all-dependencies --minimal-changes -- <パッケージ>...` を実行します。選んだパッケージの依存は、ほかの直接依存も含めて必要な場合だけ更新し、互換性が保たれるものは現在の lock の版を維持します。この限定 install には Composer 2.7 以上が必要です。古い版では未対応オプションによる install 失敗を表示し、全体更新へは切り替えません。
+
+composer.lock がない場合は、全体更新で最初の lock を生成します。Composer は `--only` がなければ全体更新し、古い版も引き続き使えます。他のパッケージマネージャーは表のコマンドを使います。
 
 Go では `go mod tidy` で、テストやプラットフォーム固有の import も含めて、ソースコードと `go.mod`・`go.sum` を揃えます。`go.mod` のハッシュに加えてモジュール本体のハッシュも記録し、後続のビルドに必要なチェックサムを揃えます。引数なしの `go mod download` と異なり、不足する間接依存を追加し、使われなくなった依存やハッシュを削除します。`// indirect` コメントが変わるほか、依存先が新しい Go を要求すると `go`・`toolchain` ディレクティブが変わる場合もあります。`vendor/` をコミットするプロジェクトでは、その後に `go mod vendor` で更新してください。tidy が失敗した場合は install 失敗として報告します。
 
@@ -523,7 +525,7 @@ pnpm 10 は `--json` を付けてもレジストリ URL を引用符なしで返
 
 Node の監査では lock を書き換えません。違反は実際のロック版・公開日・基準日時を、未確認の依存は理由を常に表示します。PM 自身の age フィルターで新規の解決を制限できる場合も、最後の検証を省略しません。この実行で入った版が条件を満たさなければ、install 単位を実行前の状態へ戻します ([最終の lockfile が age 監査を通らなかったとき](#最終の-lockfile-が-age-監査を通らなかったとき))。
 
-age が有効な `--install` では、更新を書き込む前にも既存の `pnpm-lock.yaml` を監査します。install・最終監査と同じ workspace の共有設定を使い、更新のないメンバーの厳しい設定も含めます。Node 自身に更新がなくても、つながる Node/Cargo install のどちらかに実更新があれば確認します。違反・未確認・lock の読み込みや依存グラフの取得失敗・age 設定の読み込みや解釈失敗があれば、その scope のマニフェストと install を止めます。予定した更新は失敗として数え、終了コード 2 で通知します。独立した scope は処理を続けます。Tauri は共有 Node/Cargo workspace でつながるプロジェクトもまとめて止め、同期した片側だけの書き込みを防ぎます。Cargo の所属判定が失敗した manifest は、成功した Cargo の実行環境から読み取り専用の `locate-project` で再確認します。成功した回答が同じ root を示せば所属を確定し、回答が食い違う場合や成功がない場合は未確認のまま扱います。独立と確認できない Rust と対応する Node を止め、判定エラーの理由を表示します。別の root と確認できた scope は、同じ Node install を共有していなければ続行します。通常の Rust helper の所属が不明なだけでは、確認済みの別 root 同士をつなぎません。停止した Node/Cargo scope は install 後の監査と Cargo lock の差し戻しから除外します。残る独立した Rust install は、確認済みの root で full cargo update を実行します。root の判定が失敗した場合は、停止した Tauri ディレクトリを選ばずエラーを表示します。確認を通った scope と、更新のない独立した既存 lock の最終監査は維持します。dry-run と `--install` を付けない実行では、この事前監査を行いません。
+age が有効な `--install` では、更新を書き込む前にも既存の `pnpm-lock.yaml` を監査します。install・最終監査と同じ workspace の共有設定を使い、更新のないメンバーの厳しい設定も含めます。Node 自身に更新がなくても、つながる Node/Cargo install のどちらかに実更新があれば確認します。違反・未確認・lock の読み込みや依存グラフの取得失敗・age 設定の読み込みや解釈失敗があれば、その scope のマニフェストと install を止めます。予定した更新は失敗として数え、終了コード 2 で通知します。独立した scope は処理を続けます。Tauri は共有 Node/Cargo workspace でつながるプロジェクトもまとめて止め、同期した片側だけの書き込みを防ぎます。Cargo の所属判定が失敗した manifest は、成功した Cargo の実行環境から読み取り専用の `locate-project` で再確認します。成功した回答が同じ root を示せば所属を確定し、回答が食い違う場合や成功がない場合は未確認のまま扱います。独立と確認できない Rust と対応する Node を止め、判定エラーの理由を表示します。別の root と確認できた scope は、同じ Node install を共有していなければ続行します。通常の Rust helper の所属が不明なだけでは、確認済みの別 root 同士をつなぎません。停止した Node/Cargo scope は install 後の監査と Cargo lock の差し戻しから除外します。残る独立した Rust プロジェクトでは、確認済みの root で対象を絞って Cargo を実行します。root を判定できなければ、準備の失敗として表示します。確認を通った scope と、更新のない独立した既存 lock の最終監査は維持します。dry-run と `--install` を付けない実行では、この事前監査を行いません。
 
 実際の age 違反がある場合は、手動で作り直すコマンドを表示します。`pnpm clean --lockfile` の後に、`npm_config_minimum_release_age` と `pnpm_config_minimum_release_age` の両方を付けた `pnpm install` を実行する手順です。分数は、固定した基準日時から表示時までの経過期間を計算し、切り上げた値です。時間を置いて実行する場合は、depup を再実行して案内を生成してください。`clean --lockfile` には [pnpm 11 以降](https://pnpm.io/blog/releases/11.0) が必要で、`node_modules` と lockfile を削除します。作り直すと lock 全体を解決し直すため、無関係な依存の版も変わります。depup はこのコマンドを実行せず、age の除外設定も緩めません。違反を確認できていない読み込み・メタデータ・検証の失敗だけでは、clean の手順を案内しません。`--refresh-lock` を付けた場合も、その pnpm の範囲は再解決せず、再解決の結果に `failed` として止めた理由とともに出します。
 

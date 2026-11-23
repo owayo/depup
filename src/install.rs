@@ -155,22 +155,13 @@ impl InstallPlan {
             .collect();
         if orchestrator.refresh_lock_requested() {
             refresh::plan_jobs(&mut jobs, orchestrator, result, &node_audits);
-        } else if only_mode {
-            scoped::replace_scoped_jobs(
-                &mut jobs,
-                orchestrator,
-                result,
-                &[Language::Rust, Language::Php],
-            );
-        } else if orchestrator.package_exclusions_requested() {
-            scoped::replace_scoped_jobs(&mut jobs, orchestrator, result, &[Language::Rust]);
-        } else if result.errors.iter().any(|error| {
-            matches!(
-                error,
-                crate::orchestrator::OrchestratorError::NodePreflightError { .. }
-            )
-        }) {
-            scoped::replace_full_rust_jobs(&mut jobs, orchestrator, result);
+        } else {
+            let languages: &[Language] = if only_mode {
+                &[Language::Rust, Language::Php]
+            } else {
+                &[Language::Rust]
+            };
+            scoped::replace_scoped_jobs(&mut jobs, orchestrator, result, languages);
         }
         let groups = RustLockGroups::collect(orchestrator, result);
         let baselines = groups
