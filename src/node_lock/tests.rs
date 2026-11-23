@@ -580,7 +580,11 @@ fn pnpm_registry_output_preserves_json_and_unset_values() {
         parse_pnpm_registry_output(b"\"https://registry.npmjs.org/\"\r\n"),
         Ok(Some("https://registry.npmjs.org/".into()))
     );
-    for output in ["", " \t\r\n", "null", " null\r\n"] {
+    assert_eq!(
+        parse_pnpm_registry_output(b"\"undefined\""),
+        Ok(Some("undefined".into()))
+    );
+    for output in ["", " \t\r\n", "null", " null\r\n", " \tundefined\r\n"] {
         assert_eq!(parse_pnpm_registry_output(output.as_bytes()), Ok(None));
     }
 }
@@ -589,6 +593,7 @@ fn pnpm_registry_output_preserves_json_and_unset_values() {
 fn pnpm_registry_output_rejects_unverified_values() {
     for output in [
         &b"not JSON"[..],
+        b"undefined\nwarning",
         b"registry.npmjs.org/",
         b"//registry.npmjs.org/",
         b"/registry.npmjs.org/",
@@ -727,7 +732,7 @@ async fn pnpm_scoped_registry_overrides_default_and_private_tarballs_remain_unve
 #[tokio::test]
 async fn pnpm_unset_scoped_registry_falls_back_to_verified_default() {
     let directory = tempfile::tempdir().unwrap();
-    for unset in ["", " \t\r\n", "null"] {
+    for unset in ["", " \t\r\n", "null", " \tundefined\r\n"] {
         let program = fake_pnpm(
             directory.path(),
             &format!(
@@ -775,6 +780,7 @@ async fn pnpm_unreadable_registry_config_never_sends_names_to_public_npm() {
         "printf 'https://registry.npmjs.org/\\nwarning'",
         "printf 'https://registry.\\tnpmjs.org/'",
         "printf null",
+        "printf undefined",
         "printf '\"https://registry.npmjs.org/\"'; printf warning >&2",
         "printf 'https://registry.npmjs.org/'; printf warning >&2",
         "printf 'https://registry.npmjs.org/'; exit 7",
