@@ -923,7 +923,7 @@ mod tests {
     ) -> Vec<String> {
         use crate::domain::{ManifestUpdateResult, UpdateResult, UpdateSummary};
         use clap::Parser;
-        let mut args = crate::cli::CliArgs::parse_from(["depup", "--no-age"]);
+        let mut args = crate::cli::CliArgs::parse_from(["depup", "--install", "--age", "2w"]);
         args.path = project.path().to_path_buf();
         if only {
             args.only = vec![dependency.manifest_name().into()];
@@ -1047,22 +1047,34 @@ mod tests {
     }
 
     #[test]
-    fn install_without_only_still_refreshes_unselected_packages() {
+    fn ordinary_cargo_install_keeps_unrelated_workspace_dependencies_locked() {
         use crate::test_support::local_registry::{LocalRegistry, TestProject};
         let registry = LocalRegistry::new();
         registry.publish("selected", "1.0.0", &[]);
-        registry.publish("untouched", "1.0.0", &[]);
-        let project = TestProject::new(
-            &registry,
-            "[package]\nname = 'example'\nversion = '0.1.0'\n[dependencies]\nselected = '1.0.0'\nuntouched = '1.0.0'\n",
+        registry.publish("untouched", "1.0.0", &[("unrelated", "1.0.0")]);
+        registry.publish("unrelated", "1.0.0", &[]);
+        let manifest = |version: &str| {
+            format!(
+                "[package]\nname = 'example'\nversion = '0.1.0'\nedition = '2024'\n[workspace]\nmembers = ['other']\n[dependencies]\nselected = '{version}'\n"
+            )
+        };
+        let project = TestProject::new(&registry, &manifest("1.0.0"));
+        project.write(
+            "other/Cargo.toml",
+            "[package]\nname = 'other'\nversion = '0.1.0'\nedition = '2024'\n[dependencies]\nuntouched = '1.0.0'\n",
         );
+        project.write("other/src/lib.rs", "");
         project.cargo_ok(&["generate-lockfile"]);
-        registry.publish("selected", "1.0.1", &[]);
-        registry.publish("untouched", "1.0.1", &[]);
+        registry.publish("selected", "2.0.0", &[("required", "1.1.0")]);
+        registry.publish("required", "1.1.0", &[]);
+        registry.publish("unrelated", "1.0.1", &[]);
+        project.write("Cargo.toml", &manifest("2.0.0"));
         let args = planned_cargo_args(&project, "selected", "1.0.0", false);
-        assert_eq!(args, ["cargo", "update"]);
         project.cargo_ok(&args[1..].iter().map(String::as_str).collect::<Vec<_>>());
-        assert_eq!(project.locked_versions("untouched"), ["1.0.1"]);
+        assert_eq!(project.locked_versions("selected"), ["2.0.0"]);
+        assert_eq!(project.locked_versions("required"), ["1.1.0"]);
+        assert_eq!(project.locked_versions("unrelated"), ["1.0.0"]);
+        project.cargo_ok(&["update", "--workspace", "--locked"]);
     }
 
     #[test]

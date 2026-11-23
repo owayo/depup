@@ -153,7 +153,7 @@ fn shared_workspace_lock_combines_member_targets_once() {
     }
     let project = TestProject::new(
         &registry,
-        "[workspace]\nmembers = ['first-app', 'second-app']\nresolver = '3'\n",
+        "[workspace]\nmembers = ['first-app', 'second-app', 'src-tauri']\nresolver = '3'\n",
     );
     let member = |name: &str, dependency: &str, version: &str| {
         format!(
@@ -170,6 +170,11 @@ fn shared_workspace_lock_combines_member_targets_once() {
         &member("second-app", "second", "1.0.0"),
     );
     project.write("second-app/src/lib.rs", "");
+    project.write(
+        "src-tauri/Cargo.toml",
+        "[package]\nname = 'desktop'\nversion = '0.1.0'\nedition = '2024'\n",
+    );
+    project.write("src-tauri/src/lib.rs", "");
     project.cargo_ok(&["generate-lockfile"]);
     for name in ["first", "second"] {
         registry.publish(name, "2.0.0", &[]);
@@ -191,6 +196,10 @@ fn shared_workspace_lock_combines_member_targets_once() {
         ManifestUpdateResult::new(project.path().join("second-app/Cargo.toml"), Language::Rust);
     second.add_result(UpdateResult::update(dep("second", "1.0.0"), "2.0.0"));
     result.summary.add_manifest(second);
+    let desktop = project.path().join("src-tauri/Cargo.toml");
+    result
+        .summary
+        .add_manifest(ManifestUpdateResult::new(desktop.clone(), Language::Rust));
     let mut args = CliArgs::parse_from(["depup", "--only", "first,second", "--no-age"]);
     args.path = project.path().to_path_buf();
     let orchestrator = Orchestrator::new(args).unwrap();
@@ -206,6 +215,7 @@ fn shared_workspace_lock_combines_member_targets_once() {
     assert_eq!(excluded_plan.jobs.len(), 1);
     assert_eq!(excluded_plan.jobs[0].directory, plan.jobs[0].directory);
     assert_eq!(excluded_plan.jobs[0].scope, plan.jobs[0].scope);
+    assert!(plan.jobs[0].manifests.contains(&desktop));
     assert_eq!(plan.jobs.len(), 1);
     assert_eq!(
         plan.jobs[0].directory,
@@ -223,6 +233,24 @@ fn shared_workspace_lock_combines_member_targets_once() {
     assert_eq!(project.locked_versions("first"), ["2.0.0"]);
     assert_eq!(project.locked_versions("second"), ["2.0.0"]);
     assert_eq!(project.locked_versions("untouched"), ["1.0.0"]);
+
+    let mut args = CliArgs::parse_from(["depup", "--install", "--refresh-lock", "--no-age"]);
+    args.path = project.path().to_path_buf();
+    let refresh = Orchestrator::new(args).unwrap();
+    let refresh_plan = InstallPlan::new(&refresh, &result, &directories, project.path());
+    assert_eq!(refresh_plan.jobs.len(), 1);
+    let job = &refresh_plan.jobs[0];
+    assert_eq!(job.scope, Ok(InstallScope::Refresh));
+    let command = crate::package_manager::SystemPackageManager::new()
+        .scoped_install_args(
+            "cargo",
+            job.policy.as_ref().unwrap(),
+            job.scope.as_ref().unwrap(),
+        )
+        .unwrap();
+    assert_eq!(command, ["cargo", "update"]);
+    project.cargo_ok(&[command[1].as_str()]);
+    assert_eq!(project.locked_versions("untouched"), ["1.0.1"]);
 }
 
 #[test]
