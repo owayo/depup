@@ -127,6 +127,22 @@ impl OutputFormatter for DiffFormatter {
                 writeln!(writer)?;
             }
         }
+        for sync in result.package_manager_syncs() {
+            let path = crate::user_path::display(&sync.path);
+            writeln!(writer, "{prefix}--- a/{path}")?;
+            writeln!(writer, "{prefix}+++ b/{path}")?;
+            writeln!(writer, "@@ packageManager @@")?;
+            writeln!(writer, "-  \"packageManager\": \"{}\"", sync.from)?;
+            writeln!(writer, "+  \"packageManager\": \"{}\"\n", sync.to)?;
+        }
+        for warning in result.errors.iter().filter(|error| {
+            matches!(
+                error,
+                crate::orchestrator::OrchestratorError::PackageManagerSyncWarning { .. }
+            )
+        }) {
+            writeln!(writer, "{prefix}# Warning: {warning}")?;
+        }
 
         for module in result.summary.submodules.iter().flatten() {
             let path = &module.path;

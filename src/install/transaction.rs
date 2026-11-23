@@ -35,8 +35,14 @@ struct Task {
     node_root: Option<PathBuf>,
     trees: Vec<FileGuard>,
     tree_links: BTreeMap<PathBuf, FileGuard>,
+    package_manager_pins: Vec<PackageManagerPin>,
     mise_locks: Option<mise_lock::Preservation>,
     uv_lock: Option<uv_lock::Normalization>,
+}
+struct PackageManagerPin {
+    alias: PathBuf,
+    target: PathBuf,
+    expected: String,
 }
 struct Unit {
     files: BTreeSet<PathBuf>,
@@ -78,6 +84,7 @@ pub struct InstallTransactions {
     files: BTreeMap<PathBuf, FileRecord>,
     node_managers: BTreeMap<PathBuf, (PathBuf, &'static str)>,
     mise_recovery_boundary: PathBuf,
+    linked_mise_started: bool,
 }
 
 #[derive(Debug)]
@@ -161,6 +168,7 @@ impl InstallTransactions {
             files: BTreeMap::new(),
             node_managers: BTreeMap::new(),
             mise_recovery_boundary,
+            linked_mise_started: false,
         };
         for job in &plan.node_audits {
             if let Some(manager) = pm.resolve_package_manager(job.language, &job.directory) {
@@ -182,33 +190,39 @@ impl InstallTransactions {
 
     /// 後で保存する更新済みのマニフェストの状態を、書き込み記録で上書きする。
     fn record_manifest_writes(&mut self, result: &OrchestratorResult) {
-        for write in &result.write_results {
-            if let Some(journal) = &write.journal {
-                let before = FileState {
-                    bytes: Some(journal.before.clone()),
-                    permissions: Some(journal.permissions.clone()),
-                };
-                let expected = FileState {
-                    bytes: Some(journal.written.clone()),
-                    permissions: Some(journal.permissions.clone()),
-                };
-                self.files
-                    .entry(journal.target.clone())
-                    .and_modify(|record| {
-                        if !record.expected.matches(&before) {
-                            record.conflict = Some("Manifest changed between writes".into());
-                        }
-                        record.expected = expected.clone();
-                        record.guards.push(journal.guard.clone());
-                    })
-                    .or_insert(FileRecord {
-                        parent_permissions: parent_permissions(&journal.target),
-                        guards: vec![journal.guard.clone()],
-                        before,
-                        expected,
-                        conflict: None,
-                    });
-            }
+        let journals = result.write_results.iter().flat_map(|write| {
+            write.journal.iter().chain(
+                write
+                    .package_manager_sync
+                    .iter()
+                    .filter_map(|sync| sync.journal.as_ref()),
+            )
+        });
+        for journal in journals {
+            let before = FileState {
+                bytes: Some(journal.before.clone()),
+                permissions: Some(journal.permissions.clone()),
+            };
+            let expected = FileState {
+                bytes: Some(journal.written.clone()),
+                permissions: Some(journal.permissions.clone()),
+            };
+            self.files
+                .entry(journal.target.clone())
+                .and_modify(|record| {
+                    if !record.expected.matches(&before) {
+                        record.conflict = Some("Manifest changed between writes".into());
+                    }
+                    record.expected = expected.clone();
+                    record.guards.push(journal.guard.clone());
+                })
+                .or_insert(FileRecord {
+                    parent_permissions: parent_permissions(&journal.target),
+                    guards: vec![journal.guard.clone()],
+                    before,
+                    expected,
+                    conflict: None,
+                });
         }
     }
 
@@ -311,6 +325,23 @@ impl InstallTransactions {
             if applies {
                 task.summaries.insert(index);
                 self.add_path(&mut task, &manifest.path, false);
+                if manifest.language == Language::Mise
+                    && let Some(sync) = result
+                        .write_results
+                        .iter()
+                        .find(|write| write.path == manifest.path)
+                        .and_then(|write| write.package_manager_sync.as_ref())
+                    && let Some(journal) = &sync.journal
+                {
+                    // Use the original identity so a replaced alias cannot detach the write from recovery.
+                    task.claimed.insert(journal.guard.alias.clone());
+                    task.files.insert(journal.target.clone());
+                    task.package_manager_pins.push(PackageManagerPin {
+                        alias: journal.guard.alias.clone(),
+                        target: journal.target.clone(),
+                        expected: sync.to.clone(),
+                    });
+                }
             }
         }
         let Some((effective_dir, manager)) = selection else {
@@ -561,6 +592,12 @@ impl InstallTransactions {
                 let shared = !a.files.is_disjoint(&b.files)
                     || !a.scope_paths.is_disjoint(&b.scope_paths)
                     || !a.summaries.is_disjoint(&b.summaries)
+                    || a.package_manager_pins
+                        .iter()
+                        .any(|pin| b.claimed.contains(&pin.alias))
+                    || b.package_manager_pins
+                        .iter()
+                        .any(|pin| a.claimed.contains(&pin.alias))
                     || a.rust_root
                         .as_ref()
                         .is_some_and(|root| b.rust_root.as_ref() == Some(root))
@@ -634,8 +671,48 @@ impl InstallTransactions {
     }
 
     pub fn execute(&mut self, mut runner: impl FnMut(&PreparedInstall) -> InstallResult) {
+        self.execute_linked_mise(&mut runner);
         for index in 0..self.tasks.len() {
-            self.execute_task(index, None, &mut runner);
+            if self.tasks[index].package_manager_pins.is_empty() {
+                self.execute_task(index, None, &mut runner);
+            }
+        }
+        self.verify_package_manager_pins();
+    }
+
+    /// Install the selected package manager before Node reads or rewrites its lockfile.
+    pub(super) fn execute_linked_mise(
+        &mut self,
+        runner: &mut impl FnMut(&PreparedInstall) -> InstallResult,
+    ) {
+        if std::mem::replace(&mut self.linked_mise_started, true) {
+            return;
+        }
+        for index in 0..self.tasks.len() {
+            if !self.tasks[index].package_manager_pins.is_empty() {
+                self.execute_task(index, None, runner);
+            }
+        }
+    }
+
+    fn verify_package_manager_pins(&mut self) {
+        for (index, task) in self.tasks.iter().enumerate() {
+            let unit = &mut self.units[self.task_units[index]];
+            if unit.failure.is_some() {
+                continue;
+            }
+            for pin in &task.package_manager_pins {
+                if !read_record(&self.files[&pin.target])
+                    .is_ok_and(|state| package_manager_matches(&state, &pin.expected))
+                {
+                    unit.failure = Some(format!(
+                        "Expected packageManager {} in {} after install",
+                        pin.expected,
+                        for_display(&pin.alias).display(),
+                    ));
+                    break;
+                }
+            }
         }
     }
 
@@ -1166,6 +1243,7 @@ impl Task {
             node_root: None,
             trees: vec![],
             tree_links: BTreeMap::new(),
+            package_manager_pins: vec![],
             mise_locks: None,
             uv_lock: None,
         }
@@ -1269,6 +1347,20 @@ fn read_record(record: &FileRecord) -> io::Result<FileState> {
         guard.check()?;
     }
     FileState::read(&record.guards[0].target)
+}
+
+fn package_manager_matches(state: &FileState, expected: &str) -> bool {
+    let Some(content) = state
+        .bytes
+        .as_deref()
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+    else {
+        return false;
+    };
+    let (_, body) = crate::manifest::split_utf8_bom(content);
+    serde_json::from_str::<serde_json::Value>(body).is_ok()
+        && crate::manifest::unique_top_level_string_property(body, "packageManager")
+            .is_ok_and(|field| field.is_some_and(|(_, value)| value == expected))
 }
 fn restore_record(record: &FileRecord) -> FileOutcome {
     if let Some(reason) = &record.conflict {

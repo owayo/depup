@@ -21,6 +21,8 @@ pub struct ManifestInfo {
     pub is_workspace_root: bool,
     /// Tauri プロジェクトの src-tauri ディレクトリのマニフェストかどうか
     pub is_tauri_rust: bool,
+    /// mise がこの設定を読み込むプロジェクト。設定ファイルの親と異なる場合がある。
+    pub(crate) mise_project: Option<PathBuf>,
 }
 
 impl ManifestInfo {
@@ -31,6 +33,7 @@ impl ManifestInfo {
             language,
             is_workspace_root: false,
             is_tauri_rust: false,
+            mise_project: None,
         }
     }
 
@@ -194,6 +197,11 @@ pub fn detect_manifests_with_warnings(dir: &Path) -> ManifestDetection {
     // 拾えるが、mise は同じディレクトリの複数ファイルを読むので残りも足す。
     for mise_path in detect_mise_manifests(dir) {
         push_unique_manifest(&mut manifests, mise_path, Language::Mise);
+    }
+    for manifest in &mut manifests {
+        if manifest.language == Language::Mise {
+            manifest.mise_project = Some(dir.to_path_buf());
+        }
     }
 
     ManifestDetection {

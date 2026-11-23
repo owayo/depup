@@ -160,11 +160,8 @@ pub(crate) async fn run_with(
         InstallTransactions::begin_for_run(plan, result, &orchestrator.rust_lock_boundary());
     note_node_package_managers(args, &tx);
     note_direct_only_age(args, plan, &tx);
-    // パッケージマネージャーが lockfile を書き換える前に読む。
-    let baselines = node_baselines(plan, &tx, checks, false).await;
-    let osv_baselines = node_baselines(plan, &tx, checks, true).await;
     let mut progress = Progress::new(!args.quiet);
-    tx.execute(|command| {
+    let mut install = |command: &PreparedInstall| {
         progress.spinner(&format!(
             "Running {} install...",
             command.language.display_name()
@@ -188,7 +185,12 @@ pub(crate) async fn run_with(
             }
         }
         outcome
-    });
+    };
+    tx.execute_linked_mise(&mut install);
+    // 新しいパッケージマネージャーで、lockfile を書き換える前の版を読む。
+    let baselines = node_baselines(plan, &tx, checks, false).await;
+    let osv_baselines = node_baselines(plan, &tx, checks, true).await;
+    tx.execute(install);
     let mut audit_plan = plan.rust_audit_plan(orchestrator, result);
     // Cargo.lock を受け持つ単位がすでに失敗していれば、その lock は復元されるので監査しない。
     // 同じディレクトリの別の言語の単位 (Bundler・Go・uv など) の失敗では外さない (#89)。

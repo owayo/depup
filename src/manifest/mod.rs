@@ -52,6 +52,7 @@ pub use gradle_wrapper::GRADLE_WRAPPER_PACKAGE;
 pub(crate) use gradle_wrapper::{
     GRADLE_WRAPPER_FILES, GRADLE_WRAPPER_PROPERTIES, has_gradle_wrapper_checksum,
 };
+pub(crate) use json_sections::unique_top_level_string_property;
 pub use mise::MiseParser;
 pub(crate) use mise::{mise_project_directory, read_mise_requires_python};
 pub use mise_settings::{MISE_CONFIG_FILENAMES, MiseSettings, has_mise_config, mise_config_paths};
@@ -61,6 +62,9 @@ pub use pnpm_settings::{PnpmSettings, has_pnpm_workspace};
 pub use pyproject_toml::PyprojectTomlParser;
 pub use tool_versions::TOOL_VERSIONS_FILENAME;
 pub use writer::{ManifestWriter, WriteFailure, WriteResult, read_manifest, write_manifest};
+pub(crate) use writer::{
+    PackageManagerSync, capture_package_manager_pins, is_mise_package_manager,
+};
 
 use crate::domain::{Dependency, Language};
 use crate::error::ManifestError;

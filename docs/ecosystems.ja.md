@@ -254,6 +254,12 @@ depup は mise の確認を自動では承認しません（`MISE_YES` を渡し
 
 タスクの複数行文字列に含まれるツール宣言は無視します。通常の文字列やコメントの中に三重引用符があっても、その後の `[tools]` 宣言は更新対象として読み取ります。
 
+#### Node のパッケージマネージャーの版
+
+mise 設定で npm・pnpm・Yarn の固定版を更新すると、同じプロジェクトの `package.json` にある同名の `packageManager` も更新します。`--mise` でも適用します。更新内容は `--dry-run --diff` や JSON の `package_manager_syncs` 配列で確認できます。`--install` で復元が必要になった場合は、両方の変更を同じ単位として戻します。
+
+古い版にチェックサムが付いている場合や、同じツールが複数の mise 設定にある場合は、警告を表示して `packageManager` の指定を維持します。版が下がる場合や `--max-change` を超える場合も同様です。この同期には mise 側の固定版の更新が必要です。
+
 #### lock の platform 情報
 
 `--install` では、`mise install` の実行前に既存の mise lock が持つ platform 情報を保存します。install で情報が欠けた場合は、対象のツールだけ `mise lock <tool...> --platform <元のplatform集合>` で再生成します。ツールごとの platform 集合と install の age 制約を引き継ぎ、形式のアップグレードや `--bump` による版の再選択は行いません。

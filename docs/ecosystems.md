@@ -258,6 +258,12 @@ Only the `[tools]` section is rewritten; identically named keys under `[settings
 
 Tool declarations inside multiline task strings are ignored. Triple-quote markers inside ordinary strings or comments do not hide subsequent `[tools]` declarations.
 
+#### Node package manager versions
+
+When depup updates an exact npm, pnpm, or Yarn version in a mise config, it also updates the matching top-level `packageManager` field in the same project's `package.json`. This applies with `--mise` and appears in `--dry-run --diff` and in the JSON `package_manager_syncs` array. With `--install`, the two changes are part of the same recovery unit.
+
+depup keeps the field and warns if it has a checksum for the old version, the project has competing mise declarations, or the change would downgrade the pin or exceed `--max-change`. Synchronization requires mise to update the corresponding tool version.
+
 #### Lockfile Platforms
 
 With `--install`, depup records the platform metadata in existing mise lockfiles before running `mise install`. If the install drops metadata, depup refreshes the affected tools with `mise lock <tool...> --platform <original-platforms>`, preserving each tool's platform set and the install's age cutoff. It does not request a format upgrade or re-resolve selectors with `--bump`.

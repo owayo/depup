@@ -93,7 +93,7 @@ pub(crate) fn looks_like_tool_versions(content: &str) -> bool {
 }
 
 /// 行を `(ツール名, バージョン列)` に分解する。空行・コメント行は `None`。
-fn split_tool_line(line: &str) -> Option<(&str, Vec<&str>)> {
+pub(super) fn split_tool_line(line: &str) -> Option<(&str, Vec<&str>)> {
     let body = strip_comment(line);
     let mut tokens = body.split_whitespace();
     let tool = tokens.next()?;

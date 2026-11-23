@@ -245,6 +245,69 @@ fn success(command: &PreparedInstall) -> InstallResult {
 }
 
 #[test]
+fn mise_package_manager_and_node_dependency_writes_share_recovery() {
+    let temp = tempfile::tempdir().unwrap();
+    let directory = temp.path();
+    let mise = directory.join("mise.toml");
+    let package = directory.join("package.json");
+    let lock = directory.join("package-lock.json");
+    let mise_before = "[tools]\nnpm = '1.0.0'\n";
+    let package_before = r#"{"packageManager":"npm@1.0.0","dependencies":{"example":"1.0.0"}}"#;
+    let mut result = result();
+
+    for (path, language, content) in [
+        (&package, Language::Node, package_before),
+        (&mise, Language::Mise, mise_before),
+    ] {
+        fs::write(path, content).unwrap();
+        let mut manifest = ManifestUpdateResult::new(path, language);
+        let dependency = parser_for(path, language).parse(content).unwrap().remove(0);
+        manifest.add_result(UpdateResult::update(dependency, "2.0.0"));
+        result.summary.add_manifest(manifest);
+    }
+    fs::write(&lock, "{}").unwrap();
+    result.write_results = ManifestWriter::new(false).apply_scoped_updates(
+        &result.summary.manifests,
+        parser_for,
+        &BTreeSet::new(),
+        &detect_manifests(directory),
+        &crate::manifest::capture_package_manager_pins(std::iter::once(directory)),
+        None,
+    );
+    assert_eq!(
+        fs::read_to_string(&package).unwrap(),
+        package_before.replace("1.0.0", "2.0.0")
+    );
+
+    let plan = plan(vec![
+        job(directory, Language::Node, std::slice::from_ref(&package)),
+        job(directory, Language::Mise, std::slice::from_ref(&mise)),
+    ]);
+    let mut tx = InstallTransactions::begin(&plan, &result, directory);
+    assert_eq!(tx.units.len(), 1);
+    let mut calls = Vec::new();
+    let mut runner = |command: &PreparedInstall| {
+        calls.push(command.language);
+        if command.language == Language::Node {
+            // A successful Node command can still rewrite the packageManager pin.
+            let contents = fs::read_to_string(&package).unwrap();
+            fs::write(&package, contents.replace("npm@2.0.0", "npm@1.0.0")).unwrap();
+        }
+        success(command)
+    };
+    tx.execute_linked_mise(&mut runner);
+    tx.execute(runner);
+    assert_eq!(calls, [Language::Mise, Language::Node]);
+    let report = tx.rollback();
+    assert!(report.has_install_failures());
+    report.mark_summary(&mut result.summary);
+    assert_eq!(result.summary.total_updates(), 0);
+    assert_eq!(result.package_manager_syncs().count(), 0);
+    assert_eq!(fs::read_to_string(&package).unwrap(), package_before);
+    assert_eq!(fs::read_to_string(&mise).unwrap(), mise_before);
+}
+
+#[test]
 fn uv_install_normalizes_transient_cutoff_without_changing_the_resolution() {
     for workspace in [false, true] {
         for native in [

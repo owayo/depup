@@ -10,7 +10,7 @@
 
 use super::ManifestParser;
 use super::mise_toml::MiseTomlParser;
-use super::tool_versions::{ToolVersionsParser, looks_like_tool_versions};
+use super::tool_versions::{ToolVersionsParser, looks_like_tool_versions, split_tool_line};
 use crate::domain::{Dependency, Language};
 use crate::error::ManifestError;
 use std::path::Path;
@@ -25,6 +25,27 @@ pub(crate) fn mise_project_directory(config: &Path) -> &Path {
         .max()
         .unwrap_or(1);
     config.ancestors().nth(depth).unwrap_or(config)
+}
+
+/// Count declarations even when a selector (such as `latest` or an array) cannot be updated.
+pub(super) fn count_mise_tool_declarations(
+    content: &str,
+    matches_tool: impl Fn(&str) -> bool,
+) -> Result<usize, toml::de::Error> {
+    if looks_like_tool_versions(content) {
+        return Ok(content
+            .lines()
+            .filter_map(split_tool_line)
+            .filter(|(tool, _)| matches_tool(tool))
+            .count());
+    }
+    let document: toml::Table = toml::from_str(content)?;
+    Ok(document
+        .get("tools")
+        .and_then(toml::Value::as_table)
+        .map_or(0, |tools| {
+            tools.keys().filter(|tool| matches_tool(tool)).count()
+        }))
 }
 
 /// mise の Python だけが、同じプロジェクトのインタープリター制約を使う。

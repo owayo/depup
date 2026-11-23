@@ -112,6 +112,28 @@ pub struct OrchestratorResult {
     pub errors: Vec<OrchestratorError>,
 }
 
+impl OrchestratorResult {
+    pub(crate) fn package_manager_syncs(
+        &self,
+    ) -> impl Iterator<Item = &crate::manifest::PackageManagerSync> {
+        self.write_results.iter().filter_map(|write| {
+            let sync = write.package_manager_sync.as_ref()?;
+            let source = self
+                .summary
+                .manifests
+                .iter()
+                .find(|manifest| manifest.path == write.path)?;
+            // A failed install marks the source update as cancelled, so the sync cannot be reported as applied.
+            source
+                .results
+                .get(sync.source_index)?
+                .write_error()
+                .is_none()
+                .then_some(sync)
+        })
+    }
+}
+
 /// オーケストレーション中に発生しうるエラー
 #[derive(Debug)]
 pub enum OrchestratorError {
@@ -125,6 +147,8 @@ pub enum OrchestratorError {
     RegistryError { package: String, message: String },
     /// マニフェストの書き込みに失敗
     WriteError { path: String, message: String },
+    /// The mise tool was updated without changing its paired packageManager field.
+    PackageManagerSyncWarning { path: PathBuf, reason: String },
     /// pnpm の最終的な解決結果が、表示した更新先へ到達しなかった。
     InstallResolutionError { directory: PathBuf, message: String },
     /// 書き込み前に停止した共有 pnpm scope。事後に同じ lock を再監査しない。
@@ -153,7 +177,10 @@ impl OrchestratorError {
     pub fn is_warning(&self) -> bool {
         matches!(
             self,
-            Self::OsvWarning { .. } | Self::OsvCandidateExcluded { .. } | Self::OsvTradeoff { .. }
+            Self::OsvWarning { .. }
+                | Self::OsvCandidateExcluded { .. }
+                | Self::OsvTradeoff { .. }
+                | Self::PackageManagerSyncWarning { .. }
         )
     }
 }
@@ -173,6 +200,13 @@ impl std::fmt::Display for OrchestratorError {
             }
             OrchestratorError::WriteError { path, message } => {
                 write!(f, "Failed to write {}: {}", path, message)
+            }
+            OrchestratorError::PackageManagerSyncWarning { path, reason } => {
+                write!(
+                    f,
+                    "Could not synchronize packageManager in {}: {reason}",
+                    crate::user_path::display(path)
+                )
             }
             OrchestratorError::InstallResolutionError { directory, message } => {
                 write!(
@@ -640,6 +674,15 @@ impl Orchestrator {
         let manifests = manifests.as_slice();
 
         let parsed = self.parse_phase(manifests, progress, &mut errors);
+        let initial_pins =
+            crate::manifest::capture_package_manager_pins(parsed.iter().filter_map(|manifest| {
+                let project = manifest.info.mise_project.as_deref()?;
+                manifest
+                    .dependencies
+                    .iter()
+                    .any(|dep| crate::manifest::is_mise_package_manager(&dep.name))
+                    .then_some(project)
+            }));
         self.check_phase(parsed, progress, &mut summary, &mut errors, auditor)
             .await;
         self.sync_tauri_if_needed(manifests, progress, &mut summary, &mut errors)
@@ -682,7 +725,14 @@ impl Orchestrator {
         } else {
             BTreeSet::new()
         };
-        let write_results = self.write_phase(&mut summary, progress, &mut errors, &skip);
+        let write_results = self.write_phase(
+            &mut summary,
+            progress,
+            &mut errors,
+            &skip,
+            manifests,
+            &initial_pins,
+        );
 
         OrchestratorResult {
             summary,
@@ -941,21 +991,30 @@ impl Orchestrator {
         progress: &mut Progress,
         errors: &mut Vec<OrchestratorError>,
         skip: &BTreeSet<PathBuf>,
+        manifests: &[ManifestInfo],
+        initial_pins: &BTreeMap<PathBuf, String>,
     ) -> Vec<WriteResult> {
         if !self.args.dry_run {
             progress.spinner("Writing updates...");
         }
         let writer = ManifestWriter::new(self.args.dry_run);
-        let writable: Vec<_> = summary
-            .manifests
-            .iter()
-            .filter(|manifest| !skip.contains(&manifest.path))
-            .cloned()
-            .collect();
-        let write_results = writer.apply_all_updates(&writable, parser_for);
+        let write_results = writer.apply_scoped_updates(
+            &summary.manifests,
+            parser_for,
+            skip,
+            manifests,
+            initial_pins,
+            self.args.max_change,
+        );
         progress.finish_and_clear();
 
         for result in &write_results {
+            if let Some((path, reason)) = &result.package_manager_warning {
+                errors.push(OrchestratorError::PackageManagerSyncWarning {
+                    path: path.clone(),
+                    reason: reason.clone(),
+                });
+            }
             for failure in &result.failed_updates {
                 summary.record_write_error(&result.path, failure.index, failure.reason.clone());
             }

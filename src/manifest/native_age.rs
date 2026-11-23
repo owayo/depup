@@ -102,29 +102,7 @@ fn read_scoped_values(
                 paths.push(scope.join(name));
             }
         } else {
-            for name in super::MISE_CONFIG_FILENAMES
-                .iter()
-                .chain(["mise.local.toml", ".mise.local.toml"].iter())
-            {
-                paths.push(scope.join(name));
-            }
-            for environment in environments.split(',').filter(|env| {
-                !env.is_empty()
-                    && env
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
-            }) {
-                for name in super::MISE_CONFIG_FILENAMES {
-                    if let Some(stem) = name.strip_suffix(".toml") {
-                        for name in [
-                            format!("{stem}.{environment}.toml"),
-                            format!("{stem}.{environment}.local.toml"),
-                        ] {
-                            paths.push(scope.join(name));
-                        }
-                    }
-                }
-            }
+            paths.extend(mise_config_layers(scope, &environments));
         }
     }
     paths.into_iter().try_fold(Vec::new(), |mut values, path| {
@@ -136,6 +114,28 @@ fn read_scoped_values(
         )?);
         Ok(values)
     })
+}
+
+pub(crate) fn mise_config_layers(scope: &Path, environments: &str) -> Vec<PathBuf> {
+    let mut paths: Vec<_> = super::MISE_CONFIG_FILENAMES
+        .iter()
+        .chain(["mise.local.toml", ".mise.local.toml"].iter())
+        .map(|name| scope.join(name))
+        .collect();
+    for environment in environments.split(',').filter(|env| {
+        !env.is_empty()
+            && env
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    }) {
+        for name in super::MISE_CONFIG_FILENAMES {
+            if let Some(stem) = name.strip_suffix(".toml") {
+                paths.push(scope.join(format!("{stem}.{environment}.toml")));
+                paths.push(scope.join(format!("{stem}.{environment}.local.toml")));
+            }
+        }
+    }
+    paths
 }
 
 fn read_age_values(language: Language, path: &Path) -> Result<Vec<String>, String> {

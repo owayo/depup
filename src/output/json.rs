@@ -36,6 +36,8 @@ struct JsonOutput<'a> {
     lock_age_failures: Vec<crate::domain::LockAgeFailure>,
     #[serde(skip_serializing_if = "Option::is_none")]
     submodules: Option<&'a [SubmoduleResult]>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    package_manager_syncs: Vec<JsonPackageManagerSync<'a>>,
     /// dry-run だったかどうか
     dry_run: bool,
     /// サマリ統計
@@ -45,6 +47,13 @@ struct JsonOutput<'a> {
     /// 発生したエラー
     #[serde(skip_serializing_if = "Vec::is_empty")]
     errors: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct JsonPackageManagerSync<'a> {
+    path: String,
+    from: &'a str,
+    to: &'a str,
 }
 
 /// サマリ統計の JSON 表現
@@ -331,6 +340,14 @@ impl OutputFormatter for JsonFormatter {
 
         let output = JsonOutput {
             submodules: result.summary.submodules.as_deref(),
+            package_manager_syncs: result
+                .package_manager_syncs()
+                .map(|sync| JsonPackageManagerSync {
+                    path: crate::user_path::display(&sync.path).to_string(),
+                    from: &sync.from,
+                    to: &sync.to,
+                })
+                .collect(),
             // 再解決の単位のディレクトリは正規化されている。テキストと同じく `\\?\` を外す (#148)
             lock_refreshes: result
                 .summary
