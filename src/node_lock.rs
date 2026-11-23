@@ -397,8 +397,8 @@ fn parse_pnpm_registry_output(output: &[u8]) -> Result<Option<String>, String> {
     let output = std::str::from_utf8(output)
         .map_err(|_| invalid().to_string())?
         .trim();
-    // pnpm 11 は未設定のキーに JSON を出さず、それより新しい版は null を出す。
-    if output.is_empty() {
+    // 未設定の出力は pnpm の版によって異なる。10.11.0 は undefined、11 は空、12 は JSON null。
+    if matches!(output, "" | "undefined") {
         return Ok(None);
     }
     match serde_json::from_str::<Value>(output) {

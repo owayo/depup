@@ -79,10 +79,9 @@ impl PnpmOverrides {
         )
         .await?;
         let mut overrides = Self::default();
-        if !output
-            .bytes()
-            .all(|byte| byte.is_ascii_whitespace() || byte == 0x0b)
-        {
+        // pnpm 10.11.0 は未設定でも --json に引用符なしの undefined を返す。
+        let trimmed = output.trim_matches(|ch: char| ch.is_ascii_whitespace() || ch == '\x0b');
+        if !matches!(trimmed, "" | "undefined") {
             let value: serde_json::Value = serde_json::from_str(&output)
                 .map_err(|_| "pnpm overrides configuration is not valid JSON".to_string())?;
             overrides.add(&value, "effective pnpm overrides")?;
@@ -224,6 +223,7 @@ mod tests {
     #[tokio::test]
     async fn pnpm_legacy_overrides_are_inactive_since_version_11() {
         for major in [10, 11, 12] {
+            let unset = if major == 10 { "undefined" } else { "null" };
             let directory = tempfile::tempdir().unwrap();
             std::fs::write(
                 directory.path().join("package.json"),
@@ -233,7 +233,7 @@ mod tests {
             let program = fake(
                 directory.path(),
                 &format!(
-                    "if [ \"$1\" = --version ]; then printf '{major}.0.0'; else printf null; fi"
+                    "if [ \"$1\" = --version ]; then printf '{major}.0.0'; else printf '{unset}'; fi"
                 ),
             );
             let overrides = PnpmOverrides::read_with(directory.path(), &program)
@@ -289,21 +289,23 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn pnpm_effective_overrides_accept_empty_and_fail_closed_on_invalid_config() {
-        for output in ["", " \\t\\r\\n", "null", "{}"] {
+        for output in ["", " \\t\\r\\n", "null", "{}", " \\tundefined\\r\\n"] {
             let directory = tempfile::tempdir().unwrap();
             std::fs::write(directory.path().join("package.json"), "{}").unwrap();
             let program = fake(directory.path(), &format!("printf '{output}'"));
-            assert!(
-                PnpmOverrides::read_with(directory.path(), &program)
-                    .await
-                    .is_ok()
-            );
+            let overrides = PnpmOverrides::read_with(directory.path(), &program)
+                .await
+                .unwrap_or_else(|error| panic!("{output:?}: {error}"));
+            assert!(overrides.reason(&dependency("example")).is_none());
         }
         for script in [
             "exit 7",
             "printf invalid",
+            "printf 'undefined\\nwarning'",
+            "printf '\"undefined\"'",
             "printf '[]'",
-            "printf null; printf secret >&2",
+            "printf undefined; printf secret >&2",
+            "printf undefined; exit 7",
         ] {
             let directory = tempfile::tempdir().unwrap();
             std::fs::write(directory.path().join("package.json"), "{}").unwrap();
