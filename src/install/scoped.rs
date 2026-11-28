@@ -71,7 +71,7 @@ pub(super) fn replace_scoped_jobs(
         let language = manifests[0].language;
         let scope = match language {
             Language::Rust if stopped_roots.contains(&directory) => {
-                Err("Cargo root was stopped by the pnpm preflight".into())
+                Err("Cargo root was stopped by the Node lockfile preflight".into())
             }
             Language::Rust => cargo_scope(&directory, &manifests),
             Language::Php => composer_scope(&directory, &manifests),

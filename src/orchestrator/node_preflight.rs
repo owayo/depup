@@ -1,4 +1,4 @@
-//! 書き込み前に既存 pnpm lock の age を確認する。
+//! 書き込み前に Bun の age 監査の可否と、既存 pnpm lock の公開日を確認する。
 
 use super::{OrchestratorError, tauri_project_directory};
 use crate::cargo_scope::{CargoMembership, CargoRoot};
@@ -62,6 +62,7 @@ pub(super) struct BlockedScope {
 }
 
 enum Failure {
+    UnsupportedBunLock,
     Audit(NodeLockAuditResult),
     Policy(String),
     Lock(String),
@@ -70,6 +71,7 @@ enum Failure {
 impl Failure {
     fn reason(&self) -> &'static str {
         match self {
+            Self::UnsupportedBunLock => "depup cannot verify Bun lockfiles against --age",
             Self::Audit(audit) if !audit.violations.is_empty() => {
                 "the existing pnpm-lock.yaml violates --age"
             }
@@ -136,6 +138,15 @@ pub(super) async fn preflight(
             continue;
         }
         let failure = match existing_pnpm_lock(&scope.directory) {
+            Ok(false)
+                if !refresh_lock
+                    && matches!(
+                        SystemPackageManager::new().detect_node_pm_with_source(&scope.directory),
+                        Some(("bun", _))
+                    ) =>
+            {
+                Failure::UnsupportedBunLock
+            }
             Ok(false) => continue,
             Err(error) => Failure::Lock(error),
             Ok(true) => match &scope.policy {
@@ -205,7 +216,7 @@ pub(super) fn block(
                 reason.clone()
             } else {
                 format!(
-                    "shares a synchronized Tauri install with the stopped pnpm scope in {}",
+                    "shares a synchronized Tauri install with the stopped Node project in {}",
                     crate::user_path::display(&scope.directory)
                 )
             };
@@ -568,10 +579,13 @@ fn repair_install_command(age: Duration) -> String {
 fn report_lines(scope: &BlockedScope) -> Vec<String> {
     let directory = crate::user_path::display(&scope.directory);
     let mut lines = vec![format!(
-        "  {directory} — {}; manifests were not changed and pnpm install was skipped",
+        "  {directory} — {}; manifests were not changed and the install was skipped",
         scope.failure.reason()
     )];
     match &scope.failure {
+        Failure::UnsupportedBunLock => lines.push(format!(
+            "  {directory} — omit --install to update direct dependencies under the age policy"
+        )),
         Failure::Audit(audit) => {
             lines.extend(
                 audit
