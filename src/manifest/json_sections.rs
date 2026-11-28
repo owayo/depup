@@ -98,39 +98,36 @@ fn direct_child_properties(
     })
 }
 
-pub(crate) fn direct_child_object_section_ranges(
+/// 親オブジェクトの直下から、条件に合うキーとオブジェクト本文の範囲を返す。
+pub(super) fn child_object_sections(
     content: &str,
-    parent_ranges: &[(usize, usize)],
-    section_names: Option<&[&str]>,
-) -> Vec<(usize, usize)> {
+    (start, end): (usize, usize),
+    select: impl Fn(&str) -> bool,
+) -> impl Iterator<Item = (Cow<'_, str>, (usize, usize))> {
     let bytes = content.as_bytes();
-    let mut ranges = Vec::new();
-    for &(start, end) in parent_ranges {
-        for (raw_key, value_start) in direct_child_properties(content, start, end) {
-            if bytes[value_start] == b'{'
-                && let Some(key) = decode_json_string(raw_key)
-                && section_names.is_none_or(|names| names.contains(&key.as_ref()))
-                && let Some(object_end) = find_matching_json_object_end(bytes, value_start)
-                && object_end <= end
-            {
-                ranges.push((value_start + 1, object_end));
-            }
+    direct_child_properties(content, start, end).filter_map(move |(raw_key, value_start)| {
+        if bytes[value_start] != b'{' {
+            return None;
         }
-    }
-    ranges
+        let key = decode_json_string(raw_key)?;
+        if !select(&key) {
+            return None;
+        }
+        let object_end = find_matching_json_object_end(bytes, value_start)?;
+        (object_end <= end).then_some((key, (value_start + 1, object_end)))
+    })
 }
 
-pub(crate) fn top_level_object_section_ranges(
-    content: &str,
-    section_names: &[&str],
-) -> Vec<(usize, usize)> {
+fn top_level_object_section_ranges(content: &str, section_names: &[&str]) -> Vec<(usize, usize)> {
     let Some(range) = root_object_range(content) else {
         return Vec::new();
     };
-    direct_child_object_section_ranges(content, &[range], Some(section_names))
+    child_object_sections(content, range, |key| section_names.contains(&key))
+        .map(|(_, body)| body)
+        .collect()
 }
 
-fn root_object_range(content: &str) -> Option<(usize, usize)> {
+pub(super) fn root_object_range(content: &str) -> Option<(usize, usize)> {
     let bytes = content.as_bytes();
     let start = skip_json_ws(bytes, 0);
     if bytes.get(start) != Some(&b'{') {
@@ -141,8 +138,8 @@ fn root_object_range(content: &str) -> Option<(usize, usize)> {
 
 type StringProperty<'a> = (std::ops::Range<usize>, Cow<'a, str>);
 
-/// For validated JSON, locate a unique top-level string literal by its decoded key.
-/// Duplicate keys have no unique edit site, even if one value is not a string.
+/// 検証済みの JSON から、デコードしたキーに一致する直下の文字列リテラルを探す。
+/// キーが重複した場合は、一方の値が文字列以外でも書き換え位置を決めない。
 pub(crate) fn unique_top_level_string_property<'a>(
     content: &'a str,
     property: &str,
@@ -422,7 +419,9 @@ mod tests {
 }"#;
         let parents = top_level_object_section_ranges(content, &["workspaces"]);
 
-        let ranges = direct_child_object_section_ranges(content, &parents, Some(&["catalog"]));
+        let ranges: Vec<_> = child_object_sections(content, parents[0], |key| key == "catalog")
+            .map(|(_, body)| body)
+            .collect();
 
         assert_eq!(ranges.len(), 1);
         assert_eq!(
@@ -508,7 +507,7 @@ mod tests {
         // 閉じない文字列リテラルで break しても panic しない
         assert!(top_level_object_section_ranges(r#"{ "depend"#, &["dependencies"]).is_empty());
         assert!(
-            direct_child_object_section_ranges("", &[(0, 0)], None).is_empty(),
+            child_object_sections("", (0, 0), |_| true).next().is_none(),
             "空入力の親範囲でも panic しない"
         );
     }

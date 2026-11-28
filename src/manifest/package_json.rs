@@ -10,12 +10,18 @@ use crate::domain::{Dependency, Language};
 use crate::error::ManifestError;
 use crate::manifest::ManifestParser;
 use crate::manifest::json_sections::{
-    direct_child_object_section_ranges, replace_string_property_in_ranges,
-    replace_string_property_in_top_level_sections, top_level_object_section_ranges,
+    child_object_sections, replace_string_property_in_ranges, root_object_range,
 };
 use crate::parser::{VersionParser, get_parser};
 use serde_json::{Map, Value};
 use std::path::PathBuf;
+
+const DEPENDENCY_SECTIONS: [&str; 4] = [
+    "dependencies",
+    "devDependencies",
+    "peerDependencies",
+    "optionalDependencies",
+];
 
 /// `package.json` 用パーサ
 pub struct PackageJsonParser;
@@ -31,24 +37,15 @@ impl ManifestParser for PackageJsonParser {
         let mut dependencies = Vec::new();
         let parser = get_parser(Language::Node);
 
-        // 通常の依存関係を解釈する
-        if let Some(deps) = json.get("dependencies").and_then(|v| v.as_object()) {
-            parse_dependency_object(deps, parser.as_ref(), false, &mut dependencies);
-        }
-
-        // 開発依存を解釈する
-        if let Some(deps) = json.get("devDependencies").and_then(|v| v.as_object()) {
-            parse_dependency_object(deps, parser.as_ref(), true, &mut dependencies);
-        }
-
-        // peerDependencies は通常依存として扱う
-        if let Some(deps) = json.get("peerDependencies").and_then(|v| v.as_object()) {
-            parse_dependency_object(deps, parser.as_ref(), false, &mut dependencies);
-        }
-
-        // optionalDependencies を解釈する
-        if let Some(deps) = json.get("optionalDependencies").and_then(|v| v.as_object()) {
-            parse_dependency_object(deps, parser.as_ref(), false, &mut dependencies);
+        for section in DEPENDENCY_SECTIONS {
+            if let Some(deps) = json.get(section).and_then(Value::as_object) {
+                parse_dependency_object(
+                    deps,
+                    parser.as_ref(),
+                    section == "devDependencies",
+                    &mut dependencies,
+                );
+            }
         }
 
         // Bun Catalogs は root package.json の `catalog` / `catalogs` か
@@ -70,23 +67,12 @@ impl ManifestParser for PackageJsonParser {
     ) -> Result<String, ManifestError> {
         let parser = get_parser(Language::Node);
 
-        // 元の整形とキー順を保つため、依存セクション内だけをテキスト置換で更新する
-        let sections = [
-            "dependencies",
-            "devDependencies",
-            "peerDependencies",
-            "optionalDependencies",
-        ];
-        let (result, updated) = replace_string_property_in_top_level_sections(
+        let (result, updated) = replace_string_property_in_ranges(
             content,
-            &sections,
+            dependency_object_ranges(content),
             package,
-            |old_version| format_node_update(parser.as_ref(), old_version, new_version),
+            &mut |old_version| format_node_update(parser.as_ref(), old_version, new_version),
         );
-
-        let (result, catalog_updated) =
-            replace_bun_catalog_versions(&result, package, new_version, parser.as_ref());
-        let updated = updated || catalog_updated;
 
         if !updated {
             return Err(ManifestError::InvalidVersionSpec {
@@ -96,7 +82,7 @@ impl ManifestParser for PackageJsonParser {
             });
         }
 
-        Ok(result.to_string())
+        Ok(result)
     }
 }
 
@@ -224,49 +210,33 @@ fn parse_bun_catalog_container(
     }
 }
 
-fn bun_catalog_object_ranges(content: &str) -> Vec<(usize, usize)> {
+fn dependency_object_ranges(content: &str) -> Vec<(usize, usize)> {
+    let Some(root) = root_object_range(content) else {
+        return Vec::new();
+    };
     let mut ranges = Vec::new();
-
-    // トップレベルの `catalog`
-    ranges.extend(top_level_object_section_ranges(content, &["catalog"]));
-
-    // トップレベルの `catalogs.<name>`
-    let top_catalogs = top_level_object_section_ranges(content, &["catalogs"]);
-    ranges.extend(direct_child_object_section_ranges(
-        content,
-        &top_catalogs,
-        None,
-    ));
-
-    // `workspaces.catalog` を処理する
-    let workspaces = top_level_object_section_ranges(content, &["workspaces"]);
-    ranges.extend(direct_child_object_section_ranges(
-        content,
-        &workspaces,
-        Some(&["catalog"]),
-    ));
-
-    // `workspaces.catalogs.<name>` を処理する
-    let workspace_catalogs =
-        direct_child_object_section_ranges(content, &workspaces, Some(&["catalogs"]));
-    ranges.extend(direct_child_object_section_ranges(
-        content,
-        &workspace_catalogs,
-        None,
-    ));
-
+    let mut add_section = |key: &str, body| {
+        if key == "catalogs" {
+            // 名前付き catalog はそれぞれが依存の一覧を持つ。
+            ranges
+                .extend(child_object_sections(content, body, |_| true).map(|(_, catalog)| catalog));
+        } else {
+            ranges.push(body);
+        }
+    };
+    let is_catalog = |key: &str| matches!(key, "catalog" | "catalogs");
+    for (key, body) in child_object_sections(content, root, |key| {
+        DEPENDENCY_SECTIONS.contains(&key) || is_catalog(key) || key == "workspaces"
+    }) {
+        if key == "workspaces" {
+            for (key, catalog) in child_object_sections(content, body, is_catalog) {
+                add_section(&key, catalog);
+            }
+        } else {
+            add_section(&key, body);
+        }
+    }
     ranges
-}
-
-fn replace_bun_catalog_versions(
-    content: &str,
-    package: &str,
-    new_version: &str,
-    parser: &dyn VersionParser,
-) -> (String, bool) {
-    let ranges = bun_catalog_object_ranges(content);
-    let mut transform = |old_version: &str| format_node_update(parser, old_version, new_version);
-    replace_string_property_in_ranges(content, ranges, package, &mut transform)
 }
 
 #[cfg(test)]
@@ -419,6 +389,26 @@ mod tests {
             .unwrap();
         assert!(result.contains(r#""lodash": "^4.18.0""#));
         assert!(result.contains(r#""lodash": "4.17.20""#));
+    }
+
+    #[test]
+    fn ordinary_and_bun_sections_update_together_at_their_declared_depth() {
+        let content = r#"{
+  "workspaces": {
+    "catalogs": {"dependencies": {"pkg": "npm:real@^1.2.3"}, "ignored": ["pkg"]},
+    "dependencies": {"pkg": "^0.9.0"},
+    "catalog": {"pkg": "~1.2.3"}
+  },
+  "overrides": {"catalog": {"pkg": "^0.9.0"}},
+  "catalogs": {"workspaces": {"pkg": "^1.2.3", "nested": {"pkg": "^0.9.0"}}},
+  "devDependencies": {"pkg": "~1.2.3"},
+  "catal\u006fg": {"pkg": "^1.2.3"},
+  "dependencies": {"pkg": "catalog:"}
+}"#;
+        let updated = PackageJsonParser
+            .update_version(content, "pkg", "20.30.40")
+            .unwrap();
+        assert_eq!(updated, content.replace("1.2.3", "20.30.40"));
     }
 
     #[test]
