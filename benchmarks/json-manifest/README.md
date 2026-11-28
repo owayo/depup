@@ -46,3 +46,20 @@ after  f322c96fd27618a58281cee09e43346335a9bd84f424b6cdce4125e751a76552
 - The temporary collection and string ownership in the JSON walker were chosen because the baseline showed over 1,000 allocations per large update. The longer install transaction and OSV functions coordinate recovery/security decisions; splitting them without a specific improvement would broaden this change's risk. Public `enforce_lock_age_rust` remains available even though there is no internal caller.
 - No reproducible product bug was found. Open GitHub issues were empty at the initial collection and subsequent check. No issue or PR was needed for this maintenance change.
 - The documentation-link script `/Users/owa/GitHub/mac-shell/shell/link_agent.md.sh` is absent on Windows, and no equivalent was found in the local Windows scripts. It was not run. `CLAUDE.md` is a regular file in this checkout; it was preserved rather than replaced or edited.
+
+## Node and Bun section lookup on 2026-11-28
+
+The writer locates ordinary dependency sections and Bun catalogs together and applies replacements to one copy of the input. Both builds used Rust 1.100.0 (MSVC), the same lockfile and release profile on Windows x86_64 (Ryzen 7 5700X). The baseline is `db34bfd` and the changed implementation is `07801e0`.
+
+Build each revision with `mise exec -- cargo build --release --locked --example manifest_update_bench`. Run the two binaries with `manifest_update_bench 1000 7` in the order before, after, after, before, pinned to the same logical processor (affinity mask 4). Each run warms up with 100 updates per case. The table gives the median of 14 samples per implementation in microseconds per update. Allocation requests and requested bytes include reallocations and were counted separately for one warmed update. The timer covers in-memory rewriting. [All 168 samples](section-traversal.csv)
+
+| Case | Before µs | After µs | Time reduction | Allocation requests | Requested bytes |
+|---|---:|---:|---:|---:|---:|
+| Node, 1 dependency | 2.591 | 1.699 | 34.44% | 21 → 19 | 1,650 → 1,182 |
+| Node, 100 dependencies | 21.748 | 12.895 | 40.71% | 21 → 19 | 11,748 → 4,548 |
+| Node, 1,000 dependencies | 201.572 | 115.753 | 42.57% | 21 → 19 | 103,548 → 35,148 |
+| Node, 100 escaped keys with CRLF | 35.875 | 26.436 | 26.31% | 321 → 319 | 17,587 → 9,161 |
+| Bun, 100 nested catalog dependencies | 40.639 | 23.886 | 41.23% | 24 → 19 | 13,419 → 5,041 |
+| Composer, 1,000 dependencies | 94.186 | 94.194 | -0.01% | 13 → 13 | 66,992 → 66,992 |
+
+The Node case with 1,000 dependencies requested 68,400 fewer bytes per update (66.06%). Its samples ranged from 200.311 to 235.382 µs before the change and 112.566 to 206.373 µs after it. The single slowest new sample overlaps the baseline. The Bun sample ranges were 40.101–47.176 µs and 23.730–25.617 µs. Composer’s median moved by 0.008 µs, within the observed variation, and its allocation counts and bytes matched. No builds or tests ran during these four measurements.

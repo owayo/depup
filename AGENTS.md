@@ -143,6 +143,7 @@ make ci                # CI と同じ検査 (fmt-check + lint + test、書き換
 ## Testing Strategy
 
 - JSON マニフェスト更新の性能は `mise exec -- cargo run --release --locked --example manifest_update_bench -- 1000 7` で測る。入力・依存・ツールチェーン・release 設定をそろえ、ビルドやテストを並行実行しない。確保バイト数は再確保を含む要求量で、ピークメモリではない。生データと比較条件は `benchmarks/json-manifest/` に保存する。
+- `package.json` の通常依存は解析と書き戻しで `DEPENDENCY_SECTIONS` を共有する。書き戻しは元の入力から通常依存と Bun の `catalog`・`catalogs.<name>` の範囲を集め、一度に値を置き換える。`workspaces` の内側でたどるのは catalog 宣言だけ。
 - Cargo の更新性能は同じコマンドの末尾に `cargo` を付けて測り、生データと比較条件を `benchmarks/cargo-manifest/` に保存する。単純指定・inline table・dotted key・複数行テーブルと git tag の更新を含む。Cargo の書き換えは正規表現を使わず、`cargo_sites` が見出しと行頭のキーを TOML のキーとして読んだ論理パスで宣言の場所を集め、値の範囲だけを置き換える (#168)。キーを文字列にするのはパッケージ名を書いた行とパッケージのテーブルの本文の行だけで、ほかの行は値の形 (複数行の inline table か) だけを見る。ソース除外と書き換えで同じ宣言の一覧を使う。
 - crates.io の版の取得を含む CLI 全体の時間は `bash benchmarks/crates-io-fetch/measure.sh <実装名> <depup の実行ファイル> <回数>` で測る。ネットワークに左右されるので、変更前後の release ビルドを before → after → after → before の順に交互に測り、生データと比較条件を `benchmarks/crates-io-fetch/` に保存する。
 - 依存の確認の並列度 (`MAX_VERSION_CHECK_CONCURRENCY`) を含む CLI 全体の時間は `bash benchmarks/version-check-concurrency/measure.sh <実装名> <depup の実行ファイル> <回数>` で測る (既定の age と OSV を有効にした `--dry-run`。crates.io 60 件・その 4 メンバーの workspace・npm 30 件・対照の depup 自身)。ネットワークに左右されるので、変更前後を before → after → after → before の順に交互に測り、作業用のディレクトリは `BENCH_WORK_ROOT` の下に残す
