@@ -359,6 +359,43 @@ async fn unverified_or_failed_existing_lock_blocks_without_clean_guidance() {
 }
 
 #[tokio::test]
+async fn bun_age_stops_updates_before_writing_or_scheduling_install() {
+    for marker in ["bun.lock", "bun.lockb", "packageManager", "bunfig.toml"] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        write_project(&root);
+        let manifest = root.join("package.json");
+        match marker {
+            "packageManager" => std::fs::write(
+                &manifest,
+                r#"{"packageManager":"bun@1.4.4","dependencies":{"example":"^1.0.0"}}"#,
+            ),
+            "bunfig.toml" => {
+                std::fs::write(root.join(marker), "[install]\nminimumReleaseAge = 86400")
+            }
+            _ => std::fs::write(root.join(marker), "existing lock"),
+        }
+        .unwrap();
+        let before = std::fs::read(&manifest).unwrap();
+        let options = if marker == "bunfig.toml" {
+            vec!["--install", "--no-age"]
+        } else {
+            vec!["--install", "--age", "2w"]
+        };
+        let orchestrator = orchestrator(&root, &options).await;
+        let result = run(&orchestrator, &[&root], &FakeAuditor::default()).await;
+        assert_eq!(std::fs::read(&manifest).unwrap(), before, "{marker}");
+        assert_eq!(result.summary.total_failed(), 1, "{marker}");
+        assert!(result.errors.iter().any(|error| matches!(error,
+            OrchestratorError::NodePreflightError { message, .. }
+                if message.contains("Bun") && message.contains("--age")
+        )));
+        let plan = InstallPlan::new(&orchestrator, &result, &None, &root);
+        assert!(plan.jobs.is_empty() && plan.node_audits.is_empty());
+    }
+}
+
+#[tokio::test]
 async fn preflight_skips_noinstall_dryrun_noage_nolock_other_pm_and_no_updates() {
     for (options, lock_name, no_updates) in [
         (vec![], "pnpm-lock.yaml", false),
@@ -366,6 +403,10 @@ async fn preflight_skips_noinstall_dryrun_noage_nolock_other_pm_and_no_updates()
         (vec!["--install", "--no-age"], "pnpm-lock.yaml", false),
         (vec!["--install"], "", false),
         (vec!["--install"], "package-lock.json", false),
+        (vec![], "bun.lock", false),
+        (vec!["--install", "--dry-run"], "bun.lock", false),
+        (vec!["--install", "--no-age"], "bun.lock", false),
+        (vec!["--install"], "bun.lock", true),
         (vec!["--install"], "pnpm-lock.yaml", true),
     ] {
         let temp = tempfile::tempdir().unwrap();

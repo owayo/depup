@@ -151,7 +151,7 @@ pub enum OrchestratorError {
     PackageManagerSyncWarning { path: PathBuf, reason: String },
     /// pnpm の最終的な解決結果が、表示した更新先へ到達しなかった。
     InstallResolutionError { directory: PathBuf, message: String },
-    /// 書き込み前に停止した共有 pnpm scope。事後に同じ lock を再監査しない。
+    /// 書き込み前に停止した Node の解決単位。事後に同じ lock を再監査しない。
     NodePreflightError { directory: PathBuf, message: String },
     /// 判明していれば、Cargo マニフェストと確定した install・監査ルートを停止する。
     CargoPreflightError {
@@ -219,7 +219,7 @@ impl std::fmt::Display for OrchestratorError {
             OrchestratorError::NodePreflightError { directory, message } => {
                 write!(
                     f,
-                    "pnpm preflight failed in {}: {}",
+                    "Node lockfile preflight failed in {}: {}",
                     crate::user_path::display(directory),
                     message
                 )
@@ -704,7 +704,7 @@ impl Orchestrator {
                 manifests,
                 cargo: &cargo_membership,
             };
-            progress.start(0, "Auditing existing pnpm-lock.yaml against --age");
+            progress.start(0, "Checking Node lockfiles before install");
             let bar = progress.bar();
             let blocked = node_preflight::preflight(
                 &summary,
